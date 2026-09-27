@@ -294,7 +294,7 @@ class DshService extends ChangeNotifier {
           final newSessionMeta = SessionMeta(
             sessionId: newSessionId,
             title: '新对话',
-            createdAt: DateTime.now(),
+            lastPromptAt: DateTime.now().millisecondsSinceEpoch,
           );
 
           _currentWorkspace!.sessions.insert(0, newSessionMeta);
