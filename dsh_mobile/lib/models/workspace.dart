@@ -17,6 +17,33 @@ class SessionMeta {
     this.isRunning = false,
   });
 
+  bool matchesSessionId(String? otherId) {
+    if (otherId == null || otherId.isEmpty) return false;
+    final a = sessionId.replaceAll('session-', '').toLowerCase();
+    final b = otherId.replaceAll('session-', '').toLowerCase();
+    return a == b;
+  }
+
+  SessionMeta copyWith({
+    String? sessionId,
+    String? title,
+    String? firstPrompt,
+    int? lastPromptAt,
+    String? model,
+    int? lastSeq,
+    bool? isRunning,
+  }) {
+    return SessionMeta(
+      sessionId: sessionId ?? this.sessionId,
+      title: title ?? this.title,
+      firstPrompt: firstPrompt ?? this.firstPrompt,
+      lastPromptAt: lastPromptAt ?? this.lastPromptAt,
+      model: model ?? this.model,
+      lastSeq: lastSeq ?? this.lastSeq,
+      isRunning: isRunning ?? this.isRunning,
+    );
+  }
+
   factory SessionMeta.fromJson(Map<String, dynamic> json) {
     return SessionMeta(
       sessionId: json['sessionId'] ?? '',

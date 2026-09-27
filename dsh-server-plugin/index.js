@@ -177,7 +177,8 @@ function getWorkspacesData() {
               sessionMeta.lastPromptAt = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
               sessionMeta.model = rows.modelSelection?.val?.lastUsed?.model || '';
               sessionMeta.lastSeq = rows.turnBoundary?.seq || rows.tokenUsage?.seq || 0;
-              sessionMeta.isRunning = rows.turnBoundary?.val?.openTurnStartSeq != null || activePrompts.has(sId) || activePrompts.has(sId.replace('session-', ''));
+              const follower = getSessionFollower(sId);
+              sessionMeta.isRunning = (follower && follower.isRunning) || rows.turnBoundary?.val?.openTurnStartSeq != null || activePrompts.has(sId) || activePrompts.has(sId.replace('session-', ''));
               break;
             } catch (err) {}
           }
@@ -219,9 +220,13 @@ async function getSessionHistory(sessionId) {
     path.join(projCacheDir, `${cleanId}.json`)
   ];
 
+  const fullId = normalizeSessionId(sessionId);
+  followSession(fullId);
+  const follower = getSessionFollower(fullId);
+
   let targetSeq = 0;
   let sessionTitle = sessionId;
-  let isSessionRunning = false;
+  let isSessionRunning = (follower && follower.isRunning) || false;
 
   for (const cPath of candidates) {
     if (fs.existsSync(cPath)) {
@@ -240,7 +245,7 @@ async function getSessionHistory(sessionId) {
             activePrompts.delete(`session-${cleanId}`);
           }
         }
-        isSessionRunning = rows.turnBoundary?.val?.openTurnStartSeq != null || activePrompts.has(sessionId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
+        isSessionRunning = (follower && follower.isRunning) || rows.turnBoundary?.val?.openTurnStartSeq != null || activePrompts.has(sessionId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
         break;
       } catch (_) {}
     }
@@ -343,6 +348,24 @@ async function getSessionHistory(sessionId) {
           turn: ev.data?.turn
         });
       }
+    }
+  }
+
+  // If the session is actively generating, and the in-flight turn hasn't committed to records yet:
+  if (follower && (follower.isRunning || follower.textBuffer || follower.thinkingBuffer)) {
+    isSessionRunning = true;
+    if (messages.length === 0 || messages[messages.length - 1].role === 'user') {
+      messages.push({
+        id: `in_flight_${cleanId}_${Date.now()}`,
+        role: 'assistant',
+        content: follower.textBuffer || '',
+        thinking: follower.thinkingBuffer || null,
+        tools: follower.tools || [],
+        time: Date.now(),
+        seq: 999999,
+        turn: 999999,
+        isStreaming: follower.isRunning
+      });
     }
   }
 
@@ -519,10 +542,65 @@ function isCommandReadOnly(cmdStr, toolName) {
 // Active Prompts & Turn Tracking
 const activePrompts = new Map(); // sessionId -> promptTimestamp
 
-// Approval Management State
-const pendingApprovals = new Map(); // id -> { id, eventId, clientId, sessionId, toolName, reason, callId, createdAt }
+// Active session followers: sessionId -> { isRunning: boolean, thinkingBuffer: string, textBuffer: string, tools: Array, lastUpdated: number }
+const activeSessionFollowers = new Map();
+let upstreamMuxWs = null;
 let activeEventsWs = null;
 let currentEventsClientId = null;
+
+function normalizeSessionId(sId) {
+  if (!sId) return '';
+  return sId.startsWith('session-') ? sId : `session-${sId}`;
+}
+
+function getSessionFollower(sId) {
+  if (!sId) return null;
+  const fullId = normalizeSessionId(sId);
+  const cleanId = fullId.replace('session-', '');
+  return activeSessionFollowers.get(fullId) || activeSessionFollowers.get(cleanId);
+}
+
+function followSession(sId) {
+  if (!sId) return;
+  const fullId = normalizeSessionId(sId);
+  let follower = activeSessionFollowers.get(fullId);
+  if (!follower) {
+    follower = {
+      sessionId: fullId,
+      streamId: `follow-${fullId}`,
+      isRunning: false,
+      thinkingBuffer: '',
+      textBuffer: '',
+      tools: [],
+      lastUpdated: Date.now()
+    };
+    activeSessionFollowers.set(fullId, follower);
+  }
+
+  if (upstreamMuxWs && upstreamMuxWs.readyState === WebSocket.OPEN) {
+    try {
+      upstreamMuxWs.send(JSON.stringify({
+        type: 'open',
+        streamId: `follow-${fullId}`,
+        endpoint: 'session/follow',
+        payload: {
+          args: {
+            request: {
+              address: { kind: 'session', sessionId: fullId },
+              assistantStream: true
+            }
+          }
+        }
+      }));
+      console.log(`[DSH Follow] Subscribed to session/follow for ${fullId}`);
+    } catch (err) {
+      console.error(`[DSH Follow] Failed to send open for ${fullId}:`, err);
+    }
+  }
+}
+
+// Approval Management State
+const pendingApprovals = new Map(); // id -> { id, eventId, clientId, sessionId, toolName, reason, callId, createdAt }
 
 // Connected Mobile WebSocket Clients
 const mobileClients = new Set();
@@ -538,13 +616,13 @@ function broadcastToMobileClients(msgObj) {
   }
 }
 
-// Persistent Upstream Events Listener (for tool approvals)
-function connectUpstreamEvents() {
+// Persistent Upstream Multiplexed WebSocket Listener (for session/follow streaming and approvals)
+function connectUpstreamMux() {
   const authority = `${CONFIG.DSH_HOST}:${CONFIG.DSH_PORT}`;
   const dshCookie = generateDshCookie(authority);
   const targetUrl = `ws://${authority}/api/remote.mux`;
 
-  console.log(`[DSH Events] Connecting to upstream $events on ${targetUrl}...`);
+  console.log(`[DSH Mux] Connecting to upstream mux on ${targetUrl}...`);
 
   try {
     const ws = new WebSocket(targetUrl, {
@@ -554,30 +632,190 @@ function connectUpstreamEvents() {
       }
     });
 
+    upstreamMuxWs = ws;
     activeEventsWs = ws;
 
     ws.on('open', () => {
-      console.log('[DSH Events] Connected to upstream WebSocket. Opening $events stream...');
+      console.log('[DSH Mux] Connected to upstream remote.mux. Opening $events stream...');
       ws.send(JSON.stringify({
         type: 'open',
         streamId: 'gw-events-stream',
         endpoint: '$events',
         payload: { args: {} }
       }));
+
+      // Re-follow all tracked active sessions
+      for (const fullId of activeSessionFollowers.keys()) {
+        try {
+          ws.send(JSON.stringify({
+            type: 'open',
+            streamId: `follow-${fullId}`,
+            endpoint: 'session/follow',
+            payload: {
+              args: {
+                request: {
+                  address: { kind: 'session', sessionId: fullId },
+                  assistantStream: true
+                }
+              }
+            }
+          }));
+          console.log(`[DSH Mux] Re-subscribed to session/follow for ${fullId}`);
+        } catch (_) {}
+      }
     });
 
     ws.on('message', (data) => {
       try {
         const frame = JSON.parse(data.toString());
+
+        // 1. Session follow stream frames
+        if (frame.type === 'item' && frame.streamId && frame.streamId.startsWith('follow-')) {
+          const sId = frame.streamId.replace('follow-', '');
+          const cleanId = sId.replace('session-', '');
+          let follower = activeSessionFollowers.get(sId) || activeSessionFollowers.get(cleanId);
+          if (!follower) {
+            follower = {
+              sessionId: sId,
+              streamId: frame.streamId,
+              isRunning: false,
+              thinkingBuffer: '',
+              textBuffer: '',
+              tools: [],
+              lastUpdated: Date.now()
+            };
+            activeSessionFollowers.set(sId, follower);
+          }
+          follower.lastUpdated = Date.now();
+
+          const val = frame.value;
+          if (!val) return;
+
+          // A. Assistant stream frames (real-time reasoning & text deltas)
+          if (val.type === 'assistant-stream') {
+            const aFrame = val.frame;
+            if (!aFrame) return;
+
+            if (aFrame.type === 'start') {
+              follower.isRunning = true;
+              follower.thinkingBuffer = '';
+              follower.textBuffer = '';
+              follower.tools = [];
+              broadcastToMobileClients({
+                type: 'session_status',
+                sessionId: sId,
+                isRunning: true
+              });
+            } else if (aFrame.type === 'chunk') {
+              const c = aFrame.chunk;
+              if (c) {
+                if (c.type === 'reasoning-delta' && c.text) {
+                  follower.isRunning = true;
+                  follower.thinkingBuffer += c.text;
+                  broadcastToMobileClients({
+                    type: 'thinking',
+                    sessionId: sId,
+                    delta: c.text
+                  });
+                } else if (c.type === 'text-delta' && c.text) {
+                  follower.isRunning = true;
+                  follower.textBuffer += c.text;
+                  broadcastToMobileClients({
+                    type: 'delta',
+                    sessionId: sId,
+                    delta: c.text
+                  });
+                } else if (c.type === 'tool-call-delta') {
+                  broadcastToMobileClients({
+                    type: 'tool_call',
+                    sessionId: sId,
+                    tool: c.name || 'tool',
+                    delta: c.argumentsDelta || ''
+                  });
+                }
+              }
+            } else if (aFrame.type === 'end') {
+              // End of stream attempt
+            }
+            return;
+          }
+
+          // B. Committed event frames (turn/start, turn/end, tool/call, tool/result)
+          if (val.type === 'event' && val.event) {
+            const ev = val.event;
+            if (ev.type === 'turn/start') {
+              follower.isRunning = true;
+              follower.thinkingBuffer = '';
+              follower.textBuffer = '';
+              follower.tools = [];
+              broadcastToMobileClients({
+                type: 'session_status',
+                sessionId: sId,
+                isRunning: true
+              });
+            } else if (ev.type === 'turn/end') {
+              follower.isRunning = false;
+              activePrompts.delete(sId);
+              activePrompts.delete(cleanId);
+              broadcastToMobileClients({
+                type: 'done',
+                sessionId: sId
+              });
+              broadcastToMobileClients({
+                type: 'session_status',
+                sessionId: sId,
+                isRunning: false
+              });
+              // Clear temporary buffers after disk projcache sync
+              setTimeout(() => {
+                if (!follower.isRunning) {
+                  follower.thinkingBuffer = '';
+                  follower.textBuffer = '';
+                  follower.tools = [];
+                }
+              }, 6000);
+            } else if (ev.type === 'tool/call') {
+              const toolObj = {
+                id: ev.data?.id || `tool_${Date.now()}`,
+                name: ev.data?.name || 'tool',
+                input: ev.data?.arguments || '',
+                output: '',
+                isRunning: true
+              };
+              follower.tools.push(toolObj);
+              broadcastToMobileClients({
+                type: 'tool_start',
+                sessionId: sId,
+                tool: toolObj.name,
+                input: toolObj.input
+              });
+            } else if (ev.type === 'tool/result') {
+              if (follower.tools.length > 0) {
+                const t = follower.tools[follower.tools.length - 1];
+                t.isRunning = false;
+                t.output = ev.data?.output || '执行完毕';
+              }
+              broadcastToMobileClients({
+                type: 'tool_result',
+                sessionId: sId,
+                output: ev.data?.output || '执行完毕'
+              });
+            }
+            return;
+          }
+          return;
+        }
+
+        // 2. Events stream ($events for approval and interaction)
         if (frame.type === 'item' && frame.value) {
           const val = frame.value;
 
-          // 1. Ready frame
+          // Ready frame
           if (val.type === 'ready') {
             currentEventsClientId = val.clientId;
             console.log(`[DSH Events] $events stream ready with clientId: ${currentEventsClientId}`);
           }
-          // 2. Approval Request frame
+          // Approval Request frame
           else if (val.type === 'request' && val.event === 'approval/request') {
             const toolName = val.request?.toolName || 'Unknown Tool';
             const reason = val.request?.reason || '';
@@ -587,7 +825,6 @@ function connectUpstreamEvents() {
             const currentPerms = getPermissions();
             const sessionPolicy = currentPerms.sessionPolicies?.[sessionId] || currentPerms.defaultPolicy || 'ask';
 
-            // Check if policy allows auto-approval
             let shouldAutoApprove = false;
             let autoApproveReason = '';
 
@@ -624,7 +861,6 @@ function connectUpstreamEvents() {
               return;
             }
 
-            // Otherwise, queue for manual mobile confirmation
             const approval = {
               id: val.id,
               eventId: val.id,
@@ -648,13 +884,12 @@ function connectUpstreamEvents() {
               reason: '等待人工确认'
             });
 
-            // Broadcast to all mobile clients
             broadcastToMobileClients({
               type: 'approval_request',
               approval: approval
             });
           }
-          // 3. User questions or other interactions
+          // User questions
           else if (val.type === 'request' && val.event === 'user-questions/request') {
             console.log(`[DSH Events] Received user question request:`, val);
             const question = {
@@ -675,22 +910,23 @@ function connectUpstreamEvents() {
           }
         }
       } catch (err) {
-        console.error('[DSH Events] Error parsing upstream message:', err);
+        console.error('[DSH Mux] Error parsing upstream message:', err);
       }
     });
 
     ws.on('close', (code, reason) => {
-      console.warn(`[DSH Events] Upstream events socket closed: ${code}, ${reason?.toString() || ''}. Reconnecting in 3s...`);
+      console.warn(`[DSH Mux] Upstream mux socket closed: ${code}, ${reason?.toString() || ''}. Reconnecting in 3s...`);
+      upstreamMuxWs = null;
       activeEventsWs = null;
-      setTimeout(connectUpstreamEvents, 3000);
+      setTimeout(connectUpstreamMux, 3000);
     });
 
     ws.on('error', (err) => {
-      console.error(`[DSH Events] Upstream events error: ${err.message}`);
+      console.error(`[DSH Mux] Upstream mux error: ${err.message}`);
     });
   } catch (err) {
-    console.error(`[DSH Events] Error launching upstream socket: ${err.message}. Retrying in 5s...`);
-    setTimeout(connectUpstreamEvents, 5000);
+    console.error(`[DSH Mux] Error launching upstream socket: ${err.message}. Retrying in 5s...`);
+    setTimeout(connectUpstreamMux, 5000);
   }
 }
 
@@ -847,15 +1083,30 @@ const server = http.createServer(async (req, res) => {
     // 4. POST /api/mobile/sessions/prompt
     if (pathname === '/api/mobile/sessions/prompt' && req.method === 'POST') {
       const body = await readBody();
-      if (body.sessionId) {
-        activePrompts.set(body.sessionId, Date.now());
-        activePrompts.set(body.sessionId.replace('session-', ''), Date.now());
+      const rawSessionId = body.sessionId || '';
+      const fullId = normalizeSessionId(rawSessionId);
+      const cleanId = fullId.replace('session-', '');
+
+      // Follow session immediately for live token streaming
+      followSession(fullId);
+      const follower = getSessionFollower(fullId);
+      if (follower) {
+        follower.isRunning = true;
+        follower.thinkingBuffer = '';
+        follower.textBuffer = '';
+        follower.tools = [];
+        follower.lastUpdated = Date.now();
       }
+      activePrompts.set(fullId, Date.now());
+      activePrompts.set(cleanId, Date.now());
+
+      broadcastToMobileClients({ type: 'session_status', sessionId: fullId, isRunning: true });
+
       const result = await callDshRpc('session/prompt', {
         args: {
           request: {
             requestId: crypto.randomUUID(),
-            sessionId: body.sessionId,
+            sessionId: fullId,
             mode: 'queue',
             content: [{ type: 'text', text: body.text || '' }]
           }
@@ -869,14 +1120,26 @@ const server = http.createServer(async (req, res) => {
     // 5. POST /api/mobile/sessions/cancel
     if (pathname === '/api/mobile/sessions/cancel' && req.method === 'POST') {
       const body = await readBody();
-      if (body.sessionId) {
-        activePrompts.delete(body.sessionId);
-        activePrompts.delete(body.sessionId.replace('session-', ''));
+      const rawSessionId = body.sessionId || '';
+      const fullId = normalizeSessionId(rawSessionId);
+      const cleanId = fullId.replace('session-', '');
+
+      const follower = getSessionFollower(fullId);
+      if (follower) {
+        follower.isRunning = false;
+        follower.thinkingBuffer = '';
+        follower.textBuffer = '';
+        follower.tools = [];
       }
+      activePrompts.delete(fullId);
+      activePrompts.delete(cleanId);
+      broadcastToMobileClients({ type: 'session_status', sessionId: fullId, isRunning: false });
+      broadcastToMobileClients({ type: 'done', sessionId: fullId });
+
       const result = await callDshRpc('session/cancel', {
         args: {
           request: {
-            sessionId: body.sessionId
+            sessionId: fullId
           }
         }
       });
@@ -1093,39 +1356,6 @@ wss.on('connection', (clientWs, req) => {
     pendingApprovals: Array.from(pendingApprovals.values())
   }));
 
-  // Upstream DSH multiplexed stream for this client session
-  const authority = `${CONFIG.DSH_HOST}:${CONFIG.DSH_PORT}`;
-  const dshCookie = generateDshCookie(authority);
-  const dshTargetUrl = `ws://${authority}/api/remote.mux`;
-  let upstreamWs = null;
-
-  try {
-    upstreamWs = new WebSocket(dshTargetUrl, {
-      headers: {
-        'Host': authority,
-        'Cookie': dshCookie
-      }
-    });
-
-    upstreamWs.on('message', (data) => {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        try {
-          const raw = data.toString();
-          // Forward stream items to mobile
-          clientWs.send(raw);
-        } catch (_) {
-          clientWs.send(data);
-        }
-      }
-    });
-
-    upstreamWs.on('error', (err) => {
-      console.error(`[DSH Bridge] Upstream error: ${err.message}`);
-    });
-  } catch (err) {
-    console.error('[DSH Bridge] Failed to connect upstream for client:', err);
-  }
-
   // Handle mobile client messages
   clientWs.on('message', async (message) => {
     try {
@@ -1137,7 +1367,17 @@ wss.on('connection', (clientWs, req) => {
 
       const json = JSON.parse(msgStr);
 
-      // 1. Approval response from client
+      // 1. Follow session request
+      if (json.type === 'follow' || json.type === 'select_session') {
+        const rawId = json.sessionId || json.id;
+        if (rawId) {
+          followSession(rawId);
+          clientWs.send(JSON.stringify({ type: 'follow_ack', sessionId: rawId }));
+        }
+        return;
+      }
+
+      // 2. Approval response from client
       if (json.type === 'approval_response') {
         const { eventId, outcome } = json;
         if (eventId && outcome) {
@@ -1151,17 +1391,33 @@ wss.on('connection', (clientWs, req) => {
         return;
       }
 
-      // 2. Chat prompt from client
+      // 3. Chat prompt from client over WebSocket
       if (json.type === 'chat' || json.method === 'session/send') {
-        const sessionId = json.sessionId || json.params?.sessionId || 'default';
+        const rawSessionId = json.sessionId || json.params?.sessionId || 'default';
         const content = json.content || json.params?.content || json.params?.message || '';
+        const fullId = normalizeSessionId(rawSessionId);
+        const cleanId = fullId.replace('session-', '');
+
+        followSession(fullId);
+        const follower = getSessionFollower(fullId);
+        if (follower) {
+          follower.isRunning = true;
+          follower.thinkingBuffer = '';
+          follower.textBuffer = '';
+          follower.tools = [];
+          follower.lastUpdated = Date.now();
+        }
+        activePrompts.set(fullId, Date.now());
+        activePrompts.set(cleanId, Date.now());
+
+        broadcastToMobileClients({ type: 'session_status', sessionId: fullId, isRunning: true });
 
         try {
           await callDshRpc('session/prompt', {
             args: {
               request: {
                 requestId: crypto.randomUUID(),
-                sessionId: sessionId,
+                sessionId: fullId,
                 mode: 'queue',
                 content: [{ type: 'text', text: content }]
               }
@@ -1172,11 +1428,6 @@ wss.on('connection', (clientWs, req) => {
         }
         return;
       }
-
-      // 3. Raw passthrough if needed
-      if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) {
-        upstreamWs.send(msgStr);
-      }
     } catch (err) {
       console.error(`[DSH Bridge] Error handling client message: ${err.message}`);
     }
@@ -1185,9 +1436,6 @@ wss.on('connection', (clientWs, req) => {
   clientWs.on('close', () => {
     console.log(`[DSH Bridge] Mobile client disconnected`);
     mobileClients.delete(clientWs);
-    if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) {
-      upstreamWs.close();
-    }
   });
 });
 
@@ -1200,8 +1448,8 @@ function startServer() {
     console.log(`🔑 支持的 Token: ${CONFIG.AUTH_TOKENS.join(', ')}`);
     console.log('======================================================');
 
-    // Launch background upstream $events listener
-    connectUpstreamEvents();
+    // Launch persistent upstream multiplexer (events + session follow streams)
+    connectUpstreamMux();
   });
 }
 

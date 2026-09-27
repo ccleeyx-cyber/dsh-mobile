@@ -187,6 +187,16 @@ class DshService extends ChangeNotifier {
     }
   }
 
+  void _sendWsJson(Map<String, dynamic> data) {
+    if (_status == ConnectionStatus.connected && _channel != null) {
+      try {
+        _channel?.sink.add(jsonEncode(data));
+      } catch (e) {
+        debugPrint('[DshService] _sendWsJson error: $e');
+      }
+    }
+  }
+
   // Session Management
   Future<void> selectSession(SessionMeta session) async {
     _currentSession = session;
@@ -194,6 +204,9 @@ class DshService extends ChangeNotifier {
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     notifyListeners();
+
+    // Notify server to follow this session for real-time streaming
+    _sendWsJson({'type': 'follow', 'sessionId': session.sessionId});
 
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/${session.sessionId}');
@@ -305,6 +318,9 @@ class DshService extends ChangeNotifier {
     _isSending = true;
     notifyListeners();
 
+    // Send follow event via WS
+    _sendWsJson({'type': 'follow', 'sessionId': sessionId});
+
     try {
       // Send via HTTP RPC
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/prompt');
@@ -317,7 +333,7 @@ class DshService extends ChangeNotifier {
         }),
       ).timeout(const Duration(seconds: 15));
 
-      // 3. Immediately poll for progressive tokens & thinking updates
+      // 3. Start fallback session polling
       _startSessionPolling(sessionId);
     } catch (e) {
       debugPrint('[DshService] sendPrompt error: $e');
@@ -383,12 +399,14 @@ class DshService extends ChangeNotifier {
               );
             }).toList();
 
-            if (isRunning && parsedMessages.isNotEmpty && parsedMessages.last.isAssistant) {
-              parsedMessages.last.isStreaming = true;
+            final isActivelyWsStreaming = _status == ConnectionStatus.connected && _messages.isNotEmpty && _messages.last.isStreaming;
+            if (!isActivelyWsStreaming || !isRunning) {
+              if (isRunning && parsedMessages.isNotEmpty && parsedMessages.last.isAssistant) {
+                parsedMessages.last.isStreaming = true;
+              }
+              _messages = parsedMessages;
+              notifyListeners();
             }
-
-            _messages = parsedMessages;
-            notifyListeners();
           }
 
           if (!isRunning) {
@@ -726,46 +744,123 @@ class DshService extends ChangeNotifier {
         return;
       }
 
-      // 4. Streaming tokens and chat chunks
-      if (_messages.isNotEmpty && _messages.last.isAssistant) {
-        final current = _messages.last;
+      // 4. Session Status Updates (Running / Idle)
+      if (type == 'session_status') {
+        final sId = json['sessionId']?.toString() ?? '';
+        final isRunning = json['isRunning'] == true;
+        bool changed = false;
+        for (var ws in _workspaces) {
+          for (var i = 0; i < ws.sessions.length; i++) {
+            final s = ws.sessions[i];
+            if (s.matchesSessionId(sId) && s.isRunning != isRunning) {
+              ws.sessions[i] = s.copyWith(isRunning: isRunning);
+              changed = true;
+            }
+          }
+        }
+        if (_currentSession != null && _currentSession!.matchesSessionId(sId)) {
+          _isSending = isRunning;
+          if (!isRunning && _messages.isNotEmpty && _messages.last.isAssistant) {
+            _messages.last.isStreaming = false;
+          }
+          changed = true;
+        }
+        if (changed) {
+          notifyListeners();
+        }
+        return;
+      }
 
-        // Reasoning / Thinking
+      // 5. Streaming tokens and chat chunks (thinking / delta / token)
+      if (type == 'thinking' || type == 'delta' || type == 'token' || json.containsKey('delta') || json.containsKey('thinking')) {
+        final sId = json['sessionId']?.toString();
+        if (sId != null && _currentSession != null && !_currentSession!.matchesSessionId(sId)) {
+          return;
+        }
+
+        if (_messages.isEmpty || !_messages.last.isAssistant) {
+          _messages.add(ChatMessage(
+            id: _uuid.v4(),
+            role: 'assistant',
+            content: '',
+            thinking: '',
+            isStreaming: true,
+            timestamp: DateTime.now(),
+          ));
+        }
+
+        final current = _messages.last;
+        current.isStreaming = true;
+        _isSending = true;
+
         if (type == 'thinking' || json.containsKey('thinking')) {
           final text = json['delta'] ?? json['thinking'] ?? '';
           current.thinking = (current.thinking ?? '') + text.toString();
           notifyListeners();
-        }
-        // Streaming text
-        else if (type == 'token' || type == 'delta' || json.containsKey('delta')) {
+        } else {
           final text = json['delta'] ?? json['content'] ?? json['text'] ?? '';
           current.content += text.toString();
           notifyListeners();
         }
-        // Tool call
-        else if (type == 'tool_start' || type == 'tool_call') {
-          final toolName = json['tool'] ?? json['name'] ?? 'tool';
-          final toolInput = json['input'] ?? json['args']?.toString() ?? '';
-          current.tools.add(ToolExecution(name: toolName, input: toolInput));
+        return;
+      }
+
+      // 6. Tool Executions
+      if (type == 'tool_start' || type == 'tool_call') {
+        final sId = json['sessionId']?.toString();
+        if (sId != null && _currentSession != null && !_currentSession!.matchesSessionId(sId)) {
+          return;
+        }
+        if (_messages.isEmpty || !_messages.last.isAssistant) {
+          _messages.add(ChatMessage(
+            id: _uuid.v4(),
+            role: 'assistant',
+            content: '',
+            thinking: '',
+            isStreaming: true,
+            timestamp: DateTime.now(),
+          ));
+        }
+        final toolName = json['tool'] ?? json['name'] ?? 'tool';
+        final toolInput = json['input'] ?? json['args']?.toString() ?? '';
+        _messages.last.tools.add(ToolExecution(name: toolName, input: toolInput, isRunning: true));
+        _messages.last.isStreaming = true;
+        _isSending = true;
+        notifyListeners();
+        return;
+      }
+
+      if (type == 'tool_result' || type == 'tool_end') {
+        final sId = json['sessionId']?.toString();
+        if (sId != null && _currentSession != null && !_currentSession!.matchesSessionId(sId)) {
+          return;
+        }
+        if (_messages.isNotEmpty && _messages.last.isAssistant && _messages.last.tools.isNotEmpty) {
+          final lastTool = _messages.last.tools.last;
+          lastTool.isRunning = false;
+          lastTool.output = json['output']?.toString() ?? json['result']?.toString() ?? '完成';
           notifyListeners();
         }
-        // Tool result
-        else if (type == 'tool_result' || type == 'tool_end') {
-          if (current.tools.isNotEmpty) {
-            final lastTool = current.tools.last;
-            lastTool.isRunning = false;
-            lastTool.output = json['output']?.toString() ?? json['result']?.toString() ?? '完成';
-            notifyListeners();
-          }
+        return;
+      }
+
+      // 7. Completion
+      if (type == 'done' || type == 'end') {
+        final sId = json['sessionId']?.toString();
+        if (sId != null && _currentSession != null && !_currentSession!.matchesSessionId(sId)) {
+          return;
         }
-        // Completion
-        else if (type == 'done' || type == 'end') {
+        if (_messages.isNotEmpty && _messages.last.isAssistant) {
+          final current = _messages.last;
           current.isStreaming = false;
           for (var t in current.tools) {
             t.isRunning = false;
           }
-          notifyListeners();
         }
+        _isSending = false;
+        notifyListeners();
+        fetchWorkspaces();
+        return;
       }
     } catch (e) {
       debugPrint('[DshService] JSON parse error: $e');

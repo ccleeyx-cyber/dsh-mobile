@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -17,11 +18,38 @@ class WorkspacesView extends StatefulWidget {
 class _WorkspacesViewState extends State<WorkspacesView> {
   final TextEditingController _searchController = TextEditingController();
   String _searchFilter = '';
+  Timer? _refreshTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        Provider.of<DshService>(context, listen: false).fetchWorkspaces();
+      }
+    });
+    // Periodically refresh workspaces if any session is actively running
+    _refreshTimer = Timer.periodic(const Duration(seconds: 4), (_) {
+      if (mounted) {
+        final dsh = Provider.of<DshService>(context, listen: false);
+        final hasRunning = dsh.workspaces.any((w) => w.sessions.any((s) => _isSessionRunning(s, dsh)));
+        if (hasRunning) {
+          dsh.fetchWorkspaces();
+        }
+      }
+    });
+  }
 
   @override
   void dispose() {
+    _refreshTimer?.cancel();
     _searchController.dispose();
     super.dispose();
+  }
+
+  bool _isSessionRunning(SessionMeta s, DshService dsh) {
+    final matchesCurrent = s.matchesSessionId(dsh.currentSession?.sessionId);
+    return s.isRunning || (dsh.isSending && matchesCurrent);
   }
 
   String _formatTime(int? timestamp) {
@@ -291,7 +319,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
   }
 
   Widget _buildWorkspaceCard(BuildContext context, DshService dsh, Workspace ws, bool isCurrent) {
-    final hasRunning = ws.sessions.any((s) => s.isRunning || (dsh.isSending && s.sessionId == dsh.currentSession?.sessionId));
+    final hasRunning = ws.sessions.any((s) => _isSessionRunning(s, dsh));
 
     return Container(
       margin: const EdgeInsets.only(bottom: 14),
@@ -464,18 +492,26 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                 itemCount: ws.sessions.length,
                 itemBuilder: (context, sIdx) {
                   final s = ws.sessions[sIdx];
-                  final isCurrentSession = isCurrent && s.sessionId == dsh.currentSession?.sessionId;
-                  final isRunning = s.isRunning || (dsh.isSending && isCurrentSession);
+                  final isCurrentSession = isCurrent && s.matchesSessionId(dsh.currentSession?.sessionId);
+                  final isRunning = _isSessionRunning(s, dsh);
 
                   return ListTile(
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                     leading: isRunning
-                        ? const SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: Padding(
-                              padding: EdgeInsets.all(2.0),
-                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blueAccent),
+                        ? Container(
+                            width: 28,
+                            height: 28,
+                            decoration: BoxDecoration(
+                              color: Colors.blueAccent.withOpacity(0.15),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.blueAccent.withOpacity(0.35)),
+                            ),
+                            child: const Center(
+                              child: SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blueAccent),
+                              ),
                             ),
                           )
                         : Icon(
@@ -500,13 +536,24 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                         if (isRunning) ...[
                           const SizedBox(width: 6),
                           Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
                             decoration: BoxDecoration(
-                              color: Colors.blueAccent.withOpacity(0.18),
+                              color: Colors.blueAccent.withOpacity(0.2),
                               borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: Colors.blueAccent.withOpacity(0.4)),
+                              border: Border.all(color: Colors.blueAccent.withOpacity(0.5)),
                             ),
-                            child: const Text('执行中...', style: TextStyle(color: Colors.blueAccent, fontSize: 9.5, fontWeight: FontWeight.bold)),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: const [
+                                SizedBox(
+                                  width: 8,
+                                  height: 8,
+                                  child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.blueAccent),
+                                ),
+                                SizedBox(width: 4),
+                                Text('运行中...', style: TextStyle(color: Color(0xFF60A5FA), fontSize: 9.5, fontWeight: FontWeight.bold)),
+                              ],
+                            ),
                           ),
                         ],
                       ],
