@@ -564,6 +564,9 @@ function followSession(sId) {
   if (!sId) return;
   const fullId = normalizeSessionId(sId);
   let follower = activeSessionFollowers.get(fullId);
+  if (follower && follower.subscribed) {
+    return;
+  }
   if (!follower) {
     follower = {
       sessionId: fullId,
@@ -572,12 +575,13 @@ function followSession(sId) {
       thinkingBuffer: '',
       textBuffer: '',
       tools: [],
+      subscribed: false,
       lastUpdated: Date.now()
     };
     activeSessionFollowers.set(fullId, follower);
   }
 
-  if (upstreamMuxWs && upstreamMuxWs.readyState === WebSocket.OPEN) {
+  if (upstreamMuxWs && upstreamMuxWs.readyState === WebSocket.OPEN && !follower.subscribed) {
     try {
       upstreamMuxWs.send(JSON.stringify({
         type: 'open',
@@ -592,6 +596,7 @@ function followSession(sId) {
           }
         }
       }));
+      follower.subscribed = true;
       console.log(`[DSH Follow] Subscribed to session/follow for ${fullId}`);
     } catch (err) {
       console.error(`[DSH Follow] Failed to send open for ${fullId}:`, err);
@@ -645,7 +650,7 @@ function connectUpstreamMux() {
       }));
 
       // Re-follow all tracked active sessions
-      for (const fullId of activeSessionFollowers.keys()) {
+      for (const [fullId, follower] of activeSessionFollowers.entries()) {
         try {
           ws.send(JSON.stringify({
             type: 'open',
@@ -660,6 +665,7 @@ function connectUpstreamMux() {
               }
             }
           }));
+          follower.subscribed = true;
           console.log(`[DSH Mux] Re-subscribed to session/follow for ${fullId}`);
         } catch (_) {}
       }
@@ -715,7 +721,8 @@ function connectUpstreamMux() {
                   broadcastToMobileClients({
                     type: 'thinking',
                     sessionId: sId,
-                    delta: c.text
+                    delta: c.text,
+                    text: c.text
                   });
                 } else if (c.type === 'text-delta' && c.text) {
                   follower.isRunning = true;
@@ -723,7 +730,8 @@ function connectUpstreamMux() {
                   broadcastToMobileClients({
                     type: 'delta',
                     sessionId: sId,
-                    delta: c.text
+                    delta: c.text,
+                    text: c.text
                   });
                 } else if (c.type === 'tool-call-delta') {
                   broadcastToMobileClients({
@@ -918,6 +926,9 @@ function connectUpstreamMux() {
       console.warn(`[DSH Mux] Upstream mux socket closed: ${code}, ${reason?.toString() || ''}. Reconnecting in 3s...`);
       upstreamMuxWs = null;
       activeEventsWs = null;
+      for (const follower of activeSessionFollowers.values()) {
+        follower.subscribed = false;
+      }
       setTimeout(connectUpstreamMux, 3000);
     });
 
@@ -1012,14 +1023,18 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 2. Direct APK Download
-  if (pathname === '/dsh-agent.apk' || pathname === '/download/apk') {
-    const apkPath = path.join(__dirname, 'public', 'dsh-agent.apk');
-    if (fs.existsSync(apkPath)) {
+  if (pathname === '/dsh-agent.apk' || pathname === '/download/apk' || pathname.endsWith('.apk')) {
+    const filename = pathname.endsWith('.apk') ? path.basename(pathname) : 'dsh-agent.apk';
+    const apkPath = path.join(__dirname, 'public', filename);
+    const targetApk = fs.existsSync(apkPath) ? apkPath : path.join(__dirname, 'public', 'dsh-agent.apk');
+    if (fs.existsSync(targetApk)) {
+      const stat = fs.statSync(targetApk);
       res.writeHead(200, {
         'Content-Type': 'application/vnd.android.package-archive',
-        'Content-Disposition': 'attachment; filename="dsh-agent-v1.2.0.apk"'
+        'Content-Length': stat.size,
+        'Content-Disposition': 'attachment; filename="dsh-agent-v1.2.2.apk"'
       });
-      fs.createReadStream(apkPath).pipe(res);
+      fs.createReadStream(targetApk).pipe(res);
       return;
     }
   }
