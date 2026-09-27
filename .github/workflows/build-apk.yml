@@ -57,17 +57,18 @@ jobs:
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.2.4
-          name: "DSH Mobile v1.2.4 - 长期记忆快照自动折叠与对话框空间优化"
+          tag_name: v1.2.5
+          name: "DSH Mobile v1.2.5 - 携带上下文与工作区文档全量默认收缩优化"
           body: |
-            ### 🚀 DSH Mobile v1.2.4 发布说明
+            ### 🚀 DSH Mobile v1.2.5 发布说明
             
-            本次更新针对用户发送消息时携带的长期记忆快照（Mnemon Memory Snapshot）占用整个对话框的问题进行了彻底优化：
+            本次更新彻底解决了对话中携带的上下文、工作区文档（如 AGENTS.md、USER.md 等）、运行环境与技能列表平铺展开导致对话框被万字长文占满的问题：
 
-            #### 🧠 1. 记忆快照自动折叠卡片 (MemoryCard)
-            - **长文本不再挤占屏幕**: 针对 `dsh-mnemon` 插件自动召回的数千字记忆快照，自动收纳为高度仅 32px 的精致胶囊卡片，对话框重新恢复清爽。
-            - **按需展开与滚动浏览**: 点击胶囊栏即可平滑展开记忆详情，支持在限制高度的容器内滚动查阅与 Markdown 语法高亮展示。
-            - **多重记忆源精准识别**: 服务端网关与客户端模型双重校验，无论是独立的记忆事件还是嵌入在消息中的记忆快照，均自动折叠。
+            #### 📄 1. 携带上下文与 Markdown 文件默认全量折叠 (Collapsible Context Cards)
+            - **万字长文彻底折叠**: 无论是 `AGENTS.md` 工作区规则（1.5万字符）、`available_skills` 技能列表（1万字符）、运行时沙箱权限配置，还是用户画像记忆 `USER.md`，全部默认以 ~40px 优雅胶囊卡片呈现，完全不挤占对话空间。
+            - **智能元数据与分类徽标**: 自动识别文档来源与类型，高亮展示 `[AGENTS.md]`、`[USER.md]`、`[Skills]`、`[Runtime]`、`[Mnemon]` 徽标与精确字符数。
+            - **沉浸式展开与一键收起**: 点击即可展开限制高度的高清 Markdown 滚动面板，底部提供便捷的「收起上下文」按钮。
+            - **端云双重多维匹配**: 服务端网关与客户端双引擎实时提取并剥离嵌入式上下文，保障纯净对话流体验。
           files: dsh_mobile/build/app/outputs/flutter-apk/app-release.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

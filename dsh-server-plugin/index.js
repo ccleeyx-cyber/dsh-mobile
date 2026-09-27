@@ -209,6 +209,20 @@ function getWorkspacesData() {
   }
 }
 
+function isCarriedContext(text, ev) {
+  if (!text || typeof text !== 'string') return false;
+  if (ev?.data?.source?.plugin === 'dsh-mnemon' || ev?.source?.plugin === 'dsh-mnemon') return true;
+  const trimmed = text.trim();
+  if (trimmed.startsWith('MNEMON RUNTIME MEMORY SNAPSHOT') || trimmed.startsWith('[MNEMON]')) return true;
+  if (trimmed.includes('<runtime-memory-file') || trimmed.includes('</runtime-memory-file>')) return true;
+  if (trimmed.includes('<system-reminder>')) return true;
+  if (trimmed.startsWith('Current runtime context.') || trimmed.includes('DSH file policy:')) return true;
+  if (trimmed.includes('Instructions from:') || trimmed.includes('Contents of ')) return true;
+  if (trimmed.includes('<available_skills>') || trimmed.includes('A skill is a reusable set')) return true;
+  if (/<(workspace|project|environment|file)_context>/i.test(trimmed)) return true;
+  return false;
+}
+
 // Session History Loader
 async function getSessionHistory(sessionId) {
   // First find the lastSeq from cache
@@ -302,15 +316,18 @@ async function getSessionHistory(sessionId) {
           textContent = ev.data.text;
         }
 
-        const isMemory = ev.data?.source?.plugin === 'dsh-mnemon' ||
+        const isContext = isCarriedContext(textContent, ev);
+        const isMemory = isContext ||
+                         ev.data?.source?.plugin === 'dsh-mnemon' ||
                          ev.source?.plugin === 'dsh-mnemon' ||
                          textContent.startsWith('MNEMON RUNTIME MEMORY SNAPSHOT') ||
                          textContent.includes('<runtime-memory-file');
 
         messages.push({
           id: ev.data?.id || `user_${ev.seq}`,
-          role: isMemory ? 'memory' : 'user',
+          role: isContext ? 'context' : 'user',
           isMemory: isMemory,
+          isContext: isContext,
           content: textContent,
           time: ev.time,
           seq: ev.seq,

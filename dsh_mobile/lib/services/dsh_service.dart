@@ -226,6 +226,7 @@ class DshService extends ChangeNotifier {
             content: m['content'] ?? '',
             thinking: m['thinking'],
             isMemory: m['isMemory'] == true || m['role'] == 'memory',
+            isContext: m['isContext'] == true || m['role'] == 'context',
             tools: rawTools.map((t) => ToolExecution(
               name: t['name'] ?? '',
               input: t['input'] ?? '',
@@ -424,6 +425,7 @@ class DshService extends ChangeNotifier {
                 content: m['content'] ?? '',
                 thinking: m['thinking'],
                 isMemory: m['isMemory'] == true || m['role'] == 'memory',
+                isContext: m['isContext'] == true || m['role'] == 'context',
                 tools: rawTools.map((t) => ToolExecution(
                   name: t['name'] ?? '',
                   input: t['input'] ?? '',

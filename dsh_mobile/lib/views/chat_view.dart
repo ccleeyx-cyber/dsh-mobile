@@ -872,22 +872,53 @@ class _ChatViewState extends State<ChatView> {
   }
 
   Widget _buildMessageItem(ChatMessage msg) {
-    // 1. Standalone Memory Snapshot message -> Collapsed MemoryCard
-    if (msg.isMemoryRecall && (msg.role == 'memory' || msg.isMemory || msg.content.startsWith('MNEMON'))) {
+    // 1. Standalone context or memory snapshot message -> Collapsed MemoryCard
+    if (msg.isContextOrMemory) {
       return Padding(
         padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
         child: MemoryCard(content: msg.content),
       );
     }
 
-    // 2. User message with embedded memory snapshot -> Split and collapse memory part
-    const memoryMarker = 'MNEMON RUNTIME MEMORY SNAPSHOT';
-    final memoryIndex = msg.content.indexOf(memoryMarker);
+    // 2. Embedded context markers in message -> Split prompt and collapse context part
+    const contextMarkers = [
+      '<system-reminder>',
+      '<runtime-memory-file',
+      'MNEMON RUNTIME MEMORY SNAPSHOT',
+      '[MNEMON]',
+      'Current runtime context.',
+      'Instructions from:',
+      '<available_skills>',
+      'Contents of ',
+    ];
+
+    int earliestMarkerIndex = -1;
+    for (final marker in contextMarkers) {
+      final idx = msg.content.indexOf(marker);
+      if (idx != -1) {
+        if (earliestMarkerIndex == -1 || idx < earliestMarkerIndex) {
+          earliestMarkerIndex = idx;
+        }
+      }
+    }
+
     String displayContent = msg.content;
-    String? embeddedMemory;
-    if (memoryIndex > 0) {
-      displayContent = msg.content.substring(0, memoryIndex).trim();
-      embeddedMemory = msg.content.substring(memoryIndex).trim();
+    String? embeddedContext;
+    if (earliestMarkerIndex == 0) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+        child: MemoryCard(content: msg.content),
+      );
+    } else if (earliestMarkerIndex > 0) {
+      displayContent = msg.content.substring(0, earliestMarkerIndex).trim();
+      embeddedContext = msg.content.substring(earliestMarkerIndex).trim();
+    }
+
+    if (displayContent.isEmpty && (embeddedContext != null && embeddedContext.isNotEmpty)) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+        child: MemoryCard(content: embeddedContext),
+      );
     }
 
     final isUser = msg.role == 'user';
@@ -960,11 +991,11 @@ class _ChatViewState extends State<ChatView> {
                     ),
                   ),
 
-                // Embedded Memory Card if present
-                if (embeddedMemory != null && embeddedMemory.isNotEmpty)
+                // Embedded Context Card if present
+                if (embeddedContext != null && embeddedContext.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(top: 6),
-                    child: MemoryCard(content: embeddedMemory),
+                    child: MemoryCard(content: embeddedContext),
                   ),
 
                 // Streaming Indicator
