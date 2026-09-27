@@ -7,8 +7,9 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "http-proxy": "^1.18.1",
     "ws": "^8.18.0",
-    "http-proxy": "^1.18.1"
+    "yaml": "^2.9.1"
   },
   "keywords": [
     "deepseek",

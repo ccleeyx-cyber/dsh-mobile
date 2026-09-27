@@ -4,7 +4,12 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/status.dart' as ws_status;
+import 'package:uuid/uuid.dart';
 import '../models/server_config.dart';
+import '../models/chat_message.dart';
+import '../models/workspace.dart';
+import '../models/approval_request.dart';
+import '../models/dsh_settings.dart';
 
 enum ConnectionStatus {
   disconnected,
@@ -19,17 +24,41 @@ class DshService extends ChangeNotifier {
   ConnectionStatus _status = ConnectionStatus.disconnected;
   String _lastError = '';
   ServerConfig? _currentConfig;
+  final Uuid _uuid = const Uuid();
 
+  // State
+  List<Workspace> _workspaces = [];
+  Workspace? _currentWorkspace;
+  SessionMeta? _currentSession;
+  List<ChatMessage> _messages = [];
+  List<ApprovalRequest> _pendingApprovals = [];
+  DshSettings? _settings;
+  bool _isLoadingHistory = false;
+  bool _isSending = false;
+
+  // Getters
   ConnectionStatus get status => _status;
   String get lastError => _lastError;
   bool get isConnected => _status == ConnectionStatus.connected;
+  ServerConfig? get currentConfig => _currentConfig;
 
-  // 消息流控制器
-  final StreamController<Map<String, dynamic>> _messageController =
-      StreamController<Map<String, dynamic>>.broadcast();
-  Stream<Map<String, dynamic>> get messageStream => _messageController.stream;
+  List<Workspace> get workspaces => _workspaces;
+  Workspace? get currentWorkspace => _currentWorkspace;
+  SessionMeta? get currentSession => _currentSession;
+  List<ChatMessage> get messages => _messages;
+  List<ApprovalRequest> get pendingApprovals => _pendingApprovals;
+  DshSettings? get settings => _settings;
+  bool get isLoadingHistory => _isLoadingHistory;
+  bool get isSending => _isSending;
 
-  // 测试与服务端的 HTTP 连通性和鉴权
+  // Headers for HTTP
+  Map<String, String> get _authHeaders => {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ${_currentConfig?.token ?? ''}',
+        'x-dsh-token': _currentConfig?.token ?? '',
+      };
+
+  // Test Connection
   Future<bool> testConnection(ServerConfig config) async {
     try {
       final url = Uri.parse('${config.httpBaseUrl}/health');
@@ -49,7 +78,7 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  // 建立 WebSocket 连接
+  // Connect
   Future<void> connect(ServerConfig config) async {
     _currentConfig = config;
     _status = ConnectionStatus.connecting;
@@ -59,11 +88,12 @@ class DshService extends ChangeNotifier {
       final uri = Uri.parse(config.wsUrl);
       _channel = WebSocketChannel.connect(uri);
 
-      // 等待并监听流
       _channel!.stream.listen(
         (data) {
-          _status = ConnectionStatus.connected;
-          notifyListeners();
+          if (_status != ConnectionStatus.connected) {
+            _status = ConnectionStatus.connected;
+            notifyListeners();
+          }
           _handleRawMessage(data);
         },
         onError: (error) {
@@ -80,6 +110,11 @@ class DshService extends ChangeNotifier {
       );
 
       _startHeartbeat();
+
+      // Fetch initial data
+      await fetchWorkspaces();
+      await fetchSettings();
+      await fetchApprovals();
     } catch (e) {
       _status = ConnectionStatus.error;
       _lastError = e.toString();
@@ -87,46 +122,360 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  // 发送消息
-  void sendPrompt(String text, {String sessionId = 'default'}) {
-    if (_channel == null || _status != ConnectionStatus.connected) return;
+  // Workspaces Management
+  Future<void> fetchWorkspaces() async {
+    if (_currentConfig == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces');
+      final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
 
-    final payload = {
-      'id': DateTime.now().millisecondsSinceEpoch.toString(),
-      'type': 'chat',
-      'method': 'session/send',
-      'params': {
-        'sessionId': sessionId,
-        'content': text,
-        'message': text,
-      }
-    };
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final list = data['workspaces'] as List<dynamic>? ?? [];
+        _workspaces = list.map((w) => Workspace.fromJson(w as Map<String, dynamic>)).toList();
 
-    _channel!.sink.add(jsonEncode(payload));
-  }
-
-  // 发送原始数据
-  void sendRaw(String data) {
-    if (_channel != null && _status == ConnectionStatus.connected) {
-      _channel!.sink.add(data);
-    }
-  }
-
-  void _handleRawMessage(dynamic data) {
-    if (data is String) {
-      if (data == 'pong') return; // 心跳回复
-      try {
-        final json = jsonDecode(data);
-        if (json is Map<String, dynamic>) {
-          _messageController.add(json);
+        // Default to first workspace if not set
+        if (_currentWorkspace == null && _workspaces.isNotEmpty) {
+          _currentWorkspace = _workspaces.first;
+          if (_currentWorkspace!.sessions.isNotEmpty) {
+            await selectSession(_currentWorkspace!.sessions.first);
+          }
         }
-      } catch (e) {
-        debugPrint('[DshService] JSON parse error: $e');
+        notifyListeners();
       }
+    } catch (e) {
+      debugPrint('[DshService] fetchWorkspaces error: $e');
     }
   }
 
-  // 心跳维持保活
+  void selectWorkspace(Workspace ws) {
+    _currentWorkspace = ws;
+    if (ws.sessions.isNotEmpty) {
+      selectSession(ws.sessions.first);
+    } else {
+      _currentSession = null;
+      _messages = [
+        ChatMessage(
+          id: _uuid.v4(),
+          role: 'assistant',
+          content: '当前工作区 [${ws.title}] 暂无会话。点击上方“新建对话”开始！',
+        )
+      ];
+      notifyListeners();
+    }
+  }
+
+  // Session Management
+  Future<void> selectSession(SessionMeta session) async {
+    _currentSession = session;
+    _isLoadingHistory = true;
+    notifyListeners();
+
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/${session.sessionId}');
+      final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final rawMessages = data['data']?['messages'] as List<dynamic>? ?? [];
+
+        _messages = rawMessages.map((m) {
+          final rawTools = m['tools'] as List<dynamic>? ?? [];
+          return ChatMessage(
+            id: m['id'] ?? _uuid.v4(),
+            role: m['role'] ?? 'assistant',
+            content: m['content'] ?? '',
+            thinking: m['thinking'],
+            tools: rawTools.map((t) => ToolExecution(
+              name: t['name'] ?? '',
+              input: t['input'] ?? '',
+              output: t['output'] ?? '',
+              isRunning: t['isRunning'] ?? false,
+            )).toList(),
+            timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
+          );
+        }).toList();
+
+        if (_messages.isEmpty) {
+          _messages.add(ChatMessage(
+            id: _uuid.v4(),
+            role: 'assistant',
+            content: '这是会话 [${session.title}]。你可以直接向 DSH 智能体下达指令。',
+          ));
+        }
+      }
+    } catch (e) {
+      debugPrint('[DshService] selectSession error: $e');
+    } finally {
+      _isLoadingHistory = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> createNewSession() async {
+    if (_currentConfig == null || _currentWorkspace == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/create');
+      final res = await http.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({
+          'workspaceId': _currentWorkspace!.workspaceId,
+          'cwd': _currentWorkspace!.path,
+        }),
+      ).timeout(const Duration(seconds: 8));
+
+      if (res.statusCode == 200) {
+        await fetchWorkspaces();
+        // The newly created session will be in the updated workspace
+        final updatedWs = _workspaces.firstWhere(
+          (w) => w.workspaceId == _currentWorkspace!.workspaceId,
+          orElse: () => _currentWorkspace!,
+        );
+        _currentWorkspace = updatedWs;
+        if (updatedWs.sessions.isNotEmpty) {
+          await selectSession(updatedWs.sessions.first);
+        }
+      }
+    } catch (e) {
+      debugPrint('[DshService] createNewSession error: $e');
+    }
+  }
+
+  // Send Prompt
+  Future<void> sendChatMessage(String text) async {
+    if (text.trim().isEmpty) return;
+
+    final sessionId = _currentSession?.sessionId ?? 'default';
+
+    // 1. Add user message to UI immediately
+    final userMsg = ChatMessage(
+      id: _uuid.v4(),
+      role: 'user',
+      content: text,
+    );
+    _messages.add(userMsg);
+
+    // 2. Prepare streaming assistant placeholder
+    final assistantMsg = ChatMessage(
+      id: _uuid.v4(),
+      role: 'assistant',
+      content: '',
+      isStreaming: true,
+    );
+    _messages.add(assistantMsg);
+
+    _isSending = true;
+    notifyListeners();
+
+    try {
+      // Send via HTTP RPC or WS
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/prompt');
+      await http.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({
+          'sessionId': sessionId,
+          'text': text,
+        }),
+      ).timeout(const Duration(seconds: 15));
+    } catch (e) {
+      debugPrint('[DshService] sendPrompt error: $e');
+      assistantMsg.content = '发送指令失败: $e';
+      assistantMsg.isStreaming = false;
+      notifyListeners();
+    } finally {
+      _isSending = false;
+      notifyListeners();
+    }
+  }
+
+  // Cancel Turn
+  Future<void> cancelActiveTurn() async {
+    if (_currentSession == null || _currentConfig == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/cancel');
+      await http.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({
+          'sessionId': _currentSession!.sessionId,
+        }),
+      );
+
+      if (_messages.isNotEmpty && _messages.last.isStreaming) {
+        _messages.last.isStreaming = false;
+        _messages.last.content += '\n*(任务已被手动停止)*';
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('[DshService] cancelTurn error: $e');
+    }
+  }
+
+  // Settings
+  Future<void> fetchSettings() async {
+    if (_currentConfig == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings');
+      final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        if (data['settings'] != null) {
+          _settings = DshSettings.fromJson(data['settings']);
+          notifyListeners();
+        }
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchSettings error: $e');
+    }
+  }
+
+  Future<bool> switchModel(String modelId) async {
+    if (_currentConfig == null) return false;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings/model');
+      final res = await http.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'model': modelId}),
+      ).timeout(const Duration(seconds: 6));
+
+      if (res.statusCode == 200) {
+        await fetchSettings();
+        return true;
+      }
+      return false;
+    } catch (e) {
+      debugPrint('[DshService] switchModel error: $e');
+      return false;
+    }
+  }
+
+  // Approvals
+  Future<void> fetchApprovals() async {
+    if (_currentConfig == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approvals');
+      final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final list = data['approvals'] as List<dynamic>? ?? [];
+        _pendingApprovals = list.map((a) => ApprovalRequest.fromJson(a as Map<String, dynamic>)).toList();
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchApprovals error: $e');
+    }
+  }
+
+  Future<void> respondApproval(ApprovalRequest req, String outcome) async {
+    if (_currentConfig == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approval');
+      final res = await http.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({
+          'eventId': req.eventId,
+          'outcome': outcome, // 'allowed-once' or 'rejected'
+        }),
+      ).timeout(const Duration(seconds: 8));
+
+      if (res.statusCode == 200) {
+        _pendingApprovals.removeWhere((a) => a.eventId == req.eventId);
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('[DshService] respondApproval error: $e');
+    }
+  }
+
+  // Incoming WebSocket Message Processing
+  void _handleRawMessage(dynamic raw) {
+    if (raw is! String) return;
+    if (raw == 'pong') return;
+
+    try {
+      final json = jsonDecode(raw);
+      if (json is! Map<String, dynamic>) return;
+
+      final type = json['type'] ?? json['event'];
+
+      // 1. Initial pending approvals from server
+      if (type == 'system' && json['pendingApprovals'] is List) {
+        final list = json['pendingApprovals'] as List<dynamic>;
+        _pendingApprovals = list.map((a) => ApprovalRequest.fromJson(a as Map<String, dynamic>)).toList();
+        notifyListeners();
+        return;
+      }
+
+      // 2. Real-time Approval Request
+      if (type == 'approval_request' && json['approval'] != null) {
+        final req = ApprovalRequest.fromJson(json['approval'] as Map<String, dynamic>);
+        // Avoid duplicate
+        if (!_pendingApprovals.any((a) => a.eventId == req.eventId)) {
+          _pendingApprovals.add(req);
+          notifyListeners();
+        }
+        return;
+      }
+
+      // 3. Approval Settled
+      if (type == 'approval_settled') {
+        final eventId = json['eventId'];
+        _pendingApprovals.removeWhere((a) => a.eventId == eventId);
+        notifyListeners();
+        return;
+      }
+
+      // 4. Streaming tokens and chat chunks
+      if (_messages.isNotEmpty && _messages.last.isAssistant) {
+        final current = _messages.last;
+
+        // Reasoning / Thinking
+        if (type == 'thinking' || json.containsKey('thinking')) {
+          final text = json['delta'] ?? json['thinking'] ?? '';
+          current.thinking = (current.thinking ?? '') + text.toString();
+          notifyListeners();
+        }
+        // Streaming text
+        else if (type == 'token' || type == 'delta' || json.containsKey('delta')) {
+          final text = json['delta'] ?? json['content'] ?? json['text'] ?? '';
+          current.content += text.toString();
+          notifyListeners();
+        }
+        // Tool call
+        else if (type == 'tool_start' || type == 'tool_call') {
+          final toolName = json['tool'] ?? json['name'] ?? 'tool';
+          final toolInput = json['input'] ?? json['args']?.toString() ?? '';
+          current.tools.add(ToolExecution(name: toolName, input: toolInput));
+          notifyListeners();
+        }
+        // Tool result
+        else if (type == 'tool_result' || type == 'tool_end') {
+          if (current.tools.isNotEmpty) {
+            final lastTool = current.tools.last;
+            lastTool.isRunning = false;
+            lastTool.output = json['output']?.toString() ?? json['result']?.toString() ?? '完成';
+            notifyListeners();
+          }
+        }
+        // Completion
+        else if (type == 'done' || type == 'end') {
+          current.isStreaming = false;
+          for (var t in current.tools) {
+            t.isRunning = false;
+          }
+          notifyListeners();
+        }
+      }
+    } catch (e) {
+      debugPrint('[DshService] JSON parse error: $e');
+    }
+  }
+
+  // Heartbeat
   void _startHeartbeat() {
     _stopHeartbeat();
     _heartbeatTimer = Timer.periodic(const Duration(seconds: 15), (_) {
@@ -143,7 +492,6 @@ class DshService extends ChangeNotifier {
     _heartbeatTimer = null;
   }
 
-  // 断开连接
   void disconnect() {
     _stopHeartbeat();
     _channel?.sink.close(ws_status.goingAway);
@@ -154,9 +502,7 @@ class DshService extends ChangeNotifier {
 
   @override
   void dispose() {
-    _stopHeartbeat();
-    _channel?.sink.close();
-    _messageController.close();
+    disconnect();
     super.dispose();
   }
 }

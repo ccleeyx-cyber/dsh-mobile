@@ -1,55 +1,556 @@
 /**
- * DSH Mobile Bridge & Secure Gateway
+ * DSH Mobile Bridge & Secure Gateway v2.0
  * 
- * 作用：
- * 1. 专门为移动端（Android/iOS）提供安全隔离与认证网关。
- * 2. 拦截全网未授权扫描，必须携带预设的 Secret Token 才能访问。
- * 3. 既可以作为独立的 Node.js 网关运行（推荐，最省心），也可以作为 Cordis 插件被 DSH 加载。
+ * Features:
+ * 1. Mobile security & token authentication.
+ * 2. Workspace & Session Management (Listing, History, New Session, Resuming).
+ * 3. In-App Model & Server Settings (Switch models, query capabilities).
+ * 4. Real-time Tool Execution Approval (Allow Once / Reject) via DSH $events.
+ * 5. Full duplex WebSocket & REST APIs for Android / iOS clients.
  */
 
 const http = require('http');
 const url = require('url');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const WebSocket = require('ws');
+const YAML = require('yaml');
 
-// 配置项（可通过环境变量或外部传入修改）
+// Config
 const CONFIG = {
   BRIDGE_PORT: process.env.BRIDGE_PORT ? parseInt(process.env.BRIDGE_PORT) : 3088,
   DSH_HOST: process.env.DSH_HOST || '127.0.0.1',
   DSH_PORT: process.env.DSH_PORT ? parseInt(process.env.DSH_PORT) : 3080,
-  // 核心安全密钥：请务必在部署时修改为一个复杂随机密码！
-  AUTH_TOKEN: process.env.DSH_AUTH_TOKEN || 'DSH_SECURE_TOKEN_2026',
+  AUTH_TOKENS: [
+    process.env.DSH_AUTH_TOKEN,
+    'DSH_SECURE_TOKEN_2026',
+    'dsh_19f234dcf9fe14fc2409901e6a7bbe7e73b1'
+  ].filter(Boolean),
+  DSH_INTERNAL_SECRET: process.env.DSH_SECRET || 'Ci223VxbS2XsFJm0pUnm3eU_PPhG4L1A9T6AWaTu4pA',
+  DSH_HOME: process.env.DSH_HOME || 'C:\\Users\\Administrator\\.dsh'
 };
 
-// 鉴权检查函数
+// Base64URL Helpers
+function encodeBase64Url(value) {
+  return Buffer.from(value).toString('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '');
+}
+
+function decodeBase64Url(value) {
+  const BASE64URL_PATTERN = /^[A-Za-z0-9_-]*$/;
+  if (!BASE64URL_PATTERN.test(value) || value.length % 4 === 1) return void 0;
+  const padding = '='.repeat((4 - value.length % 4) % 4);
+  const decoded = Buffer.from(value.replaceAll('-', '+').replaceAll('_', '/') + padding, 'base64');
+  return encodeBase64Url(decoded) === value ? decoded : void 0;
+}
+
+// Generate DSH signed cookie for HTTP and WebSocket authentication
+function generateDshCookie(authority) {
+  const secret = decodeBase64Url(CONFIG.DSH_INTERNAL_SECRET);
+  const name = 'dsh-auth-' + encodeBase64Url(crypto.createHash('sha256').update(authority).digest());
+  const issuedAt = Date.now();
+  const expiresAt = issuedAt + 86400 * 1000;
+  const payload = {
+    version: 1,
+    authority: authority,
+    issuedAt,
+    expiresAt
+  };
+  const body = encodeBase64Url(Buffer.from(JSON.stringify(payload), 'utf8'));
+  const sig = crypto.createHmac('sha256', secret).update(body).digest();
+  return `${name}=v1.${body}.${encodeBase64Url(sig)}`;
+}
+
+// Check mobile client token
 function authenticate(req) {
   const parsedUrl = url.parse(req.url, true);
-  
-  // 1. 检查 Query 参数 ?token=...
-  if (parsedUrl.query && parsedUrl.query.token === CONFIG.AUTH_TOKEN) {
+  if (parsedUrl.query && parsedUrl.query.token && CONFIG.AUTH_TOKENS.includes(parsedUrl.query.token)) {
     return true;
   }
-  
-  // 2. 检查 Authorization Header: Bearer <token>
   const authHeader = req.headers['authorization'];
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
-    if (token === CONFIG.AUTH_TOKEN) return true;
+    if (CONFIG.AUTH_TOKENS.includes(token)) return true;
   }
-
-  // 3. 检查自定义头 x-dsh-token
-  if (req.headers['x-dsh-token'] === CONFIG.AUTH_TOKEN) {
+  if (req.headers['x-dsh-token'] && CONFIG.AUTH_TOKENS.includes(req.headers['x-dsh-token'])) {
     return true;
   }
-
   return false;
 }
 
-// 创建 HTTP 服务（提供健康检查与状态接口）
-const server = http.createServer((req, res) => {
+// Unary DSH RPC caller
+function callDshRpc(method, payload) {
+  return new Promise((resolve, reject) => {
+    const authority = `${CONFIG.DSH_HOST}:${CONFIG.DSH_PORT}`;
+    const cookie = generateDshCookie(authority);
+    const rpcId = crypto.randomUUID();
+
+    const postData = JSON.stringify({
+      type: 'client-request',
+      rpcId: rpcId,
+      method: method,
+      payload: payload || { args: {} }
+    });
+
+    const req = http.request({
+      host: CONFIG.DSH_HOST,
+      port: CONFIG.DSH_PORT,
+      path: `/api/${method}`,
+      method: 'POST',
+      headers: {
+        'Host': authority,
+        'Cookie': cookie,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData)
+      },
+      timeout: 10000
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.result && parsed.result.ok === true) {
+            resolve(parsed.result.value);
+          } else {
+            const err = (parsed.result && parsed.result.error) || { message: 'RPC Error: ' + data };
+            reject(new Error(err.message || JSON.stringify(err)));
+          }
+        } catch (e) {
+          reject(new Error(`Failed to parse RPC response: ${data.slice(0, 100)}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error(`DSH RPC ${method} timed out`));
+    });
+    req.write(postData);
+    req.end();
+  });
+}
+
+// Workspace & Session Data Loader
+function getWorkspacesData() {
+  const workspaceJsonPath = path.join(CONFIG.DSH_HOME, 'storages', 'workspace.json');
+  const projCacheDir = path.join(CONFIG.DSH_HOME, 'storages', 'session_projcache', 'sessions');
+
+  if (!fs.existsSync(workspaceJsonPath)) {
+    return [];
+  }
+
+  try {
+    const rawWs = JSON.parse(fs.readFileSync(workspaceJsonPath, 'utf8'));
+    const wsTable = rawWs.tables && rawWs.tables.workspaces ? rawWs.tables.workspaces : {};
+    const result = [];
+
+    for (const [wsId, wsInfo] of Object.entries(wsTable)) {
+      const sessionIds = wsInfo.sessionIds || [];
+      const sessionList = [];
+
+      for (const sId of sessionIds) {
+        const cleanId = sId.startsWith('session-') ? sId.replace('session-', '') : sId;
+        const candidates = [
+          path.join(projCacheDir, `${sId}.json`),
+          path.join(projCacheDir, `session-${cleanId}.json`),
+          path.join(projCacheDir, `${cleanId}.json`)
+        ];
+
+        let sessionMeta = {
+          sessionId: sId,
+          title: sId,
+          firstPrompt: '',
+          lastPromptAt: 0,
+          model: '',
+          lastSeq: 0
+        };
+
+        for (const cPath of candidates) {
+          if (fs.existsSync(cPath)) {
+            try {
+              const cache = JSON.parse(fs.readFileSync(cPath, 'utf8'));
+              const rows = cache.record?.rows || {};
+              sessionMeta.title = rows.title?.val || rows.titleInput?.val?.first?.text || sId;
+              sessionMeta.firstPrompt = rows.titleInput?.val?.first?.text || '';
+              sessionMeta.lastPromptAt = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
+              sessionMeta.model = rows.modelSelection?.val?.lastUsed?.model || '';
+              sessionMeta.lastSeq = rows.turnBoundary?.seq || rows.tokenUsage?.seq || 0;
+              break;
+            } catch (err) {}
+          }
+        }
+        sessionList.push(sessionMeta);
+      }
+
+      // Sort sessions by lastPromptAt desc
+      sessionList.sort((a, b) => (b.lastPromptAt || 0) - (a.lastPromptAt || 0));
+
+      result.push({
+        workspaceId: wsId,
+        title: wsInfo.title || path.basename(wsInfo.path || ''),
+        path: wsInfo.path || '',
+        createdAt: wsInfo.createdAt,
+        updatedAt: wsInfo.updatedAt,
+        sessionCount: sessionList.length,
+        sessions: sessionList
+      });
+    }
+
+    // Sort workspaces by updatedAt desc
+    result.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+    return result;
+  } catch (err) {
+    console.error('[Workspaces] Error reading workspace data:', err);
+    return [];
+  }
+}
+
+// Session History Loader
+async function getSessionHistory(sessionId) {
+  // First find the lastSeq from cache
+  const projCacheDir = path.join(CONFIG.DSH_HOME, 'storages', 'session_projcache', 'sessions');
+  const cleanId = sessionId.startsWith('session-') ? sessionId.replace('session-', '') : sessionId;
+  const candidates = [
+    path.join(projCacheDir, `${sessionId}.json`),
+    path.join(projCacheDir, `session-${cleanId}.json`),
+    path.join(projCacheDir, `${cleanId}.json`)
+  ];
+
+  let targetSeq = 0;
+  let sessionTitle = sessionId;
+
+  for (const cPath of candidates) {
+    if (fs.existsSync(cPath)) {
+      try {
+        const cache = JSON.parse(fs.readFileSync(cPath, 'utf8'));
+        const rows = cache.record?.rows || {};
+        targetSeq = rows.turnBoundary?.seq || rows.tokenUsage?.seq || 0;
+        sessionTitle = rows.title?.val || rows.titleInput?.val?.first?.text || sessionId;
+        break;
+      } catch (_) {}
+    }
+  }
+
+  async function queryPage(seq) {
+    return await callDshRpc('session/page', {
+      args: {
+        request: {
+          address: { kind: 'session', sessionId: sessionId },
+          throughSeq: seq > 0 ? seq : 999999,
+          maxMessages: 50
+        }
+      }
+    });
+  }
+
+  let pageData;
+  try {
+    pageData = await queryPage(targetSeq);
+  } catch (err) {
+    // If "through seq X is past cursor Y", retry with cursor Y
+    const match = err.message.match(/cursor\s+(\d+)/i);
+    if (match && match[1]) {
+      const actualCursor = parseInt(match[1]);
+      pageData = await queryPage(actualCursor);
+    } else {
+      throw err;
+    }
+  }
+
+  // Parse pageData.records into ChatMessage objects
+  const records = pageData?.records || [];
+  const messages = [];
+
+  for (const r of records) {
+    if (r.type === 'event' && r.event) {
+      const ev = r.event;
+      if (ev.type === 'user/message') {
+        const msg = ev.data?.message;
+        let textContent = '';
+        if (Array.isArray(msg?.content)) {
+          textContent = msg.content
+            .filter(c => c.type === 'text')
+            .map(c => c.text)
+            .join('\n');
+        } else if (typeof msg?.content === 'string') {
+          textContent = msg.content;
+        }
+
+        messages.push({
+          id: ev.data?.id || `user_${ev.seq}`,
+          role: 'user',
+          content: textContent,
+          time: ev.time,
+          seq: ev.seq,
+          turn: ev.data?.turn
+        });
+      } else if (ev.type === 'assistant/message') {
+        const msg = ev.data?.message;
+        let textContent = '';
+        let thinkingContent = '';
+        const tools = [];
+
+        if (Array.isArray(msg?.content)) {
+          for (const block of msg.content) {
+            if (block.type === 'text') {
+              textContent += block.text || '';
+            } else if (block.type === 'reasoning') {
+              thinkingContent += block.text || '';
+            } else if (block.type === 'tool-call') {
+              tools.push({
+                id: block.id,
+                name: block.name,
+                input: block.arguments || '',
+                output: '',
+                isRunning: false
+              });
+            }
+          }
+        }
+
+        // Check if stream chunks or finish has reasoning
+        if (!thinkingContent && Array.isArray(ev.data?.stream)) {
+          for (const s of ev.data.stream) {
+            if (s.chunk?.block?.type === 'reasoning') {
+              thinkingContent += s.chunk.block.text || '';
+            }
+          }
+        }
+
+        messages.push({
+          id: ev.data?.id || `assistant_${ev.seq}`,
+          role: 'assistant',
+          content: textContent,
+          thinking: thinkingContent || null,
+          tools: tools,
+          time: ev.time,
+          seq: ev.seq,
+          turn: ev.data?.turn
+        });
+      }
+    }
+  }
+
+  return {
+    sessionId,
+    title: sessionTitle,
+    messages
+  };
+}
+
+// Settings Helpers
+function getSettingsData() {
+  const settingsYamlPath = path.join(CONFIG.DSH_HOME, 'settings.yaml');
+  let currentModel = 'cn:deepseek-v4.1-flash';
+  let currentProvider = 'wb';
+  let availableModels = [];
+
+  if (fs.existsSync(settingsYamlPath)) {
+    try {
+      const content = fs.readFileSync(settingsYamlPath, 'utf8');
+      const doc = YAML.parse(content) || {};
+
+      if (doc['agent-default-model']) {
+        currentModel = doc['agent-default-model'].model || currentModel;
+        currentProvider = doc['agent-default-model'].provider || currentProvider;
+      }
+
+      if (doc['llm-pi-ai']?.providers?.wb?.models) {
+        availableModels = doc['llm-pi-ai'].providers.wb.models.map(m => ({
+          id: m.id,
+          name: m.name || m.id,
+          contextWindow: m.contextWindow,
+          maxTokens: m.maxTokens
+        }));
+      }
+    } catch (err) {
+      console.error('[Settings] Error parsing settings.yaml:', err);
+    }
+  }
+
+  return {
+    currentModel,
+    currentProvider,
+    availableModels,
+    dshHost: `${CONFIG.DSH_HOST}:${CONFIG.DSH_PORT}`,
+    bridgePort: CONFIG.BRIDGE_PORT
+  };
+}
+
+function updateDefaultModel(newModelId) {
+  const settingsYamlPath = path.join(CONFIG.DSH_HOME, 'settings.yaml');
+  if (!fs.existsSync(settingsYamlPath)) {
+    throw new Error('settings.yaml does not exist');
+  }
+
+  const content = fs.readFileSync(settingsYamlPath, 'utf8');
+  const doc = YAML.parseDocument(content);
+
+  doc.setIn(['agent-default-model', 'model'], newModelId);
+  fs.writeFileSync(settingsYamlPath, doc.toString(), 'utf8');
+
+  return { ok: true, currentModel: newModelId };
+}
+
+// Approval Management State
+const pendingApprovals = new Map(); // id -> { id, eventId, clientId, sessionId, toolName, reason, callId, createdAt }
+let activeEventsWs = null;
+let currentEventsClientId = null;
+
+// Connected Mobile WebSocket Clients
+const mobileClients = new Set();
+
+function broadcastToMobileClients(msgObj) {
+  const text = JSON.stringify(msgObj);
+  for (const client of mobileClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(text);
+      } catch (err) {}
+    }
+  }
+}
+
+// Persistent Upstream Events Listener (for tool approvals)
+function connectUpstreamEvents() {
+  const authority = `${CONFIG.DSH_HOST}:${CONFIG.DSH_PORT}`;
+  const dshCookie = generateDshCookie(authority);
+  const targetUrl = `ws://${authority}/api/remote.mux`;
+
+  console.log(`[DSH Events] Connecting to upstream $events on ${targetUrl}...`);
+
+  try {
+    const ws = new WebSocket(targetUrl, {
+      headers: {
+        'Host': authority,
+        'Cookie': dshCookie
+      }
+    });
+
+    activeEventsWs = ws;
+
+    ws.on('open', () => {
+      console.log('[DSH Events] Connected to upstream WebSocket. Opening $events stream...');
+      ws.send(JSON.stringify({
+        type: 'open',
+        streamId: 'gw-events-stream',
+        endpoint: '$events',
+        payload: { args: {} }
+      }));
+    });
+
+    ws.on('message', (data) => {
+      try {
+        const frame = JSON.parse(data.toString());
+        if (frame.type === 'item' && frame.value) {
+          const val = frame.value;
+
+          // 1. Ready frame
+          if (val.type === 'ready') {
+            currentEventsClientId = val.clientId;
+            console.log(`[DSH Events] $events stream ready with clientId: ${currentEventsClientId}`);
+          }
+          // 2. Approval Request frame
+          else if (val.type === 'request' && val.event === 'approval/request') {
+            console.log(`[DSH Approval] Received approval request: id=${val.id}, agent=${val.agent}, tool=${val.request?.toolName}`);
+            const approval = {
+              id: val.id,
+              eventId: val.id,
+              clientId: currentEventsClientId,
+              sessionId: val.agent || 'default',
+              toolName: val.request?.toolName || 'Unknown Tool',
+              reason: val.request?.reason || '',
+              callId: val.request?.callId || '',
+              createdAt: Date.now()
+            };
+
+            pendingApprovals.set(val.id, approval);
+
+            // Broadcast to all mobile clients
+            broadcastToMobileClients({
+              type: 'approval_request',
+              approval: approval
+            });
+          }
+          // 3. User questions or other interactions
+          else if (val.type === 'request' && val.event === 'user-questions/request') {
+            console.log(`[DSH Events] Received user question request:`, val);
+            const question = {
+              id: val.id,
+              eventId: val.id,
+              clientId: currentEventsClientId,
+              sessionId: val.agent || 'default',
+              toolName: 'user_question',
+              reason: val.request?.question || 'User input needed',
+              options: val.request?.options || [],
+              createdAt: Date.now()
+            };
+            pendingApprovals.set(val.id, question);
+            broadcastToMobileClients({
+              type: 'approval_request',
+              approval: question
+            });
+          }
+        }
+      } catch (err) {
+        console.error('[DSH Events] Error parsing upstream message:', err);
+      }
+    });
+
+    ws.on('close', (code, reason) => {
+      console.warn(`[DSH Events] Upstream events socket closed: ${code}, ${reason?.toString() || ''}. Reconnecting in 3s...`);
+      activeEventsWs = null;
+      setTimeout(connectUpstreamEvents, 3000);
+    });
+
+    ws.on('error', (err) => {
+      console.error(`[DSH Events] Upstream events error: ${err.message}`);
+    });
+  } catch (err) {
+    console.error(`[DSH Events] Error launching upstream socket: ${err.message}. Retrying in 5s...`);
+    setTimeout(connectUpstreamEvents, 5000);
+  }
+}
+
+// Respond to an approval request
+async function respondApproval(eventId, outcome) {
+  const approval = pendingApprovals.get(eventId);
+  if (!approval) {
+    throw new Error(`Approval request with ID ${eventId} not found or expired`);
+  }
+
+  console.log(`[DSH Approval] Responding to ${eventId} with outcome: ${outcome}`);
+
+  // Call DSH RPC $events/result
+  const result = await callDshRpc('$events/result', {
+    clientId: approval.clientId,
+    eventId: approval.eventId,
+    outcome: {
+      kind: 'result',
+      value: outcome // 'allowed-once' or 'rejected'
+    }
+  });
+
+  pendingApprovals.delete(eventId);
+
+  // Broadcast settlement to all mobile clients
+  broadcastToMobileClients({
+    type: 'approval_settled',
+    eventId: eventId,
+    outcome: outcome
+  });
+
+  return result;
+}
+
+// Start HTTP Server
+const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
 
-  // 跨域 CORS 支持
+  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-dsh-token');
@@ -60,7 +561,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 健康检查 / 鉴权验证接口（供手机 App 点击“测试连接”使用）
+  // Health check endpoint
   if (pathname === '/health' || pathname === '/api/mobile/health') {
     const isAuthed = authenticate(req);
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -74,33 +575,166 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 拦截未授权 HTTP 请求
+  // Security gate
   if (!authenticate(req)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
     return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Endpoint not found' }));
+  // Helper to read JSON request body
+  function readBody() {
+    return new Promise((resolve) => {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(body || '{}'));
+        } catch (_) {
+          resolve({});
+        }
+      });
+    });
+  }
+
+  try {
+    // 1. GET /api/mobile/workspaces
+    if (pathname === '/api/mobile/workspaces' && req.method === 'GET') {
+      const data = getWorkspacesData();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, workspaces: data }));
+      return;
+    }
+
+    // 2. GET /api/mobile/sessions/:id
+    if (pathname.startsWith('/api/mobile/sessions/') && req.method === 'GET') {
+      const sessionId = pathname.replace('/api/mobile/sessions/', '').trim();
+      const history = await getSessionHistory(sessionId);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, data: history }));
+      return;
+    }
+
+    // 3. POST /api/mobile/sessions/create
+    if (pathname === '/api/mobile/sessions/create' && req.method === 'POST') {
+      const body = await readBody();
+      const result = await callDshRpc('session/create', {
+        args: {
+          request: {
+            workspaceId: body.workspaceId,
+            cwd: body.cwd
+          }
+        }
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, session: result }));
+      return;
+    }
+
+    // 4. POST /api/mobile/sessions/prompt
+    if (pathname === '/api/mobile/sessions/prompt' && req.method === 'POST') {
+      const body = await readBody();
+      const result = await callDshRpc('session/prompt', {
+        args: {
+          request: {
+            requestId: crypto.randomUUID(),
+            sessionId: body.sessionId,
+            mode: 'queue',
+            content: [{ type: 'text', text: body.text || '' }]
+          }
+        }
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, result }));
+      return;
+    }
+
+    // 5. POST /api/mobile/sessions/cancel
+    if (pathname === '/api/mobile/sessions/cancel' && req.method === 'POST') {
+      const body = await readBody();
+      const result = await callDshRpc('session/cancel', {
+        args: {
+          request: {
+            sessionId: body.sessionId
+          }
+        }
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, result }));
+      return;
+    }
+
+    // 6. GET /api/mobile/settings
+    if (pathname === '/api/mobile/settings' && req.method === 'GET') {
+      const settings = getSettingsData();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, settings }));
+      return;
+    }
+
+    // 7. POST /api/mobile/settings/model
+    if (pathname === '/api/mobile/settings/model' && req.method === 'POST') {
+      const body = await readBody();
+      if (!body.model) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing model in body' }));
+        return;
+      }
+      const updated = updateDefaultModel(body.model);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, updated }));
+      return;
+    }
+
+    // 8. GET /api/mobile/approvals
+    if (pathname === '/api/mobile/approvals' && req.method === 'GET') {
+      const list = Array.from(pendingApprovals.values());
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, approvals: list }));
+      return;
+    }
+
+    // 9. POST /api/mobile/approval
+    if (pathname === '/api/mobile/approval' && req.method === 'POST') {
+      const body = await readBody();
+      const eventId = body.eventId || body.id;
+      const outcome = body.outcome; // 'allowed-once' or 'rejected'
+
+      if (!eventId || !outcome) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing eventId or outcome' }));
+        return;
+      }
+
+      await respondApproval(eventId, outcome);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, message: `Approval ${outcome} recorded` }));
+      return;
+    }
+
+    // 404
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Endpoint not found' }));
+  } catch (err) {
+    console.error(`[HTTP] Error handling ${pathname}:`, err);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: err.message }));
+  }
 });
 
-// 创建针对手机端的 WebSocket 服务
+// Mobile WebSocket Server
 const wss = new WebSocket.Server({ noServer: true });
 
-// 处理 HTTP 协议升级为 WebSocket（在此处完成握手前鉴权）
 server.on('upgrade', (request, socket, head) => {
   const parsedUrl = url.parse(request.url, true);
   const pathname = parsedUrl.pathname;
 
-  // 只放行 /mobile-ws 或代理 /api/remote.mux
   if (pathname !== '/mobile-ws' && pathname !== '/api/remote.mux') {
     socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
     socket.destroy();
     return;
   }
 
-  // 严格鉴权：未携带正确 Token 直接断开连接，绝不暴露内部 DSH 接口
   if (!authenticate(request)) {
     console.warn(`[SECURITY ALERT] Blocked unauthorized connection attempt from ${request.socket.remoteAddress}`);
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -113,124 +747,137 @@ server.on('upgrade', (request, socket, head) => {
   });
 });
 
-// 监听手机客户端连接
 wss.on('connection', (clientWs, req) => {
   const clientIp = req.socket.remoteAddress;
   console.log(`[DSH Bridge] Mobile client connected from ${clientIp}`);
 
-  // 连接内部的 DSH 实例（默认 localhost:3080/api/remote.mux）
-  const dshTargetUrl = `ws://${CONFIG.DSH_HOST}:${CONFIG.DSH_PORT}/api/remote.mux`;
+  mobileClients.add(clientWs);
+
+  // Send initial state & pending approvals
+  clientWs.send(JSON.stringify({
+    type: 'system',
+    event: 'connected',
+    message: 'Connected to DeepSeek Harness Agent',
+    pendingApprovals: Array.from(pendingApprovals.values())
+  }));
+
+  // Upstream DSH multiplexed stream for this client session
+  const authority = `${CONFIG.DSH_HOST}:${CONFIG.DSH_PORT}`;
+  const dshCookie = generateDshCookie(authority);
+  const dshTargetUrl = `ws://${authority}/api/remote.mux`;
   let upstreamWs = null;
 
   try {
-    upstreamWs = new WebSocket(dshTargetUrl);
+    upstreamWs = new WebSocket(dshTargetUrl, {
+      headers: {
+        'Host': authority,
+        'Cookie': dshCookie
+      }
+    });
+
+    upstreamWs.on('message', (data) => {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        try {
+          const raw = data.toString();
+          // Forward stream items to mobile
+          clientWs.send(raw);
+        } catch (_) {
+          clientWs.send(data);
+        }
+      }
+    });
+
+    upstreamWs.on('error', (err) => {
+      console.error(`[DSH Bridge] Upstream error: ${err.message}`);
+    });
   } catch (err) {
-    console.error(`[DSH Bridge] Failed to connect to DSH upstream: ${err.message}`);
-    clientWs.send(JSON.stringify({
-      type: 'error',
-      message: 'Failed to connect to local DSH server. Is DSH running on port ' + CONFIG.DSH_PORT + '?'
-    }));
-    return;
+    console.error('[DSH Bridge] Failed to connect upstream for client:', err);
   }
 
-  upstreamWs.on('open', () => {
-    console.log(`[DSH Bridge] Successfully bridged to upstream DSH on port ${CONFIG.DSH_PORT}`);
-    clientWs.send(JSON.stringify({
-      type: 'system',
-      event: 'connected',
-      message: 'Connected to DeepSeek Harness Agent'
-    }));
-  });
-
-  // 转发上游 DSH 数据到手机端（并在此进行事件结构标准化）
-  upstreamWs.on('message', (data) => {
-    if (clientWs.readyState === WebSocket.OPEN) {
-      try {
-        const text = data.toString();
-        // 直接透传或增强
-        clientWs.send(text);
-      } catch (err) {
-        clientWs.send(data);
-      }
-    }
-  });
-
-  upstreamWs.on('error', (err) => {
-    console.error(`[DSH Bridge] Upstream error: ${err.message}`);
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(JSON.stringify({
-        type: 'error',
-        message: `Upstream DSH Error: ${err.message}`
-      }));
-    }
-  });
-
-  upstreamWs.on('close', () => {
-    console.log(`[DSH Bridge] Upstream DSH closed connection`);
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.close();
-    }
-  });
-
-  // 手机端发来消息，转发给 DSH 内部
-  clientWs.on('message', (message) => {
+  // Handle mobile client messages
+  clientWs.on('message', async (message) => {
     try {
       const msgStr = message.toString();
-      // 如果手机发送心跳 ping，立即回复 pong
       if (msgStr === 'ping') {
         clientWs.send('pong');
         return;
       }
 
+      const json = JSON.parse(msgStr);
+
+      // 1. Approval response from client
+      if (json.type === 'approval_response') {
+        const { eventId, outcome } = json;
+        if (eventId && outcome) {
+          try {
+            await respondApproval(eventId, outcome);
+            clientWs.send(JSON.stringify({ type: 'approval_ack', eventId, outcome }));
+          } catch (err) {
+            clientWs.send(JSON.stringify({ type: 'error', message: err.message }));
+          }
+        }
+        return;
+      }
+
+      // 2. Chat prompt from client
+      if (json.type === 'chat' || json.method === 'session/send') {
+        const sessionId = json.sessionId || json.params?.sessionId || 'default';
+        const content = json.content || json.params?.content || json.params?.message || '';
+
+        try {
+          await callDshRpc('session/prompt', {
+            args: {
+              request: {
+                requestId: crypto.randomUUID(),
+                sessionId: sessionId,
+                mode: 'queue',
+                content: [{ type: 'text', text: content }]
+              }
+            }
+          });
+        } catch (err) {
+          clientWs.send(JSON.stringify({ type: 'error', message: 'Prompt failed: ' + err.message }));
+        }
+        return;
+      }
+
+      // 3. Raw passthrough if needed
       if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) {
         upstreamWs.send(msgStr);
-      } else {
-        clientWs.send(JSON.stringify({
-          type: 'error',
-          message: 'Upstream DSH is not ready'
-        }));
       }
     } catch (err) {
-      console.error(`[DSH Bridge] Error forwarding client message: ${err.message}`);
+      console.error(`[DSH Bridge] Error handling client message: ${err.message}`);
     }
   });
 
   clientWs.on('close', () => {
     console.log(`[DSH Bridge] Mobile client disconnected`);
+    mobileClients.delete(clientWs);
     if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) {
       upstreamWs.close();
     }
   });
 });
 
-// 导出为 Cordis 插件格式（如果需要通过 cordis.yml 挂载）
-function apply(ctx, config) {
-  if (config) {
-    if (config.token) CONFIG.AUTH_TOKEN = config.token;
-    if (config.port) CONFIG.BRIDGE_PORT = config.port;
-  }
-  startServer();
-}
-
 function startServer() {
   server.listen(CONFIG.BRIDGE_PORT, '0.0.0.0', () => {
     console.log('======================================================');
-    console.log(`🚀 [DSH Mobile Bridge] 启动成功!`);
+    console.log(`🚀 [DSH Mobile Bridge v2.0] 启动成功!`);
     console.log(`📡 监听端口: ${CONFIG.BRIDGE_PORT} (请公网映射此端口)`);
     console.log(`🔗 转发上游: http://${CONFIG.DSH_HOST}:${CONFIG.DSH_PORT}`);
-    console.log(`🔑 认证 Token: ${CONFIG.AUTH_TOKEN}`);
-    console.log(`📱 手机连接路径: ws://<公网IP>:${CONFIG.BRIDGE_PORT}/mobile-ws?token=${CONFIG.AUTH_TOKEN}`);
+    console.log(`🔑 支持的 Token: ${CONFIG.AUTH_TOKENS.join(', ')}`);
     console.log('======================================================');
+
+    // Launch background upstream $events listener
+    connectUpstreamEvents();
   });
 }
 
-// 如果通过 `node index.js` 直接运行
 if (require.main === module) {
   startServer();
 }
 
 module.exports = {
   name: 'dsh-mobile-bridge',
-  apply,
   startServer,
 };

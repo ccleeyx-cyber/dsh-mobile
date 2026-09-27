@@ -7,6 +7,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build Release APK
@@ -49,3 +52,18 @@ jobs:
           name: dsh-agent-release-apk
           path: dsh_mobile/build/app/outputs/flutter-apk/app-release.apk
           retention-days: 14
+
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.1.0
+          name: "DeepSeek Harness Android v1.1.0"
+          body: |
+            ### 🚀 DSH Mobile v1.1.0 更新日志
+            - 📁 **工作区管理 (Workspace Management)**: 支持多工作区切换、浏览完整历史对话、随时恢复继续操作，支持新建会话与对话搜索。
+            - ⚙️ **模型与系统设置 (In-App Settings)**: 支持直接在线切换 16+ 个 LLM 模型，查看服务器状态与公网穿透连接。
+            - 🛡️ **执行权限授权 (Tool Authorization)**: 实时捕获并弹出高权限工具（如终端 Bash、沙箱文件等）审批请求，支持「允许一次」与「拒绝」。
+          files: dsh_mobile/build/app/outputs/flutter-apk/app-release.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
