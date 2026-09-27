@@ -1058,7 +1058,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, {
         'Content-Type': 'application/vnd.android.package-archive',
         'Content-Length': stat.size,
-        'Content-Disposition': 'attachment; filename="dsh-agent-v1.2.3.apk"'
+        'Content-Disposition': 'attachment; filename="dsh-agent-v1.2.4.apk"'
       });
       fs.createReadStream(targetApk).pipe(res);
       return;
