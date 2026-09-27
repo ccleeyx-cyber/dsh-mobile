@@ -302,9 +302,15 @@ async function getSessionHistory(sessionId) {
           textContent = ev.data.text;
         }
 
+        const isMemory = ev.data?.source?.plugin === 'dsh-mnemon' ||
+                         ev.source?.plugin === 'dsh-mnemon' ||
+                         textContent.startsWith('MNEMON RUNTIME MEMORY SNAPSHOT') ||
+                         textContent.includes('<runtime-memory-file');
+
         messages.push({
           id: ev.data?.id || `user_${ev.seq}`,
-          role: 'user',
+          role: isMemory ? 'memory' : 'user',
+          isMemory: isMemory,
           content: textContent,
           time: ev.time,
           seq: ev.seq,

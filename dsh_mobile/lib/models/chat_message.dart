@@ -20,6 +20,7 @@ class ChatMessage {
   List<ToolExecution> tools;
   bool isStreaming;
   final DateTime timestamp;
+  final bool isMemory;
 
   ChatMessage({
     required this.id,
@@ -29,10 +30,16 @@ class ChatMessage {
     List<ToolExecution>? tools,
     this.isStreaming = false,
     DateTime? timestamp,
+    this.isMemory = false,
   })  : tools = tools ?? [],
         timestamp = timestamp ?? DateTime.now();
 
   bool get isUser => role == 'user';
   bool get isAssistant => role == 'assistant';
   bool get isSystem => role == 'system';
+  bool get isMemoryRecall =>
+      isMemory ||
+      role == 'memory' ||
+      content.startsWith('MNEMON RUNTIME MEMORY SNAPSHOT') ||
+      content.contains('<runtime-memory-file');
 }

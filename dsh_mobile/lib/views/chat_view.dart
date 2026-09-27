@@ -9,6 +9,7 @@ import '../services/dsh_service.dart';
 import '../widgets/thinking_card.dart';
 import '../widgets/tool_call_card.dart';
 import '../widgets/approval_card.dart';
+import '../widgets/memory_card.dart';
 
 class ChatView extends StatefulWidget {
   final VoidCallback? onOpenWorkspaces;
@@ -871,6 +872,24 @@ class _ChatViewState extends State<ChatView> {
   }
 
   Widget _buildMessageItem(ChatMessage msg) {
+    // 1. Standalone Memory Snapshot message -> Collapsed MemoryCard
+    if (msg.isMemoryRecall && (msg.role == 'memory' || msg.isMemory || msg.content.startsWith('MNEMON'))) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+        child: MemoryCard(content: msg.content),
+      );
+    }
+
+    // 2. User message with embedded memory snapshot -> Split and collapse memory part
+    const memoryMarker = 'MNEMON RUNTIME MEMORY SNAPSHOT';
+    final memoryIndex = msg.content.indexOf(memoryMarker);
+    String displayContent = msg.content;
+    String? embeddedMemory;
+    if (memoryIndex > 0) {
+      displayContent = msg.content.substring(0, memoryIndex).trim();
+      embeddedMemory = msg.content.substring(memoryIndex).trim();
+    }
+
     final isUser = msg.role == 'user';
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
@@ -912,7 +931,7 @@ class _ChatViewState extends State<ChatView> {
                   ),
 
                 // Content Bubble
-                if (msg.content.isNotEmpty)
+                if (displayContent.isNotEmpty)
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                     decoration: BoxDecoration(
@@ -923,7 +942,7 @@ class _ChatViewState extends State<ChatView> {
                       ),
                     ),
                     child: MarkdownBody(
-                      data: msg.content,
+                      data: displayContent,
                       selectable: true,
                       styleSheet: MarkdownStyleSheet(
                         p: const TextStyle(fontSize: 14.5, color: Colors.white, height: 1.45),
@@ -939,6 +958,13 @@ class _ChatViewState extends State<ChatView> {
                         ),
                       ),
                     ),
+                  ),
+
+                // Embedded Memory Card if present
+                if (embeddedMemory != null && embeddedMemory.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: MemoryCard(content: embeddedMemory),
                   ),
 
                 // Streaming Indicator
