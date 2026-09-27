@@ -689,6 +689,13 @@ class _ChatViewState extends State<ChatView> {
             tooltip: '新建对话',
             icon: const Icon(Icons.add_comment_outlined, color: Colors.white),
             onPressed: () async {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('正在新建对话...'),
+                  duration: Duration(milliseconds: 1200),
+                  behavior: SnackBarBehavior.floating,
+                ),
+              );
               await dsh.createNewSession();
               _scrollToBottom();
             },
@@ -813,7 +820,16 @@ class _ChatViewState extends State<ChatView> {
                     icon: Icons.cleaning_services_outlined,
                     label: '清屏新建',
                     color: Colors.orangeAccent,
-                    onTap: () => dsh.createNewSession(),
+                    onTap: () async {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('正在新建对话...'),
+                          duration: Duration(milliseconds: 1200),
+                          behavior: SnackBarBehavior.floating,
+                        ),
+                      );
+                      await dsh.createNewSession();
+                    },
                   ),
                 ],
               ),

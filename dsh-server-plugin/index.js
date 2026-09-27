@@ -172,7 +172,7 @@ function getWorkspacesData() {
             try {
               const cache = JSON.parse(fs.readFileSync(cPath, 'utf8'));
               const rows = cache.record?.rows || {};
-              sessionMeta.title = rows.title?.val || rows.titleInput?.val?.first?.text || sId;
+              sessionMeta.title = rows.title?.val || rows.titleInput?.val?.first?.text || '新会话';
               sessionMeta.firstPrompt = rows.titleInput?.val?.first?.text || '';
               sessionMeta.lastPromptAt = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
               sessionMeta.model = rows.modelSelection?.val?.lastUsed?.model || '';
@@ -256,7 +256,7 @@ async function getSessionHistory(sessionId) {
       args: {
         request: {
           address: { kind: 'session', sessionId: sessionId },
-          throughSeq: seq > 0 ? seq : 999999,
+          throughSeq: seq > 0 ? seq : 99999999,
           maxMessages: 50
         }
       }
@@ -265,15 +265,19 @@ async function getSessionHistory(sessionId) {
 
   let pageData;
   try {
-    pageData = await queryPage(targetSeq);
+    // Attempt with a large throughSeq to discover the exact latest cursor if past
+    pageData = await queryPage(99999999);
   } catch (err) {
-    // If "through seq X is past cursor Y", retry with cursor Y
     const match = err.message.match(/cursor\s+(\d+)/i);
     if (match && match[1]) {
       const actualCursor = parseInt(match[1]);
-      pageData = await queryPage(actualCursor);
-    } else {
-      throw err;
+      try {
+        pageData = await queryPage(actualCursor);
+      } catch (_) {}
+    } else if (targetSeq > 0) {
+      try {
+        pageData = await queryPage(targetSeq);
+      } catch (_) {}
     }
   }
 
@@ -285,15 +289,17 @@ async function getSessionHistory(sessionId) {
     if (r.type === 'event' && r.event) {
       const ev = r.event;
       if (ev.type === 'user/message') {
-        const msg = ev.data?.message;
+        const contentArr = ev.data?.content || ev.data?.message?.content;
         let textContent = '';
-        if (Array.isArray(msg?.content)) {
-          textContent = msg.content
-            .filter(c => c.type === 'text')
-            .map(c => c.text)
+        if (Array.isArray(contentArr)) {
+          textContent = contentArr
+            .filter(c => c && (c.type === 'text' || typeof c === 'string'))
+            .map(c => typeof c === 'string' ? c : (c.text || ''))
             .join('\n');
-        } else if (typeof msg?.content === 'string') {
-          textContent = msg.content;
+        } else if (typeof contentArr === 'string') {
+          textContent = contentArr;
+        } else if (typeof ev.data?.text === 'string') {
+          textContent = ev.data.text;
         }
 
         messages.push({
@@ -352,8 +358,21 @@ async function getSessionHistory(sessionId) {
   }
 
   // If the session is actively generating, and the in-flight turn hasn't committed to records yet:
-  if (follower && (follower.isRunning || follower.textBuffer || follower.thinkingBuffer)) {
+  if (follower && (follower.isRunning || follower.textBuffer || follower.thinkingBuffer || follower.activePromptText)) {
     isSessionRunning = true;
+
+    // Ensure the latest user message is present if it hasn't landed in records yet
+    if (follower.activePromptText && (messages.length === 0 || messages[messages.length - 1].role !== 'user' || messages[messages.length - 1].content !== follower.activePromptText)) {
+      messages.push({
+        id: `user_prompt_${cleanId}_${Date.now()}`,
+        role: 'user',
+        content: follower.activePromptText,
+        time: Date.now() - 1000,
+        seq: 999998,
+        turn: 999998
+      });
+    }
+
     if (messages.length === 0 || messages[messages.length - 1].role === 'user') {
       messages.push({
         id: `in_flight_${cleanId}_${Date.now()}`,
@@ -763,6 +782,7 @@ function connectUpstreamMux() {
               });
             } else if (ev.type === 'turn/end') {
               follower.isRunning = false;
+              follower.activePromptText = null;
               activePrompts.delete(sId);
               activePrompts.delete(cleanId);
               broadcastToMobileClients({
@@ -1082,16 +1102,30 @@ const server = http.createServer(async (req, res) => {
     // 3. POST /api/mobile/sessions/create
     if (pathname === '/api/mobile/sessions/create' && req.method === 'POST') {
       const body = await readBody();
-      const result = await callDshRpc('session/create', {
-        args: {
-          request: {
-            workspaceId: body.workspaceId,
-            cwd: body.cwd
+      const requestPayload = {};
+      if (body.workspaceId) {
+        requestPayload.workspaceId = body.workspaceId;
+      } else if (body.cwd) {
+        requestPayload.cwd = body.cwd;
+      }
+
+      try {
+        const result = await callDshRpc('session/create', {
+          args: {
+            request: requestPayload
           }
+        });
+        const newSessionId = result?.sessionId;
+        if (newSessionId) {
+          followSession(newSessionId);
         }
-      });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ code: 0, session: result }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ code: 0, sessionId: newSessionId, session: result }));
+      } catch (err) {
+        console.error('[Session Create] Failed:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ code: 500, error: err.message }));
+      }
       return;
     }
 
@@ -1110,6 +1144,7 @@ const server = http.createServer(async (req, res) => {
         follower.thinkingBuffer = '';
         follower.textBuffer = '';
         follower.tools = [];
+        follower.activePromptText = body.text || '';
         follower.lastUpdated = Date.now();
       }
       activePrompts.set(fullId, Date.now());
@@ -1420,6 +1455,7 @@ wss.on('connection', (clientWs, req) => {
           follower.thinkingBuffer = '';
           follower.textBuffer = '';
           follower.tools = [];
+          follower.activePromptText = content;
           follower.lastUpdated = Date.now();
         }
         activePrompts.set(fullId, Date.now());

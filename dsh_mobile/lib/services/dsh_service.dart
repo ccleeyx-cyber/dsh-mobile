@@ -260,7 +260,22 @@ class DshService extends ChangeNotifier {
   }
 
   Future<void> createNewSession() async {
+    if (_currentWorkspace == null) {
+      if (_workspaces.isEmpty) {
+        await fetchWorkspaces();
+      }
+      if (_workspaces.isNotEmpty) {
+        _currentWorkspace = _workspaces.first;
+      }
+    }
     if (_currentConfig == null || _currentWorkspace == null) return;
+
+    _sessionPollTimer?.cancel();
+    _sessionPollTimer = null;
+    _isLoadingHistory = true;
+    _messages = [];
+    notifyListeners();
+
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/create');
       final res = await http.post(
@@ -268,25 +283,43 @@ class DshService extends ChangeNotifier {
         headers: _authHeaders,
         body: jsonEncode({
           'workspaceId': _currentWorkspace!.workspaceId,
-          'cwd': _currentWorkspace!.path,
         }),
       ).timeout(const Duration(seconds: 8));
 
       if (res.statusCode == 200) {
-        await fetchWorkspaces();
-        // The newly created session will be in the updated workspace
-        final updatedWs = _workspaces.firstWhere(
-          (w) => w.workspaceId == _currentWorkspace!.workspaceId,
-          orElse: () => _currentWorkspace!,
-        );
-        _currentWorkspace = updatedWs;
-        if (updatedWs.sessions.isNotEmpty) {
-          await selectSession(updatedWs.sessions.first);
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final newSessionId = data['sessionId']?.toString() ?? data['session']?['sessionId']?.toString();
+
+        if (newSessionId != null && newSessionId.isNotEmpty) {
+          final newSessionMeta = SessionMeta(
+            sessionId: newSessionId,
+            title: '新对话',
+            createdAt: DateTime.now(),
+          );
+
+          _currentWorkspace!.sessions.insert(0, newSessionMeta);
+          _currentSession = newSessionMeta;
+          _messages = [
+            ChatMessage(
+              id: _uuid.v4(),
+              role: 'assistant',
+              content: '新对话已创建。你可以直接向 DSH 智能体下达指令。',
+            )
+          ];
+          _isLoadingHistory = false;
+          notifyListeners();
+
+          _sendWsJson({'type': 'follow', 'sessionId': newSessionId});
+          fetchWorkspaces();
+          return;
         }
       }
     } catch (e) {
       debugPrint('[DshService] createNewSession error: $e');
     }
+
+    _isLoadingHistory = false;
+    notifyListeners();
   }
 
   // Send Prompt
@@ -381,7 +414,7 @@ class DshService extends ChangeNotifier {
           final bool isRunning = sessionData['isRunning'] == true;
           final rawMessages = sessionData['messages'] as List<dynamic>? ?? [];
 
-          if (rawMessages.isNotEmpty && _currentSession?.sessionId == sessionId) {
+          if (rawMessages.isNotEmpty && _currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
             final parsedMessages = rawMessages.map((m) {
               final rawTools = m['tools'] as List<dynamic>? ?? [];
               return ChatMessage(
@@ -404,6 +437,17 @@ class DshService extends ChangeNotifier {
               if (isRunning && parsedMessages.isNotEmpty && parsedMessages.last.isAssistant) {
                 parsedMessages.last.isStreaming = true;
               }
+
+              // Preserve locally added user messages if server hasn't committed them yet
+              final serverUserTexts = parsedMessages.where((m) => m.isUser).map((m) => m.content).toSet();
+              for (final localMsg in _messages.where((m) => m.isUser)) {
+                if (localMsg.content.isNotEmpty && !serverUserTexts.contains(localMsg.content)) {
+                  if (localMsg.timestamp == null || DateTime.now().difference(localMsg.timestamp!).inSeconds < 30) {
+                    parsedMessages.add(localMsg);
+                  }
+                }
+              }
+
               _messages = parsedMessages;
               notifyListeners();
             }
