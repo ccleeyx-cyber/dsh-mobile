@@ -5,11 +5,11 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
 
+    <!-- 允许非加密明文流量(ws:// 和 http://)，方便公网 IP 直接连接 -->
     <application
         android:label="DSH Agent"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
-        <!-- 允许非加密明文流量(ws:// 和 http://)，方便公网 IP 直接连接 -->
         android:usesCleartextTraffic="true">
         
         <activity

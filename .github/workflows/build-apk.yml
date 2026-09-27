@@ -5,7 +5,7 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch: # 支持在 GitHub 网页上手动点击“Run workflow”一键打包
+  workflow_dispatch:
 
 jobs:
   build:
@@ -32,8 +32,10 @@ jobs:
       - name: Prepare Android Project & Dependencies
         working-directory: ./dsh_mobile
         run: |
-          # 补齐原生 Android 工程构建骨架
-          flutter create . --platforms=android
+          # 备份定制的 Android 配置文件
+          cp android/app/src/main/AndroidManifest.xml /tmp/AndroidManifest.xml || true
+          flutter create . --platforms=android --project-name=dsh_mobile
+          cp /tmp/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
           flutter pub get
 
       - name: Build APK (Release)
