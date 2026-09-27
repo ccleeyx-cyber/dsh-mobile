@@ -657,8 +657,7 @@ class _ChatViewState extends State<ChatView> {
                           padding: const EdgeInsets.only(bottom: 12),
                           child: ApprovalCard(
                             request: req,
-                            onAllowed: () => dsh.respondApproval(req, 'allowed-once'),
-                            onRejected: () => dsh.respondApproval(req, 'rejected'),
+                            onRespond: (r, outcome) => dsh.respondApproval(r, outcome),
                           ),
                         );
                       }
@@ -772,7 +771,7 @@ class _ChatViewState extends State<ChatView> {
                 if (msg.thinking != null && msg.thinking!.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 6),
-                    child: ThinkingCard(thinkingText: msg.thinking!),
+                    child: ThinkingCard(content: msg.thinking!),
                   ),
 
                 // Tool Executions

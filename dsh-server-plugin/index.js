@@ -764,7 +764,7 @@ const server = http.createServer(async (req, res) => {
     if (fs.existsSync(apkPath)) {
       res.writeHead(200, {
         'Content-Type': 'application/vnd.android.package-archive',
-        'Content-Disposition': 'attachment; filename="dsh-agent-v1.1.0.apk"'
+        'Content-Disposition': 'attachment; filename="dsh-agent-v1.2.0.apk"'
       });
       fs.createReadStream(apkPath).pipe(res);
       return;
