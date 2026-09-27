@@ -4,7 +4,7 @@ import 'models/server_config.dart';
 import 'services/dsh_service.dart';
 import 'services/storage_service.dart';
 import 'views/config_page.dart';
-import 'views/chat_page.dart';
+import 'views/main_shell.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -28,23 +28,27 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'DSH Mobile',
+      title: 'WorkBuddy Mobile',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
+        scaffoldBackgroundColor: const Color(0xFF0B0F19),
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF2563EB),
-          brightness: Brightness.light,
+          brightness: Brightness.dark,
+          surface: const Color(0xFF131B2E),
         ),
       ),
       darkTheme: ThemeData(
         useMaterial3: true,
+        scaffoldBackgroundColor: const Color(0xFF0B0F19),
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF2563EB),
           brightness: Brightness.dark,
+          surface: const Color(0xFF131B2E),
         ),
       ),
-      themeMode: ThemeMode.system,
+      themeMode: ThemeMode.dark,
       home: _buildHome(context),
     );
   }
@@ -55,7 +59,7 @@ class MyApp extends StatelessWidget {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         Provider.of<DshService>(context, listen: false).connect(initialConfig!);
       });
-      return const ChatPage();
+      return const MainShell();
     }
     return const ConfigPage();
   }

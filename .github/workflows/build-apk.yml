@@ -57,13 +57,35 @@ jobs:
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.1.0
-          name: "DeepSeek Harness Android v1.1.0"
+          tag_name: v1.2.0
+          name: "WorkBuddy Edition for DSH v1.2.0"
           body: |
-            ### 🚀 DSH Mobile v1.1.0 更新日志
-            - 📁 **工作区管理 (Workspace Management)**: 支持多工作区切换、浏览完整历史对话、随时恢复继续操作，支持新建会话与对话搜索。
-            - ⚙️ **模型与系统设置 (In-App Settings)**: 支持直接在线切换 16+ 个 LLM 模型，查看服务器状态与公网穿透连接。
-            - 🛡️ **执行权限授权 (Tool Authorization)**: 实时捕获并弹出高权限工具（如终端 Bash、沙箱文件等）审批请求，支持「允许一次」与「拒绝」。
+            ### 🚀 WorkBuddy 手机端深度重构版 (v1.2.0) 发布
+            仿照 WorkBuddy 官方手机端全功能架构进行深度设计与体验升级：
+
+            #### 💬 1. 智能对话工作台 (Agent Chat)
+            - **权限与环境胶囊**: 顶栏直观展示当前工作区、当前模型及**对话专属执行权限状态**。
+            - **会话级权限设置 (Session Permissions)**: 支持点击安全盾牌即时配置当前会话执行策略：
+              - 🛡️ **每次询问 (Ask Every Time)**: 终端命令与工具需手机审批确认 (安全优先)
+              - 🔍 **只读自动放行 (Auto Read-Only)**: `ls`, `grep`, `cat`, `git status` 等安全指令直接运行，写操作拦截
+              - ⚡ **完全放行模式 (Danger Full Access)**: 全速自主执行
+            - **参数微调**: 对话单轮执行步数上限 (Max Steps 10-60) 即时调节。
+            - **交互体验**: 思考链路 (CoT Reasoning) 折叠卡片、终端命令 stdout 折叠、代码语法高亮与一键复制。
+
+            #### 📁 2. 独立工作区与项目管理中心 (Workspaces)
+            - **多项目概览**: 项目卡片展示挂载路径、对话统计与最后活跃时间。
+            - **项目指令与记忆 (MEMORY.md)**: 手机端直接查看与编辑项目的 `MEMORY.md` 规则与架构约定。
+            - **会话历史无缝流转**: 按项目检索历史对话，一键加载并无缝切换至对话交互界面。
+
+            #### 🛡️ 3. 权限与安全审计中心 (Security & Approvals)
+            - **待审批队列**: 实时高优先级工具执行审批卡片，一键放行或阻断。
+            - **全局策略矩阵**: 全局终端执行模式、沙箱特权提升 (Privilege Escalation) 与敏感目录防护 (.git / .dsh 等)。
+            - **实时审计流水**: 记录所有工具执行结果（已放行/已拒绝/只读自动放行），带精确时间戳。
+
+            #### ⚙️ 4. 设置与深度自定义 (Settings & Customization)
+            - **大模型与思考预算**: 16+ 个 LLM 模型随时切换，推理 Token 预算滑块 (0 ~ 32k) 与温度参数调节。
+            - **智能体人设预设**: 全栈研发架构师、缺陷定位专家、极客终端运维、安全代码审计及自定义人设提示词。
+            - **网络测速诊断**: 实时网关 Ping 往返延迟测速 (ms) 与一键断线重连。
           files: dsh_mobile/build/app/outputs/flutter-apk/app-release.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

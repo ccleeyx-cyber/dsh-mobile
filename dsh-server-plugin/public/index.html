@@ -1,0 +1,895 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeepSeek Harness - 移动网关与可视化控制台</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#eff6ff',
+              100: '#dbeafe',
+              500: '#3b82f6',
+              600: '#2563eb',
+              700: '#1d4ed8',
+              800: '#1e40af',
+              900: '#1e3a8a',
+              950: '#0f172a'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <!-- FontAwesome -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <!-- Vue 3 -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <!-- QRCode.js -->
+  <script src="https://unpkg.com/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <style>
+    [v-cloak] { display: none !important; }
+    /* 自定义滚动条 */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #475569; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen antialiased selection:bg-blue-600 selection:text-white">
+  <div id="app" v-cloak class="min-h-screen flex flex-col">
+
+    <!-- 顶部导航栏 -->
+    <header class="sticky top-0 z-40 bg-slate-900/80 backdrop-blur border-b border-slate-800 px-4 lg:px-8 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center text-white shadow-lg shadow-blue-500/20">
+          <i class="fa-solid fa-microchip text-lg"></i>
+        </div>
+        <div>
+          <div class="flex items-center gap-2">
+            <h1 class="font-bold text-lg tracking-tight text-white">DeepSeek Harness</h1>
+            <span class="text-xs px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 font-semibold border border-blue-500/30">Plugin v2.1</span>
+          </div>
+          <p class="text-xs text-slate-400">Mobile Gateway & Visual Controller</p>
+        </div>
+      </div>
+
+      <!-- 实时服务状态标签 -->
+      <div class="hidden md:flex items-center gap-4 text-xs">
+        <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/80 border border-slate-700/60">
+          <span class="w-2 h-2 rounded-full" :class="dshOnline ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'"></span>
+          <span class="text-slate-400">DSH 上游:</span>
+          <span class="font-mono text-slate-200">127.0.0.1:3080</span>
+        </div>
+        <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/80 border border-slate-700/60">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span class="text-slate-400">NPC 公网映射:</span>
+          <span class="font-mono text-slate-200">n.cnm.asia:3088</span>
+        </div>
+        <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/80 border border-slate-700/60">
+          <i class="fa-solid fa-mobile-screen text-blue-400"></i>
+          <span class="text-slate-400">活跃 App:</span>
+          <span class="font-semibold text-slate-200">{{ activeClients }}</span>
+        </div>
+      </div>
+
+      <!-- 右侧控制区 -->
+      <div class="flex items-center gap-2">
+        <!-- 待审批预警角标 -->
+        <button 
+          v-if="pendingApprovals.length > 0"
+          @click="activeTab = 'approvals'"
+          class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-amber-500/20 border border-amber-500/50 text-amber-300 animate-bounce text-xs font-semibold"
+        >
+          <i class="fa-solid fa-shield-halved"></i>
+          <span>{{ pendingApprovals.length }} 项待审批</span>
+        </button>
+
+        <a 
+          href="/dsh-agent.apk"
+          download
+          class="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white text-xs font-medium transition shadow-md shadow-blue-500/10"
+        >
+          <i class="fa-brands fa-android text-sm"></i>
+          <span>下载手机 App (APK)</span>
+        </a>
+
+        <button 
+          @click="showTokenModal = true"
+          class="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs transition"
+          title="令牌设置"
+        >
+          <i class="fa-solid fa-key"></i>
+        </button>
+      </div>
+    </header>
+
+    <!-- 导航标签栏 -->
+    <div class="bg-slate-900 border-b border-slate-800 px-4 lg:px-8">
+      <nav class="flex space-x-1 lg:space-x-4 overflow-x-auto text-sm font-medium">
+        <button 
+          v-for="tab in tabs" 
+          :key="tab.id"
+          @click="activeTab = tab.id"
+          :class="activeTab === tab.id ? 'border-blue-500 text-blue-400 bg-blue-500/10' : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-700'"
+          class="flex items-center gap-2 py-3 px-4 border-b-2 font-medium text-xs sm:text-sm whitespace-nowrap transition"
+        >
+          <i :class="tab.icon"></i>
+          <span>{{ tab.name }}</span>
+          <span 
+            v-if="tab.badge" 
+            class="ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+            :class="tab.badgeColor || 'bg-slate-800 text-slate-300'"
+          >{{ tab.badge }}</span>
+        </button>
+      </nav>
+    </div>
+
+    <!-- 主体容器 -->
+    <main class="flex-1 p-4 lg:p-8 max-w-7xl mx-auto w-full">
+
+      <!-- TAB 1: 总览看板 -->
+      <section v-if="activeTab === 'overview'" class="space-y-6">
+        <!-- 核心指标统计卡 -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div class="p-5 rounded-2xl bg-slate-900/60 border border-slate-800/80 shadow-sm relative overflow-hidden">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium text-slate-400">当前默认大模型</span>
+              <span class="p-2 rounded-lg bg-blue-500/10 text-blue-400"><i class="fa-solid fa-brain"></i></span>
+            </div>
+            <div class="mt-3">
+              <div class="text-lg font-bold text-white truncate" :title="settings?.currentModel">{{ settings?.currentModel || '加载中...' }}</div>
+              <p class="text-xs text-slate-400 mt-1">Provider: {{ settings?.currentProvider || 'wb' }}</p>
+            </div>
+          </div>
+
+          <div class="p-5 rounded-2xl bg-slate-900/60 border border-slate-800/80 shadow-sm relative overflow-hidden">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium text-slate-400">托管工作区数量</span>
+              <span class="p-2 rounded-lg bg-emerald-500/10 text-emerald-400"><i class="fa-solid fa-folder-tree"></i></span>
+            </div>
+            <div class="mt-3">
+              <div class="text-2xl font-bold text-white">{{ workspaces.length }}</div>
+              <p class="text-xs text-slate-400 mt-1">包含 {{ totalSessionsCount }} 个历史对话</p>
+            </div>
+          </div>
+
+          <div class="p-5 rounded-2xl bg-slate-900/60 border border-slate-800/80 shadow-sm relative overflow-hidden">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium text-slate-400">待审批工具执行</span>
+              <span class="p-2 rounded-lg bg-amber-500/10 text-amber-400"><i class="fa-solid fa-user-shield"></i></span>
+            </div>
+            <div class="mt-3">
+              <div class="text-2xl font-bold text-white" :class="pendingApprovals.length > 0 ? 'text-amber-400' : ''">{{ pendingApprovals.length }}</div>
+              <p class="text-xs text-slate-400 mt-1">实时事件监听中</p>
+            </div>
+          </div>
+
+          <div class="p-5 rounded-2xl bg-slate-900/60 border border-slate-800/80 shadow-sm relative overflow-hidden">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium text-slate-400">网关状态 & 穿透</span>
+              <span class="p-2 rounded-lg bg-purple-500/10 text-purple-400"><i class="fa-solid fa-network-wired"></i></span>
+            </div>
+            <div class="mt-3">
+              <div class="text-2xl font-bold text-emerald-400 flex items-center gap-2">
+                <span>正常在线</span>
+                <span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping"></span>
+              </div>
+              <p class="text-xs text-slate-400 mt-1 font-mono">端口: 3088 (TCP)</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- 快速功能入口 -->
+        <div class="p-6 rounded-2xl bg-slate-900/40 border border-slate-800 flex flex-col md:flex-row items-center justify-between gap-4">
+          <div class="flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-blue-600/20 text-blue-400 flex items-center justify-center text-xl">
+              <i class="fa-solid fa-bolt"></i>
+            </div>
+            <div>
+              <h3 class="font-semibold text-white">DSH 移动网关快捷操作</h3>
+              <p class="text-xs text-slate-400 mt-0.5">支持在网页端直接调控大模型、审批智能体命令、管理工作区与下载安卓客户端</p>
+            </div>
+          </div>
+          <div class="flex flex-wrap gap-2 w-full md:w-auto">
+            <button @click="activeTab = 'models'" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium border border-slate-700 text-slate-200 transition">
+              <i class="fa-solid fa-brain mr-1.5 text-blue-400"></i>切换模型
+            </button>
+            <button @click="activeTab = 'workspaces'" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium border border-slate-700 text-slate-200 transition">
+              <i class="fa-solid fa-folder mr-1.5 text-emerald-400"></i>浏览工作区
+            </button>
+            <button @click="activeTab = 'approvals'" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium border border-slate-700 text-slate-200 transition">
+              <i class="fa-solid fa-shield mr-1.5 text-amber-400"></i>审批控制台
+            </button>
+            <button @click="activeTab = 'mobile'" class="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-xs font-medium text-white transition">
+              <i class="fa-solid fa-qrcode mr-1.5"></i>扫码配对
+            </button>
+          </div>
+        </div>
+
+        <!-- 待处理审批卡片提醒（如果有） -->
+        <div v-if="pendingApprovals.length > 0" class="space-y-3">
+          <div class="flex items-center justify-between">
+            <h3 class="text-sm font-semibold text-amber-400 flex items-center gap-2">
+              <i class="fa-solid fa-triangle-exclamation"></i>
+              <span>等待授权的工具调用 ({{ pendingApprovals.length }})</span>
+            </h3>
+            <button @click="activeTab = 'approvals'" class="text-xs text-blue-400 hover:underline">查看全部</button>
+          </div>
+          <div v-for="req in pendingApprovals.slice(0, 3)" :key="req.id" class="p-4 rounded-xl bg-amber-950/20 border border-amber-600/40 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono text-xs font-bold">{{ req.toolName }}</span>
+                <span class="text-xs text-slate-400">Session: {{ req.sessionId }}</span>
+              </div>
+              <p class="text-sm font-medium text-slate-200 mt-1">{{ req.reason || '申请执行外部高权限工具' }}</p>
+            </div>
+            <div class="flex items-center gap-2 w-full md:w-auto">
+              <button @click="respondApproval(req.id, 'rejected')" class="flex-1 md:flex-none px-3 py-1.5 rounded-lg border border-rose-500/50 hover:bg-rose-500/10 text-rose-400 text-xs font-medium transition">
+                拒绝
+              </button>
+              <button @click="respondApproval(req.id, 'allowed-once')" class="flex-1 md:flex-none px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium transition">
+                允许执行一次
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 工作区快速预览列表 -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between">
+            <h3 class="text-sm font-semibold text-slate-200 flex items-center gap-2">
+              <i class="fa-solid fa-folder-open text-blue-400"></i>
+              <span>工作区概览</span>
+            </h3>
+            <button @click="activeTab = 'workspaces'" class="text-xs text-blue-400 hover:underline">管理工作区</button>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div v-for="ws in workspaces" :key="ws.workspaceId" class="p-5 rounded-2xl bg-slate-900/60 border border-slate-800 hover:border-slate-700 transition flex flex-col justify-between">
+              <div>
+                <div class="flex items-center justify-between">
+                  <h4 class="font-bold text-white text-base truncate">{{ ws.title }}</h4>
+                  <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono">{{ ws.sessionCount }} 会话</span>
+                </div>
+                <p class="text-xs font-mono text-slate-400 mt-2 truncate" :title="ws.path">{{ ws.path }}</p>
+                <div class="mt-4 pt-3 border-t border-slate-800/80">
+                  <div class="text-xs text-slate-400">最近对话:</div>
+                  <div class="text-xs font-medium text-slate-300 truncate mt-1">
+                    {{ ws.sessions && ws.sessions[0] ? ws.sessions[0].title : '暂无对话' }}
+                  </div>
+                </div>
+              </div>
+              <button @click="selectWorkspaceForInspect(ws)" class="mt-4 w-full py-2 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-xs text-blue-400 font-medium transition flex items-center justify-center gap-1.5">
+                <span>进入查看</span>
+                <i class="fa-solid fa-arrow-right text-[10px]"></i>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: 模型配置 -->
+      <section v-if="activeTab === 'models'" class="space-y-6">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <h2 class="text-lg font-bold text-white flex items-center gap-2">
+              <i class="fa-solid fa-brain text-blue-400"></i>
+              <span>智能体模型设置</span>
+            </h2>
+            <p class="text-xs text-slate-400 mt-1">管理 DeepSeek Harness 后台挂载的大语言模型，切换宿主机默认模型及查看参数规格</p>
+          </div>
+          <button @click="fetchSettings" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 border border-slate-700 transition self-start flex items-center gap-1.5">
+            <i class="fa-solid fa-arrows-rotate"></i>
+            <span>刷新模型列表</span>
+          </button>
+        </div>
+
+        <!-- 当前活动模型 Banner -->
+        <div class="p-6 rounded-2xl bg-gradient-to-r from-blue-950/40 via-slate-900 to-slate-900 border border-blue-500/30 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+          <div class="flex items-center gap-4">
+            <div class="w-14 h-14 rounded-2xl bg-blue-500/20 text-blue-400 border border-blue-500/30 flex items-center justify-center text-2xl">
+              <i class="fa-solid fa-robot"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="text-xs font-semibold px-2 py-0.5 rounded bg-blue-500/20 text-blue-400">当前激活默认</span>
+                <span class="text-xs text-slate-400">Provider: {{ settings?.currentProvider || 'wb' }}</span>
+              </div>
+              <h3 class="text-xl font-bold text-white mt-1">{{ settings?.currentModel }}</h3>
+            </div>
+          </div>
+          <div class="text-xs text-slate-400 md:text-right">
+            <div>配置已同步至: <code class="text-slate-300 font-mono bg-slate-800 px-1.5 py-0.5 rounded">.dsh/settings.yaml</code></div>
+            <div class="mt-1 text-emerald-400"><i class="fa-solid fa-check-circle mr-1"></i>所有新会话与手机指令均即时生效</div>
+          </div>
+        </div>
+
+        <!-- 可用模型网格列表 -->
+        <div class="space-y-3">
+          <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+            支持的模型列表 (共 {{ settings?.availableModels?.length || 0 }} 个)
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div 
+              v-for="model in settings?.availableModels" 
+              :key="model.id"
+              class="p-5 rounded-2xl border transition relative flex flex-col justify-between"
+              :class="model.id === settings?.currentModel ? 'bg-blue-950/20 border-blue-500 shadow-md shadow-blue-500/5' : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'"
+            >
+              <div>
+                <div class="flex items-start justify-between gap-2">
+                  <div class="font-bold text-sm text-white truncate" :title="model.name">{{ model.name }}</div>
+                  <span v-if="model.id === settings?.currentModel" class="px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/30 text-[10px] font-bold">
+                    当前使用
+                  </span>
+                </div>
+                <div class="mt-3 flex flex-wrap gap-2 text-xs">
+                  <span v-if="model.contextWindow" class="px-2 py-1 rounded bg-slate-800 text-slate-300 font-mono text-[11px]">
+                    上下文: {{ (model.contextWindow / 1000).toFixed(0) }}k
+                  </span>
+                  <span v-if="model.maxTokens" class="px-2 py-1 rounded bg-slate-800 text-slate-300 font-mono text-[11px]">
+                    输出: {{ (model.maxTokens / 1000).toFixed(0) }}k
+                  </span>
+                </div>
+              </div>
+              <div class="mt-5 pt-3 border-t border-slate-800/80 flex items-center justify-between">
+                <span class="text-xs text-slate-400 font-mono truncate max-w-[120px]">{{ model.id }}</span>
+                <button 
+                  v-if="model.id !== settings?.currentModel"
+                  @click="switchModel(model.id)"
+                  :disabled="switchingModel"
+                  class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-blue-600 text-white text-xs font-medium transition flex items-center gap-1.5"
+                >
+                  <i class="fa-solid fa-check"></i>
+                  <span>设为默认</span>
+                </button>
+                <span v-else class="text-xs text-blue-400 font-medium flex items-center gap-1">
+                  <i class="fa-solid fa-circle-check"></i>
+                  <span>默认生效中</span>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: 授权与安全控制台 -->
+      <section v-if="activeTab === 'approvals'" class="space-y-6">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <h2 class="text-lg font-bold text-white flex items-center gap-2">
+              <i class="fa-solid fa-shield-halved text-amber-400"></i>
+              <span>安全审批与工具权限控制台</span>
+            </h2>
+            <p class="text-xs text-slate-400 mt-1">控制 DSH 智能体执行 Bash、沙箱终端及敏感文件时的授权策略</p>
+          </div>
+          <button @click="fetchApprovals" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 border border-slate-700 transition self-start flex items-center gap-1.5">
+            <i class="fa-solid fa-arrows-rotate"></i>
+            <span>刷新审批项</span>
+          </button>
+        </div>
+
+        <!-- 待处理审批列表 -->
+        <div class="p-6 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4">
+          <div class="flex items-center justify-between">
+            <h3 class="font-bold text-white text-sm flex items-center gap-2">
+              <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse"></span>
+              <span>实时待审批队列 ({{ pendingApprovals.length }})</span>
+            </h3>
+            <span class="text-xs text-slate-400">基于 DSH Cordis Waterfall 协议</span>
+          </div>
+
+          <div v-if="pendingApprovals.length === 0" class="py-12 text-center text-slate-400">
+            <div class="w-12 h-12 mx-auto rounded-full bg-slate-800/80 flex items-center justify-center text-slate-500 text-xl mb-3">
+              <i class="fa-solid fa-check"></i>
+            </div>
+            <p class="text-sm font-medium">当前没有任何等待审批的工具调用</p>
+            <p class="text-xs text-slate-500 mt-1">当智能体在手机端或宿主机下达需要提升权限的操作时，将立即在此呈现并声音提醒</p>
+          </div>
+
+          <div v-else class="space-y-3">
+            <div v-for="req in pendingApprovals" :key="req.id" class="p-5 rounded-xl bg-slate-950 border border-amber-500/40 space-y-3">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="flex items-center gap-2">
+                  <span class="px-2.5 py-1 rounded-md bg-amber-500/20 text-amber-300 font-mono text-xs font-bold border border-amber-500/30">
+                    <i class="fa-solid fa-terminal mr-1"></i>{{ req.toolName }}
+                  </span>
+                  <span class="text-xs text-slate-400 font-mono">会话: {{ req.sessionId }}</span>
+                </div>
+                <span class="text-xs text-slate-500">{{ new Date(req.createdAt).toLocaleTimeString() }}</span>
+              </div>
+
+              <div class="p-3 rounded-lg bg-slate-900 border border-slate-800 font-mono text-xs text-slate-200 break-all">
+                {{ req.reason || '申请调用外部工具执行操作' }}
+              </div>
+
+              <div v-if="req.callId" class="text-[11px] text-slate-500 font-mono">
+                CallId: {{ req.callId }}
+              </div>
+
+              <div class="flex justify-end gap-3 pt-2">
+                <button @click="respondApproval(req.id, 'rejected')" class="px-4 py-2 rounded-lg border border-rose-500/40 hover:bg-rose-500/10 text-rose-400 text-xs font-semibold transition">
+                  <i class="fa-solid fa-xmark mr-1"></i>拒绝执行 (Reject)
+                </button>
+                <button @click="respondApproval(req.id, 'allowed-once')" class="px-5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition shadow-md shadow-emerald-600/20">
+                  <i class="fa-solid fa-check mr-1"></i>允许执行一次 (Allow Once)
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 审批策略说明 -->
+        <div class="p-5 rounded-2xl bg-slate-900/40 border border-slate-800 text-xs text-slate-400 space-y-2">
+          <div class="font-bold text-slate-300 text-sm">💡 权限审批机制 (Approval Seam)</div>
+          <p>• <b>Ask 策略（默认安全模式）</b>：当 DSH Agent 需要执行 Shell/Bash 脚本、创建进程或访问沙箱外敏感资源时，会暂时挂起执行，等待你在手机或本控制台点击「允许一次」。</p>
+          <p>• <b>单次授权保证</b>：授权仅对当前单次 Tool Call 有效，杜绝未预期的自动化越权。</p>
+        </div>
+      </section>
+
+      <!-- TAB 4: 工作区与会话 -->
+      <section v-if="activeTab === 'workspaces'" class="space-y-6">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <h2 class="text-lg font-bold text-white flex items-center gap-2">
+              <i class="fa-solid fa-folder-tree text-emerald-400"></i>
+              <span>工作区与对话管理</span>
+            </h2>
+            <p class="text-xs text-slate-400 mt-1">浏览宿主机上的各个工程工作区及对应的会话历史</p>
+          </div>
+          <button @click="fetchWorkspaces" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 border border-slate-700 transition self-start flex items-center gap-1.5">
+            <i class="fa-solid fa-arrows-rotate"></i>
+            <span>刷新工作区</span>
+          </button>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          <!-- 左侧：工作区列表 -->
+          <div class="lg:col-span-4 space-y-3">
+            <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider">选择工作区</div>
+            <div class="space-y-2">
+              <div 
+                v-for="ws in workspaces" 
+                :key="ws.workspaceId"
+                @click="selectedWorkspace = ws"
+                class="p-4 rounded-xl border cursor-pointer transition"
+                :class="selectedWorkspace?.workspaceId === ws.workspaceId ? 'bg-blue-950/20 border-blue-500' : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'"
+              >
+                <div class="flex items-center justify-between">
+                  <h4 class="font-bold text-white text-sm truncate">{{ ws.title }}</h4>
+                  <span class="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">{{ ws.sessionCount }} 对话</span>
+                </div>
+                <p class="text-xs font-mono text-slate-400 mt-1 truncate">{{ ws.path }}</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- 右侧：会话列表 -->
+          <div class="lg:col-span-8 space-y-3">
+            <div class="flex items-center justify-between">
+              <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                【{{ selectedWorkspace?.title || '未选择' }}】的对话记录 ({{ selectedWorkspace?.sessions?.length || 0 }})
+              </div>
+              <input 
+                v-model="sessionSearchQuery"
+                type="text" 
+                placeholder="搜索会话标题..."
+                class="px-3 py-1 text-xs rounded-lg bg-slate-900 border border-slate-800 text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500"
+              >
+            </div>
+
+            <div v-if="!selectedWorkspace" class="p-8 text-center text-slate-500 bg-slate-900/30 rounded-2xl border border-slate-800">
+              请在左侧选择一个工作区以浏览对话
+            </div>
+
+            <div v-else class="space-y-2">
+              <div 
+                v-for="session in filteredSessions" 
+                :key="session.sessionId"
+                class="p-4 rounded-xl bg-slate-900/60 border border-slate-800 hover:border-slate-700 transition flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3"
+              >
+                <div class="overflow-hidden">
+                  <div class="flex items-center gap-2">
+                    <span class="font-semibold text-sm text-white truncate">{{ session.title }}</span>
+                    <span v-if="session.model" class="px-1.5 py-0.5 rounded bg-slate-800 text-[10px] text-blue-400 font-mono">{{ session.model }}</span>
+                  </div>
+                  <p v-if="session.firstPrompt" class="text-xs text-slate-400 truncate mt-1">{{ session.firstPrompt }}</p>
+                  <div class="text-[11px] text-slate-500 font-mono mt-1">
+                    ID: {{ session.sessionId }} • {{ formatTime(session.lastPromptAt) }}
+                  </div>
+                </div>
+                <button 
+                  @click="inspectSession(session)"
+                  class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-blue-400 font-medium transition whitespace-nowrap self-end sm:self-center"
+                >
+                  查看历史记录
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 5: 手机配对与下载 -->
+      <section v-if="activeTab === 'mobile'" class="space-y-6">
+        <div>
+          <h2 class="text-lg font-bold text-white flex items-center gap-2">
+            <i class="fa-solid fa-mobile-screen-button text-blue-400"></i>
+            <span>手机端 App 配对与一键安装</span>
+          </h2>
+          <p class="text-xs text-slate-400 mt-1">使用手机浏览器扫描下方二维码即可直接下载安装包，或复制连接参数进入 App</p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <!-- 二维码与下载卡 -->
+          <div class="p-6 rounded-2xl bg-slate-900/60 border border-slate-800 flex flex-col items-center text-center space-y-4">
+            <h3 class="font-bold text-white text-base">安卓 APK 安装包下载</h3>
+            <!-- 二维码画布 -->
+            <div class="p-3 bg-white rounded-xl shadow-lg">
+              <canvas id="apkQrCanvas" class="w-48 h-48"></canvas>
+            </div>
+            <div class="space-y-1">
+              <p class="text-xs text-slate-400">支持 Android 8.0+ 手机/平板</p>
+              <p class="text-xs font-mono text-emerald-400 font-semibold">版本: v1.1.0 • 大小: 22.28 MB</p>
+            </div>
+            <a 
+              href="/dsh-agent.apk"
+              download
+              class="w-full py-3 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-semibold text-sm transition shadow-lg shadow-blue-500/20 flex items-center justify-center gap-2"
+            >
+              <i class="fa-solid fa-download"></i>
+              <span>直接下载 APK 安装文件</span>
+            </a>
+          </div>
+
+          <!-- 连接参数卡 -->
+          <div class="p-6 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4">
+            <h3 class="font-bold text-white text-base">手机 App 登录参数</h3>
+            <p class="text-xs text-slate-400">在手机端打开 App 后，填入以下参数即可连入宿主机：</p>
+
+            <div class="space-y-3">
+              <div>
+                <label class="text-xs text-slate-400 font-medium">公网穿透主机 (Host / IP)</label>
+                <div class="flex items-center gap-2 mt-1">
+                  <input type="text" readonly value="n.cnm.asia" class="flex-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-sm font-mono text-white focus:outline-none">
+                  <button @click="copyText('n.cnm.asia')" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">复制</button>
+                </div>
+              </div>
+
+              <div>
+                <label class="text-xs text-slate-400 font-medium">网关端口 (Port)</label>
+                <div class="flex items-center gap-2 mt-1">
+                  <input type="text" readonly value="3088" class="flex-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-sm font-mono text-white focus:outline-none">
+                  <button @click="copyText('3088')" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">复制</button>
+                </div>
+              </div>
+
+              <div>
+                <label class="text-xs text-slate-400 font-medium">安全鉴权令牌 (Token)</label>
+                <div class="flex items-center gap-2 mt-1">
+                  <input type="password" readonly :value="token" class="flex-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-sm font-mono text-white focus:outline-none">
+                  <button @click="copyText(token)" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">复制</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="p-4 rounded-xl bg-slate-950 border border-slate-800/80 text-xs text-slate-400 space-y-1 mt-4">
+              <div class="font-semibold text-slate-300">💡 局域网直连模式：</div>
+              <p>如果手机与宿主机在同一个局域网（同一 WiFi），Host 亦可填写真实内网 IP。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- 底部状态栏 -->
+    <footer class="bg-slate-950 border-t border-slate-800/80 px-4 lg:px-8 py-3 text-xs text-slate-500 flex flex-col sm:flex-row items-center justify-between gap-2">
+      <div class="flex items-center gap-2">
+        <span>DeepSeek Harness Mobile Extension</span>
+        <span>•</span>
+        <span>Ready for Antigravity & Remote Coding</span>
+      </div>
+      <div class="font-mono">
+        Status: Online (3088)
+      </div>
+    </footer>
+
+    <!-- 对话详情查看 Drawer 模态弹窗 -->
+    <div v-if="inspectingSessionData" class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex justify-end">
+      <div class="w-full max-w-2xl bg-slate-900 h-full border-l border-slate-800 flex flex-col shadow-2xl">
+        <div class="p-4 border-b border-slate-800 flex items-center justify-between bg-slate-900/80">
+          <div>
+            <h3 class="font-bold text-white text-sm truncate max-w-md">{{ inspectingSessionData.title }}</h3>
+            <p class="text-xs text-slate-400 font-mono">{{ inspectingSessionData.sessionId }}</p>
+          </div>
+          <button @click="inspectingSessionData = null" class="p-2 rounded-lg hover:bg-slate-800 text-slate-400 text-sm">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto p-4 space-y-4">
+          <div v-if="inspectingSessionData.messages.length === 0" class="text-center py-12 text-slate-500 text-xs">
+            暂无消息记录
+          </div>
+          <div v-for="m in inspectingSessionData.messages" :key="m.id" class="space-y-1">
+            <div class="flex items-center gap-2 text-xs text-slate-400 font-semibold">
+              <span :class="m.role === 'user' ? 'text-blue-400' : 'text-emerald-400'">
+                {{ m.role === 'user' ? '用户 (User)' : 'DSH Agent' }}
+              </span>
+              <span class="text-[10px] text-slate-500 font-mono">{{ new Date(m.time).toLocaleTimeString() }}</span>
+            </div>
+
+            <!-- Thinking block -->
+            <div v-if="m.thinking" class="p-3 rounded-lg bg-slate-950/60 border border-slate-800 text-xs text-amber-300/80 font-mono">
+              <div class="text-[10px] text-amber-400 font-bold mb-1">💭 深度思考过程：</div>
+              <div class="whitespace-pre-wrap">{{ m.thinking }}</div>
+            </div>
+
+            <!-- Content body -->
+            <div class="p-3.5 rounded-xl text-xs sm:text-sm whitespace-pre-wrap break-words" :class="m.role === 'user' ? 'bg-blue-600/10 border border-blue-500/20 text-slate-100' : 'bg-slate-800/60 border border-slate-700/50 text-slate-200'">
+              {{ m.content }}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 令牌验证模态窗 -->
+    <div v-if="showTokenModal" class="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+      <div class="w-full max-w-md bg-slate-900 rounded-2xl border border-slate-800 p-6 space-y-4 shadow-2xl">
+        <div class="flex items-center justify-between">
+          <h3 class="font-bold text-white text-base flex items-center gap-2">
+            <i class="fa-solid fa-key text-blue-400"></i>
+            <span>网关访问令牌 (Token)</span>
+          </h3>
+          <button @click="showTokenModal = false" class="text-slate-400 hover:text-white">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+        <p class="text-xs text-slate-400">请输入服务端预设的安全令牌以激活各项控制功能：</p>
+        <input 
+          v-model="tokenInput"
+          type="text" 
+          placeholder="请输入 Token..."
+          class="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono text-white focus:outline-none focus:border-blue-500"
+        >
+        <div class="flex justify-end gap-2 pt-2">
+          <button @click="showTokenModal = false" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">取消</button>
+          <button @click="saveToken" class="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-xs font-semibold text-white">确认并连接</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const { createApp, ref, computed, onMounted, nextTick } = Vue;
+
+    createApp({
+      setup() {
+        const token = ref(localStorage.getItem('dsh_gateway_token') || 'DSH_SECURE_TOKEN_2026');
+        const tokenInput = ref(token.value);
+        const showTokenModal = ref(!localStorage.getItem('dsh_gateway_token'));
+        
+        const activeTab = ref('overview');
+        const dshOnline = ref(true);
+        const activeClients = ref(1);
+
+        const settings = ref(null);
+        const workspaces = ref([]);
+        const pendingApprovals = ref([]);
+        const selectedWorkspace = ref(null);
+        const sessionSearchQuery = ref('');
+        const inspectingSessionData = ref(null);
+        const switchingModel = ref(false);
+
+        const tabs = computed(() => [
+          { id: 'overview', name: '总览看板', icon: 'fa-solid fa-gauge-high' },
+          { id: 'models', name: '模型设置', icon: 'fa-solid fa-brain', badge: settings.value?.availableModels?.length },
+          { id: 'approvals', name: '权限审批', icon: 'fa-solid fa-shield-halved', badge: pendingApprovals.value.length || null, badgeColor: 'bg-amber-500/20 text-amber-300' },
+          { id: 'workspaces', name: '工作区管理', icon: 'fa-solid fa-folder-tree', badge: workspaces.value.length },
+          { id: 'mobile', name: '手机配对', icon: 'fa-solid fa-mobile-screen' }
+        ]);
+
+        const totalSessionsCount = computed(() => {
+          return workspaces.value.reduce((acc, ws) => acc + (ws.sessionCount || 0), 0);
+        });
+
+        const filteredSessions = computed(() => {
+          if (!selectedWorkspace.value || !selectedWorkspace.value.sessions) return [];
+          if (!sessionSearchQuery.value.trim()) return selectedWorkspace.value.sessions;
+          const q = sessionSearchQuery.value.toLowerCase();
+          return selectedWorkspace.value.sessions.filter(s => 
+            s.title.toLowerCase().includes(q) || s.firstPrompt.toLowerCase().includes(q)
+          );
+        });
+
+        const authHeaders = () => ({
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token.value}`,
+          'x-dsh-token': token.value
+        });
+
+        // 统一 API 请求封装
+        async function api(path, options = {}) {
+          options.headers = { ...authHeaders(), ...(options.headers || {}) };
+          const res = await fetch(path, options);
+          if (res.status === 401) {
+            showTokenModal.value = true;
+            throw new Error('未授权，请检查 Token');
+          }
+          return await res.json();
+        }
+
+        async function fetchSettings() {
+          try {
+            const data = await api('/api/mobile/settings');
+            if (data.settings) settings.value = data.settings;
+          } catch(e) { console.error(e); }
+        }
+
+        async function fetchWorkspaces() {
+          try {
+            const data = await api('/api/mobile/workspaces');
+            if (data.workspaces) {
+              workspaces.value = data.workspaces;
+              if (!selectedWorkspace.value && workspaces.value.length > 0) {
+                selectedWorkspace.value = workspaces.value[0];
+              }
+            }
+          } catch(e) { console.error(e); }
+        }
+
+        async function fetchApprovals() {
+          try {
+            const data = await api('/api/mobile/approvals');
+            if (data.approvals) pendingApprovals.value = data.approvals;
+          } catch(e) { console.error(e); }
+        }
+
+        async function switchModel(modelId) {
+          switchingModel.value = true;
+          try {
+            await api('/api/mobile/settings/model', {
+              method: 'POST',
+              body: JSON.stringify({ model: modelId })
+            });
+            await fetchSettings();
+          } catch(e) {
+            alert('切换模型失败: ' + e.message);
+          } finally {
+            switchingModel.value = false;
+          }
+        }
+
+        async function respondApproval(id, outcome) {
+          try {
+            await api('/api/mobile/approval', {
+              method: 'POST',
+              body: JSON.stringify({ id, outcome })
+            });
+            pendingApprovals.value = pendingApprovals.value.filter(a => a.id !== id);
+          } catch(e) {
+            alert('审批提交失败: ' + e.message);
+          }
+        }
+
+        async function inspectSession(session) {
+          try {
+            const data = await api('/api/mobile/sessions/' + session.sessionId);
+            if (data.data) {
+              inspectingSessionData.value = data.data;
+            }
+          } catch(e) {
+            alert('加载对话记录失败: ' + e.message);
+          }
+        }
+
+        function selectWorkspaceForInspect(ws) {
+          selectedWorkspace.value = ws;
+          activeTab.value = 'workspaces';
+        }
+
+        function formatTime(timestamp) {
+          if (!timestamp) return '';
+          return new Date(timestamp).toLocaleString();
+        }
+
+        function copyText(text) {
+          navigator.clipboard.writeText(text);
+          alert('已复制到剪贴板: ' + text);
+        }
+
+        function saveToken() {
+          token.value = tokenInput.value.trim();
+          localStorage.setItem('dsh_gateway_token', token.value);
+          showTokenModal.value = false;
+          initData();
+        }
+
+        function generateApkQr() {
+          nextTick(() => {
+            const canvas = document.getElementById('apkQrCanvas');
+            if (canvas && window.QRCode) {
+              const apkUrl = window.location.origin + '/dsh-agent.apk';
+              QRCode.toCanvas(canvas, apkUrl, { width: 192, margin: 1 }, function (error) {
+                if (error) console.error(error);
+              });
+            }
+          });
+        }
+
+        // 初始化 WebSocket 实时监听审批流
+        function initWebSocket() {
+          const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const wsUrl = `${wsProto}//${location.host}/mobile-ws?token=${token.value}`;
+          const ws = new WebSocket(wsUrl);
+
+          ws.onmessage = (event) => {
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg.type === 'approval_request' && msg.approval) {
+                if (!pendingApprovals.value.some(a => a.id === msg.approval.id)) {
+                  pendingApprovals.value.push(msg.approval);
+                }
+              } else if (msg.type === 'approval_settled') {
+                pendingApprovals.value = pendingApprovals.value.filter(a => a.id !== msg.eventId);
+              }
+            } catch(_) {}
+          };
+
+          ws.onclose = () => {
+            setTimeout(initWebSocket, 4000);
+          };
+        }
+
+        async function initData() {
+          await Promise.all([fetchSettings(), fetchWorkspaces(), fetchApprovals()]);
+          generateApkQr();
+        }
+
+        onMounted(() => {
+          initData();
+          initWebSocket();
+        });
+
+        return {
+          token,
+          tokenInput,
+          showTokenModal,
+          activeTab,
+          tabs,
+          dshOnline,
+          activeClients,
+          settings,
+          workspaces,
+          pendingApprovals,
+          selectedWorkspace,
+          sessionSearchQuery,
+          filteredSessions,
+          inspectingSessionData,
+          totalSessionsCount,
+          switchingModel,
+          fetchSettings,
+          fetchWorkspaces,
+          fetchApprovals,
+          switchModel,
+          respondApproval,
+          inspectSession,
+          selectWorkspaceForInspect,
+          formatTime,
+          copyText,
+          saveToken
+        };
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>

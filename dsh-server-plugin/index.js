@@ -394,6 +394,114 @@ function updateDefaultModel(newModelId) {
   return { ok: true, currentModel: newModelId };
 }
 
+// Permission & Security Configuration
+const PERMISSIONS_FILE = path.join(CONFIG.DSH_HOME, 'mobile-access', 'permissions.json');
+const PERSONAS_FILE = path.join(CONFIG.DSH_HOME, 'mobile-access', 'personas.json');
+
+const DEFAULT_PERMISSIONS = {
+  defaultPolicy: 'ask', // 'ask' | 'auto-read' | 'danger-full-access'
+  sandboxMode: 'workspace-write', // 'sandboxed' | 'workspace-write' | 'danger-full-access'
+  maxSteps: 30,
+  protectGit: true,
+  sessionPolicies: {} // sessionId -> policy
+};
+
+function getPermissions() {
+  try {
+    if (fs.existsSync(PERMISSIONS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(PERMISSIONS_FILE, 'utf8'));
+      return { ...DEFAULT_PERMISSIONS, ...data };
+    }
+  } catch (e) {
+    console.error('Error reading permissions file:', e);
+  }
+  return { ...DEFAULT_PERMISSIONS };
+}
+
+function savePermissions(newPerms) {
+  try {
+    const dir = path.dirname(PERMISSIONS_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(PERMISSIONS_FILE, JSON.stringify(newPerms, null, 2), 'utf8');
+    return true;
+  } catch (e) {
+    console.error('Error saving permissions file:', e);
+    return false;
+  }
+}
+
+// Preset and Custom Agent Personas
+const DEFAULT_PERSONAS = [
+  {
+    id: 'fullstack',
+    title: '全栈研发架构师 (Fullstack Architect)',
+    icon: 'code',
+    description: '擅长端到端架构设计、高质量代码重构与工程规范',
+    prompt: '你是一名资深全栈研发架构师，精通前端、后端与系统架构。在编写代码时遵循Clean Architecture与工程最佳实践，代码具备健壮性与高可读性。',
+    isCustom: false
+  },
+  {
+    id: 'bug_hunter',
+    title: '缺陷定位专家 (Bug Hunter)',
+    icon: 'bug',
+    description: '快速定位复杂报错、逻辑异常及并发竞争条件',
+    prompt: '你是一名专家级Bug分析师。专注于排查复杂报错、逻辑缺陷、内存泄漏和并发问题。提供精准的根因分析及最小化安全补丁。',
+    isCustom: false
+  },
+  {
+    id: 'devops',
+    title: '极客终端运维 (DevOps Ninja)',
+    icon: 'terminal',
+    description: '熟练编写 Shell / PowerShell / Docker 脚本与 CI/CD 流水线',
+    prompt: '你是一名经验丰富的Linux/Windows运维与DevOps专家，精通Shell、PowerShell、Docker与CI/CD自动化，善于编写高效的自动化运维脚本。',
+    isCustom: false
+  },
+  {
+    id: 'auditor',
+    title: '安全代码审计 (Security Auditor)',
+    icon: 'shield',
+    description: '代码安全合规检查，防范提权、注入与敏感信息泄露',
+    prompt: '你是一名代码安全与漏洞审计专家，专注于识别SQL注入、XSS、提权漏洞、硬编码密钥及OWASP Top 10风险，并给出严格的安全加固建议。',
+    isCustom: false
+  }
+];
+
+function getPersonas() {
+  try {
+    if (fs.existsSync(PERSONAS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(PERSONAS_FILE, 'utf8'));
+      if (Array.isArray(data) && data.length > 0) return data;
+    }
+  } catch (e) {}
+  return DEFAULT_PERSONAS;
+}
+
+function savePersonas(list) {
+  try {
+    const dir = path.dirname(PERSONAS_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(PERSONAS_FILE, JSON.stringify(list, null, 2), 'utf8');
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Audit Logs Ring Buffer (last 100 entries)
+const auditLogs = [];
+function logAudit(entry) {
+  auditLogs.unshift(entry);
+  if (auditLogs.length > 100) auditLogs.pop();
+}
+
+function isCommandReadOnly(cmdStr, toolName) {
+  if (toolName === 'read_file' || toolName === 'view_file' || toolName === 'search_web' || toolName === 'list_dir') return true;
+  if (!cmdStr) return false;
+  const safePrefixes = ['ls', 'dir', 'cat', 'grep', 'find', 'head', 'tail', 'wc', 'git status', 'git log', 'git diff', 'pwd', 'echo', 'which', 'where'];
+  const trimmed = cmdStr.trim().toLowerCase();
+  return safePrefixes.some(p => trimmed === p || trimmed.startsWith(p + ' '));
+}
+
 // Approval Management State
 const pendingApprovals = new Map(); // id -> { id, eventId, clientId, sessionId, toolName, reason, callId, createdAt }
 let activeEventsWs = null;
@@ -454,19 +562,74 @@ function connectUpstreamEvents() {
           }
           // 2. Approval Request frame
           else if (val.type === 'request' && val.event === 'approval/request') {
-            console.log(`[DSH Approval] Received approval request: id=${val.id}, agent=${val.agent}, tool=${val.request?.toolName}`);
+            const toolName = val.request?.toolName || 'Unknown Tool';
+            const reason = val.request?.reason || '';
+            const sessionId = val.agent || 'default';
+            console.log(`[DSH Approval] Received approval request: id=${val.id}, agent=${sessionId}, tool=${toolName}, cmd=${reason.slice(0, 80)}`);
+
+            const currentPerms = getPermissions();
+            const sessionPolicy = currentPerms.sessionPolicies?.[sessionId] || currentPerms.defaultPolicy || 'ask';
+
+            // Check if policy allows auto-approval
+            let shouldAutoApprove = false;
+            let autoApproveReason = '';
+
+            if (sessionPolicy === 'danger-full-access' || currentPerms.defaultPolicy === 'danger-full-access') {
+              shouldAutoApprove = true;
+              autoApproveReason = '全信任模式 (Danger Full Access) 自动放行';
+            } else if (sessionPolicy === 'auto-read' || currentPerms.defaultPolicy === 'auto-read') {
+              if (isCommandReadOnly(reason, toolName)) {
+                shouldAutoApprove = true;
+                autoApproveReason = '安全策略: 只读指令自动放行';
+              }
+            }
+
+            if (shouldAutoApprove) {
+              console.log(`[DSH Approval] AUTO-APPROVED: id=${val.id}, session=${sessionId}, reason=${autoApproveReason}`);
+              callDshRpc('$events/result', {
+                clientId: currentEventsClientId,
+                eventId: val.id,
+                outcome: {
+                  kind: 'result',
+                  value: 'allowed-once'
+                }
+              }).catch(e => console.error('[DSH Approval] Auto-approve RPC error:', e));
+
+              logAudit({
+                id: val.id,
+                time: Date.now(),
+                sessionId,
+                toolName,
+                command: reason,
+                outcome: 'auto-approved',
+                reason: autoApproveReason
+              });
+              return;
+            }
+
+            // Otherwise, queue for manual mobile confirmation
             const approval = {
               id: val.id,
               eventId: val.id,
               clientId: currentEventsClientId,
-              sessionId: val.agent || 'default',
-              toolName: val.request?.toolName || 'Unknown Tool',
-              reason: val.request?.reason || '',
+              sessionId: sessionId,
+              toolName: toolName,
+              reason: reason,
               callId: val.request?.callId || '',
               createdAt: Date.now()
             };
 
             pendingApprovals.set(val.id, approval);
+
+            logAudit({
+              id: val.id,
+              time: Date.now(),
+              sessionId,
+              toolName,
+              command: reason,
+              outcome: 'pending',
+              reason: '等待人工确认'
+            });
 
             // Broadcast to all mobile clients
             broadcastToMobileClients({
@@ -535,6 +698,16 @@ async function respondApproval(eventId, outcome) {
 
   pendingApprovals.delete(eventId);
 
+  logAudit({
+    id: eventId,
+    time: Date.now(),
+    sessionId: approval.sessionId,
+    toolName: approval.toolName,
+    command: approval.reason,
+    outcome: outcome,
+    reason: outcome === 'allowed-once' ? '人工手机审批放行' : '人工手机拒绝执行'
+  });
+
   // Broadcast settlement to all mobile clients
   broadcastToMobileClients({
     type: 'approval_settled',
@@ -575,7 +748,30 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Security gate
+  // 1. Static Web Dashboard (Visual Admin Interface)
+  if (pathname === '/' || pathname === '/dashboard' || pathname === '/admin' || pathname === '/ui') {
+    const htmlPath = path.join(__dirname, 'public', 'index.html');
+    if (fs.existsSync(htmlPath)) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      fs.createReadStream(htmlPath).pipe(res);
+      return;
+    }
+  }
+
+  // 2. Direct APK Download
+  if (pathname === '/dsh-agent.apk' || pathname === '/download/apk') {
+    const apkPath = path.join(__dirname, 'public', 'dsh-agent.apk');
+    if (fs.existsSync(apkPath)) {
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.android.package-archive',
+        'Content-Disposition': 'attachment; filename="dsh-agent-v1.1.0.apk"'
+      });
+      fs.createReadStream(apkPath).pipe(res);
+      return;
+    }
+  }
+
+  // Security gate for /api endpoints
   if (!authenticate(req)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Unauthorized: Invalid token' }));
@@ -709,6 +905,117 @@ const server = http.createServer(async (req, res) => {
       await respondApproval(eventId, outcome);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ code: 0, message: `Approval ${outcome} recorded` }));
+      return;
+    }
+
+    // 10. GET /api/mobile/permissions
+    if (pathname === '/api/mobile/permissions' && req.method === 'GET') {
+      const perms = getPermissions();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, permissions: perms }));
+      return;
+    }
+
+    // 11. POST /api/mobile/permissions
+    if (pathname === '/api/mobile/permissions' && req.method === 'POST') {
+      const body = await readBody();
+      const current = getPermissions();
+      const updated = {
+        ...current,
+        ...body,
+        sessionPolicies: {
+          ...(current.sessionPolicies || {}),
+          ...(body.sessionPolicies || {})
+        }
+      };
+      savePermissions(updated);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, permissions: updated }));
+      return;
+    }
+
+    // 12. GET /api/mobile/audit-logs
+    if (pathname === '/api/mobile/audit-logs' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, auditLogs: auditLogs }));
+      return;
+    }
+
+    // 13. GET /api/mobile/personas
+    if (pathname === '/api/mobile/personas' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, personas: getPersonas() }));
+      return;
+    }
+
+    // 14. POST /api/mobile/personas
+    if (pathname === '/api/mobile/personas' && req.method === 'POST') {
+      const body = await readBody();
+      if (Array.isArray(body.personas)) {
+        savePersonas(body.personas);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ code: 0, personas: body.personas }));
+        return;
+      }
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Expected personas array in body' }));
+      return;
+    }
+
+    // 15. GET /api/mobile/workspace/memory
+    if (pathname === '/api/mobile/workspace/memory' && req.method === 'GET') {
+      const targetPath = parsedUrl.query.path;
+      if (!targetPath) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing path query parameter' }));
+        return;
+      }
+      const candidates = [
+        path.join(targetPath, 'MEMORY.md'),
+        path.join(targetPath, 'AGENTS.md'),
+        path.join(targetPath, '.cursorrules'),
+        path.join(targetPath, 'README.md')
+      ];
+      let foundPath = candidates[0];
+      let content = '';
+      for (const c of candidates) {
+        if (fs.existsSync(c)) {
+          try {
+            foundPath = c;
+            content = fs.readFileSync(c, 'utf8');
+            break;
+          } catch (_) {}
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, filePath: foundPath, content }));
+      return;
+    }
+
+    // 16. POST /api/mobile/workspace/memory
+    if (pathname === '/api/mobile/workspace/memory' && req.method === 'POST') {
+      const body = await readBody();
+      if (!body.path) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing path in body' }));
+        return;
+      }
+      const memFile = path.join(body.path, 'MEMORY.md');
+      try {
+        fs.writeFileSync(memFile, body.content || '', 'utf8');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ code: 0, message: 'Saved successfully', filePath: memFile }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    // 17. GET /api/mobile/ping
+    if (pathname === '/api/mobile/ping' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, time: Date.now() }));
       return;
     }
 

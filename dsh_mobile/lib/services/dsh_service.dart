@@ -10,6 +10,9 @@ import '../models/chat_message.dart';
 import '../models/workspace.dart';
 import '../models/approval_request.dart';
 import '../models/dsh_settings.dart';
+import '../models/permission_config.dart';
+import '../models/audit_log.dart';
+import '../models/persona.dart';
 
 enum ConnectionStatus {
   disconnected,
@@ -33,6 +36,13 @@ class DshService extends ChangeNotifier {
   List<ChatMessage> _messages = [];
   List<ApprovalRequest> _pendingApprovals = [];
   DshSettings? _settings;
+  PermissionConfig _permissions = PermissionConfig();
+  List<AuditLogItem> _auditLogs = [];
+  List<AgentPersona> _personas = [];
+  String? _activePersonaId;
+  int _pingMs = -1;
+  int _reasoningBudget = 8000;
+  double _temperature = 0.7;
   bool _isLoadingHistory = false;
   bool _isSending = false;
 
@@ -48,6 +58,13 @@ class DshService extends ChangeNotifier {
   List<ChatMessage> get messages => _messages;
   List<ApprovalRequest> get pendingApprovals => _pendingApprovals;
   DshSettings? get settings => _settings;
+  PermissionConfig get permissions => _permissions;
+  List<AuditLogItem> get auditLogs => _auditLogs;
+  List<AgentPersona> get personas => _personas;
+  String? get activePersonaId => _activePersonaId;
+  int get pingMs => _pingMs;
+  int get reasoningBudget => _reasoningBudget;
+  double get temperature => _temperature;
   bool get isLoadingHistory => _isLoadingHistory;
   bool get isSending => _isSending;
 
@@ -115,6 +132,10 @@ class DshService extends ChangeNotifier {
       await fetchWorkspaces();
       await fetchSettings();
       await fetchApprovals();
+      await fetchPermissions();
+      await fetchAuditLogs();
+      await fetchPersonas();
+      await measurePing();
     } catch (e) {
       _status = ConnectionStatus.error;
       _lastError = e.toString();
@@ -388,6 +409,181 @@ class DshService extends ChangeNotifier {
       }
     } catch (e) {
       debugPrint('[DshService] respondApproval error: $e');
+    }
+  }
+
+  // Permissions
+  Future<void> fetchPermissions() async {
+    if (_currentConfig == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/permissions');
+      final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        if (data['permissions'] != null) {
+          _permissions = PermissionConfig.fromJson(data['permissions']);
+          notifyListeners();
+        }
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchPermissions error: $e');
+    }
+  }
+
+  Future<bool> updatePermissions(PermissionConfig newConfig) async {
+    if (_currentConfig == null) return false;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/permissions');
+      final res = await http.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode(newConfig.toJson()),
+      ).timeout(const Duration(seconds: 6));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        if (data['permissions'] != null) {
+          _permissions = PermissionConfig.fromJson(data['permissions']);
+          notifyListeners();
+          return true;
+        }
+      }
+      return false;
+    } catch (e) {
+      debugPrint('[DshService] updatePermissions error: $e');
+      return false;
+    }
+  }
+
+  Future<void> setSessionPermission(String sessionId, String policy) async {
+    final updatedMap = Map<String, String>.from(_permissions.sessionPolicies);
+    updatedMap[sessionId] = policy;
+    final updated = _permissions.copyWith(sessionPolicies: updatedMap);
+    await updatePermissions(updated);
+  }
+
+  String getSessionPermission(String sessionId) {
+    return _permissions.getPolicyForSession(sessionId);
+  }
+
+  // Audit Logs
+  Future<void> fetchAuditLogs() async {
+    if (_currentConfig == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/audit-logs');
+      final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final list = data['auditLogs'] as List<dynamic>? ?? [];
+        _auditLogs = list.map((a) => AuditLogItem.fromJson(a as Map<String, dynamic>)).toList();
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchAuditLogs error: $e');
+    }
+  }
+
+  // Personas
+  Future<void> fetchPersonas() async {
+    if (_currentConfig == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/personas');
+      final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final list = data['personas'] as List<dynamic>? ?? [];
+        _personas = list.map((p) => AgentPersona.fromJson(p as Map<String, dynamic>)).toList();
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchPersonas error: $e');
+    }
+  }
+
+  Future<bool> savePersonas(List<AgentPersona> list) async {
+    if (_currentConfig == null) return false;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/personas');
+      final res = await http.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'personas': list.map((p) => p.toJson()).toList()}),
+      ).timeout(const Duration(seconds: 6));
+      if (res.statusCode == 200) {
+        _personas = list;
+        notifyListeners();
+        return true;
+      }
+      return false;
+    } catch (e) {
+      debugPrint('[DshService] savePersonas error: $e');
+      return false;
+    }
+  }
+
+  void setActivePersona(String? id) {
+    _activePersonaId = id;
+    notifyListeners();
+  }
+
+  void setReasoningBudget(int tokens) {
+    _reasoningBudget = tokens;
+    notifyListeners();
+  }
+
+  void setTemperature(double temp) {
+    _temperature = temp;
+    notifyListeners();
+  }
+
+  // Ping
+  Future<int> measurePing() async {
+    if (_currentConfig == null) return -1;
+    final start = DateTime.now().millisecondsSinceEpoch;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/ping');
+      final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 4));
+      if (res.statusCode == 200) {
+        _pingMs = DateTime.now().millisecondsSinceEpoch - start;
+        notifyListeners();
+        return _pingMs;
+      }
+    } catch (_) {}
+    _pingMs = -1;
+    notifyListeners();
+    return -1;
+  }
+
+  // Workspace Memory & Instructions
+  Future<String> fetchWorkspaceMemory(String workspacePath) async {
+    if (_currentConfig == null) return '';
+    try {
+      final uri = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/memory').replace(
+        queryParameters: {'path': workspacePath},
+      );
+      final res = await http.get(uri, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        return data['content'] ?? '';
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchWorkspaceMemory error: $e');
+    }
+    return '';
+  }
+
+  Future<bool> saveWorkspaceMemory(String workspacePath, String content) async {
+    if (_currentConfig == null) return false;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/memory');
+      final res = await http.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'path': workspacePath, 'content': content}),
+      ).timeout(const Duration(seconds: 6));
+      return res.statusCode == 200;
+    } catch (e) {
+      debugPrint('[DshService] saveWorkspaceMemory error: $e');
+      return false;
     }
   }
 

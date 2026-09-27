@@ -3,7 +3,7 @@ import 'package:provider/provider.dart';
 import '../models/server_config.dart';
 import '../services/dsh_service.dart';
 import '../services/storage_service.dart';
-import 'chat_page.dart';
+import 'main_shell.dart';
 
 class ConfigPage extends StatefulWidget {
   const ConfigPage({super.key});
@@ -80,7 +80,7 @@ class _ConfigPageState extends State<ConfigPage> {
 
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
-      MaterialPageRoute(builder: (_) => const ChatPage()),
+      MaterialPageRoute(builder: (_) => const MainShell()),
     );
   }
 
