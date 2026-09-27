@@ -291,6 +291,8 @@ class _WorkspacesViewState extends State<WorkspacesView> {
   }
 
   Widget _buildWorkspaceCard(BuildContext context, DshService dsh, Workspace ws, bool isCurrent) {
+    final hasRunning = ws.sessions.any((s) => s.isRunning || (dsh.isSending && s.sessionId == dsh.currentSession?.sessionId));
+
     return Container(
       margin: const EdgeInsets.only(bottom: 14),
       decoration: BoxDecoration(
@@ -331,7 +333,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
-              if (isCurrent)
+              if (isCurrent) ...[
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
@@ -339,6 +341,29 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                     borderRadius: BorderRadius.circular(6),
                   ),
                   child: const Text('当前活跃', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
+                ),
+                const SizedBox(width: 6),
+              ],
+              if (hasRunning)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.purpleAccent.withOpacity(0.18),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: Colors.purpleAccent.withOpacity(0.4)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: const [
+                      SizedBox(
+                        width: 8,
+                        height: 8,
+                        child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.purpleAccent),
+                      ),
+                      SizedBox(width: 4),
+                      Text('运行中', style: TextStyle(color: Colors.purpleAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+                    ],
+                  ),
                 ),
             ],
           ),
@@ -440,22 +465,51 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                 itemBuilder: (context, sIdx) {
                   final s = ws.sessions[sIdx];
                   final isCurrentSession = isCurrent && s.sessionId == dsh.currentSession?.sessionId;
+                  final isRunning = s.isRunning || (dsh.isSending && isCurrentSession);
+
                   return ListTile(
                     contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
-                    leading: Icon(
-                      Icons.chat_bubble_outline_rounded,
-                      size: 18,
-                      color: isCurrentSession ? Colors.blueAccent : Colors.white38,
-                    ),
-                    title: Text(
-                      s.title,
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: isCurrentSession ? FontWeight.bold : FontWeight.normal,
-                        color: isCurrentSession ? Colors.blueAccent : Colors.white,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                    leading: isRunning
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: Padding(
+                              padding: EdgeInsets.all(2.0),
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blueAccent),
+                            ),
+                          )
+                        : Icon(
+                            Icons.chat_bubble_outline_rounded,
+                            size: 18,
+                            color: isCurrentSession ? Colors.blueAccent : Colors.white38,
+                          ),
+                    title: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            s.title,
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: isCurrentSession ? FontWeight.bold : FontWeight.normal,
+                              color: isCurrentSession ? Colors.blueAccent : Colors.white,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (isRunning) ...[
+                          const SizedBox(width: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                            decoration: BoxDecoration(
+                              color: Colors.blueAccent.withOpacity(0.18),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.blueAccent.withOpacity(0.4)),
+                            ),
+                            child: const Text('执行中...', style: TextStyle(color: Colors.blueAccent, fontSize: 9.5, fontWeight: FontWeight.bold)),
+                          ),
+                        ],
+                      ],
                     ),
                     subtitle: Text(
                       s.firstPrompt.isNotEmpty ? s.firstPrompt : '无预览内容',

@@ -27,12 +27,43 @@ class ChatView extends StatefulWidget {
 class _ChatViewState extends State<ChatView> {
   final TextEditingController _inputController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  String? _lastSessionId;
+  bool _showScrollToBottom = false;
+  int _lastMessageCount = 0;
+  bool _wasLoadingHistory = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollController.addListener(_onScroll);
+  }
 
   @override
   void dispose() {
+    _scrollController.removeListener(_onScroll);
     _inputController.dispose();
     _scrollController.dispose();
     super.dispose();
+  }
+
+  void _onScroll() {
+    if (!_scrollController.hasClients) return;
+    final maxScroll = _scrollController.position.maxScrollExtent;
+    final currentOffset = _scrollController.offset;
+    final show = (maxScroll - currentOffset) > 160;
+    if (show != _showScrollToBottom) {
+      setState(() {
+        _showScrollToBottom = show;
+      });
+    }
+  }
+
+  void _jumpToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+      }
+    });
   }
 
   void _scrollToBottom() {
@@ -497,6 +528,24 @@ class _ChatViewState extends State<ChatView> {
     final sessionId = currentSession?.sessionId ?? 'default';
     final policy = dsh.getSessionPermission(sessionId);
     final modelName = dsh.settings?.currentModel ?? 'cn:deepseek-v4.1-flash';
+    final currentSessionId = currentSession?.sessionId;
+    final isSessionRunning = dsh.isSending || (currentSession?.isRunning ?? false);
+
+    // Auto-scroll logic: jump to bottom on session change or after history loaded
+    if (currentSessionId != _lastSessionId) {
+      _lastSessionId = currentSessionId;
+      _lastMessageCount = dsh.messages.length;
+      _jumpToBottom();
+    } else if (_wasLoadingHistory && !dsh.isLoadingHistory) {
+      _jumpToBottom();
+    } else if (dsh.messages.length != _lastMessageCount) {
+      final wasNearBottom = !_showScrollToBottom;
+      _lastMessageCount = dsh.messages.length;
+      if (wasNearBottom) {
+        _scrollToBottom();
+      }
+    }
+    _wasLoadingHistory = dsh.isLoadingHistory;
 
     return Scaffold(
       backgroundColor: const Color(0xFF0B0F19),
@@ -572,11 +621,41 @@ class _ChatViewState extends State<ChatView> {
               ],
             ),
             const SizedBox(height: 2),
-            Text(
-              currentSession?.title ?? '新会话',
-              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Colors.white70),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
+            Row(
+              children: [
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 160),
+                  child: Text(
+                    currentSession?.title ?? '新会话',
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Colors.white70),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (isSessionRunning) ...[
+                  const SizedBox(width: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                    decoration: BoxDecoration(
+                      color: Colors.blueAccent.withOpacity(0.18),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Colors.blueAccent.withOpacity(0.4)),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: const [
+                        SizedBox(
+                          width: 8,
+                          height: 8,
+                          child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.blueAccent),
+                        ),
+                        SizedBox(width: 4),
+                        Text('执行中...', style: TextStyle(color: Colors.blueAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
             ),
           ],
         ),
@@ -641,31 +720,63 @@ class _ChatViewState extends State<ChatView> {
               ),
             ),
 
-          // Chat Body
+          // Chat Body with Floating Jump to Latest Button
           Expanded(
             child: dsh.isLoadingHistory
                 ? const Center(child: CircularProgressIndicator())
-                : ListView.builder(
-                    controller: _scrollController,
-                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                    itemCount: dsh.messages.length + dsh.pendingApprovals.length,
-                    itemBuilder: (context, index) {
-                      // Inline pending approvals first
-                      if (index < dsh.pendingApprovals.length) {
-                        final req = dsh.pendingApprovals[index];
-                        return Padding(
-                          padding: const EdgeInsets.only(bottom: 12),
-                          child: ApprovalCard(
-                            request: req,
-                            onRespond: (r, outcome) => dsh.respondApproval(r, outcome),
-                          ),
-                        );
-                      }
+                : Stack(
+                    children: [
+                      ListView.builder(
+                        controller: _scrollController,
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                        itemCount: dsh.messages.length + dsh.pendingApprovals.length,
+                        itemBuilder: (context, index) {
+                          // Inline pending approvals first
+                          if (index < dsh.pendingApprovals.length) {
+                            final req = dsh.pendingApprovals[index];
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 12),
+                              child: ApprovalCard(
+                                request: req,
+                                onRespond: (r, outcome) => dsh.respondApproval(r, outcome),
+                              ),
+                            );
+                          }
 
-                      final msgIndex = index - dsh.pendingApprovals.length;
-                      final msg = dsh.messages[msgIndex];
-                      return _buildMessageItem(msg);
-                    },
+                          final msgIndex = index - dsh.pendingApprovals.length;
+                          final msg = dsh.messages[msgIndex];
+                          return _buildMessageItem(msg);
+                        },
+                      ),
+                      if (_showScrollToBottom)
+                        Positioned(
+                          right: 16,
+                          bottom: 12,
+                          child: Material(
+                            elevation: 6,
+                            color: const Color(0xFF2563EB),
+                            borderRadius: BorderRadius.circular(20),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(20),
+                              onTap: _scrollToBottom,
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: const [
+                                    Icon(Icons.arrow_downward_rounded, size: 16, color: Colors.white),
+                                    SizedBox(width: 4),
+                                    Text(
+                                      '回到最新消息',
+                                      style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
                   ),
           ),
 
@@ -768,10 +879,13 @@ class _ChatViewState extends State<ChatView> {
               crossAxisAlignment: isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
               children: [
                 // Thinking Fold Card
-                if (msg.thinking != null && msg.thinking!.isNotEmpty)
+                if ((msg.thinking != null && msg.thinking!.isNotEmpty) || (msg.isStreaming && msg.content.isEmpty))
                   Padding(
                     padding: const EdgeInsets.only(bottom: 6),
-                    child: ThinkingCard(content: msg.thinking!),
+                    child: ThinkingCard(
+                      content: msg.thinking ?? '',
+                      isThinking: msg.isStreaming,
+                    ),
                   ),
 
                 // Tool Executions
@@ -892,7 +1006,7 @@ class _ChatViewState extends State<ChatView> {
                   maxLines: 4,
                   minLines: 1,
                   decoration: const InputDecoration(
-                    hintText: '给 WorkBuddy 发送指令...',
+                    hintText: '发送消息...',
                     hintStyle: TextStyle(color: Colors.white38),
                     border: InputBorder.none,
                     contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 8),

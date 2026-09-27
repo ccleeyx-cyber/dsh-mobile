@@ -15,7 +15,21 @@ class ThinkingCard extends StatefulWidget {
 }
 
 class _ThinkingCardState extends State<ThinkingCard> {
-  bool _expanded = false;
+  late bool _expanded;
+
+  @override
+  void initState() {
+    super.initState();
+    _expanded = widget.isThinking;
+  }
+
+  @override
+  void didUpdateWidget(covariant ThinkingCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isThinking && !_expanded) {
+      _expanded = true;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -23,16 +37,16 @@ class _ThinkingCardState extends State<ThinkingCard> {
       return const SizedBox.shrink();
     }
 
-    final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
+    final isThinking = widget.isThinking;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
-        color: isDark ? Colors.grey[900] : const Color(0xFFF3F4F6),
+        color: const Color(0xFF131B2E),
         borderRadius: BorderRadius.circular(12),
         border: Border.all(
-          color: isDark ? Colors.grey[800]! : const Color(0xFFE5E7EB),
+          color: isThinking ? Colors.purpleAccent.withOpacity(0.5) : Colors.white12,
+          width: isThinking ? 1.2 : 1.0,
         ),
       ),
       child: Column(
@@ -46,24 +60,35 @@ class _ThinkingCardState extends State<ThinkingCard> {
               child: Row(
                 children: [
                   Icon(
-                    widget.isThinking ? Icons.psychology : Icons.lightbulb_outline,
+                    isThinking ? Icons.psychology_rounded : Icons.lightbulb_outline_rounded,
                     size: 18,
-                    color: widget.isThinking ? Colors.orange : Colors.grey[600],
+                    color: isThinking ? Colors.purpleAccent : Colors.white54,
                   ),
                   const SizedBox(width: 8),
                   Text(
-                    widget.isThinking ? '深度思考中...' : '已完成思考',
+                    isThinking ? '深度思考中...' : '已完成思考 (${widget.content.length} 字)',
                     style: TextStyle(
-                      fontSize: 13,
+                      fontSize: 12.5,
                       fontWeight: FontWeight.w600,
-                      color: isDark ? Colors.grey[300] : Colors.grey[700],
+                      color: isThinking ? Colors.purpleAccent : Colors.white70,
                     ),
                   ),
+                  if (isThinking) ...[
+                    const SizedBox(width: 8),
+                    const SizedBox(
+                      width: 10,
+                      height: 10,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 1.5,
+                        color: Colors.purpleAccent,
+                      ),
+                    ),
+                  ],
                   const Spacer(),
                   Icon(
-                    _expanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+                    _expanded ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded,
                     size: 18,
-                    color: Colors.grey,
+                    color: Colors.white54,
                   ),
                 ],
               ),
@@ -73,11 +98,11 @@ class _ThinkingCardState extends State<ThinkingCard> {
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
               child: SelectableText(
-                widget.content.isEmpty ? '等待思考内容...' : widget.content,
-                style: TextStyle(
+                widget.content.isEmpty ? '正在分析上下文并规划步骤...' : widget.content,
+                style: const TextStyle(
                   fontSize: 12,
                   height: 1.5,
-                  color: isDark ? Colors.grey[400] : Colors.grey[700],
+                  color: Colors.white70,
                   fontFamily: 'monospace',
                 ),
               ),

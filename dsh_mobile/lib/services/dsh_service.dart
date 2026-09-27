@@ -24,6 +24,7 @@ enum ConnectionStatus {
 class DshService extends ChangeNotifier {
   WebSocketChannel? _channel;
   Timer? _heartbeatTimer;
+  Timer? _sessionPollTimer;
   ConnectionStatus _status = ConnectionStatus.disconnected;
   String _lastError = '';
   ServerConfig? _currentConfig;
@@ -190,6 +191,8 @@ class DshService extends ChangeNotifier {
   Future<void> selectSession(SessionMeta session) async {
     _currentSession = session;
     _isLoadingHistory = true;
+    _sessionPollTimer?.cancel();
+    _sessionPollTimer = null;
     notifyListeners();
 
     try {
@@ -198,7 +201,9 @@ class DshService extends ChangeNotifier {
 
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        final rawMessages = data['data']?['messages'] as List<dynamic>? ?? [];
+        final sessionData = data['data'] as Map<String, dynamic>?;
+        final rawMessages = sessionData?['messages'] as List<dynamic>? ?? [];
+        final isRunning = sessionData?['isRunning'] == true || session.isRunning;
 
         _messages = rawMessages.map((m) {
           final rawTools = m['tools'] as List<dynamic>? ?? [];
@@ -216,6 +221,14 @@ class DshService extends ChangeNotifier {
             timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
           );
         }).toList();
+
+        if (isRunning && _messages.isNotEmpty && _messages.last.isAssistant) {
+          _messages.last.isStreaming = true;
+          _isSending = true;
+          _startSessionPolling(session.sessionId);
+        } else {
+          _isSending = false;
+        }
 
         if (_messages.isEmpty) {
           _messages.add(ChatMessage(
@@ -274,15 +287,18 @@ class DshService extends ChangeNotifier {
       id: _uuid.v4(),
       role: 'user',
       content: text,
+      timestamp: DateTime.now(),
     );
     _messages.add(userMsg);
 
-    // 2. Prepare streaming assistant placeholder
+    // 2. Prepare streaming assistant placeholder with thinking state
     final assistantMsg = ChatMessage(
       id: _uuid.v4(),
       role: 'assistant',
       content: '',
+      thinking: '', // initialize so ThinkingCard immediately displays active reasoning state
       isStreaming: true,
+      timestamp: DateTime.now(),
     );
     _messages.add(assistantMsg);
 
@@ -290,7 +306,7 @@ class DshService extends ChangeNotifier {
     notifyListeners();
 
     try {
-      // Send via HTTP RPC or WS
+      // Send via HTTP RPC
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/prompt');
       await http.post(
         url,
@@ -300,19 +316,103 @@ class DshService extends ChangeNotifier {
           'text': text,
         }),
       ).timeout(const Duration(seconds: 15));
+
+      // 3. Immediately poll for progressive tokens & thinking updates
+      _startSessionPolling(sessionId);
     } catch (e) {
       debugPrint('[DshService] sendPrompt error: $e');
       assistantMsg.content = '发送指令失败: $e';
       assistantMsg.isStreaming = false;
-      notifyListeners();
-    } finally {
       _isSending = false;
       notifyListeners();
     }
   }
 
+  // Active Session Polling (Live Reasoning & Execution Sync)
+  void _startSessionPolling(String sessionId) {
+    _sessionPollTimer?.cancel();
+    int ticks = 0;
+    const maxTicks = 350; // max ~240s
+
+    _sessionPollTimer = Timer.periodic(const Duration(milliseconds: 700), (timer) async {
+      ticks++;
+      if (ticks > maxTicks) {
+        timer.cancel();
+        _sessionPollTimer = null;
+        _isSending = false;
+        if (_messages.isNotEmpty && _messages.last.isStreaming) {
+          _messages.last.isStreaming = false;
+        }
+        notifyListeners();
+        return;
+      }
+
+      if (_currentConfig == null) {
+        timer.cancel();
+        _sessionPollTimer = null;
+        return;
+      }
+
+      try {
+        final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$sessionId');
+        final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 5));
+
+        if (res.statusCode == 200) {
+          final data = jsonDecode(utf8.decode(res.bodyBytes));
+          final sessionData = data['data'] as Map<String, dynamic>?;
+          if (sessionData == null) return;
+
+          final bool isRunning = sessionData['isRunning'] == true;
+          final rawMessages = sessionData['messages'] as List<dynamic>? ?? [];
+
+          if (rawMessages.isNotEmpty && _currentSession?.sessionId == sessionId) {
+            final parsedMessages = rawMessages.map((m) {
+              final rawTools = m['tools'] as List<dynamic>? ?? [];
+              return ChatMessage(
+                id: m['id'] ?? _uuid.v4(),
+                role: m['role'] ?? 'assistant',
+                content: m['content'] ?? '',
+                thinking: m['thinking'],
+                tools: rawTools.map((t) => ToolExecution(
+                  name: t['name'] ?? '',
+                  input: t['input'] ?? '',
+                  output: t['output'] ?? '',
+                  isRunning: t['isRunning'] ?? false,
+                )).toList(),
+                timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
+              );
+            }).toList();
+
+            if (isRunning && parsedMessages.isNotEmpty && parsedMessages.last.isAssistant) {
+              parsedMessages.last.isStreaming = true;
+            }
+
+            _messages = parsedMessages;
+            notifyListeners();
+          }
+
+          if (!isRunning) {
+            timer.cancel();
+            _sessionPollTimer = null;
+            _isSending = false;
+            if (_messages.isNotEmpty && _messages.last.isStreaming) {
+              _messages.last.isStreaming = false;
+            }
+            fetchWorkspaces();
+            notifyListeners();
+          }
+        }
+      } catch (e) {
+        debugPrint('[DshService] session poll tick error: $e');
+      }
+    });
+  }
+
   // Cancel Turn
   Future<void> cancelActiveTurn() async {
+    _sessionPollTimer?.cancel();
+    _sessionPollTimer = null;
+    _isSending = false;
     if (_currentSession == null || _currentConfig == null) return;
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/cancel');
@@ -329,6 +429,7 @@ class DshService extends ChangeNotifier {
         _messages.last.content += '\n*(任务已被手动停止)*';
         notifyListeners();
       }
+      fetchWorkspaces();
     } catch (e) {
       debugPrint('[DshService] cancelTurn error: $e');
     }
@@ -689,6 +790,8 @@ class DshService extends ChangeNotifier {
   }
 
   void disconnect() {
+    _sessionPollTimer?.cancel();
+    _sessionPollTimer = null;
     _stopHeartbeat();
     _channel?.sink.close(ws_status.goingAway);
     _channel = null;

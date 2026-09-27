@@ -5,6 +5,7 @@ class SessionMeta {
   final int lastPromptAt;
   final String model;
   final int lastSeq;
+  final bool isRunning;
 
   SessionMeta({
     required this.sessionId,
@@ -13,6 +14,7 @@ class SessionMeta {
     this.lastPromptAt = 0,
     this.model = '',
     this.lastSeq = 0,
+    this.isRunning = false,
   });
 
   factory SessionMeta.fromJson(Map<String, dynamic> json) {
@@ -23,17 +25,19 @@ class SessionMeta {
       lastPromptAt: json['lastPromptAt'] is int ? json['lastPromptAt'] : 0,
       model: json['model'] ?? '',
       lastSeq: json['lastSeq'] is int ? json['lastSeq'] : 0,
+      isRunning: json['isRunning'] == true,
     );
   }
 
   Map<String, dynamic> toJson() => {
-    'sessionId': sessionId,
-    'title': title,
-    'firstPrompt': firstPrompt,
-    'lastPromptAt': lastPromptAt,
-    'model': model,
-    'lastSeq': lastSeq,
-  };
+        'sessionId': sessionId,
+        'title': title,
+        'firstPrompt': firstPrompt,
+        'lastPromptAt': lastPromptAt,
+        'model': model,
+        'lastSeq': lastSeq,
+        'isRunning': isRunning,
+      };
 }
 
 class Workspace {

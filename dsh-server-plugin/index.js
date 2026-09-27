@@ -177,6 +177,7 @@ function getWorkspacesData() {
               sessionMeta.lastPromptAt = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
               sessionMeta.model = rows.modelSelection?.val?.lastUsed?.model || '';
               sessionMeta.lastSeq = rows.turnBoundary?.seq || rows.tokenUsage?.seq || 0;
+              sessionMeta.isRunning = rows.turnBoundary?.val?.openTurnStartSeq != null || activePrompts.has(sId) || activePrompts.has(sId.replace('session-', ''));
               break;
             } catch (err) {}
           }
@@ -220,6 +221,7 @@ async function getSessionHistory(sessionId) {
 
   let targetSeq = 0;
   let sessionTitle = sessionId;
+  let isSessionRunning = false;
 
   for (const cPath of candidates) {
     if (fs.existsSync(cPath)) {
@@ -228,6 +230,17 @@ async function getSessionHistory(sessionId) {
         const rows = cache.record?.rows || {};
         targetSeq = rows.turnBoundary?.seq || rows.tokenUsage?.seq || 0;
         sessionTitle = rows.title?.val || rows.titleInput?.val?.first?.text || sessionId;
+        
+        const hasPrompt = activePrompts.has(sessionId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
+        if (hasPrompt) {
+          const pTime = activePrompts.get(sessionId) || activePrompts.get(cleanId) || activePrompts.get(`session-${cleanId}`);
+          if (Date.now() - pTime > 4000 && rows.turnBoundary?.val?.openTurnStartSeq == null) {
+            activePrompts.delete(sessionId);
+            activePrompts.delete(cleanId);
+            activePrompts.delete(`session-${cleanId}`);
+          }
+        }
+        isSessionRunning = rows.turnBoundary?.val?.openTurnStartSeq != null || activePrompts.has(sessionId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
         break;
       } catch (_) {}
     }
@@ -336,6 +349,7 @@ async function getSessionHistory(sessionId) {
   return {
     sessionId,
     title: sessionTitle,
+    isRunning: isSessionRunning,
     messages
   };
 }
@@ -501,6 +515,9 @@ function isCommandReadOnly(cmdStr, toolName) {
   const trimmed = cmdStr.trim().toLowerCase();
   return safePrefixes.some(p => trimmed === p || trimmed.startsWith(p + ' '));
 }
+
+// Active Prompts & Turn Tracking
+const activePrompts = new Map(); // sessionId -> promptTimestamp
 
 // Approval Management State
 const pendingApprovals = new Map(); // id -> { id, eventId, clientId, sessionId, toolName, reason, callId, createdAt }
@@ -830,6 +847,10 @@ const server = http.createServer(async (req, res) => {
     // 4. POST /api/mobile/sessions/prompt
     if (pathname === '/api/mobile/sessions/prompt' && req.method === 'POST') {
       const body = await readBody();
+      if (body.sessionId) {
+        activePrompts.set(body.sessionId, Date.now());
+        activePrompts.set(body.sessionId.replace('session-', ''), Date.now());
+      }
       const result = await callDshRpc('session/prompt', {
         args: {
           request: {
@@ -848,6 +869,10 @@ const server = http.createServer(async (req, res) => {
     // 5. POST /api/mobile/sessions/cancel
     if (pathname === '/api/mobile/sessions/cancel' && req.method === 'POST') {
       const body = await readBody();
+      if (body.sessionId) {
+        activePrompts.delete(body.sessionId);
+        activePrompts.delete(body.sessionId.replace('session-', ''));
+      }
       const result = await callDshRpc('session/cancel', {
         args: {
           request: {

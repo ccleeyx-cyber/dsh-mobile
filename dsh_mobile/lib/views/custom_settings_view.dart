@@ -577,9 +577,9 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                     const Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text('WorkBuddy Mobile for DSH', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
+                        Text('DSH Mobile Pro', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
                         SizedBox(height: 2),
-                        Text('版本: v1.2.0 (Build 3)', style: TextStyle(color: Colors.white54, fontSize: 12)),
+                        Text('版本: v1.2.1 (Build 4)', style: TextStyle(color: Colors.white54, fontSize: 12)),
                       ],
                     ),
                   ],
