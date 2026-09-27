@@ -1,0 +1,16 @@
+{
+  "aionui-permission-bridge": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"E:\\soft\\aionUi\\resources\\bundled-aioncore\\win32-x64\\aioncore.exe\" antigravity-hook"
+          }
+        ]
+      }
+    ]
+  }
+}

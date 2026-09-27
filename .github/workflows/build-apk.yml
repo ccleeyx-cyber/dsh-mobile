@@ -1,0 +1,49 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: # 支持在 GitHub 网页上手动点击“Run workflow”一键打包
+
+jobs:
+  build:
+    name: Build Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.x'
+          channel: 'stable'
+          cache: true
+
+      - name: Prepare Android Project & Dependencies
+        working-directory: ./dsh_mobile
+        run: |
+          # 补齐原生 Android 工程构建骨架
+          flutter create . --platforms=android
+          flutter pub get
+
+      - name: Build APK (Release)
+        working-directory: ./dsh_mobile
+        run: |
+          flutter build apk --release
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-agent-release-apk
+          path: dsh_mobile/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 14

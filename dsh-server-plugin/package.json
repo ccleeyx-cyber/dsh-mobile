@@ -1,0 +1,22 @@
+{
+  "name": "dsh-mobile-bridge",
+  "version": "1.0.0",
+  "description": "Secure mobile bridge and authentication plugin for DeepSeek Harness (DSH)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "http-proxy": "^1.18.1"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "mobile-gateway"
+  ],
+  "author": "Antigravity",
+  "license": "MIT"
+}
