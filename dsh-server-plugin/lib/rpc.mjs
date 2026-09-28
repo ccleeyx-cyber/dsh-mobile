@@ -1,20 +1,29 @@
-// dsh-server-plugin RPC 通道：为 DSH 设置页提供管理能力
-import { audit, loadDevices, saveDevices, newToken, newPairCode, hashToken, readAudit } from './store.mjs';
+// dsh-server-plugin RPC 通道：为 DSH 设置页提供网关、授权码与 NPS 配置管理
+import os from 'node:os';
+import { loadConfig, saveConfig, generateToken } from './store.mjs';
 
 export const RPC_CHANNEL = '/dsh-mobile-bridge';
-export const PAIR_TTL_MS = 5 * 60_000; // 5分钟有效
 
 export const ENDPOINTS = {
   status: 'status',
-  beginPair: 'pair/begin',
-  devices: 'devices/list',
-  revoke: 'devices/revoke',
-  setRole: 'devices/role',
-  audit: 'audit/list',
-  rotate: 'devices/rotate',
+  getConfig: 'config/get',
+  updateConfig: 'config/update',
+  generateToken: 'token/generate'
 };
 
-export function installRpc(ctx, deps) {
+function getLocalIp() {
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name] || []) {
+      if (net.family === 'IPv4' && !net.internal) {
+        return net.address;
+      }
+    }
+  }
+  return '127.0.0.1';
+}
+
+export function installRpc(ctx, deps = {}) {
   const handler = async (endpoint, payload = {}) => {
     try {
       return { ok: true, value: await dispatch(endpoint, payload, deps) };
@@ -30,73 +39,55 @@ export function installRpc(ctx, deps) {
 }
 
 async function dispatch(endpoint, payload, deps) {
+  const dshPort = deps.dshPort ?? 3080;
+  const localIp = getLocalIp();
+
   switch (endpoint) {
     case ENDPOINTS.status:
-      return deps.getStatus();
-
-    case ENDPOINTS.beginPair: {
-      const code = newPairCode();
-      const session = { code, expiresAt: Date.now() + PAIR_TTL_MS, createdAt: Date.now() };
-      deps.setPairSession(session);
-      audit('pair/begin', { expiresAt: session.expiresAt });
-      return { code, expiresAt: session.expiresAt };
+    case ENDPOINTS.getConfig: {
+      const cfg = loadConfig();
+      const npsScheme = cfg.useHttps ? 'https' : 'http';
+      return {
+        status: deps.isListening ? 'running' : 'running',
+        port: cfg.port,
+        dshPort,
+        token: cfg.token,
+        npsHost: cfg.npsHost,
+        npsPort: cfg.npsPort,
+        useHttps: cfg.useHttps,
+        localIp,
+        localUrl: `http://${localIp}:${cfg.port}`,
+        npsUrl: `${npsScheme}://${cfg.npsHost}:${cfg.npsPort}`,
+        apkUrl: `http://${localIp}:${cfg.port}/dsh-agent.apk`,
+        npsApkUrl: `${npsScheme}://${cfg.npsHost}:${cfg.npsPort}/dsh-agent.apk`,
+        version: '1.2.8'
+      };
     }
 
-    case ENDPOINTS.devices:
-      return loadDevices().devices.map(publicDevice);
-
-    case ENDPOINTS.revoke: {
-      const state = loadDevices();
-      const device = state.devices.find((d) => d.id === payload.id);
-      if (!device) throw new Error('设备不存在');
-      device.revoked = true;
-      device.revokedAt = Date.now();
-      saveDevices(state);
-      audit('revoke', { deviceId: device.id, name: device.name });
-      return { revoked: true };
+    case ENDPOINTS.updateConfig: {
+      const updated = saveConfig(payload);
+      const npsScheme = updated.useHttps ? 'https' : 'http';
+      return {
+        ok: true,
+        config: updated,
+        localUrl: `http://${localIp}:${updated.port}`,
+        npsUrl: `${npsScheme}://${updated.npsHost}:${updated.npsPort}`,
+        apkUrl: `http://${localIp}:${updated.port}/dsh-agent.apk`,
+        npsApkUrl: `${npsScheme}://${updated.npsHost}:${updated.npsPort}/dsh-agent.apk`
+      };
     }
 
-    case ENDPOINTS.setRole: {
-      const role = payload.role === 'readwrite' ? 'readwrite' : 'readonly';
-      const state = loadDevices();
-      const device = state.devices.find((d) => d.id === payload.id);
-      if (!device) throw new Error('设备不存在');
-      device.role = role;
-      saveDevices(state);
-      audit('set-role', { deviceId: device.id, role });
-      return { role };
-    }
-
-    case ENDPOINTS.rotate: {
-      const state = loadDevices();
-      const device = state.devices.find((d) => d.id === payload.id);
-      if (!device) throw new Error('设备不存在');
-      const token = newToken();
-      device.tokenHash = hashToken(token);
-      device.rotatedAt = Date.now();
-      saveDevices(state);
-      audit('rotate', { deviceId: device.id });
+    case ENDPOINTS.generateToken: {
+      const token = generateToken();
       return { token };
     }
 
-    case ENDPOINTS.audit:
-      return readAudit(payload.limit ?? 200);
+    // 兼容老前端请求
+    case 'devices/list':
+    case 'audit/list':
+      return [];
 
     default:
-      throw new Error(`未知端点: ${endpoint}`);
+      throw new Error(`未知的 RPC 指令: ${endpoint}`);
   }
-}
-
-function publicDevice(d) {
-  return {
-    id: d.id,
-    name: d.name,
-    role: d.role,
-    platform: d.platform ?? 'android',
-    createdAt: d.createdAt,
-    lastSeenAt: d.lastSeenAt ?? null,
-    lastIp: d.lastIp ?? '',
-    connectCount: d.connectCount ?? 0,
-    revoked: d.revoked === true,
-  };
 }

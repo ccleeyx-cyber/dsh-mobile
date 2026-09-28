@@ -17,11 +17,10 @@ import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 
 import {
-  audit, loadDevices, saveDevices, newToken, newPairCode, hashToken,
-  verifyToken, touchDevice, roleCanWrite, ensureDataDir, dataDir, readAudit,
-  dshHome
+  loadConfig, saveConfig, verifyToken, ensureDataDir, dshHome, audit, readAudit,
+  loadDevices, saveDevices, newToken, hashToken
 } from './store.mjs';
-import { installRpc, RPC_CHANNEL, ENDPOINTS, PAIR_TTL_MS } from './rpc.mjs';
+import { installRpc, RPC_CHANNEL, ENDPOINTS } from './rpc.mjs';
 
 const require = createRequire(import.meta.url);
 const WebSocket = require('ws');
@@ -65,8 +64,9 @@ function decodeBase64Url(value) {
 
 export function apply(ctx, config = {}, internals = {}) {
   const logger = ctx.logger?.(name) ?? console;
+  const cfg = loadConfig();
   const dshPort = internals.dshPort ?? ctx.webServer?.port ?? config.dshPort ?? 3080;
-  const listenPort = internals.port ?? config.port ?? 3088;
+  const listenPort = internals.port ?? config.port ?? cfg.port ?? 3088;
   const bindHost = config.host ?? '0.0.0.0';
   const dshHomeDir = dshHome();
 
@@ -570,19 +570,13 @@ export function apply(ctx, config = {}, internals = {}) {
       token = String(parsed.query.token).trim();
     }
 
-    if (!token) return { ok: false, code: 401, error: '缺少认证令牌' };
+    if (!token) return { ok: false, code: 401, error: '缺少认证授权码 (Authorization Token Required)' };
 
-    if (DEFAULT_AUTH_TOKENS.includes(token)) {
-      return { ok: true, device: { id: 'admin', name: '系统管理员', role: 'readwrite' } };
+    if (verifyToken(token)) {
+      return { ok: true, device: { id: 'admin', name: '移动终端', role: 'readwrite' } };
     }
 
-    const device = verifyToken(token);
-    if (device) {
-      touchDevice(device.id, req.socket?.remoteAddress);
-      return { ok: true, device };
-    }
-
-    return { ok: false, code: 401, error: '令牌无效或已撤销' };
+    return { ok: false, code: 401, error: '授权码错误，请在 DSH 设置中查看正确授权码' };
   }
 
   const server = createServer(async (req, res) => {
@@ -611,8 +605,7 @@ export function apply(ctx, config = {}, internals = {}) {
         name: 'dsh-mobile-bridge',
         port: listenPort,
         dshPort: dshPort,
-        version: '1.2.7',
-        devices: loadDevices().devices.filter(d => !d.revoked).length,
+        version: '1.2.8',
         time: new Date().toISOString()
       });
       return;
@@ -930,24 +923,8 @@ export function apply(ctx, config = {}, internals = {}) {
 
   const apkFilePath = path.join(import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)), '..', 'public', 'dsh-agent.apk');
   const disposeRpc = installRpc(ctx, {
-    getStatus: () => ({
-      running: true,
-      port: listenPort,
-      dshPort: dshPort,
-      paired: loadDevices().devices.filter(d => !d.revoked).length,
-      cookieReady: Boolean(dshCookie),
-      apkReady: fs.existsSync(apkFilePath),
-      apkVersion: '1.2.7',
-      policy: globalPermissions.executionPolicy,
-      connectedClients: connectedClients.size,
-      workspacesCount: getWorkspacesData().length
-    }),
-    getPairSession: () => pairSession,
-    setPairSession: (s) => { pairSession = s; },
-    setPolicy: (p) => {
-      globalPermissions.executionPolicy = p;
-      audit('permission/global', { policy: p });
-    }
+    dshPort,
+    isListening: true
   });
 
   server.on('error', (err) => {
@@ -990,4 +967,4 @@ export function apply(ctx, config = {}, internals = {}) {
 }
 
 export { name, inject };
-export { newPairCode, newToken, hashToken };
+
