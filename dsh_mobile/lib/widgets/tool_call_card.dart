@@ -21,10 +21,10 @@ class _ToolCallCardState extends State<ToolCallCard> {
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
       decoration: BoxDecoration(
-        color: isDark ? const Color(0xFF1E293B) : const Color(0xFFEFF6FF),
-        borderRadius: BorderRadius.circular(10),
+        color: const Color(0xFF1E2432),
+        borderRadius: BorderRadius.circular(8),
         border: Border.all(
-          color: isDark ? const Color(0xFF334155) : const Color(0xFFBFDBFE),
+          color: Colors.white.withOpacity(0.08),
         ),
       ),
       child: Column(
@@ -32,39 +32,39 @@ class _ToolCallCardState extends State<ToolCallCard> {
         children: [
           InkWell(
             onTap: () => setState(() => _expanded = !_expanded),
-            borderRadius: BorderRadius.circular(10),
+            borderRadius: BorderRadius.circular(8),
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
               child: Row(
                 children: [
-                  Icon(
-                    Icons.terminal,
-                    size: 16,
-                    color: Colors.blue[600],
+                  const Icon(
+                    Icons.terminal_rounded,
+                    size: 15,
+                    color: Color(0xFF60A5FA),
                   ),
                   const SizedBox(width: 6),
                   Text(
-                    '执行工具: ${widget.tool.name}',
-                    style: TextStyle(
+                    '工具调用: ${widget.tool.name}',
+                    style: const TextStyle(
                       fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                      color: isDark ? Colors.blue[200] : Colors.blue[900],
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFF93C5FD),
                     ),
                   ),
                   const Spacer(),
                   if (widget.tool.isRunning)
                     const SizedBox(
-                      width: 12,
-                      height: 12,
-                      child: CircularProgressIndicator(strokeWidth: 2),
+                      width: 10,
+                      height: 10,
+                      child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF60A5FA)),
                     )
                   else
-                    const Icon(Icons.check_circle, size: 14, color: Colors.green),
+                    const Icon(Icons.check_circle_rounded, size: 14, color: Color(0xFF10B981)),
                   const SizedBox(width: 4),
                   Icon(
-                    _expanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+                    _expanded ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded,
                     size: 16,
-                    color: Colors.grey,
+                    color: Colors.white38,
                   ),
                 ],
               ),
@@ -76,33 +76,35 @@ class _ToolCallCardState extends State<ToolCallCard> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('输入参数:', style: TextStyle(fontSize: 10, color: Colors.grey[600])),
+                  const Text('输入参数:', style: TextStyle(fontSize: 10.5, color: Colors.white54, fontWeight: FontWeight.w500)),
                   Container(
                     width: double.infinity,
-                    padding: const EdgeInsets.all(6),
-                    margin: const EdgeInsets.only(top: 2, bottom: 4),
+                    padding: const EdgeInsets.all(7),
+                    margin: const EdgeInsets.only(top: 3, bottom: 6),
                     decoration: BoxDecoration(
-                      color: isDark ? Colors.black45 : Colors.white,
+                      color: const Color(0xFF131722),
                       borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: Colors.white.withOpacity(0.06)),
                     ),
                     child: SelectableText(
                       widget.tool.input,
-                      style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
+                      style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Colors.white70),
                     ),
                   ),
                   if (widget.tool.output.isNotEmpty) ...[
-                    Text('执行输出:', style: TextStyle(fontSize: 10, color: Colors.grey[600])),
+                    const Text('执行输出:', style: TextStyle(fontSize: 10.5, color: Colors.white54, fontWeight: FontWeight.w500)),
                     Container(
                       width: double.infinity,
-                      padding: const EdgeInsets.all(6),
-                      margin: const EdgeInsets.only(top: 2),
+                      padding: const EdgeInsets.all(7),
+                      margin: const EdgeInsets.only(top: 3),
                       decoration: BoxDecoration(
-                        color: isDark ? Colors.black45 : Colors.white,
+                        color: const Color(0xFF131722),
                         borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: Colors.white.withOpacity(0.06)),
                       ),
                       child: SelectableText(
                         widget.tool.output,
-                        style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
+                        style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Colors.white70),
                       ),
                     ),
                   ]

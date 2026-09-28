@@ -109,9 +109,9 @@ class _ChatViewState extends State<ChatView> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF131B2E),
+      backgroundColor: const Color(0xFF181C26),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (ctx) {
         return StatefulBuilder(
@@ -139,10 +139,11 @@ class _ChatViewState extends State<ChatView> {
                         Container(
                           padding: const EdgeInsets.all(8),
                           decoration: BoxDecoration(
-                            color: Colors.blueAccent.withOpacity(0.15),
-                            borderRadius: BorderRadius.circular(10),
+                            color: const Color(0xFF0078D4).withOpacity(0.15),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.3)),
                           ),
-                          child: const Icon(Icons.shield_outlined, color: Colors.blueAccent, size: 22),
+                          child: const Icon(Icons.shield_outlined, color: Color(0xFF60A5FA), size: 20),
                         ),
                         const SizedBox(width: 12),
                         Expanded(
@@ -151,7 +152,7 @@ class _ChatViewState extends State<ChatView> {
                             children: [
                               const Text(
                                 '对话权限与执行策略',
-                                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                                style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white),
                               ),
                               Text(
                                 '当前对话: ${currentSession?.title ?? sessionId}',
@@ -167,7 +168,7 @@ class _ChatViewState extends State<ChatView> {
                     const SizedBox(height: 20),
                     const Text(
                       '终端命令执行策略 (Execution Policy)',
-                      style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white70),
+                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.white70),
                     ),
                     const SizedBox(height: 10),
 
@@ -207,7 +208,7 @@ class _ChatViewState extends State<ChatView> {
                     const SizedBox(height: 16),
                     const Text(
                       '单轮迭代步数上限 (Max Steps)',
-                      style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white70),
+                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.white70),
                     ),
                     Row(
                       children: [
@@ -217,7 +218,7 @@ class _ChatViewState extends State<ChatView> {
                             min: 10,
                             max: 60,
                             divisions: 10,
-                            activeColor: Colors.blueAccent,
+                            activeColor: const Color(0xFF0078D4),
                             label: '$maxSteps 步',
                             onChanged: (v) {
                               setModalState(() => maxSteps = v.round());
@@ -227,8 +228,9 @@ class _ChatViewState extends State<ChatView> {
                         Container(
                           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                           decoration: BoxDecoration(
-                            color: Colors.white10,
-                            borderRadius: BorderRadius.circular(8),
+                            color: Colors.white.withOpacity(0.08),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: Colors.white.withOpacity(0.08)),
                           ),
                           child: Text('$maxSteps 步', style: const TextStyle(color: Colors.white, fontSize: 13)),
                         ),
@@ -238,12 +240,13 @@ class _ChatViewState extends State<ChatView> {
                     const SizedBox(height: 20),
                     SizedBox(
                       width: double.infinity,
-                      height: 48,
+                      height: 44,
                       child: ElevatedButton(
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF2563EB),
+                          backgroundColor: const Color(0xFF0078D4),
                           foregroundColor: Colors.white,
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                          elevation: 0,
                         ),
                         onPressed: () async {
                           await dsh.setSessionPermission(sessionId, selectedPolicy);
@@ -255,11 +258,12 @@ class _ChatViewState extends State<ChatView> {
                               SnackBar(
                                 content: Text('已更新会话权限策略: ${_getPolicyLabel(selectedPolicy)}'),
                                 duration: const Duration(seconds: 2),
+                                behavior: SnackBarBehavior.floating,
                               ),
                             );
                           }
                         },
-                        child: const Text('保存权限策略', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                        child: const Text('保存权限策略', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
                       ),
                     ),
                   ],
@@ -286,12 +290,12 @@ class _ChatViewState extends State<ChatView> {
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
-          color: isSelected ? Colors.blueAccent.withOpacity(0.12) : const Color(0xFF1E293B),
+          color: isSelected ? const Color(0xFF0078D4).withOpacity(0.14) : const Color(0xFF1E2432),
           border: Border.all(
-            color: isSelected ? Colors.blueAccent : Colors.white10,
+            color: isSelected ? const Color(0xFF0078D4) : Colors.white.withOpacity(0.08),
             width: isSelected ? 1.5 : 1.0,
           ),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(8),
         ),
         child: Row(
           children: [
@@ -299,7 +303,7 @@ class _ChatViewState extends State<ChatView> {
               value: value,
               groupValue: groupValue,
               onChanged: onChanged,
-              activeColor: Colors.blueAccent,
+              activeColor: const Color(0xFF0078D4),
             ),
             const SizedBox(width: 8),
             Expanded(
@@ -361,9 +365,9 @@ class _ChatViewState extends State<ChatView> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF131B2E),
+      backgroundColor: const Color(0xFF181C26),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (ctx) {
         return SafeArea(
@@ -386,17 +390,17 @@ class _ChatViewState extends State<ChatView> {
                 const SizedBox(height: 16),
                 Row(
                   children: const [
-                    Icon(Icons.smart_toy_outlined, color: Colors.purpleAccent),
+                    Icon(Icons.smart_toy_outlined, color: Color(0xFFC084FC), size: 20),
                     SizedBox(width: 8),
                     Text(
                       '切换大语言模型 (Switch Model)',
-                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white),
                     ),
                   ],
                 ),
                 if (currentSession != null)
                   Padding(
-                    padding: const EdgeInsets.only(top: 4, left: 32),
+                    padding: const EdgeInsets.only(top: 4, left: 28),
                     child: Text(
                       '生效会话: ${currentSession.title}',
                       style: const TextStyle(fontSize: 12, color: Colors.white54),
@@ -412,12 +416,12 @@ class _ChatViewState extends State<ChatView> {
                       final m = settings!.availableModels[index];
                       final isSelected = m.id == activeModel;
                       return ListTile(
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                        tileColor: isSelected ? Colors.purpleAccent.withOpacity(0.12) : null,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        tileColor: isSelected ? const Color(0xFF0078D4).withOpacity(0.14) : null,
                         title: Text(
                           m.name,
                           style: TextStyle(
-                            color: isSelected ? Colors.purpleAccent : Colors.white,
+                            color: isSelected ? const Color(0xFF60A5FA) : Colors.white,
                             fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
                           ),
                         ),
@@ -425,7 +429,7 @@ class _ChatViewState extends State<ChatView> {
                           '${m.id} | 上下文: ${(m.contextWindow ?? 0) ~/ 1000}k',
                           style: const TextStyle(fontSize: 12, color: Colors.white54),
                         ),
-                        trailing: isSelected ? const Icon(Icons.check_circle, color: Colors.purpleAccent) : null,
+                        trailing: isSelected ? const Icon(Icons.check_circle, color: Color(0xFF60A5FA), size: 18) : null,
                         onTap: () async {
                           Navigator.pop(ctx);
                           final ok = await dsh.switchModel(m.id, sessionId: currentSession?.sessionId);
@@ -469,8 +473,8 @@ class _ChatViewState extends State<ChatView> {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF131B2E),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        backgroundColor: const Color(0xFF1E2432),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
         title: const Row(
           children: [
             Icon(Icons.delete_outline_rounded, color: Colors.redAccent, size: 22),
@@ -492,6 +496,7 @@ class _ChatViewState extends State<ChatView> {
               backgroundColor: const Color(0xFFEF4444),
               foregroundColor: Colors.white,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              elevation: 0,
             ),
             onPressed: () async {
               Navigator.pop(ctx);
@@ -530,9 +535,9 @@ class _ChatViewState extends State<ChatView> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF131B2E),
+      backgroundColor: const Color(0xFF181C26),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (ctx) {
         return SafeArea(
@@ -555,11 +560,11 @@ class _ChatViewState extends State<ChatView> {
                 const SizedBox(height: 16),
                 const Row(
                   children: [
-                    Icon(Icons.folder_open_rounded, color: Colors.blueAccent),
+                    Icon(Icons.folder_open_rounded, color: Color(0xFF60A5FA), size: 20),
                     SizedBox(width: 8),
                     Text(
                       '选择工作区 (Select Workspace)',
-                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white),
                     ),
                   ],
                 ),
@@ -573,12 +578,12 @@ class _ChatViewState extends State<ChatView> {
                       final ws = dsh.workspaces[index];
                       final isSelected = ws.workspaceId == dsh.currentWorkspace?.workspaceId;
                       return ListTile(
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                        tileColor: isSelected ? Colors.blueAccent.withOpacity(0.12) : null,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        tileColor: isSelected ? const Color(0xFF0078D4).withOpacity(0.14) : null,
                         title: Text(
                           ws.title,
                           style: TextStyle(
-                            color: isSelected ? Colors.blueAccent : Colors.white,
+                            color: isSelected ? const Color(0xFF60A5FA) : Colors.white,
                             fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
                           ),
                         ),
@@ -617,7 +622,8 @@ class _ChatViewState extends State<ChatView> {
     final policy = dsh.getSessionPermission(sessionId);
     final modelName = dsh.currentModel;
     final currentSessionId = currentSession?.sessionId;
-    final isSessionRunning = dsh.isSending || (currentSession?.isRunning ?? false);
+    final isSessionRunning = (currentSession?.isRunning ?? false) ||
+        (dsh.isSending && (currentSession?.matchesSessionId(dsh.currentSession?.sessionId) ?? false));
 
     // Auto-scroll logic: jump to bottom on session change or after history loaded
     if (currentSessionId != _lastSessionId) {
@@ -636,72 +642,76 @@ class _ChatViewState extends State<ChatView> {
     _wasLoadingHistory = dsh.isLoadingHistory;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0B0F19),
+      backgroundColor: const Color(0xFF14171F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF131B2E),
+        backgroundColor: const Color(0xFF1B202C),
         elevation: 0,
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(1),
+          child: Container(color: Colors.white.withOpacity(0.06), height: 1),
+        ),
         titleSpacing: 12,
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
-                // Workspace Selector Pill
+                // Workspace Selector Pill (Fluent Command Style)
                 GestureDetector(
                   onTap: () => _showWorkspaceSwitchSheet(context, dsh),
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                     decoration: BoxDecoration(
-                      color: Colors.blueAccent.withOpacity(0.15),
+                      color: const Color(0xFF0078D4).withOpacity(0.12),
                       borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: Colors.blueAccent.withOpacity(0.3)),
+                      border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.3)),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        const Icon(Icons.folder_rounded, size: 13, color: Colors.blueAccent),
+                        const Icon(Icons.folder_rounded, size: 12, color: Color(0xFF60A5FA)),
                         const SizedBox(width: 4),
                         ConstrainedBox(
                           constraints: const BoxConstraints(maxWidth: 110),
                           child: Text(
                             currentWs?.title ?? '选择工作区',
-                            style: const TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.w600),
+                            style: const TextStyle(fontSize: 11.5, color: Colors.white, fontWeight: FontWeight.w600),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                           ),
                         ),
-                        const Icon(Icons.arrow_drop_down, size: 14, color: Colors.white70),
+                        Icon(Icons.arrow_drop_down, size: 14, color: Colors.white.withOpacity(0.6)),
                       ],
                     ),
                   ),
                 ),
                 const SizedBox(width: 6),
 
-                // Model Selector Pill
+                // Model Selector Pill (Fluent Command Style)
                 GestureDetector(
                   onTap: () => _showModelSwitchSheet(context, dsh),
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                     decoration: BoxDecoration(
-                      color: Colors.purpleAccent.withOpacity(0.15),
+                      color: const Color(0xFF744DA9).withOpacity(0.14),
                       borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: Colors.purpleAccent.withOpacity(0.3)),
+                      border: Border.all(color: const Color(0xFF744DA9).withOpacity(0.32)),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        const Icon(Icons.smart_toy_outlined, size: 13, color: Colors.purpleAccent),
+                        const Icon(Icons.smart_toy_outlined, size: 12, color: Color(0xFFC084FC)),
                         const SizedBox(width: 4),
                         ConstrainedBox(
                           constraints: const BoxConstraints(maxWidth: 95),
                           child: Text(
                             modelName.replaceFirst('cn:', ''),
-                            style: const TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.w600),
+                            style: const TextStyle(fontSize: 11.5, color: Colors.white, fontWeight: FontWeight.w600),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                           ),
                         ),
-                        const Icon(Icons.arrow_drop_down, size: 14, color: Colors.white70),
+                        Icon(Icons.arrow_drop_down, size: 14, color: Colors.white.withOpacity(0.6)),
                       ],
                     ),
                   ),
@@ -715,7 +725,7 @@ class _ChatViewState extends State<ChatView> {
                   constraints: const BoxConstraints(maxWidth: 160),
                   child: Text(
                     currentSession?.title ?? '新会话',
-                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Colors.white70),
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Colors.white.withOpacity(0.85)),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
@@ -725,9 +735,9 @@ class _ChatViewState extends State<ChatView> {
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
                     decoration: BoxDecoration(
-                      color: Colors.blueAccent.withOpacity(0.18),
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: Colors.blueAccent.withOpacity(0.4)),
+                      color: const Color(0xFF0078D4).withOpacity(0.18),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.4)),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -735,10 +745,10 @@ class _ChatViewState extends State<ChatView> {
                         SizedBox(
                           width: 8,
                           height: 8,
-                          child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.blueAccent),
+                          child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF60A5FA)),
                         ),
                         SizedBox(width: 4),
-                        Text('执行中...', style: TextStyle(color: Colors.blueAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+                        Text('执行中', style: TextStyle(color: Color(0xFF60A5FA), fontSize: 9.5, fontWeight: FontWeight.bold)),
                       ],
                     ),
                   ),
@@ -950,22 +960,22 @@ class _ChatViewState extends State<ChatView> {
                           right: 16,
                           bottom: 12,
                           child: Material(
-                            elevation: 6,
-                            color: const Color(0xFF2563EB),
-                            borderRadius: BorderRadius.circular(20),
+                            elevation: 3,
+                            color: const Color(0xFF0078D4),
+                            borderRadius: BorderRadius.circular(8),
                             child: InkWell(
-                              borderRadius: BorderRadius.circular(20),
+                              borderRadius: BorderRadius.circular(8),
                               onTap: _scrollToBottom,
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                              child: const Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 12, vertical: 7),
                                 child: Row(
                                   mainAxisSize: MainAxisSize.min,
-                                  children: const [
-                                    Icon(Icons.arrow_downward_rounded, size: 16, color: Colors.white),
+                                  children: [
+                                    Icon(Icons.arrow_downward_rounded, size: 15, color: Colors.white),
                                     SizedBox(width: 4),
                                     Text(
                                       '回到最新消息',
-                                      style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                                      style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
                                     ),
                                   ],
                                 ),
@@ -977,10 +987,13 @@ class _ChatViewState extends State<ChatView> {
                   ),
           ),
 
-          // Quick Action Chips
+          // Quick Action Chips (Fluent Command Style)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            color: const Color(0xFF131B2E).withOpacity(0.5),
+            decoration: BoxDecoration(
+              color: const Color(0xFF181C26),
+              border: Border(top: BorderSide(color: Colors.white.withOpacity(0.06))),
+            ),
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: Row(
@@ -991,25 +1004,25 @@ class _ChatViewState extends State<ChatView> {
                     color: _getPolicyColor(policy),
                     onTap: () => _showSessionPermissionSheet(context, dsh),
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: 6),
                   _buildQuickChip(
                     icon: Icons.smart_toy_outlined,
                     label: '更换模型',
-                    color: Colors.purpleAccent,
+                    color: const Color(0xFFC084FC),
                     onTap: () => _showModelSwitchSheet(context, dsh),
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: 6),
                   _buildQuickChip(
                     icon: Icons.folder_outlined,
                     label: '项目工作区',
-                    color: Colors.blueAccent,
+                    color: const Color(0xFF60A5FA),
                     onTap: widget.onOpenWorkspaces,
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: 6),
                   _buildQuickChip(
                     icon: Icons.cleaning_services_outlined,
                     label: '清屏新建',
-                    color: Colors.orangeAccent,
+                    color: const Color(0xFFFBBF24),
                     onTap: () async {
                       ScaffoldMessenger.of(context).showSnackBar(
                         const SnackBar(
@@ -1021,11 +1034,11 @@ class _ChatViewState extends State<ChatView> {
                       await dsh.createNewSession();
                     },
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: 6),
                   _buildQuickChip(
                     icon: Icons.delete_outline_rounded,
                     label: '删除会话',
-                    color: Colors.redAccent,
+                    color: const Color(0xFFF87171),
                     onTap: () => _showDeleteCurrentSessionDialog(context, dsh),
                   ),
                 ],
@@ -1052,15 +1065,15 @@ class _ChatViewState extends State<ChatView> {
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
         decoration: BoxDecoration(
           color: color.withOpacity(0.12),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: color.withOpacity(0.3)),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: color.withOpacity(0.28)),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, size: 14, color: color),
-            const SizedBox(width: 4),
-            Text(label, style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w500)),
+            Icon(icon, size: 13, color: color),
+            const SizedBox(width: 5),
+            Text(label, style: TextStyle(color: color, fontSize: 11.5, fontWeight: FontWeight.w600)),
           ],
         ),
       ),
@@ -1126,15 +1139,16 @@ class _ChatViewState extends State<ChatView> {
         children: [
           if (!isUser) ...[
             Container(
-              width: 34,
-              height: 34,
+              width: 30,
+              height: 30,
               decoration: BoxDecoration(
-                gradient: const LinearGradient(colors: [Color(0xFF2563EB), Color(0xFF6366F1)]),
-                borderRadius: BorderRadius.circular(10),
+                color: const Color(0xFF1E2432),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.35)),
               ),
-              child: const Icon(Icons.auto_awesome, color: Colors.white, size: 18),
+              child: const Icon(Icons.auto_awesome, color: Color(0xFF60A5FA), size: 16),
             ),
-            const SizedBox(width: 10),
+            const SizedBox(width: 8),
           ],
           Flexible(
             child: Column(
@@ -1160,28 +1174,43 @@ class _ChatViewState extends State<ChatView> {
                 // Content Bubble
                 if (displayContent.isNotEmpty)
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
                     decoration: BoxDecoration(
-                      color: isUser ? const Color(0xFF2563EB) : const Color(0xFF1E293B),
-                      borderRadius: BorderRadius.circular(14),
+                      color: isUser ? const Color(0xFF0078D4) : const Color(0xFF1E2432),
+                      borderRadius: isUser
+                          ? const BorderRadius.only(
+                              topLeft: Radius.circular(10),
+                              bottomLeft: Radius.circular(10),
+                              bottomRight: Radius.circular(10),
+                              topRight: Radius.circular(3),
+                            )
+                          : const BorderRadius.only(
+                              topRight: Radius.circular(10),
+                              bottomLeft: Radius.circular(10),
+                              bottomRight: Radius.circular(10),
+                              topLeft: Radius.circular(3),
+                            ),
                       border: Border.all(
-                        color: isUser ? Colors.transparent : Colors.white12,
+                        color: isUser
+                            ? const Color(0xFF60A5FA).withOpacity(0.28)
+                            : Colors.white.withOpacity(0.08),
+                        width: 1.0,
                       ),
                     ),
                     child: MarkdownBody(
                       data: displayContent,
                       selectable: true,
                       styleSheet: MarkdownStyleSheet(
-                        p: const TextStyle(fontSize: 14.5, color: Colors.white, height: 1.45),
+                        p: const TextStyle(fontSize: 14, color: Colors.white, height: 1.45),
                         code: const TextStyle(
                           color: Color(0xFF38BDF8),
-                          backgroundColor: Color(0xFF0F172A),
+                          backgroundColor: Color(0xFF131722),
                           fontFamily: 'monospace',
                         ),
                         codeblockDecoration: BoxDecoration(
-                          color: const Color(0xFF0F172A),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.white12),
+                          color: const Color(0xFF131722),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: Colors.white.withOpacity(0.08)),
                         ),
                       ),
                     ),
@@ -1204,7 +1233,7 @@ class _ChatViewState extends State<ChatView> {
                         SizedBox(
                           width: 12,
                           height: 12,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blueAccent),
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF60A5FA)),
                         ),
                         SizedBox(width: 6),
                         Text('AI 正在思考并执行操作...', style: TextStyle(color: Colors.white54, fontSize: 11)),
@@ -1225,15 +1254,16 @@ class _ChatViewState extends State<ChatView> {
             ),
           ),
           if (isUser) ...[
-            const SizedBox(width: 10),
+            const SizedBox(width: 8),
             Container(
-              width: 34,
-              height: 34,
+              width: 30,
+              height: 30,
               decoration: BoxDecoration(
-                color: Colors.blueAccent.withOpacity(0.3),
-                borderRadius: BorderRadius.circular(10),
+                color: const Color(0xFF0078D4).withOpacity(0.18),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.4)),
               ),
-              child: const Icon(Icons.person_outline_rounded, color: Colors.white, size: 20),
+              child: const Icon(Icons.person_outline_rounded, color: Color(0xFF60A5FA), size: 17),
             ),
           ],
         ],
@@ -1244,16 +1274,16 @@ class _ChatViewState extends State<ChatView> {
   Widget _buildInputBar(DshService dsh) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: const BoxDecoration(
-        color: Color(0xFF131B2E),
-        border: Border(top: BorderSide(color: Colors.white10)),
+      decoration: BoxDecoration(
+        color: const Color(0xFF181C26),
+        border: Border(top: BorderSide(color: Colors.white.withOpacity(0.08))),
       ),
       child: SafeArea(
         child: Row(
           children: [
             // Voice / Mic Mock Button
             IconButton(
-              icon: const Icon(Icons.mic_none_rounded, color: Colors.white70),
+              icon: const Icon(Icons.mic_none_rounded, color: Colors.white60, size: 22),
               tooltip: '语音输入',
               onPressed: () {
                 ScaffoldMessenger.of(context).showSnackBar(
@@ -1265,20 +1295,20 @@ class _ChatViewState extends State<ChatView> {
             Expanded(
               child: Container(
                 decoration: BoxDecoration(
-                  color: const Color(0xFF1E293B),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: Colors.white12),
+                  color: const Color(0xFF222836),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white.withOpacity(0.12)),
                 ),
                 child: TextField(
                   controller: _inputController,
-                  style: const TextStyle(color: Colors.white, fontSize: 14),
+                  style: const TextStyle(color: Colors.white, fontSize: 13.5),
                   maxLines: 4,
                   minLines: 1,
                   decoration: const InputDecoration(
                     hintText: '发送消息...',
-                    hintStyle: TextStyle(color: Colors.white38),
+                    hintStyle: TextStyle(color: Colors.white38, fontSize: 13.5),
                     border: InputBorder.none,
-                    contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                    contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 9),
                   ),
                   onSubmitted: (_) => _sendMessage(dsh),
                 ),
@@ -1287,18 +1317,31 @@ class _ChatViewState extends State<ChatView> {
             const SizedBox(width: 8),
             // Send / Cancel Button
             if (dsh.isSending)
-              IconButton(
-                icon: const Icon(Icons.stop_circle_rounded, color: Colors.redAccent, size: 28),
-                tooltip: '停止生成',
-                onPressed: () => dsh.cancelActiveTurn(),
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFEF4444).withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: const Color(0xFFEF4444).withOpacity(0.35)),
+                ),
+                child: IconButton(
+                  padding: EdgeInsets.zero,
+                  icon: const Icon(Icons.stop_rounded, color: Color(0xFFEF4444), size: 22),
+                  tooltip: '停止生成',
+                  onPressed: () => dsh.cancelActiveTurn(),
+                ),
               )
             else
               Container(
-                decoration: const BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: Color(0xFF2563EB),
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0078D4),
+                  borderRadius: BorderRadius.circular(8),
                 ),
                 child: IconButton(
+                  padding: EdgeInsets.zero,
                   icon: const Icon(Icons.arrow_upward_rounded, color: Colors.white, size: 20),
                   tooltip: '发送',
                   onPressed: () => _sendMessage(dsh),

@@ -243,26 +243,30 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     }
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0B0F19),
+      backgroundColor: const Color(0xFF14171F),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF131B2E),
+        backgroundColor: const Color(0xFF1B202C),
         elevation: 0,
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(1),
+          child: Container(color: Colors.white.withOpacity(0.06), height: 1),
+        ),
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
               '工作区与项目管理',
-              style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white),
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white),
             ),
             Text(
               '管理各工程项目与历史会话流',
-              style: TextStyle(fontSize: 11, color: Colors.white.withOpacity(0.5)),
+              style: TextStyle(fontSize: 11, color: Colors.white.withOpacity(0.55)),
             ),
           ],
         ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.refresh_rounded, color: Colors.white70),
+            icon: const Icon(Icons.refresh_rounded, color: Colors.white70, size: 20),
             tooltip: '刷新工作区',
             onPressed: () {
               dsh.fetchWorkspaces();
@@ -273,10 +277,13 @@ class _WorkspacesViewState extends State<WorkspacesView> {
       ),
       body: Column(
         children: [
-          // Sleek Stats Pill Row
+          // Fluent CommandBar Stats Row
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            color: const Color(0xFF131B2E).withOpacity(0.4),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF181C26),
+              border: Border(bottom: BorderSide(color: Colors.white.withOpacity(0.05))),
+            ),
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: Row(
@@ -284,20 +291,20 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                   _buildHeaderPill(
                     icon: Icons.folder_rounded,
                     label: '${workspaces.length} 个挂载项目',
-                    color: Colors.blueAccent,
+                    color: const Color(0xFF0078D4),
                   ),
                   const SizedBox(width: 8),
                   _buildHeaderPill(
                     icon: Icons.chat_bubble_outline_rounded,
                     label: '$totalSessions 个历史会话',
-                    color: Colors.purpleAccent,
+                    color: const Color(0xFF9333EA),
                   ),
                   if (totalRunning > 0) ...[
                     const SizedBox(width: 8),
                     _buildHeaderPill(
                       icon: Icons.bolt_rounded,
                       label: '$totalRunning 个任务执行中',
-                      color: const Color(0xFF38BDF8),
+                      color: const Color(0xFF0078D4),
                       animate: true,
                     ),
                   ],
@@ -317,24 +324,24 @@ class _WorkspacesViewState extends State<WorkspacesView> {
 
           // Search Bar
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
+            padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
             child: Container(
-              height: 40,
+              height: 38,
               decoration: BoxDecoration(
-                color: const Color(0xFF1E293B),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: Colors.white12),
+                color: const Color(0xFF1E2432),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: Colors.white.withOpacity(0.09)),
               ),
               child: TextField(
                 controller: _searchController,
                 style: const TextStyle(color: Colors.white, fontSize: 13),
                 decoration: InputDecoration(
                   hintText: '搜索工作区、路径或历史对话...',
-                  hintStyle: const TextStyle(color: Colors.white38, fontSize: 12.5),
-                  prefixIcon: const Icon(Icons.search, size: 18, color: Colors.white38),
+                  hintStyle: TextStyle(color: Colors.white.withOpacity(0.35), fontSize: 12.5),
+                  prefixIcon: Icon(Icons.search, size: 17, color: Colors.white.withOpacity(0.4)),
                   suffixIcon: _searchFilter.isNotEmpty
                       ? IconButton(
-                          icon: const Icon(Icons.clear, size: 16, color: Colors.white38),
+                          icon: Icon(Icons.clear, size: 15, color: Colors.white.withOpacity(0.4)),
                           onPressed: () {
                             _searchController.clear();
                             setState(() => _searchFilter = '');
@@ -352,8 +359,8 @@ class _WorkspacesViewState extends State<WorkspacesView> {
           // Workspace List
           Expanded(
             child: filteredWorkspaces.isEmpty
-                ? const Center(
-                    child: Text('没有找到匹配的工作区', style: TextStyle(color: Colors.white38)),
+                ? Center(
+                    child: Text('没有找到匹配的工作区', style: TextStyle(color: Colors.white.withOpacity(0.4))),
                   )
                 : ListView.builder(
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
@@ -377,23 +384,23 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     bool animate = false,
   }) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
       decoration: BoxDecoration(
         color: color.withOpacity(0.12),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: color.withOpacity(0.3)),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color.withOpacity(0.28)),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           if (animate)
             SizedBox(
-              width: 10,
-              height: 10,
+              width: 9,
+              height: 9,
               child: CircularProgressIndicator(strokeWidth: 1.5, color: color),
             )
           else
-            Icon(icon, size: 13, color: color),
+            Icon(icon, size: 12, color: color),
           const SizedBox(width: 5),
           Text(label, style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
         ],
@@ -407,17 +414,19 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     final pendingCount = ws.sessions.fold<int>(0, (sum, s) => sum + _getSessionPendingCount(s, dsh));
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 12),
+      margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
-        color: const Color(0xFF131B2E),
-        borderRadius: BorderRadius.circular(14),
+        color: const Color(0xFF1E2432),
+        borderRadius: BorderRadius.circular(10),
         border: Border.all(
-          color: hasRunning
-              ? const Color(0xFF38BDF8).withOpacity(0.5)
-              : (pendingCount > 0
-                  ? Colors.amberAccent.withOpacity(0.5)
-                  : (isCurrent ? Colors.blueAccent.withOpacity(0.6) : Colors.white12)),
-          width: (isCurrent || hasRunning || pendingCount > 0) ? 1.5 : 1.0,
+          color: isCurrent
+              ? const Color(0xFF0078D4).withOpacity(0.6)
+              : (hasRunning
+                  ? const Color(0xFF0078D4).withOpacity(0.4)
+                  : (pendingCount > 0
+                      ? Colors.amberAccent.withOpacity(0.5)
+                      : Colors.white.withOpacity(0.08))),
+          width: 1.0,
         ),
       ),
       child: Theme(
@@ -425,16 +434,16 @@ class _WorkspacesViewState extends State<WorkspacesView> {
         child: ExpansionTile(
           initiallyExpanded: isCurrent,
           leading: Container(
-            width: 36,
-            height: 36,
+            width: 34,
+            height: 34,
             decoration: BoxDecoration(
-              color: isCurrent ? Colors.blueAccent.withOpacity(0.2) : Colors.white10,
-              borderRadius: BorderRadius.circular(10),
+              color: isCurrent ? const Color(0xFF0078D4).withOpacity(0.2) : Colors.white.withOpacity(0.06),
+              borderRadius: BorderRadius.circular(8),
             ),
             child: Icon(
               Icons.folder_rounded,
-              color: isCurrent ? Colors.blueAccent : Colors.white70,
-              size: 20,
+              color: isCurrent ? const Color(0xFF0078D4) : Colors.white70,
+              size: 18,
             ),
           ),
           title: Row(
@@ -443,22 +452,22 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                 child: Text(
                   ws.title,
                   style: TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.bold,
-                    color: isCurrent ? Colors.blueAccent : Colors.white,
+                    fontSize: 14.5,
+                    fontWeight: FontWeight.w600,
+                    color: isCurrent ? const Color(0xFF60A5FA) : Colors.white,
                   ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
-              if (hasRunning) ...[
+              if (runningSessionsCount > 0) ...[
                 const SizedBox(width: 6),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF0284C7).withOpacity(0.2),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: const Color(0xFF38BDF8).withOpacity(0.5)),
+                    color: const Color(0xFF0078D4).withOpacity(0.18),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.4)),
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
@@ -466,10 +475,10 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                       const SizedBox(
                         width: 8,
                         height: 8,
-                        child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF38BDF8)),
+                        child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF60A5FA)),
                       ),
                       const SizedBox(width: 4),
-                      Text('$runningSessionsCount 执行中', style: const TextStyle(color: Color(0xFF38BDF8), fontSize: 9.5, fontWeight: FontWeight.bold)),
+                      Text('$runningSessionsCount 执行中', style: const TextStyle(color: Color(0xFF60A5FA), fontSize: 9.5, fontWeight: FontWeight.bold)),
                     ],
                   ),
                 ),
@@ -477,10 +486,10 @@ class _WorkspacesViewState extends State<WorkspacesView> {
               if (pendingCount > 0) ...[
                 const SizedBox(width: 6),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
                     color: Colors.amberAccent.withOpacity(0.2),
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: BorderRadius.circular(4),
                     border: Border.all(color: Colors.amberAccent.withOpacity(0.5)),
                   ),
                   child: Row(
@@ -498,11 +507,11 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
-                    color: Colors.blueAccent.withOpacity(0.2),
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: Colors.blueAccent.withOpacity(0.4)),
+                    color: const Color(0xFF0078D4).withOpacity(0.18),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.4)),
                   ),
-                  child: const Text('当前活跃', style: TextStyle(color: Colors.blueAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+                  child: const Text('当前活跃', style: TextStyle(color: Color(0xFF60A5FA), fontSize: 9.5, fontWeight: FontWeight.bold)),
                 ),
               ],
             ],
@@ -625,53 +634,54 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     final pendingCount = _getSessionPendingCount(s, dsh);
 
     return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+      margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 2.5),
       decoration: BoxDecoration(
-        color: isCurrentSession ? const Color(0xFF1E293B).withOpacity(0.7) : Colors.transparent,
-        borderRadius: BorderRadius.circular(10),
+        color: isCurrentSession ? const Color(0xFF232A3B) : Colors.transparent,
+        borderRadius: BorderRadius.circular(6),
         border: Border.all(
           color: isRunning
-              ? const Color(0xFF38BDF8).withOpacity(0.4)
+              ? const Color(0xFF0078D4).withOpacity(0.4)
               : (pendingCount > 0
-                  ? Colors.amberAccent.withOpacity(0.4)
-                  : (isCurrentSession ? Colors.blueAccent.withOpacity(0.3) : Colors.transparent)),
+                  ? Colors.amberAccent.withOpacity(0.35)
+                  : (isCurrentSession ? const Color(0xFF0078D4).withOpacity(0.3) : Colors.transparent)),
+          width: 1.0,
         ),
       ),
       child: ListTile(
         dense: true,
-        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 1),
         leading: isRunning
             ? Container(
-                width: 32,
-                height: 32,
+                width: 30,
+                height: 30,
                 decoration: BoxDecoration(
-                  color: const Color(0xFF0284C7).withOpacity(0.18),
+                  color: const Color(0xFF0078D4).withOpacity(0.15),
                   shape: BoxShape.circle,
-                  border: Border.all(color: const Color(0xFF38BDF8), width: 1.5),
+                  border: Border.all(color: const Color(0xFF60A5FA), width: 1.2),
                 ),
                 child: const Center(
                   child: SizedBox(
-                    width: 15,
-                    height: 15,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF38BDF8)),
+                    width: 13,
+                    height: 13,
+                    child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF60A5FA)),
                   ),
                 ),
               )
             : (pendingCount > 0
                 ? Container(
-                    width: 32,
-                    height: 32,
+                    width: 30,
+                    height: 30,
                     decoration: BoxDecoration(
-                      color: Colors.amberAccent.withOpacity(0.18),
+                      color: Colors.amberAccent.withOpacity(0.15),
                       shape: BoxShape.circle,
-                      border: Border.all(color: Colors.amberAccent, width: 1.5),
+                      border: Border.all(color: Colors.amberAccent, width: 1.2),
                     ),
-                    child: const Icon(Icons.shield_outlined, size: 16, color: Colors.amberAccent),
+                    child: const Icon(Icons.shield_outlined, size: 15, color: Colors.amberAccent),
                   )
                 : Icon(
                     Icons.chat_bubble_outline_rounded,
-                    size: 18,
-                    color: isCurrentSession ? Colors.blueAccent : Colors.white38,
+                    size: 16,
+                    color: isCurrentSession ? const Color(0xFF60A5FA) : Colors.white30,
                   )),
         title: Row(
           children: [
@@ -679,9 +689,9 @@ class _WorkspacesViewState extends State<WorkspacesView> {
               child: Text(
                 s.title,
                 style: TextStyle(
-                  fontSize: 13.5,
-                  fontWeight: isCurrentSession ? FontWeight.bold : FontWeight.w500,
-                  color: isCurrentSession ? Colors.blueAccent : Colors.white,
+                  fontSize: 13,
+                  fontWeight: isCurrentSession ? FontWeight.w600 : FontWeight.normal,
+                  color: isCurrentSession ? const Color(0xFF93C5FD) : Colors.white.withOpacity(0.9),
                 ),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
@@ -690,22 +700,22 @@ class _WorkspacesViewState extends State<WorkspacesView> {
             if (isRunning) ...[
               const SizedBox(width: 6),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF0284C7).withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: const Color(0xFF38BDF8).withOpacity(0.6)),
+                  color: const Color(0xFF0078D4).withOpacity(0.18),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.4)),
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: const [
                     SizedBox(
-                      width: 9,
-                      height: 9,
-                      child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF38BDF8)),
+                      width: 8,
+                      height: 8,
+                      child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF60A5FA)),
                     ),
                     SizedBox(width: 4),
-                    Text('任务执行中...', style: TextStyle(color: Color(0xFF38BDF8), fontSize: 9.5, fontWeight: FontWeight.bold)),
+                    Text('执行中', style: TextStyle(color: Color(0xFF60A5FA), fontSize: 9.5, fontWeight: FontWeight.bold)),
                   ],
                 ),
               ),
@@ -713,18 +723,18 @@ class _WorkspacesViewState extends State<WorkspacesView> {
             if (pendingCount > 0) ...[
               const SizedBox(width: 6),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
                 decoration: BoxDecoration(
-                  color: Colors.amberAccent.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.amberAccent.withOpacity(0.6)),
+                  color: Colors.amberAccent.withOpacity(0.18),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: Colors.amberAccent.withOpacity(0.5)),
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.priority_high_rounded, size: 11, color: Colors.amberAccent),
+                    const Icon(Icons.priority_high_rounded, size: 10, color: Colors.amberAccent),
                     const SizedBox(width: 2),
-                    Text('待确认审批 ($pendingCount)', style: const TextStyle(color: Colors.amberAccent, fontSize: 9.5, fontWeight: FontWeight.bold)),
+                    Text('待审批 ($pendingCount)', style: const TextStyle(color: Colors.amberAccent, fontSize: 9.5, fontWeight: FontWeight.bold)),
                   ],
                 ),
               ),

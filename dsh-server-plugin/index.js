@@ -176,9 +176,12 @@ function getWorkspacesData() {
               sessionMeta.firstPrompt = rows.titleInput?.val?.first?.text || '';
               sessionMeta.lastPromptAt = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
               sessionMeta.model = rows.modelSelection?.val?.lastUsed?.model || '';
-              sessionMeta.lastSeq = rows.turnBoundary?.seq || rows.tokenUsage?.seq || 0;
               const follower = getSessionFollower(sId);
-              sessionMeta.isRunning = (follower && follower.isRunning) || rows.turnBoundary?.val?.openTurnStartSeq != null || activePrompts.has(sId) || activePrompts.has(sId.replace('session-', ''));
+              const isRecentlyPrompted = activePrompts.has(sId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
+              const lastActivity = sessionMeta.lastPromptAt || 0;
+              const isRecentActivity = (Date.now() - lastActivity) < 45000;
+              const isOpenTurnActive = rows.turnBoundary?.val?.openTurnStartSeq != null && isRecentActivity;
+              sessionMeta.isRunning = (follower && follower.isRunning) || isRecentlyPrompted || isOpenTurnActive;
               break;
             } catch (err) {}
           }
@@ -334,16 +337,11 @@ async function getSessionHistory(sessionId) {
         sessionTitle = rows.title?.val || rows.titleInput?.val?.first?.text || sessionId;
         sessionModel = rows.modelSelection?.val?.lastUsed?.model || '';
         
-        const hasPrompt = activePrompts.has(sessionId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
-        if (hasPrompt) {
-          const pTime = activePrompts.get(sessionId) || activePrompts.get(cleanId) || activePrompts.get(`session-${cleanId}`);
-          if (Date.now() - pTime > 4000 && rows.turnBoundary?.val?.openTurnStartSeq == null) {
-            activePrompts.delete(sessionId);
-            activePrompts.delete(cleanId);
-            activePrompts.delete(`session-${cleanId}`);
-          }
-        }
-        isSessionRunning = (follower && follower.isRunning) || rows.turnBoundary?.val?.openTurnStartSeq != null || activePrompts.has(sessionId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
+        const isRecentlyPrompted = activePrompts.has(sessionId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
+        const lastActivity = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
+        const isRecentActivity = (Date.now() - lastActivity) < 45000;
+        const isOpenTurnActive = rows.turnBoundary?.val?.openTurnStartSeq != null && isRecentActivity;
+        isSessionRunning = (follower && follower.isRunning) || isRecentlyPrompted || isOpenTurnActive;
         break;
       } catch (_) {}
     }
@@ -464,8 +462,8 @@ async function getSessionHistory(sessionId) {
     }
   }
 
-  // If the session is actively generating, and the in-flight turn hasn't committed to records yet:
-  if (follower && (follower.isRunning || follower.textBuffer || follower.thinkingBuffer || follower.activePromptText)) {
+  // If the session is actively generating right now, and the in-flight turn hasn't committed to records yet:
+  if (follower && follower.isRunning && (follower.textBuffer || follower.thinkingBuffer || follower.activePromptText)) {
     isSessionRunning = true;
 
     // Ensure the latest user message is present if it hasn't landed in records yet
@@ -901,19 +899,14 @@ function connectUpstreamMux() {
                 type: 'done',
                 sessionId: sId
               });
+              follower.thinkingBuffer = '';
+              follower.textBuffer = '';
+              follower.tools = [];
               broadcastToMobileClients({
                 type: 'session_status',
                 sessionId: sId,
                 isRunning: false
               });
-              // Clear temporary buffers after disk projcache sync
-              setTimeout(() => {
-                if (!follower.isRunning) {
-                  follower.thinkingBuffer = '';
-                  follower.textBuffer = '';
-                  follower.tools = [];
-                }
-              }, 6000);
             } else if (ev.type === 'tool/call') {
               const toolObj = {
                 id: ev.data?.id || `tool_${Date.now()}`,

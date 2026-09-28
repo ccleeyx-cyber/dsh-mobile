@@ -47,6 +47,7 @@ class DshService extends ChangeNotifier {
   bool _isLoadingHistory = false;
   bool _isSending = false;
   String? _currentSessionModel;
+  int _sessionLoadSeq = 0;
 
   // Getters
   ConnectionStatus get status => _status;
@@ -175,6 +176,10 @@ class DshService extends ChangeNotifier {
 
   void selectWorkspace(Workspace ws) {
     _currentWorkspace = ws;
+    _messages = [];
+    _isSending = false;
+    _sessionPollTimer?.cancel();
+    _sessionPollTimer = null;
     if (ws.sessions.isNotEmpty) {
       selectSession(ws.sessions.first);
     } else {
@@ -202,10 +207,14 @@ class DshService extends ChangeNotifier {
 
   // Session Management
   Future<void> selectSession(SessionMeta session) async {
-    _currentSession = session;
-    _isLoadingHistory = true;
+    final currentSeq = ++_sessionLoadSeq;
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
+    _currentSession = session;
+    _messages = []; // Clear immediately to prevent cross-contamination
+    _isSending = false; // Reset sending state immediately
+    _isLoadingHistory = true;
+    _lastError = '';
     notifyListeners();
 
     // Notify server to follow this session for real-time streaming
@@ -215,11 +224,14 @@ class DshService extends ChangeNotifier {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/${session.sessionId}');
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
 
+      // Guard: if user switched to another session while HTTP was in flight, discard!
+      if (currentSeq != _sessionLoadSeq) return;
+
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final sessionData = data['data'] as Map<String, dynamic>?;
         final rawMessages = sessionData?['messages'] as List<dynamic>? ?? [];
-        final isRunning = sessionData?['isRunning'] == true || session.isRunning;
+        final isRunning = sessionData?['isRunning'] == true;
         final sModel = sessionData?['model'] as String?;
         if (sModel != null && sModel.isNotEmpty) {
           _currentSessionModel = sModel;
@@ -268,11 +280,15 @@ class DshService extends ChangeNotifier {
         debugPrint('[DshService] $_lastError');
       }
     } catch (e) {
-      debugPrint('[DshService] selectSession error: $e');
-      _lastError = '加载会话异常: $e';
+      if (currentSeq == _sessionLoadSeq) {
+        debugPrint('[DshService] selectSession error: $e');
+        _lastError = '加载会话异常: $e';
+      }
     } finally {
-      _isLoadingHistory = false;
-      notifyListeners();
+      if (currentSeq == _sessionLoadSeq) {
+        _isLoadingHistory = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -416,14 +432,16 @@ class DshService extends ChangeNotifier {
 
     _sessionPollTimer = Timer.periodic(const Duration(milliseconds: 700), (timer) async {
       ticks++;
-      if (ticks > maxTicks) {
+      if (ticks > maxTicks || _currentSession == null || !_currentSession!.matchesSessionId(sessionId)) {
         timer.cancel();
         _sessionPollTimer = null;
-        _isSending = false;
-        if (_messages.isNotEmpty && _messages.last.isStreaming) {
-          _messages.last.isStreaming = false;
+        if (_currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
+          _isSending = false;
+          if (_messages.isNotEmpty && _messages.last.isStreaming) {
+            _messages.last.isStreaming = false;
+          }
+          notifyListeners();
         }
-        notifyListeners();
         return;
       }
 
@@ -436,6 +454,13 @@ class DshService extends ChangeNotifier {
       try {
         final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$sessionId');
         final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 5));
+
+        // If user changed session while HTTP was in flight, abort!
+        if (_currentSession == null || !_currentSession!.matchesSessionId(sessionId)) {
+          timer.cancel();
+          _sessionPollTimer = null;
+          return;
+        }
 
         if (res.statusCode == 200) {
           final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -471,11 +496,11 @@ class DshService extends ChangeNotifier {
                 parsedMessages.last.isStreaming = true;
               }
 
-              // Preserve locally added user messages if server hasn't committed them yet
+              // Preserve locally added user messages only if they belong to this current session
               final serverUserTexts = parsedMessages.where((m) => m.isUser).map((m) => m.content).toSet();
               for (final localMsg in _messages.where((m) => m.isUser)) {
                 if (localMsg.content.isNotEmpty && !serverUserTexts.contains(localMsg.content)) {
-                  if (localMsg.timestamp == null || DateTime.now().difference(localMsg.timestamp!).inSeconds < 30) {
+                  if (localMsg.timestamp != null && DateTime.now().difference(localMsg.timestamp!).inSeconds < 30) {
                     parsedMessages.add(localMsg);
                   }
                 }
@@ -489,12 +514,14 @@ class DshService extends ChangeNotifier {
           if (!isRunning) {
             timer.cancel();
             _sessionPollTimer = null;
-            _isSending = false;
-            if (_messages.isNotEmpty && _messages.last.isStreaming) {
-              _messages.last.isStreaming = false;
+            if (_currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
+              _isSending = false;
+              if (_messages.isNotEmpty && _messages.last.isStreaming) {
+                _messages.last.isStreaming = false;
+              }
+              notifyListeners();
             }
             fetchWorkspaces();
-            notifyListeners();
           }
         }
       } catch (e) {
@@ -981,7 +1008,7 @@ class DshService extends ChangeNotifier {
       // 5. Streaming tokens and chat chunks (thinking / delta / token)
       if (type == 'thinking' || type == 'delta' || type == 'token' || json.containsKey('delta') || json.containsKey('thinking')) {
         final sId = json['sessionId']?.toString();
-        if (sId != null && _currentSession != null && !_currentSession!.matchesSessionId(sId)) {
+        if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
           return;
         }
 
@@ -1015,7 +1042,7 @@ class DshService extends ChangeNotifier {
       // 6. Tool Executions
       if (type == 'tool_start' || type == 'tool_call') {
         final sId = json['sessionId']?.toString();
-        if (sId != null && _currentSession != null && !_currentSession!.matchesSessionId(sId)) {
+        if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
           return;
         }
         if (_messages.isEmpty || !_messages.last.isAssistant) {
@@ -1039,7 +1066,7 @@ class DshService extends ChangeNotifier {
 
       if (type == 'tool_result' || type == 'tool_end') {
         final sId = json['sessionId']?.toString();
-        if (sId != null && _currentSession != null && !_currentSession!.matchesSessionId(sId)) {
+        if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
           return;
         }
         if (_messages.isNotEmpty && _messages.last.isAssistant && _messages.last.tools.isNotEmpty) {
@@ -1054,7 +1081,7 @@ class DshService extends ChangeNotifier {
       // 7. Completion
       if (type == 'done' || type == 'end') {
         final sId = json['sessionId']?.toString();
-        if (sId != null && _currentSession != null && !_currentSession!.matchesSessionId(sId)) {
+        if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
           return;
         }
         if (_messages.isNotEmpty && _messages.last.isAssistant) {

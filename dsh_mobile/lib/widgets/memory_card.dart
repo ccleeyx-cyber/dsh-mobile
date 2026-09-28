@@ -111,8 +111,8 @@ class _MemoryCardState extends State<MemoryCard> {
       width: double.infinity,
       margin: const EdgeInsets.symmetric(vertical: 4),
       decoration: BoxDecoration(
-        color: const Color(0xFF141E33),
-        borderRadius: BorderRadius.circular(10),
+        color: const Color(0xFF181C26),
+        borderRadius: BorderRadius.circular(8),
         border: Border.all(
           color: meta.themeColor.withOpacity(0.25),
           width: 1.0,
@@ -123,14 +123,14 @@ class _MemoryCardState extends State<MemoryCard> {
         children: [
           InkWell(
             onTap: () => setState(() => _expanded = !_expanded),
-            borderRadius: BorderRadius.circular(10),
+            borderRadius: BorderRadius.circular(8),
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
               child: Row(
                 children: [
                   Icon(
                     meta.icon,
-                    size: 16,
+                    size: 15,
                     color: meta.themeColor,
                   ),
                   const SizedBox(width: 8),
@@ -165,7 +165,7 @@ class _MemoryCardState extends State<MemoryCard> {
                   const SizedBox(width: 6),
                   Icon(
                     _expanded ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded,
-                    size: 18,
+                    size: 16,
                     color: const Color(0xFF94A3B8),
                   ),
                 ],
@@ -178,9 +178,9 @@ class _MemoryCardState extends State<MemoryCard> {
               margin: const EdgeInsets.fromLTRB(10, 0, 10, 10),
               padding: const EdgeInsets.all(10),
               decoration: BoxDecoration(
-                color: const Color(0xFF0F172A),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.white10),
+                color: const Color(0xFF131722),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: Colors.white.withOpacity(0.06)),
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -196,7 +196,7 @@ class _MemoryCardState extends State<MemoryCard> {
                             p: const TextStyle(fontSize: 12.5, color: Color(0xFFCBD5E1), height: 1.45),
                             code: const TextStyle(
                               color: Color(0xFF38BDF8),
-                              backgroundColor: Color(0xFF1E293B),
+                              backgroundColor: Color(0xFF1A202C),
                               fontSize: 11.5,
                               fontFamily: 'monospace',
                             ),
