@@ -32,20 +32,20 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
-        scaffoldBackgroundColor: const Color(0xFF0B0F19),
+        scaffoldBackgroundColor: const Color(0xFF1E1E1E),
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF2563EB),
+          seedColor: const Color(0xFF0078D4),
           brightness: Brightness.dark,
-          surface: const Color(0xFF131B2E),
+          surface: const Color(0xFF252526),
         ),
       ),
       darkTheme: ThemeData(
         useMaterial3: true,
-        scaffoldBackgroundColor: const Color(0xFF0B0F19),
+        scaffoldBackgroundColor: const Color(0xFF1E1E1E),
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF2563EB),
+          seedColor: const Color(0xFF0078D4),
           brightness: Brightness.dark,
-          surface: const Color(0xFF131B2E),
+          surface: const Color(0xFF252526),
         ),
       ),
       themeMode: ThemeMode.dark,

@@ -69,8 +69,11 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF131B2E),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        backgroundColor: const Color(0xFF252526),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+          side: const BorderSide(color: Color(0xFF333333)),
+        ),
         title: const Row(
           children: [
             Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 22),
@@ -91,7 +94,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFFDC2626),
               foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
             ),
             onPressed: () async {
               Navigator.pop(ctx);
@@ -120,9 +123,9 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF131B2E),
+      backgroundColor: const Color(0xFF252526),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
       ),
       builder: (ctx) {
         return SafeArea(
@@ -150,7 +153,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                 const SizedBox(height: 16),
                 Row(
                   children: [
-                    const Icon(Icons.description_outlined, color: Colors.blueAccent),
+                    const Icon(Icons.description_outlined, color: Color(0xFF0078D4)),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
@@ -173,9 +176,9 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                 Container(
                   height: 220,
                   decoration: BoxDecoration(
-                    color: const Color(0xFF0B0F19),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: Colors.white12),
+                    color: const Color(0xFF1E1E1E),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF333333)),
                   ),
                   child: TextField(
                     controller: textController,
@@ -243,13 +246,13 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     }
 
     return Scaffold(
-      backgroundColor: const Color(0xFF14171F),
+      backgroundColor: const Color(0xFF1E1E1E),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF1B202C),
+        backgroundColor: const Color(0xFF252526),
         elevation: 0,
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(1),
-          child: Container(color: Colors.white.withOpacity(0.06), height: 1),
+          child: Container(color: const Color(0xFF333333), height: 1),
         ),
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -280,9 +283,9 @@ class _WorkspacesViewState extends State<WorkspacesView> {
           // Fluent CommandBar Stats Row
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-            decoration: BoxDecoration(
-              color: const Color(0xFF181C26),
-              border: Border(bottom: BorderSide(color: Colors.white.withOpacity(0.05))),
+            decoration: const BoxDecoration(
+              color: Color(0xFF252526),
+              border: Border(bottom: BorderSide(color: Color(0xFF333333))),
             ),
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
@@ -328,9 +331,9 @@ class _WorkspacesViewState extends State<WorkspacesView> {
             child: Container(
               height: 38,
               decoration: BoxDecoration(
-                color: const Color(0xFF1E2432),
+                color: const Color(0xFF2D2D2D),
                 borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: Colors.white.withOpacity(0.09)),
+                border: Border.all(color: const Color(0xFF3B3B3B)),
               ),
               child: TextField(
                 controller: _searchController,
@@ -416,7 +419,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
-        color: const Color(0xFF1E2432),
+        color: const Color(0xFF252526),
         borderRadius: BorderRadius.circular(10),
         border: Border.all(
           color: isCurrent
@@ -425,7 +428,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                   ? const Color(0xFF0078D4).withOpacity(0.4)
                   : (pendingCount > 0
                       ? Colors.amberAccent.withOpacity(0.5)
-                      : Colors.white.withOpacity(0.08))),
+                      : const Color(0xFF333333))),
           width: 1.0,
         ),
       ),
@@ -582,7 +585,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                       icon: const Icon(Icons.add_comment_outlined, size: 15),
                       label: const Text('新建对话', style: TextStyle(fontSize: 12)),
                       onPressed: () async {
-                        dsh.selectWorkspace(ws);
+                        dsh.selectWorkspace(ws, autoSelectSession: false);
                         await dsh.createNewSession();
                         widget.onSwitchToChat?.call();
                       },

@@ -1,23 +1,42 @@
 {
   "name": "dsh-mobile-bridge",
   "version": "1.0.0",
-  "description": "Secure mobile bridge and authentication plugin for DeepSeek Harness (DSH)",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
+  "description": "DSH 移动终端安全桥接与管理插件：原生管理 3088 移动网关，提供设备配对、APK分发与会话流式中继。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./client": "./client/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client",
+    "public",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
   },
   "dependencies": {
-    "http-proxy": "^1.18.1",
     "ws": "^8.18.0",
     "yaml": "^2.9.1"
   },
-  "keywords": [
-    "deepseek",
-    "deepseek-harness",
-    "dsh",
-    "cordis",
-    "mobile-gateway"
-  ],
-  "author": "Antigravity",
-  "license": "MIT"
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  }
 }

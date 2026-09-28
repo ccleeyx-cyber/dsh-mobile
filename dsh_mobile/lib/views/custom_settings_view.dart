@@ -23,9 +23,9 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF131B2E),
+      backgroundColor: const Color(0xFF252526),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
       ),
       builder: (ctx) {
         return SafeArea(
@@ -109,9 +109,9 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF131B2E),
+      backgroundColor: const Color(0xFF252526),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
       ),
       builder: (ctx) {
         return SafeArea(
@@ -139,7 +139,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                 const SizedBox(height: 16),
                 const Row(
                   children: [
-                    Icon(Icons.person_add_alt_1_rounded, color: Colors.blueAccent),
+                    Icon(Icons.person_add_alt_1_rounded, color: Color(0xFF0078D4)),
                     SizedBox(width: 8),
                     Text(
                       '自定义智能体人设 (Custom Persona)',
@@ -155,16 +155,18 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                     labelText: '角色名称 (如: 游戏逻辑架构师)',
                     labelStyle: const TextStyle(color: Colors.white54),
                     filled: true,
-                    fillColor: const Color(0xFF1E293B),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                    fillColor: const Color(0xFF2D2D2D),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: const BorderSide(color: Color(0xFF3B3B3B))),
+                    enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: const BorderSide(color: Color(0xFF3B3B3B))),
                   ),
                 ),
                 const SizedBox(height: 12),
                 Container(
                   height: 150,
                   decoration: BoxDecoration(
-                    color: const Color(0xFF1E293B),
-                    borderRadius: BorderRadius.circular(10),
+                    color: const Color(0xFF2D2D2D),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: const Color(0xFF3B3B3B)),
                   ),
                   child: TextField(
                     controller: promptController,
@@ -231,13 +233,17 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     final personas = dsh.personas;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0B0F19),
+      backgroundColor: const Color(0xFF1E1E1E),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF131B2E),
+        backgroundColor: const Color(0xFF252526),
         elevation: 0,
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(1),
+          child: Container(color: const Color(0xFF333333), height: 1),
+        ),
         title: const Row(
           children: [
-            Icon(Icons.tune_rounded, color: Colors.blueAccent),
+            Icon(Icons.tune_rounded, color: Color(0xFF0078D4)),
             SizedBox(width: 8),
             Text(
               '设置与深度自定义',
@@ -255,9 +261,9 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: const Color(0xFF131B2E),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: Colors.white12),
+              color: const Color(0xFF252526),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFF333333)),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -371,9 +377,9 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           Container(
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
-              color: const Color(0xFF131B2E),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: Colors.white12),
+              color: const Color(0xFF252526),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFF333333)),
             ),
             child: ListView.separated(
               shrinkWrap: true,
@@ -445,9 +451,9 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: const Color(0xFF131B2E),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: Colors.white12),
+              color: const Color(0xFF252526),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFF333333)),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -555,9 +561,9 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: const Color(0xFF131B2E),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: Colors.white12),
+              color: const Color(0xFF252526),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFF333333)),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,

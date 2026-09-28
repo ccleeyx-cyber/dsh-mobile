@@ -109,9 +109,9 @@ class _ChatViewState extends State<ChatView> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF181C26),
+      backgroundColor: const Color(0xFF252526),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
       ),
       builder: (ctx) {
         return StatefulBuilder(
@@ -290,9 +290,9 @@ class _ChatViewState extends State<ChatView> {
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
-          color: isSelected ? const Color(0xFF0078D4).withOpacity(0.14) : const Color(0xFF1E2432),
+          color: isSelected ? const Color(0xFF0078D4).withOpacity(0.14) : const Color(0xFF2D2D2D),
           border: Border.all(
-            color: isSelected ? const Color(0xFF0078D4) : Colors.white.withOpacity(0.08),
+            color: isSelected ? const Color(0xFF0078D4) : const Color(0xFF3B3B3B),
             width: isSelected ? 1.5 : 1.0,
           ),
           borderRadius: BorderRadius.circular(8),
@@ -365,9 +365,9 @@ class _ChatViewState extends State<ChatView> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF181C26),
+      backgroundColor: const Color(0xFF252526),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
       ),
       builder: (ctx) {
         return SafeArea(
@@ -473,8 +473,11 @@ class _ChatViewState extends State<ChatView> {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF1E2432),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        backgroundColor: const Color(0xFF252526),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+          side: const BorderSide(color: Color(0xFF333333)),
+        ),
         title: const Row(
           children: [
             Icon(Icons.delete_outline_rounded, color: Colors.redAccent, size: 22),
@@ -535,9 +538,9 @@ class _ChatViewState extends State<ChatView> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF181C26),
+      backgroundColor: const Color(0xFF252526),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
       ),
       builder: (ctx) {
         return SafeArea(
@@ -642,13 +645,13 @@ class _ChatViewState extends State<ChatView> {
     _wasLoadingHistory = dsh.isLoadingHistory;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF14171F),
+      backgroundColor: const Color(0xFF1E1E1E),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF1B202C),
+        backgroundColor: const Color(0xFF252526),
         elevation: 0,
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(1),
-          child: Container(color: Colors.white.withOpacity(0.06), height: 1),
+          child: Container(color: const Color(0xFF333333), height: 1),
         ),
         titleSpacing: 12,
         title: Column(
@@ -802,8 +805,11 @@ class _ChatViewState extends State<ChatView> {
           // More Options Popup Menu
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert_rounded, color: Colors.white70),
-            color: const Color(0xFF1E293B),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            color: const Color(0xFF252526),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+              side: const BorderSide(color: Color(0xFF333333)),
+            ),
             onSelected: (value) {
               switch (value) {
                 case 'model':
@@ -933,28 +939,67 @@ class _ChatViewState extends State<ChatView> {
                 ? const Center(child: CircularProgressIndicator())
                 : Stack(
                     children: [
-                      ListView.builder(
-                        controller: _scrollController,
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                        itemCount: dsh.messages.length + dsh.pendingApprovals.length,
-                        itemBuilder: (context, index) {
-                          // Inline pending approvals first
-                          if (index < dsh.pendingApprovals.length) {
-                            final req = dsh.pendingApprovals[index];
-                            return Padding(
-                              padding: const EdgeInsets.only(bottom: 12),
-                              child: ApprovalCard(
-                                request: req,
-                                onRespond: (r, outcome) => dsh.respondApproval(r, outcome),
+                      if (dsh.messages.isEmpty && dsh.pendingApprovals.isEmpty)
+                        Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Container(
+                                width: 56,
+                                height: 56,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF0078D4).withOpacity(0.12),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: const Icon(
+                                  Icons.chat_bubble_outline_rounded,
+                                  color: Color(0xFF0078D4),
+                                  size: 28,
+                                ),
                               ),
-                            );
-                          }
+                              const SizedBox(height: 14),
+                              const Text(
+                                '新对话已就绪',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                '在下方输入框中发送消息开始',
+                                style: TextStyle(
+                                  color: Colors.white.withOpacity(0.45),
+                                  fontSize: 12.5,
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      else
+                        ListView.builder(
+                          controller: _scrollController,
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                          itemCount: dsh.messages.length + dsh.pendingApprovals.length,
+                          itemBuilder: (context, index) {
+                            // Inline pending approvals first
+                            if (index < dsh.pendingApprovals.length) {
+                              final req = dsh.pendingApprovals[index];
+                              return Padding(
+                                padding: const EdgeInsets.only(bottom: 12),
+                                child: ApprovalCard(
+                                  request: req,
+                                  onRespond: (r, outcome) => dsh.respondApproval(r, outcome),
+                                ),
+                              );
+                            }
 
-                          final msgIndex = index - dsh.pendingApprovals.length;
-                          final msg = dsh.messages[msgIndex];
-                          return _buildMessageItem(msg);
-                        },
-                      ),
+                            final msgIndex = index - dsh.pendingApprovals.length;
+                            final msg = dsh.messages[msgIndex];
+                            return _buildMessageItem(msg);
+                          },
+                        ),
                       if (_showScrollToBottom)
                         Positioned(
                           right: 16,
@@ -990,9 +1035,9 @@ class _ChatViewState extends State<ChatView> {
           // Quick Action Chips (Fluent Command Style)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(
-              color: const Color(0xFF181C26),
-              border: Border(top: BorderSide(color: Colors.white.withOpacity(0.06))),
+            decoration: const BoxDecoration(
+              color: Color(0xFF252526),
+              border: Border(top: BorderSide(color: Color(0xFF333333))),
             ),
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
@@ -1142,7 +1187,7 @@ class _ChatViewState extends State<ChatView> {
               width: 30,
               height: 30,
               decoration: BoxDecoration(
-                color: const Color(0xFF1E2432),
+                color: const Color(0xFF252526),
                 borderRadius: BorderRadius.circular(6),
                 border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.35)),
               ),
@@ -1176,7 +1221,7 @@ class _ChatViewState extends State<ChatView> {
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
                     decoration: BoxDecoration(
-                      color: isUser ? const Color(0xFF0078D4) : const Color(0xFF1E2432),
+                      color: isUser ? const Color(0xFF0078D4) : const Color(0xFF252526),
                       borderRadius: isUser
                           ? const BorderRadius.only(
                               topLeft: Radius.circular(10),
@@ -1193,7 +1238,7 @@ class _ChatViewState extends State<ChatView> {
                       border: Border.all(
                         color: isUser
                             ? const Color(0xFF60A5FA).withOpacity(0.28)
-                            : Colors.white.withOpacity(0.08),
+                            : const Color(0xFF333333),
                         width: 1.0,
                       ),
                     ),
@@ -1204,13 +1249,13 @@ class _ChatViewState extends State<ChatView> {
                         p: const TextStyle(fontSize: 14, color: Colors.white, height: 1.45),
                         code: const TextStyle(
                           color: Color(0xFF38BDF8),
-                          backgroundColor: Color(0xFF131722),
+                          backgroundColor: Color(0xFF1E1E1E),
                           fontFamily: 'monospace',
                         ),
                         codeblockDecoration: BoxDecoration(
-                          color: const Color(0xFF131722),
+                          color: const Color(0xFF1E1E1E),
                           borderRadius: BorderRadius.circular(6),
-                          border: Border.all(color: Colors.white.withOpacity(0.08)),
+                          border: Border.all(color: const Color(0xFF333333)),
                         ),
                       ),
                     ),
@@ -1274,9 +1319,9 @@ class _ChatViewState extends State<ChatView> {
   Widget _buildInputBar(DshService dsh) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: const Color(0xFF181C26),
-        border: Border(top: BorderSide(color: Colors.white.withOpacity(0.08))),
+      decoration: const BoxDecoration(
+        color: Color(0xFF252526),
+        border: Border(top: BorderSide(color: Color(0xFF333333))),
       ),
       child: SafeArea(
         child: Row(
@@ -1295,9 +1340,9 @@ class _ChatViewState extends State<ChatView> {
             Expanded(
               child: Container(
                 decoration: BoxDecoration(
-                  color: const Color(0xFF222836),
+                  color: const Color(0xFF2D2D2D),
                   borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.white.withOpacity(0.12)),
+                  border: Border.all(color: const Color(0xFF3B3B3B)),
                 ),
                 child: TextField(
                   controller: _inputController,

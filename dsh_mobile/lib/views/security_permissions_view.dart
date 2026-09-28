@@ -32,13 +32,17 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
     final auditLogs = dsh.auditLogs;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0B0F19),
+      backgroundColor: const Color(0xFF1E1E1E),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF131B2E),
+        backgroundColor: const Color(0xFF252526),
         elevation: 0,
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(1),
+          child: Container(color: const Color(0xFF333333), height: 1),
+        ),
         title: const Row(
           children: [
-            Icon(Icons.security_rounded, color: Colors.blueAccent),
+            Icon(Icons.security_rounded, color: Color(0xFF0078D4)),
             SizedBox(width: 8),
             Text(
               '权限与安全中心',
@@ -68,8 +72,8 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
             Container(
               padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
               decoration: BoxDecoration(
-                color: const Color(0xFF131B2E),
-                borderRadius: BorderRadius.circular(16),
+                color: const Color(0xFF252526),
+                borderRadius: BorderRadius.circular(10),
                 border: Border.all(color: Colors.greenAccent.withOpacity(0.3)),
               ),
               child: const Row(
@@ -109,14 +113,14 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
           const SizedBox(height: 24),
 
           // 2. Global Execution & Security Policy Matrix
-          _buildSectionHeader('全局默认执行策略 (Execution Policies)', Icons.tune_rounded, Colors.blueAccent),
+          _buildSectionHeader('全局默认执行策略 (Execution Policies)', Icons.tune_rounded, const Color(0xFF0078D4)),
           const SizedBox(height: 8),
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: const Color(0xFF131B2E),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: Colors.white12),
+              color: const Color(0xFF252526),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFF333333)),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -206,22 +210,22 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
           Container(
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
-              color: const Color(0xFF131B2E),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: Colors.white12),
+              color: const Color(0xFF252526),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFF333333)),
             ),
             child: auditLogs.isEmpty
                 ? const Padding(
                     padding: EdgeInsets.symmetric(vertical: 24),
                     child: Center(
-                      child: Text('暂无历史审计记录', style: TextStyle(color: Colors.white38, fontSize: 13)),
+                       child: Text('暂无历史审计记录', style: TextStyle(color: Colors.white38, fontSize: 13)),
                     ),
                   )
                 : ListView.separated(
                     shrinkWrap: true,
                     physics: const NeverScrollableScrollPhysics(),
                     itemCount: auditLogs.length,
-                    separatorBuilder: (context, index) => const Divider(color: Colors.white10, height: 12),
+                    separatorBuilder: (context, index) => const Divider(color: Color(0xFF333333), height: 12),
                     itemBuilder: (context, index) {
                       final item = auditLogs[index];
                       return _buildAuditLogTile(item);
@@ -260,12 +264,12 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.all(10),
         decoration: BoxDecoration(
-          color: isSelected ? Colors.blueAccent.withOpacity(0.12) : const Color(0xFF1E293B),
+          color: isSelected ? const Color(0xFF0078D4).withOpacity(0.14) : const Color(0xFF2D2D2D),
           border: Border.all(
-            color: isSelected ? Colors.blueAccent : Colors.transparent,
-            width: 1.2,
+            color: isSelected ? const Color(0xFF0078D4) : const Color(0xFF3B3B3B),
+            width: 1.0,
           ),
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(8),
         ),
         child: Row(
           children: [

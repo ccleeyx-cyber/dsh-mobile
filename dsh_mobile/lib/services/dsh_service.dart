@@ -160,10 +160,19 @@ class DshService extends ChangeNotifier {
         final list = data['workspaces'] as List<dynamic>? ?? [];
         _workspaces = list.map((w) => Workspace.fromJson(w as Map<String, dynamic>)).toList();
 
-        // Default to first workspace if not set
-        if (_currentWorkspace == null && _workspaces.isNotEmpty) {
+        if (_currentWorkspace != null) {
+          final matched = _workspaces.firstWhere(
+            (w) => w.workspaceId == _currentWorkspace!.workspaceId,
+            orElse: () => _workspaces.first,
+          );
+          _currentWorkspace = matched;
+          // Preserve unsaved/active new session in the workspace session list
+          if (_currentSession != null && !_currentWorkspace!.sessions.any((s) => s.matchesSessionId(_currentSession!.sessionId))) {
+            _currentWorkspace!.sessions.insert(0, _currentSession!);
+          }
+        } else if (_workspaces.isNotEmpty) {
           _currentWorkspace = _workspaces.first;
-          if (_currentWorkspace!.sessions.isNotEmpty) {
+          if (_currentWorkspace!.sessions.isNotEmpty && _currentSession == null) {
             await selectSession(_currentWorkspace!.sessions.first);
           }
         }
@@ -174,23 +183,19 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  void selectWorkspace(Workspace ws) {
+  void selectWorkspace(Workspace ws, {bool autoSelectSession = true}) {
     _currentWorkspace = ws;
-    _messages = [];
-    _isSending = false;
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
-    if (ws.sessions.isNotEmpty) {
+    _sessionLoadSeq++; // Cancel any pending session loads
+    _isSending = false;
+    _isLoadingHistory = false;
+
+    if (autoSelectSession && ws.sessions.isNotEmpty) {
       selectSession(ws.sessions.first);
     } else {
       _currentSession = null;
-      _messages = [
-        ChatMessage(
-          id: _uuid.v4(),
-          role: 'assistant',
-          content: '当前工作区 [${ws.title}] 暂无会话。点击上方“新建对话”开始！',
-        )
-      ];
+      _messages = [];
       notifyListeners();
     }
   }
@@ -292,21 +297,44 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  Future<void> createNewSession() async {
-    if (_currentWorkspace == null) {
-      if (_workspaces.isEmpty) {
-        await fetchWorkspaces();
-      }
-      if (_workspaces.isNotEmpty) {
-        _currentWorkspace = _workspaces.first;
-      }
-    }
-    if (_currentConfig == null || _currentWorkspace == null) return;
-
+  Future<void> createNewSession([String? workspaceId]) async {
+    final currentSeq = ++_sessionLoadSeq; // Invalidate any in-flight session loads
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
-    _isLoadingHistory = true;
+    _isSending = false;
+    _isLoadingHistory = false;
+    _lastError = '';
+
+    // Immediately empty out messages as requested: "点击新增会话之后应该是出现一个空的会话"
     _messages = [];
+
+    final targetWsId = workspaceId ?? _currentWorkspace?.workspaceId;
+    if (targetWsId != null) {
+      final matched = _workspaces.firstWhere(
+        (w) => w.workspaceId == targetWsId,
+        orElse: () => _workspaces.first,
+      );
+      _currentWorkspace = matched;
+    } else if (_currentWorkspace == null && _workspaces.isNotEmpty) {
+      _currentWorkspace = _workspaces.first;
+    }
+
+    if (_currentConfig == null || _currentWorkspace == null) {
+      notifyListeners();
+      return;
+    }
+
+    // Temporary session ID for clean empty state before server response
+    final tempSessionId = 'session-${_uuid.v4()}';
+    final tempSession = SessionMeta(
+      sessionId: tempSessionId,
+      title: '新对话',
+      model: _currentSessionModel ?? _settings?.currentModel ?? '',
+      lastPromptAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    _currentSession = tempSession;
+    _currentWorkspace!.sessions.insert(0, tempSession);
+    _messages = []; // Empty session!
     notifyListeners();
 
     try {
@@ -319,40 +347,36 @@ class DshService extends ChangeNotifier {
         }),
       ).timeout(const Duration(seconds: 8));
 
+      // Guard: if user switched to another session while request was in-flight, discard
+      if (currentSeq != _sessionLoadSeq) return;
+
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        final newSessionId = data['sessionId']?.toString() ?? data['session']?['sessionId']?.toString();
-
-        if (newSessionId != null && newSessionId.isNotEmpty) {
-          final newSessionMeta = SessionMeta(
-            sessionId: newSessionId,
+        final realSessionId = data['sessionId']?.toString() ?? data['session']?['sessionId']?.toString();
+        if (realSessionId != null && realSessionId.isNotEmpty) {
+          final realSession = SessionMeta(
+            sessionId: realSessionId,
             title: '新对话',
+            model: _currentSessionModel ?? _settings?.currentModel ?? '',
             lastPromptAt: DateTime.now().millisecondsSinceEpoch,
           );
-
-          _currentWorkspace!.sessions.insert(0, newSessionMeta);
-          _currentSession = newSessionMeta;
-          _messages = [
-            ChatMessage(
-              id: _uuid.v4(),
-              role: 'assistant',
-              content: '新对话已创建。你可以直接向 DSH 智能体下达指令。',
-            )
-          ];
-          _isLoadingHistory = false;
+          if (_currentWorkspace != null) {
+            final idx = _currentWorkspace!.sessions.indexWhere((s) => s.sessionId == tempSessionId);
+            if (idx != -1) {
+              _currentWorkspace!.sessions[idx] = realSession;
+            } else {
+              _currentWorkspace!.sessions.insert(0, realSession);
+            }
+          }
+          _currentSession = realSession;
+          _messages = []; // Keep strictly empty!
           notifyListeners();
-
-          _sendWsJson({'type': 'follow', 'sessionId': newSessionId});
-          fetchWorkspaces();
-          return;
+          _sendWsJson({'type': 'follow', 'sessionId': realSessionId});
         }
       }
     } catch (e) {
       debugPrint('[DshService] createNewSession error: $e');
     }
-
-    _isLoadingHistory = false;
-    notifyListeners();
   }
 
   // Send Prompt

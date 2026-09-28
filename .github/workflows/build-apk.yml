@@ -57,12 +57,16 @@ jobs:
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.2.7
-          name: "DSH Mobile v1.2.7 - Fluent Design 2 重构、彻底解决会话内容串流与历史会话状态误报"
+          tag_name: v1.2.8
+          name: "DSH Mobile v1.2.8 - Fluent Design 2 全面重构、彻底修复新增会话跳转与空会话就绪"
           body: |
-            ### 🚀 DSH Mobile v1.2.7 发布说明
+            ### 🚀 DSH Mobile v1.2.8 发布说明
 
-            本次更新重点对会话间隔离机制、历史任务状态判断以及整体视觉风格对齐 Microsoft Fluent Design 2 规范进行了系统性优化：
+            本次更新重点包含：
+            - **彻底修复新增会话跳转 Bug**: 点击新增会话后立即呈现清爽纯净的空对话视图，不再错误跳转到历史最新会话。
+            - **会话请求序列锁**: 杜绝切换工作区/会话时的异步乱序覆盖。
+            - **Microsoft Fluent Design 2 规范**: Mica Dark、半透明 Acrylic、科技蓝聚焦指示器、清爽空状态占位图。
+            - **原生 DSH 移动终端插件集成**: 专属内置 `dsh-mobile-bridge` 插件，无外部干扰，即开即用。
 
             #### 🛡️ 1. 彻底解决会话内容“串流”与数据污染 (Session Isolation & Request Sequence Lock)
             - **即时状态重置与请求序列锁**: 点击切换会话时，毫秒级清空旧会话残留消息并复位发送中状态；引入递增序列锁机制，彻底消除快速切换会话时的网络异步乱序覆盖。

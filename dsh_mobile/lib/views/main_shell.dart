@@ -37,7 +37,7 @@ class _MainShellState extends State<MainShell> {
     final pendingCount = dsh.pendingApprovals.length;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0B0F19),
+      backgroundColor: const Color(0xFF1E1E1E),
       body: IndexedStack(
         index: _currentIndex,
         children: [
@@ -54,27 +54,27 @@ class _MainShellState extends State<MainShell> {
       ),
       bottomNavigationBar: Container(
         decoration: const BoxDecoration(
-          color: Color(0xFF131B2E),
-          border: Border(top: BorderSide(color: Colors.white10, width: 0.8)),
+          color: Color(0xFF252526),
+          border: Border(top: BorderSide(color: Color(0xFF333333), width: 0.8)),
         ),
         child: SafeArea(
           child: NavigationBarTheme(
             data: NavigationBarThemeData(
               backgroundColor: Colors.transparent,
-              indicatorColor: Colors.blueAccent.withOpacity(0.2),
+              indicatorColor: const Color(0xFF0078D4).withOpacity(0.2),
               labelTextStyle: MaterialStateProperty.resolveWith<TextStyle>((states) {
                 if (states.contains(MaterialState.selected)) {
                   return const TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.bold,
-                    color: Colors.blueAccent,
+                    color: Color(0xFF0078D4),
                   );
                 }
                 return const TextStyle(fontSize: 12, color: Colors.white54);
               }),
               iconTheme: MaterialStateProperty.resolveWith<IconThemeData>((states) {
                 if (states.contains(MaterialState.selected)) {
-                  return const IconThemeData(color: Colors.blueAccent, size: 24);
+                  return const IconThemeData(color: Color(0xFF0078D4), size: 24);
                 }
                 return const IconThemeData(color: Colors.white54, size: 24);
               }),
