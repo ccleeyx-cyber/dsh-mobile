@@ -20,6 +20,15 @@ class _MainShellState extends State<MainShell> {
     setState(() {
       _currentIndex = index;
     });
+    final dsh = Provider.of<DshService>(context, listen: false);
+    if (index == 1) {
+      dsh.fetchWorkspaces();
+      dsh.fetchApprovals();
+    } else if (index == 2) {
+      dsh.fetchApprovals();
+    } else if (index == 3) {
+      dsh.fetchSettings();
+    }
   }
 
   @override

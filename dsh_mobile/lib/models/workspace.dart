@@ -6,6 +6,7 @@ class SessionMeta {
   final String model;
   final int lastSeq;
   final bool isRunning;
+  final int pendingApprovals;
 
   SessionMeta({
     required this.sessionId,
@@ -15,6 +16,7 @@ class SessionMeta {
     this.model = '',
     this.lastSeq = 0,
     this.isRunning = false,
+    this.pendingApprovals = 0,
   });
 
   bool matchesSessionId(String? otherId) {
@@ -32,6 +34,7 @@ class SessionMeta {
     String? model,
     int? lastSeq,
     bool? isRunning,
+    int? pendingApprovals,
   }) {
     return SessionMeta(
       sessionId: sessionId ?? this.sessionId,
@@ -41,6 +44,7 @@ class SessionMeta {
       model: model ?? this.model,
       lastSeq: lastSeq ?? this.lastSeq,
       isRunning: isRunning ?? this.isRunning,
+      pendingApprovals: pendingApprovals ?? this.pendingApprovals,
     );
   }
 
@@ -53,6 +57,7 @@ class SessionMeta {
       model: json['model'] ?? '',
       lastSeq: json['lastSeq'] is int ? json['lastSeq'] : 0,
       isRunning: json['isRunning'] == true,
+      pendingApprovals: json['pendingApprovals'] is int ? json['pendingApprovals'] : 0,
     );
   }
 
@@ -64,6 +69,7 @@ class SessionMeta {
         'model': model,
         'lastSeq': lastSeq,
         'isRunning': isRunning,
+        'pendingApprovals': pendingApprovals,
       };
 }
 
@@ -74,6 +80,8 @@ class Workspace {
   final String createdAt;
   final String updatedAt;
   final int sessionCount;
+  final int pendingApprovals;
+  final bool hasRunning;
   final List<SessionMeta> sessions;
 
   Workspace({
@@ -83,6 +91,8 @@ class Workspace {
     this.createdAt = '',
     this.updatedAt = '',
     this.sessionCount = 0,
+    this.pendingApprovals = 0,
+    this.hasRunning = false,
     List<SessionMeta>? sessions,
   }) : sessions = sessions ?? [];
 
@@ -95,6 +105,8 @@ class Workspace {
       createdAt: json['createdAt'] ?? '',
       updatedAt: json['updatedAt'] ?? '',
       sessionCount: json['sessionCount'] ?? rawSessions.length,
+      pendingApprovals: json['pendingApprovals'] is int ? json['pendingApprovals'] : 0,
+      hasRunning: json['hasRunning'] == true,
       sessions: rawSessions.map((s) => SessionMeta.fromJson(s as Map<String, dynamic>)).toList(),
     );
   }
@@ -106,6 +118,8 @@ class Workspace {
     'createdAt': createdAt,
     'updatedAt': updatedAt,
     'sessionCount': sessionCount,
+    'pendingApprovals': pendingApprovals,
+    'hasRunning': hasRunning,
     'sessions': sessions.map((s) => s.toJson()).toList(),
   };
 }

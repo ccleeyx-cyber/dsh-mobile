@@ -183,11 +183,22 @@ function getWorkspacesData() {
             } catch (err) {}
           }
         }
+        if (!sessionMeta.model) {
+          sessionMeta.model = getSettingsData().currentModel || 'cn:deepseek-v4.1-flash';
+        }
+        const pendingForSession = Array.from(pendingApprovals.values()).filter(a => {
+          const aId = a.sessionId || '';
+          return aId === sId || aId === cleanId || aId === `session-${cleanId}`;
+        });
+        sessionMeta.pendingApprovals = pendingForSession.length;
         sessionList.push(sessionMeta);
       }
 
       // Sort sessions by lastPromptAt desc
       sessionList.sort((a, b) => (b.lastPromptAt || 0) - (a.lastPromptAt || 0));
+
+      const wsPendingCount = sessionList.reduce((acc, s) => acc + (s.pendingApprovals || 0), 0);
+      const wsHasRunning = sessionList.some(s => s.isRunning);
 
       result.push({
         workspaceId: wsId,
@@ -196,6 +207,8 @@ function getWorkspacesData() {
         createdAt: wsInfo.createdAt,
         updatedAt: wsInfo.updatedAt,
         sessionCount: sessionList.length,
+        pendingApprovals: wsPendingCount,
+        hasRunning: wsHasRunning,
         sessions: sessionList
       });
     }
@@ -207,6 +220,75 @@ function getWorkspacesData() {
     console.error('[Workspaces] Error reading workspace data:', err);
     return [];
   }
+}
+
+// Session Deletion
+function deleteSessionFromStore(sessionId, workspaceId) {
+  const cleanId = sessionId.startsWith('session-') ? sessionId.replace('session-', '') : sessionId;
+  const fullId = `session-${cleanId}`;
+
+  // 1. Remove from workspace.json
+  const workspaceJsonPath = path.join(CONFIG.DSH_HOME, 'storages', 'workspace.json');
+  if (fs.existsSync(workspaceJsonPath)) {
+    try {
+      const rawWs = JSON.parse(fs.readFileSync(workspaceJsonPath, 'utf8'));
+      const wsTable = rawWs.tables?.workspaces || {};
+      let modified = false;
+      for (const [wId, wInfo] of Object.entries(wsTable)) {
+        if (!workspaceId || wId === workspaceId) {
+          if (Array.isArray(wInfo.sessionIds)) {
+            const initialLen = wInfo.sessionIds.length;
+            wInfo.sessionIds = wInfo.sessionIds.filter(id => id !== sessionId && id !== cleanId && id !== fullId);
+            if (wInfo.sessionIds.length !== initialLen) {
+              modified = true;
+            }
+          }
+        }
+      }
+      if (modified) {
+        fs.writeFileSync(workspaceJsonPath, JSON.stringify(rawWs, null, 2), 'utf8');
+      }
+    } catch (e) {
+      console.error('[DeleteSession] Error updating workspace.json:', e);
+    }
+  }
+
+  // 2. Remove session projcache
+  const projCacheDir = path.join(CONFIG.DSH_HOME, 'storages', 'session_projcache', 'sessions');
+  const candidates = [
+    path.join(projCacheDir, `${sessionId}.json`),
+    path.join(projCacheDir, `${cleanId}.json`),
+    path.join(projCacheDir, `${fullId}.json`)
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) {
+      try { fs.unlinkSync(c); } catch (_) {}
+    }
+  }
+
+  // 3. Clean active follower & prompt state
+  activePrompts.delete(sessionId);
+  activePrompts.delete(cleanId);
+  activePrompts.delete(fullId);
+  activeSessionFollowers.delete(sessionId);
+  activeSessionFollowers.delete(cleanId);
+  activeSessionFollowers.delete(fullId);
+
+  // 4. Clean pending approvals for this session
+  for (const [k, v] of pendingApprovals.entries()) {
+    if (v.sessionId === sessionId || v.sessionId === cleanId || v.sessionId === fullId) {
+      pendingApprovals.delete(k);
+    }
+  }
+
+  // 5. Broadcast to mobile clients
+  broadcastToMobileClients({
+    type: 'session_deleted',
+    sessionId: fullId,
+    cleanId: cleanId
+  });
+
+  return { ok: true, sessionId: fullId };
 }
 
 function isCarriedContext(text, ev) {
@@ -240,6 +322,7 @@ async function getSessionHistory(sessionId) {
 
   let targetSeq = 0;
   let sessionTitle = sessionId;
+  let sessionModel = '';
   let isSessionRunning = (follower && follower.isRunning) || false;
 
   for (const cPath of candidates) {
@@ -249,6 +332,7 @@ async function getSessionHistory(sessionId) {
         const rows = cache.record?.rows || {};
         targetSeq = rows.turnBoundary?.seq || rows.tokenUsage?.seq || 0;
         sessionTitle = rows.title?.val || rows.titleInput?.val?.first?.text || sessionId;
+        sessionModel = rows.modelSelection?.val?.lastUsed?.model || '';
         
         const hasPrompt = activePrompts.has(sessionId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
         if (hasPrompt) {
@@ -411,9 +495,14 @@ async function getSessionHistory(sessionId) {
     }
   }
 
+  if (!sessionModel) {
+    sessionModel = getSettingsData().currentModel || 'cn:deepseek-v4.1-flash';
+  }
+
   return {
     sessionId,
     title: sessionTitle,
+    model: sessionModel,
     isRunning: isSessionRunning,
     messages
   };
@@ -1175,18 +1264,32 @@ const server = http.createServer(async (req, res) => {
 
       broadcastToMobileClients({ type: 'session_status', sessionId: fullId, isRunning: true });
 
-      const result = await callDshRpc('session/prompt', {
-        args: {
-          request: {
-            requestId: crypto.randomUUID(),
-            sessionId: fullId,
-            mode: 'queue',
-            content: [{ type: 'text', text: body.text || '' }]
+      try {
+        const result = await callDshRpc('session/prompt', {
+          args: {
+            request: {
+              requestId: crypto.randomUUID(),
+              sessionId: fullId,
+              mode: 'queue',
+              content: [{ type: 'text', text: body.text || '' }]
+            }
           }
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ code: 0, result }));
+      } catch (err) {
+        console.error(`[Prompt Error] for ${fullId}:`, err);
+        if (follower) {
+          follower.isRunning = false;
+          follower.activePromptText = null;
         }
-      });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ code: 0, result }));
+        activePrompts.delete(fullId);
+        activePrompts.delete(cleanId);
+        broadcastToMobileClients({ type: 'session_status', sessionId: fullId, isRunning: false });
+        broadcastToMobileClients({ type: 'error', sessionId: fullId, error: err.message });
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ code: 500, error: err.message }));
+      }
       return;
     }
 
@@ -1218,6 +1321,67 @@ const server = http.createServer(async (req, res) => {
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ code: 0, result }));
+      return;
+    }
+
+    // 5.1 POST /api/mobile/sessions/model
+    if (pathname === '/api/mobile/sessions/model' && req.method === 'POST') {
+      const body = await readBody();
+      const rawSessionId = body.sessionId || '';
+      const fullId = normalizeSessionId(rawSessionId);
+      const newModel = body.model;
+      const provider = body.provider || 'wb';
+
+      if (!newModel) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing model' }));
+        return;
+      }
+
+      try {
+        let rpcResult = null;
+        if (fullId && fullId !== 'session-' && fullId !== 'session-default') {
+          try {
+            rpcResult = await callDshRpc('session/selectModel', {
+              args: {
+                request: {
+                  sessionId: fullId,
+                  provider: provider,
+                  model: newModel
+                }
+              }
+            });
+          } catch (rpcErr) {
+            console.warn(`[SelectModel] DSH session/selectModel warning:`, rpcErr.message);
+          }
+        }
+
+        // Also update default model in settings.yaml
+        updateDefaultModel(newModel);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ code: 0, model: newModel, rpcResult }));
+      } catch (err) {
+        console.error('[SelectModel] Error:', err);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    // 5.2 POST /api/mobile/sessions/delete
+    if (pathname === '/api/mobile/sessions/delete' && req.method === 'POST') {
+      const body = await readBody();
+      const rawSessionId = body.sessionId || '';
+      const workspaceId = body.workspaceId || '';
+      if (!rawSessionId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing sessionId' }));
+        return;
+      }
+      const result = deleteSessionFromStore(rawSessionId, workspaceId);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, ...result }));
       return;
     }
 

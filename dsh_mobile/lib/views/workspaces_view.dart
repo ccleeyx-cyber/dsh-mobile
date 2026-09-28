@@ -26,16 +26,13 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         Provider.of<DshService>(context, listen: false).fetchWorkspaces();
+        Provider.of<DshService>(context, listen: false).fetchApprovals();
       }
     });
-    // Periodically refresh workspaces if any session is actively running
-    _refreshTimer = Timer.periodic(const Duration(seconds: 4), (_) {
+    // Periodically refresh workspaces for real-time running animation and approvals
+    _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       if (mounted) {
-        final dsh = Provider.of<DshService>(context, listen: false);
-        final hasRunning = dsh.workspaces.any((w) => w.sessions.any((s) => _isSessionRunning(s, dsh)));
-        if (hasRunning) {
-          dsh.fetchWorkspaces();
-        }
+        Provider.of<DshService>(context, listen: false).fetchWorkspaces();
       }
     });
   }
@@ -52,6 +49,11 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     return s.isRunning || (dsh.isSending && matchesCurrent);
   }
 
+  int _getSessionPendingCount(SessionMeta s, DshService dsh) {
+    final liveCount = dsh.pendingApprovals.where((a) => s.matchesSessionId(a.sessionId)).length;
+    return liveCount > 0 ? liveCount : s.pendingApprovals;
+  }
+
   String _formatTime(int? timestamp) {
     if (timestamp == null || timestamp == 0) return '';
     final dt = DateTime.fromMillisecondsSinceEpoch(timestamp);
@@ -60,6 +62,51 @@ class _WorkspacesViewState extends State<WorkspacesView> {
       return DateFormat('HH:mm').format(dt);
     }
     return DateFormat('MM-dd HH:mm').format(dt);
+  }
+
+  // Delete Session Confirmation Dialog
+  void _showDeleteSessionDialog(BuildContext context, DshService dsh, Workspace ws, SessionMeta s) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF131B2E),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 22),
+            SizedBox(width: 8),
+            Text('删除会话', style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        content: Text(
+          '确定要删除会话「${s.title}」吗？\n此操作将清除该会话的本地记录，无法撤销。',
+          style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消', style: TextStyle(color: Colors.white54)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFDC2626),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            onPressed: () async {
+              Navigator.pop(ctx);
+              final ok = await dsh.deleteSession(s.sessionId, ws.workspaceId);
+              if (context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text(ok ? '会话「${s.title}」已删除' : '删除失败: ${dsh.lastError}')),
+                );
+              }
+            },
+            child: const Text('确认删除', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
   }
 
   // View/Edit Workspace MEMORY.md
@@ -189,8 +236,10 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     }).toList();
 
     int totalSessions = 0;
+    int totalRunning = 0;
     for (final w in workspaces) {
       totalSessions += w.sessions.length;
+      totalRunning += w.sessions.where((s) => _isSessionRunning(s, dsh)).length;
     }
 
     return Scaffold(
@@ -198,13 +247,16 @@ class _WorkspacesViewState extends State<WorkspacesView> {
       appBar: AppBar(
         backgroundColor: const Color(0xFF131B2E),
         elevation: 0,
-        title: const Row(
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Icon(Icons.folder_shared_rounded, color: Colors.blueAccent),
-            SizedBox(width: 8),
-            Text(
+            const Text(
               '工作区与项目管理',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white),
+            ),
+            Text(
+              '管理各工程项目与历史会话流',
+              style: TextStyle(fontSize: 11, color: Colors.white.withOpacity(0.5)),
             ),
           ],
         ),
@@ -212,38 +264,62 @@ class _WorkspacesViewState extends State<WorkspacesView> {
           IconButton(
             icon: const Icon(Icons.refresh_rounded, color: Colors.white70),
             tooltip: '刷新工作区',
-            onPressed: () => dsh.fetchWorkspaces(),
+            onPressed: () {
+              dsh.fetchWorkspaces();
+              dsh.fetchApprovals();
+            },
           ),
         ],
       ),
       body: Column(
         children: [
-          // Stats Row
+          // Sleek Stats Pill Row
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            color: const Color(0xFF131B2E).withOpacity(0.5),
-            child: Row(
-              children: [
-                Expanded(
-                  child: _buildStatCard('已挂载项目', '${workspaces.length} 个', Colors.blueAccent),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: _buildStatCard('累计会话数', '$totalSessions 轮', Colors.purpleAccent),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: _buildStatCard('当前活跃', currentWs?.title ?? '无', Colors.greenAccent),
-                ),
-              ],
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            color: const Color(0xFF131B2E).withOpacity(0.4),
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  _buildHeaderPill(
+                    icon: Icons.folder_rounded,
+                    label: '${workspaces.length} 个挂载项目',
+                    color: Colors.blueAccent,
+                  ),
+                  const SizedBox(width: 8),
+                  _buildHeaderPill(
+                    icon: Icons.chat_bubble_outline_rounded,
+                    label: '$totalSessions 个历史会话',
+                    color: Colors.purpleAccent,
+                  ),
+                  if (totalRunning > 0) ...[
+                    const SizedBox(width: 8),
+                    _buildHeaderPill(
+                      icon: Icons.bolt_rounded,
+                      label: '$totalRunning 个任务执行中',
+                      color: const Color(0xFF38BDF8),
+                      animate: true,
+                    ),
+                  ],
+                  if (dsh.pendingApprovals.isNotEmpty) ...[
+                    const SizedBox(width: 8),
+                    _buildHeaderPill(
+                      icon: Icons.shield_outlined,
+                      label: '${dsh.pendingApprovals.length} 项待审批',
+                      color: Colors.amberAccent,
+                      animate: true,
+                    ),
+                  ],
+                ],
+              ),
             ),
           ),
 
           // Search Bar
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
             child: Container(
-              height: 42,
+              height: 40,
               decoration: BoxDecoration(
                 color: const Color(0xFF1E293B),
                 borderRadius: BorderRadius.circular(10),
@@ -254,7 +330,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                 style: const TextStyle(color: Colors.white, fontSize: 13),
                 decoration: InputDecoration(
                   hintText: '搜索工作区、路径或历史对话...',
-                  hintStyle: const TextStyle(color: Colors.white38),
+                  hintStyle: const TextStyle(color: Colors.white38, fontSize: 12.5),
                   prefixIcon: const Icon(Icons.search, size: 18, color: Colors.white38),
                   suffixIcon: _searchFilter.isNotEmpty
                       ? IconButton(
@@ -266,7 +342,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                         )
                       : null,
                   border: InputBorder.none,
-                  contentPadding: const EdgeInsets.symmetric(vertical: 10),
+                  contentPadding: const EdgeInsets.symmetric(vertical: 9),
                 ),
                 onChanged: (val) => setState(() => _searchFilter = val.trim()),
               ),
@@ -280,7 +356,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                     child: Text('没有找到匹配的工作区', style: TextStyle(color: Colors.white38)),
                   )
                 : ListView.builder(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
                     itemCount: filteredWorkspaces.length,
                     itemBuilder: (context, index) {
                       final ws = filteredWorkspaces[index];
@@ -294,41 +370,54 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     );
   }
 
-  Widget _buildStatCard(String label, String value, Color color) {
+  Widget _buildHeaderPill({
+    required IconData icon,
+    required String label,
+    required Color color,
+    bool animate = false,
+  }) {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        color: const Color(0xFF1E293B),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: color.withOpacity(0.25)),
+        color: color.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: color.withOpacity(0.3)),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Text(label, style: const TextStyle(color: Colors.white54, fontSize: 11)),
-          const SizedBox(height: 3),
-          Text(
-            value,
-            style: TextStyle(color: color, fontSize: 13, fontWeight: FontWeight.bold),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
+          if (animate)
+            SizedBox(
+              width: 10,
+              height: 10,
+              child: CircularProgressIndicator(strokeWidth: 1.5, color: color),
+            )
+          else
+            Icon(icon, size: 13, color: color),
+          const SizedBox(width: 5),
+          Text(label, style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
         ],
       ),
     );
   }
 
   Widget _buildWorkspaceCard(BuildContext context, DshService dsh, Workspace ws, bool isCurrent) {
-    final hasRunning = ws.sessions.any((s) => _isSessionRunning(s, dsh));
+    final runningSessionsCount = ws.sessions.where((s) => _isSessionRunning(s, dsh)).length;
+    final hasRunning = runningSessionsCount > 0;
+    final pendingCount = ws.sessions.fold<int>(0, (sum, s) => sum + _getSessionPendingCount(s, dsh));
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 14),
+      margin: const EdgeInsets.only(bottom: 12),
       decoration: BoxDecoration(
         color: const Color(0xFF131B2E),
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(14),
         border: Border.all(
-          color: isCurrent ? Colors.blueAccent : Colors.white12,
-          width: isCurrent ? 1.5 : 1.0,
+          color: hasRunning
+              ? const Color(0xFF38BDF8).withOpacity(0.5)
+              : (pendingCount > 0
+                  ? Colors.amberAccent.withOpacity(0.5)
+                  : (isCurrent ? Colors.blueAccent.withOpacity(0.6) : Colors.white12)),
+          width: (isCurrent || hasRunning || pendingCount > 0) ? 1.5 : 1.0,
         ),
       ),
       child: Theme(
@@ -336,7 +425,8 @@ class _WorkspacesViewState extends State<WorkspacesView> {
         child: ExpansionTile(
           initiallyExpanded: isCurrent,
           leading: Container(
-            padding: const EdgeInsets.all(8),
+            width: 36,
+            height: 36,
             decoration: BoxDecoration(
               color: isCurrent ? Colors.blueAccent.withOpacity(0.2) : Colors.white10,
               borderRadius: BorderRadius.circular(10),
@@ -344,7 +434,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
             child: Icon(
               Icons.folder_rounded,
               color: isCurrent ? Colors.blueAccent : Colors.white70,
-              size: 22,
+              size: 20,
             ),
           ),
           title: Row(
@@ -361,44 +451,66 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
-              if (isCurrent) ...[
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: Colors.blueAccent,
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: const Text('当前活跃', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
-                ),
+              if (hasRunning) ...[
                 const SizedBox(width: 6),
-              ],
-              if (hasRunning)
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
                   decoration: BoxDecoration(
-                    color: Colors.purpleAccent.withOpacity(0.18),
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: Colors.purpleAccent.withOpacity(0.4)),
+                    color: const Color(0xFF0284C7).withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF38BDF8).withOpacity(0.5)),
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
-                    children: const [
-                      SizedBox(
+                    children: [
+                      const SizedBox(
                         width: 8,
                         height: 8,
-                        child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.purpleAccent),
+                        child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF38BDF8)),
                       ),
-                      SizedBox(width: 4),
-                      Text('运行中', style: TextStyle(color: Colors.purpleAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+                      const SizedBox(width: 4),
+                      Text('$runningSessionsCount 执行中', style: const TextStyle(color: Color(0xFF38BDF8), fontSize: 9.5, fontWeight: FontWeight.bold)),
                     ],
                   ),
                 ),
+              ],
+              if (pendingCount > 0) ...[
+                const SizedBox(width: 6),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.amberAccent.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.amberAccent.withOpacity(0.5)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.shield_outlined, size: 10, color: Colors.amberAccent),
+                      const SizedBox(width: 3),
+                      Text('$pendingCount 待审批', style: const TextStyle(color: Colors.amberAccent, fontSize: 9.5, fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                ),
+              ],
+              if (isCurrent && !hasRunning && pendingCount == 0) ...[
+                const SizedBox(width: 6),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.blueAccent.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: Colors.blueAccent.withOpacity(0.4)),
+                  ),
+                  child: const Text('当前活跃', style: TextStyle(color: Colors.blueAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+                ),
+              ],
             ],
           ),
           subtitle: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const SizedBox(height: 4),
+              const SizedBox(height: 3),
               Row(
                 children: [
                   Expanded(
@@ -416,21 +528,21 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                         const SnackBar(content: Text('路径已复制到剪贴板'), duration: Duration(seconds: 1)),
                       );
                     },
-                    child: const Icon(Icons.copy, size: 14, color: Colors.white38),
+                    child: const Icon(Icons.copy, size: 13, color: Colors.white38),
                   ),
                 ],
               ),
               const SizedBox(height: 2),
               Text(
                 '共 ${ws.sessions.length} 个历史对话',
-                style: const TextStyle(fontSize: 11, color: Colors.white38),
+                style: const TextStyle(fontSize: 10.5, color: Colors.white38),
               ),
             ],
           ),
           children: [
             // Workspace Action Bar
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
               child: Row(
                 children: [
                   if (!isCurrent)
@@ -440,7 +552,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                           foregroundColor: Colors.blueAccent,
                           side: const BorderSide(color: Colors.blueAccent),
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          padding: const EdgeInsets.symmetric(vertical: 6),
                         ),
                         icon: const Icon(Icons.play_arrow_rounded, size: 16),
                         label: const Text('设为活跃', style: TextStyle(fontSize: 12)),
@@ -456,9 +568,9 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                         backgroundColor: const Color(0xFF2563EB),
                         foregroundColor: Colors.white,
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        padding: const EdgeInsets.symmetric(vertical: 6),
                       ),
-                      icon: const Icon(Icons.add_comment_outlined, size: 16),
+                      icon: const Icon(Icons.add_comment_outlined, size: 15),
                       label: const Text('新建对话', style: TextStyle(fontSize: 12)),
                       onPressed: () async {
                         dsh.selectWorkspace(ws);
@@ -470,7 +582,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                   const SizedBox(width: 8),
                   IconButton(
                     tooltip: '查看/编辑项目说明 (MEMORY.md)',
-                    icon: const Icon(Icons.menu_book_rounded, color: Colors.white70, size: 20),
+                    icon: const Icon(Icons.menu_book_rounded, color: Colors.white70, size: 19),
                     onPressed: () => _openMemoryEditor(context, dsh, ws),
                   ),
                 ],
@@ -493,91 +605,180 @@ class _WorkspacesViewState extends State<WorkspacesView> {
                 itemBuilder: (context, sIdx) {
                   final s = ws.sessions[sIdx];
                   final isCurrentSession = isCurrent && s.matchesSessionId(dsh.currentSession?.sessionId);
-                  final isRunning = _isSessionRunning(s, dsh);
-
-                  return ListTile(
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                    leading: isRunning
-                        ? Container(
-                            width: 28,
-                            height: 28,
-                            decoration: BoxDecoration(
-                              color: Colors.blueAccent.withOpacity(0.15),
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: Colors.blueAccent.withOpacity(0.35)),
-                            ),
-                            child: const Center(
-                              child: SizedBox(
-                                width: 14,
-                                height: 14,
-                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blueAccent),
-                              ),
-                            ),
-                          )
-                        : Icon(
-                            Icons.chat_bubble_outline_rounded,
-                            size: 18,
-                            color: isCurrentSession ? Colors.blueAccent : Colors.white38,
-                          ),
-                    title: Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            s.title,
-                            style: TextStyle(
-                              fontSize: 13,
-                              fontWeight: isCurrentSession ? FontWeight.bold : FontWeight.normal,
-                              color: isCurrentSession ? Colors.blueAccent : Colors.white,
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        if (isRunning) ...[
-                          const SizedBox(width: 6),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: Colors.blueAccent.withOpacity(0.2),
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: Colors.blueAccent.withOpacity(0.5)),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: const [
-                                SizedBox(
-                                  width: 8,
-                                  height: 8,
-                                  child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.blueAccent),
-                                ),
-                                SizedBox(width: 4),
-                                Text('运行中...', style: TextStyle(color: Color(0xFF60A5FA), fontSize: 9.5, fontWeight: FontWeight.bold)),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
-                    subtitle: Text(
-                      s.firstPrompt.isNotEmpty ? s.firstPrompt : '无预览内容',
-                      style: const TextStyle(fontSize: 11, color: Colors.white38),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    trailing: Text(
-                      _formatTime(s.lastPromptAt),
-                      style: const TextStyle(fontSize: 10, color: Colors.white30),
-                    ),
-                    onTap: () async {
-                      dsh.selectWorkspace(ws);
-                      await dsh.selectSession(s);
-                      widget.onSwitchToChat?.call();
-                    },
-                  );
+                  return _buildSessionItem(context, dsh, ws, s, isCurrentSession);
                 },
               ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildSessionItem(
+    BuildContext context,
+    DshService dsh,
+    Workspace ws,
+    SessionMeta s,
+    bool isCurrentSession,
+  ) {
+    final isRunning = _isSessionRunning(s, dsh);
+    final pendingCount = _getSessionPendingCount(s, dsh);
+
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+      decoration: BoxDecoration(
+        color: isCurrentSession ? const Color(0xFF1E293B).withOpacity(0.7) : Colors.transparent,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: isRunning
+              ? const Color(0xFF38BDF8).withOpacity(0.4)
+              : (pendingCount > 0
+                  ? Colors.amberAccent.withOpacity(0.4)
+                  : (isCurrentSession ? Colors.blueAccent.withOpacity(0.3) : Colors.transparent)),
+        ),
+      ),
+      child: ListTile(
+        dense: true,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+        leading: isRunning
+            ? Container(
+                width: 32,
+                height: 32,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0284C7).withOpacity(0.18),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: const Color(0xFF38BDF8), width: 1.5),
+                ),
+                child: const Center(
+                  child: SizedBox(
+                    width: 15,
+                    height: 15,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF38BDF8)),
+                  ),
+                ),
+              )
+            : (pendingCount > 0
+                ? Container(
+                    width: 32,
+                    height: 32,
+                    decoration: BoxDecoration(
+                      color: Colors.amberAccent.withOpacity(0.18),
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.amberAccent, width: 1.5),
+                    ),
+                    child: const Icon(Icons.shield_outlined, size: 16, color: Colors.amberAccent),
+                  )
+                : Icon(
+                    Icons.chat_bubble_outline_rounded,
+                    size: 18,
+                    color: isCurrentSession ? Colors.blueAccent : Colors.white38,
+                  )),
+        title: Row(
+          children: [
+            Expanded(
+              child: Text(
+                s.title,
+                style: TextStyle(
+                  fontSize: 13.5,
+                  fontWeight: isCurrentSession ? FontWeight.bold : FontWeight.w500,
+                  color: isCurrentSession ? Colors.blueAccent : Colors.white,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (isRunning) ...[
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0284C7).withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFF38BDF8).withOpacity(0.6)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: const [
+                    SizedBox(
+                      width: 9,
+                      height: 9,
+                      child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF38BDF8)),
+                    ),
+                    SizedBox(width: 4),
+                    Text('任务执行中...', style: TextStyle(color: Color(0xFF38BDF8), fontSize: 9.5, fontWeight: FontWeight.bold)),
+                  ],
+                ),
+              ),
+            ],
+            if (pendingCount > 0) ...[
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.amberAccent.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.amberAccent.withOpacity(0.6)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.priority_high_rounded, size: 11, color: Colors.amberAccent),
+                    const SizedBox(width: 2),
+                    Text('待确认审批 ($pendingCount)', style: const TextStyle(color: Colors.amberAccent, fontSize: 9.5, fontWeight: FontWeight.bold)),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SizedBox(height: 3),
+            Text(
+              s.firstPrompt.isNotEmpty ? s.firstPrompt : '无首条消息预览',
+              style: const TextStyle(fontSize: 11.5, color: Colors.white54),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 3),
+            Row(
+              children: [
+                if (s.model.isNotEmpty) ...[
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: Colors.purpleAccent.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      s.model.replaceAll('cn:', ''),
+                      style: const TextStyle(fontSize: 9.5, color: Colors.purpleAccent, fontFamily: 'monospace'),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                Text(_formatTime(s.lastPromptAt), style: const TextStyle(fontSize: 10, color: Colors.white30)),
+              ],
+            ),
+          ],
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              icon: const Icon(Icons.delete_outline_rounded, size: 18, color: Colors.white30),
+              tooltip: '删除会话',
+              onPressed: () => _showDeleteSessionDialog(context, dsh, ws, s),
+            ),
+            const Icon(Icons.chevron_right_rounded, size: 16, color: Colors.white24),
+          ],
+        ),
+        onTap: () async {
+          dsh.selectWorkspace(ws);
+          await dsh.selectSession(s);
+          widget.onSwitchToChat?.call();
+        },
       ),
     );
   }

@@ -46,10 +46,13 @@ class DshService extends ChangeNotifier {
   double _temperature = 0.7;
   bool _isLoadingHistory = false;
   bool _isSending = false;
+  String? _currentSessionModel;
 
   // Getters
   ConnectionStatus get status => _status;
   String get lastError => _lastError;
+  void clearError() { _lastError = ''; notifyListeners(); }
+  String get currentModel => _currentSessionModel ?? _settings?.currentModel ?? 'cn:deepseek-v4.1-flash';
   bool get isConnected => _status == ConnectionStatus.connected;
   ServerConfig? get currentConfig => _currentConfig;
 
@@ -217,6 +220,14 @@ class DshService extends ChangeNotifier {
         final sessionData = data['data'] as Map<String, dynamic>?;
         final rawMessages = sessionData?['messages'] as List<dynamic>? ?? [];
         final isRunning = sessionData?['isRunning'] == true || session.isRunning;
+        final sModel = sessionData?['model'] as String?;
+        if (sModel != null && sModel.isNotEmpty) {
+          _currentSessionModel = sModel;
+        } else if (session.model.isNotEmpty) {
+          _currentSessionModel = session.model;
+        } else {
+          _currentSessionModel = _settings?.currentModel;
+        }
 
         _messages = rawMessages.map((m) {
           final rawTools = m['tools'] as List<dynamic>? ?? [];
@@ -252,9 +263,13 @@ class DshService extends ChangeNotifier {
             content: '这是会话 [${session.title}]。你可以直接向 DSH 智能体下达指令。',
           ));
         }
+      } else {
+        _lastError = '加载历史失败 (HTTP ${res.statusCode})';
+        debugPrint('[DshService] $_lastError');
       }
     } catch (e) {
       debugPrint('[DshService] selectSession error: $e');
+      _lastError = '加载会话异常: $e';
     } finally {
       _isLoadingHistory = false;
       notifyListeners();
@@ -359,7 +374,7 @@ class DshService extends ChangeNotifier {
     try {
       // Send via HTTP RPC
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/prompt');
-      await http.post(
+      final res = await http.post(
         url,
         headers: _authHeaders,
         body: jsonEncode({
@@ -368,11 +383,25 @@ class DshService extends ChangeNotifier {
         }),
       ).timeout(const Duration(seconds: 15));
 
-      // 3. Start fallback session polling
-      _startSessionPolling(sessionId);
+      if (res.statusCode == 200) {
+        // 3. Start fallback session polling
+        _startSessionPolling(sessionId);
+      } else {
+        String errStr = '发送失败 (HTTP ${res.statusCode})';
+        try {
+          final data = jsonDecode(utf8.decode(res.bodyBytes));
+          if (data['error'] != null) errStr = data['error'].toString();
+        } catch (_) {}
+        _lastError = errStr;
+        assistantMsg.content = '❌ 发送失败: $errStr';
+        assistantMsg.isStreaming = false;
+        _isSending = false;
+        notifyListeners();
+      }
     } catch (e) {
       debugPrint('[DshService] sendPrompt error: $e');
-      assistantMsg.content = '发送指令失败: $e';
+      _lastError = '发送指令异常: $e';
+      assistantMsg.content = '❌ 发送指令失败: $e';
       assistantMsg.isStreaming = false;
       _isSending = false;
       notifyListeners();
@@ -519,23 +548,119 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  Future<bool> switchModel(String modelId) async {
+  Future<bool> switchModel(String modelId, {String? sessionId}) async {
     if (_currentConfig == null) return false;
+    final targetSessionId = sessionId ?? _currentSession?.sessionId;
+
     try {
+      // 1. If we have an active session, switch model for this session via session/model endpoint
+      if (targetSessionId != null && targetSessionId.isNotEmpty && targetSessionId != 'default') {
+        final sessionUrl = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/model');
+        final sRes = await http.post(
+          sessionUrl,
+          headers: _authHeaders,
+          body: jsonEncode({
+            'sessionId': targetSessionId,
+            'model': modelId,
+          }),
+        ).timeout(const Duration(seconds: 8));
+
+        if (sRes.statusCode != 200) {
+          String sErr = '切换会话模型失败 (HTTP ${sRes.statusCode})';
+          try {
+            final sData = jsonDecode(utf8.decode(sRes.bodyBytes));
+            if (sData['error'] != null) sErr = sData['error'].toString();
+          } catch (_) {}
+          _lastError = sErr;
+          notifyListeners();
+          return false;
+        }
+      }
+
+      // 2. Also persist to global settings
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings/model');
       final res = await http.post(
         url,
         headers: _authHeaders,
         body: jsonEncode({'model': modelId}),
-      ).timeout(const Duration(seconds: 6));
+      ).timeout(const Duration(seconds: 8));
 
       if (res.statusCode == 200) {
+        _currentSessionModel = modelId;
+        if (_currentSession != null) {
+          _currentSession = _currentSession!.copyWith(model: modelId);
+        }
+        for (final ws in _workspaces) {
+          for (var i = 0; i < ws.sessions.length; i++) {
+            if (ws.sessions[i].matchesSessionId(targetSessionId)) {
+              ws.sessions[i] = ws.sessions[i].copyWith(model: modelId);
+            }
+          }
+        }
         await fetchSettings();
+        notifyListeners();
         return true;
+      } else {
+        String errStr = '切换默认模型失败';
+        try {
+          final data = jsonDecode(utf8.decode(res.bodyBytes));
+          if (data['error'] != null) errStr = data['error'].toString();
+        } catch (_) {}
+        _lastError = errStr;
+        notifyListeners();
+        return false;
       }
-      return false;
     } catch (e) {
       debugPrint('[DshService] switchModel error: $e');
+      _lastError = '切换模型异常: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  // Delete Session
+  Future<bool> deleteSession(String sessionId, [String? workspaceId]) async {
+    if (_currentConfig == null) return false;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/delete');
+      final res = await http.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({
+          'sessionId': sessionId,
+          'workspaceId': workspaceId ?? _currentWorkspace?.workspaceId ?? '',
+        }),
+      ).timeout(const Duration(seconds: 8));
+
+      if (res.statusCode == 200) {
+        for (final ws in _workspaces) {
+          ws.sessions.removeWhere((s) => s.matchesSessionId(sessionId));
+        }
+
+        if (_currentSession?.matchesSessionId(sessionId) == true) {
+          if (_currentWorkspace != null && _currentWorkspace!.sessions.isNotEmpty) {
+            await selectSession(_currentWorkspace!.sessions.first);
+          } else {
+            await createNewSession();
+          }
+        } else {
+          notifyListeners();
+        }
+        return true;
+      } else {
+        String errStr = '删除会话失败';
+        try {
+          final data = jsonDecode(utf8.decode(res.bodyBytes));
+          if (data['error'] != null) errStr = data['error'].toString();
+        } catch (_) {}
+        _lastError = errStr;
+        notifyListeners();
+        return false;
+      }
+    } catch (e) {
+      debugPrint('[DshService] deleteSession error: $e');
+      _lastError = '删除会话异常: $e';
+      notifyListeners();
       return false;
     }
   }
@@ -816,6 +941,40 @@ class DshService extends ChangeNotifier {
         if (changed) {
           notifyListeners();
         }
+        return;
+      }
+
+      // 4.1 Session Deleted
+      if (type == 'session_deleted') {
+        final sId = json['sessionId']?.toString() ?? '';
+        for (final ws in _workspaces) {
+          ws.sessions.removeWhere((s) => s.matchesSessionId(sId));
+        }
+        if (_currentSession?.matchesSessionId(sId) == true) {
+          if (_currentWorkspace != null && _currentWorkspace!.sessions.isNotEmpty) {
+            selectSession(_currentWorkspace!.sessions.first);
+          } else {
+            createNewSession();
+          }
+        } else {
+          notifyListeners();
+        }
+        return;
+      }
+
+      // 4.2 System Error Event
+      if (type == 'error') {
+        final sId = json['sessionId']?.toString();
+        final errStr = json['error']?.toString() ?? '系统发生错误';
+        _lastError = errStr;
+        if (sId != null && _currentSession != null && _currentSession!.matchesSessionId(sId)) {
+          if (_messages.isNotEmpty && _messages.last.isAssistant && _messages.last.isStreaming) {
+            _messages.last.content = '❌ 发生错误: $errStr';
+            _messages.last.isStreaming = false;
+          }
+          _isSending = false;
+        }
+        notifyListeners();
         return;
       }
 
