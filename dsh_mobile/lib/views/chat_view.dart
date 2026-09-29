@@ -538,6 +538,7 @@ class _ChatViewState extends State<ChatView> {
           ),
         );
       },
+    );
   }
 
   // Delete Current Session Dialog
