@@ -1,10 +1,4 @@
 - insert:
     - id: dsh-mobile-bridge
       name: dsh-mobile-bridge
-      inject:
-        - connection
-        - webServer
-      config:
-        port: 3088
-        host: '0.0.0.0'
 

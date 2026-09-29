@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 import '../models/chat_message.dart';
 import '../models/workspace.dart';
 import '../models/permission_config.dart';
+import '../models/dsh_settings.dart';
 import '../services/dsh_service.dart';
 import '../widgets/thinking_card.dart';
 import '../widgets/tool_call_card.dart';
@@ -358,16 +359,26 @@ class _ChatViewState extends State<ChatView> {
 
   // Quick Model Selector Sheet
   void _showModelSwitchSheet(BuildContext context, DshService dsh) {
+    if (dsh.settings == null || dsh.settings!.availableModels.isEmpty) {
+      dsh.fetchSettings();
+    }
     final settings = dsh.settings;
     final currentSession = dsh.currentSession;
     final activeModel = dsh.currentModel;
+    final modelList = (settings != null && settings.availableModels.isNotEmpty)
+        ? settings.availableModels
+        : [
+            ModelItem(id: 'cn:deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1000000, maxTokens: 16384),
+            ModelItem(id: 'cn:deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1000000, maxTokens: 32768),
+            ModelItem(id: 'cn:kimi-k3-1', name: 'Kimi K3.1', contextWindow: 1000000, maxTokens: 32768),
+          ];
 
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: const Color(0xFF252526),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (ctx) {
         return SafeArea(
@@ -389,47 +400,62 @@ class _ChatViewState extends State<ChatView> {
                 ),
                 const SizedBox(height: 16),
                 Row(
-                  children: const [
-                    Icon(Icons.smart_toy_outlined, color: Color(0xFFC084FC), size: 20),
-                    SizedBox(width: 8),
-                    Text(
-                      '切换大语言模型 (Switch Model)',
-                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white),
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF744DA9).withOpacity(0.18),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(Icons.smart_toy_outlined, color: Color(0xFFC084FC), size: 20),
+                    ),
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '切换大语言模型',
+                            style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white),
+                          ),
+                          Text(
+                            '选择要在此会话中使用的 AI 模型',
+                            style: TextStyle(fontSize: 12, color: Colors.white54),
+                          ),
+                        ],
+                      ),
                     ),
                   ],
                 ),
                 if (currentSession != null)
                   Padding(
-                    padding: const EdgeInsets.only(top: 4, left: 28),
-                    child: Text(
-                      '生效会话: ${currentSession.title}',
-                      style: const TextStyle(fontSize: 12, color: Colors.white54),
+                    padding: const EdgeInsets.only(top: 8, bottom: 4),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.05),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        '当前生效会话: ${currentSession.title}',
+                        style: const TextStyle(fontSize: 12, color: Colors.white70),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
                   ),
-                const SizedBox(height: 14),
+                const SizedBox(height: 12),
                 ConstrainedBox(
                   constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.5),
-                  child: ListView.builder(
+                  child: ListView.separated(
                     shrinkWrap: true,
-                    itemCount: settings?.availableModels.length ?? 0,
+                    separatorBuilder: (_, __) => const SizedBox(height: 6),
+                    itemCount: modelList.length,
                     itemBuilder: (context, index) {
-                      final m = settings!.availableModels[index];
-                      final isSelected = m.id == activeModel;
-                      return ListTile(
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                        tileColor: isSelected ? const Color(0xFF0078D4).withOpacity(0.14) : null,
-                        title: Text(
-                          m.name,
-                          style: TextStyle(
-                            color: isSelected ? const Color(0xFF60A5FA) : Colors.white,
-                            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                          ),
-                        ),
-                        subtitle: Text(
-                          '${m.id} | 上下文: ${(m.contextWindow ?? 0) ~/ 1000}k',
-                          style: const TextStyle(fontSize: 12, color: Colors.white54),
-                        ),
-                        trailing: isSelected ? const Icon(Icons.check_circle, color: Color(0xFF60A5FA), size: 18) : null,
+                      final m = modelList[index];
+                      final isSelected = m.id == activeModel || (m.id.replaceFirst('cn:', '') == activeModel.replaceFirst('cn:', ''));
+                      return InkWell(
+                        borderRadius: BorderRadius.circular(10),
                         onTap: () async {
                           Navigator.pop(ctx);
                           final ok = await dsh.switchModel(m.id, sessionId: currentSession?.sessionId);
@@ -445,7 +471,7 @@ class _ChatViewState extends State<ChatView> {
                             } else {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(
-                                  content: Text('模型切换失败: ${dsh.lastError.isNotEmpty ? dsh.lastError : "请检查网络"}'),
+                                  content: Text('模型切换失败: ${dsh.lastError.isNotEmpty ? dsh.lastError : "请检查网络或授权码"}'),
                                   backgroundColor: const Color(0xFFEF4444),
                                   behavior: SnackBarBehavior.floating,
                                 ),
@@ -453,6 +479,56 @@ class _ChatViewState extends State<ChatView> {
                             }
                           }
                         },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                          decoration: BoxDecoration(
+                            color: isSelected ? const Color(0xFF0078D4).withOpacity(0.16) : const Color(0xFF2C2C2C),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: isSelected ? const Color(0xFF0078D4) : Colors.white.withOpacity(0.08),
+                              width: isSelected ? 1.5 : 1.0,
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                isSelected ? Icons.radio_button_checked : Icons.radio_button_off,
+                                color: isSelected ? const Color(0xFF60A5FA) : Colors.white38,
+                                size: 18,
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      m.name,
+                                      style: TextStyle(
+                                        color: isSelected ? const Color(0xFF60A5FA) : Colors.white,
+                                        fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                                        fontSize: 14,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      '${m.id} | 上下文: ${(m.contextWindow ?? 0) ~/ 1000}k',
+                                      style: const TextStyle(fontSize: 11.5, color: Colors.white54),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              if (isSelected)
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF0078D4).withOpacity(0.2),
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: const Text('使用中', style: TextStyle(color: Color(0xFF60A5FA), fontSize: 11, fontWeight: FontWeight.w600)),
+                                ),
+                            ],
+                          ),
+                        ),
                       );
                     },
                   ),
@@ -462,7 +538,6 @@ class _ChatViewState extends State<ChatView> {
           ),
         );
       },
-    );
   }
 
   // Delete Current Session Dialog
@@ -941,40 +1016,69 @@ class _ChatViewState extends State<ChatView> {
                     children: [
                       if (dsh.messages.isEmpty && dsh.pendingApprovals.isEmpty)
                         Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Container(
-                                width: 56,
-                                height: 56,
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFF0078D4).withOpacity(0.12),
-                                  shape: BoxShape.circle,
+                          child: SingleChildScrollView(
+                            padding: const EdgeInsets.symmetric(horizontal: 24),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Container(
+                                  width: 64,
+                                  height: 64,
+                                  decoration: BoxDecoration(
+                                    gradient: LinearGradient(
+                                      colors: [
+                                        const Color(0xFF0078D4).withOpacity(0.2),
+                                        const Color(0xFF744DA9).withOpacity(0.2),
+                                      ],
+                                      begin: Alignment.topLeft,
+                                      end: Alignment.bottomRight,
+                                    ),
+                                    shape: BoxShape.circle,
+                                    border: Border.all(color: Colors.white.withOpacity(0.1)),
+                                  ),
+                                  child: const Icon(
+                                    Icons.auto_awesome,
+                                    color: Color(0xFF60A5FA),
+                                    size: 30,
+                                  ),
                                 ),
-                                child: const Icon(
-                                  Icons.chat_bubble_outline_rounded,
-                                  color: Color(0xFF0078D4),
-                                  size: 28,
+                                const SizedBox(height: 16),
+                                const Text(
+                                  '今天想探索什么？',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w600,
+                                    letterSpacing: 0.2,
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(height: 14),
-                              const Text(
-                                '新对话已就绪',
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w600,
+                                const SizedBox(height: 6),
+                                Text(
+                                  '当前工作区: ${currentWs?.title ?? "默认工作区"}',
+                                  style: TextStyle(
+                                    color: Colors.white.withOpacity(0.45),
+                                    fontSize: 13,
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                '在下方输入框中发送消息开始',
-                                style: TextStyle(
-                                  color: Colors.white.withOpacity(0.45),
-                                  fontSize: 12.5,
+                                const SizedBox(height: 24),
+                                Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  alignment: WrapAlignment.center,
+                                  children: [
+                                    _buildSuggestionChip('🛠️ 分析项目代码', () {
+                                      _inputController.text = '分析当前项目代码结构并概述核心功能';
+                                    }),
+                                    _buildSuggestionChip('⚡ 检查潜在问题', () {
+                                      _inputController.text = '检查当前项目中的潜在 Bug 或异常';
+                                    }),
+                                    _buildSuggestionChip('💡 生成测试建议', () {
+                                      _inputController.text = '为当前模块编写单元测试用例建议';
+                                    }),
+                                  ],
                                 ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
                         )
                       else
@@ -1032,94 +1136,27 @@ class _ChatViewState extends State<ChatView> {
                   ),
           ),
 
-          // Quick Action Chips (Fluent Command Style)
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: const BoxDecoration(
-              color: Color(0xFF252526),
-              border: Border(top: BorderSide(color: Color(0xFF333333))),
-            ),
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: [
-                  _buildQuickChip(
-                    icon: Icons.shield_outlined,
-                    label: _getPolicyLabel(policy),
-                    color: _getPolicyColor(policy),
-                    onTap: () => _showSessionPermissionSheet(context, dsh),
-                  ),
-                  const SizedBox(width: 6),
-                  _buildQuickChip(
-                    icon: Icons.smart_toy_outlined,
-                    label: '更换模型',
-                    color: const Color(0xFFC084FC),
-                    onTap: () => _showModelSwitchSheet(context, dsh),
-                  ),
-                  const SizedBox(width: 6),
-                  _buildQuickChip(
-                    icon: Icons.folder_outlined,
-                    label: '项目工作区',
-                    color: const Color(0xFF60A5FA),
-                    onTap: widget.onOpenWorkspaces,
-                  ),
-                  const SizedBox(width: 6),
-                  _buildQuickChip(
-                    icon: Icons.cleaning_services_outlined,
-                    label: '清屏新建',
-                    color: const Color(0xFFFBBF24),
-                    onTap: () async {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text('正在新建对话...'),
-                          duration: Duration(milliseconds: 1200),
-                          behavior: SnackBarBehavior.floating,
-                        ),
-                      );
-                      await dsh.createNewSession();
-                    },
-                  ),
-                  const SizedBox(width: 6),
-                  _buildQuickChip(
-                    icon: Icons.delete_outline_rounded,
-                    label: '删除会话',
-                    color: const Color(0xFFF87171),
-                    onTap: () => _showDeleteCurrentSessionDialog(context, dsh),
-                  ),
-                ],
-              ),
-            ),
-          ),
-
-          // Rich Input Bar
+          // Modern Clean Input Bar
           _buildInputBar(dsh),
         ],
       ),
     );
   }
 
-  Widget _buildQuickChip({
-    required IconData icon,
-    required String label,
-    required Color color,
-    VoidCallback? onTap,
-  }) {
-    return GestureDetector(
+  Widget _buildSuggestionChip(String text, VoidCallback onTap) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(16),
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
         decoration: BoxDecoration(
-          color: color.withOpacity(0.12),
-          borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: color.withOpacity(0.28)),
+          color: const Color(0xFF282828),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.white.withOpacity(0.08)),
         ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 13, color: color),
-            const SizedBox(width: 5),
-            Text(label, style: TextStyle(color: color, fontSize: 11.5, fontWeight: FontWeight.w600)),
-          ],
+        child: Text(
+          text,
+          style: const TextStyle(color: Colors.white70, fontSize: 12.5),
         ),
       ),
     );
@@ -1318,76 +1355,83 @@ class _ChatViewState extends State<ChatView> {
 
   Widget _buildInputBar(DshService dsh) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: const BoxDecoration(
-        color: Color(0xFF252526),
-        border: Border(top: BorderSide(color: Color(0xFF333333))),
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF202020),
+        border: Border(top: BorderSide(color: Colors.white.withOpacity(0.06))),
       ),
       child: SafeArea(
         child: Row(
+          crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            // Voice / Mic Mock Button
-            IconButton(
-              icon: const Icon(Icons.mic_none_rounded, color: Colors.white60, size: 22),
-              tooltip: '语音输入',
-              onPressed: () {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('语音听写已就绪，正在聆听...'), duration: Duration(seconds: 1)),
-                );
-              },
-            ),
-            // Text Input
+            // Text Input Pill
             Expanded(
               child: Container(
+                constraints: const BoxConstraints(minHeight: 44, maxHeight: 120),
+                padding: const EdgeInsets.symmetric(horizontal: 16),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF2D2D2D),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: const Color(0xFF3B3B3B)),
+                  color: const Color(0xFF2A2A2A),
+                  borderRadius: BorderRadius.circular(22),
+                  border: Border.all(color: Colors.white.withOpacity(0.08)),
                 ),
-                child: TextField(
-                  controller: _inputController,
-                  style: const TextStyle(color: Colors.white, fontSize: 13.5),
-                  maxLines: 4,
-                  minLines: 1,
-                  decoration: const InputDecoration(
-                    hintText: '发送消息...',
-                    hintStyle: TextStyle(color: Colors.white38, fontSize: 13.5),
-                    border: InputBorder.none,
-                    contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                child: Center(
+                  child: TextField(
+                    controller: _inputController,
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                    maxLines: 4,
+                    minLines: 1,
+                    decoration: const InputDecoration(
+                      hintText: '发送指令或提问...',
+                      hintStyle: TextStyle(color: Colors.white38, fontSize: 13.5),
+                      border: InputBorder.none,
+                      isDense: true,
+                      contentPadding: EdgeInsets.symmetric(vertical: 11),
+                    ),
+                    onSubmitted: (_) => _sendMessage(dsh),
                   ),
-                  onSubmitted: (_) => _sendMessage(dsh),
                 ),
               ),
             ),
-            const SizedBox(width: 8),
-            // Send / Cancel Button
+            const SizedBox(width: 10),
+            // Send / Cancel Action Button
             if (dsh.isSending)
               Container(
-                width: 36,
-                height: 36,
+                width: 44,
+                height: 44,
                 decoration: BoxDecoration(
-                  color: const Color(0xFFEF4444).withOpacity(0.15),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: const Color(0xFFEF4444).withOpacity(0.35)),
+                  color: const Color(0xFFEF4444).withOpacity(0.18),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: const Color(0xFFEF4444).withOpacity(0.4)),
                 ),
                 child: IconButton(
                   padding: EdgeInsets.zero,
-                  icon: const Icon(Icons.stop_rounded, color: Color(0xFFEF4444), size: 22),
+                  icon: const Icon(Icons.stop_rounded, color: Color(0xFFEF4444), size: 24),
                   tooltip: '停止生成',
                   onPressed: () => dsh.cancelActiveTurn(),
                 ),
               )
             else
               Container(
-                width: 36,
-                height: 36,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF0078D4),
-                  borderRadius: BorderRadius.circular(8),
+                width: 44,
+                height: 44,
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [Color(0xFF0078D4), Color(0xFF0086F8)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  shape: BoxShape.circle,
+                  boxShadow: [
+                    BoxShadow(
+                      color: Color(0x330078D4),
+                      blurRadius: 8,
+                      offset: Offset(0, 2),
+                    ),
+                  ],
                 ),
                 child: IconButton(
                   padding: EdgeInsets.zero,
-                  icon: const Icon(Icons.arrow_upward_rounded, color: Colors.white, size: 20),
+                  icon: const Icon(Icons.arrow_upward_rounded, color: Colors.white, size: 22),
                   tooltip: '发送',
                   onPressed: () => _sendMessage(dsh),
                 ),

@@ -83,15 +83,26 @@ class DshService extends ChangeNotifier {
   // Test Connection
   Future<bool> testConnection(ServerConfig config) async {
     try {
-      final url = Uri.parse('${config.httpBaseUrl}/health');
-      final res = await http.get(url, headers: {
+      final headers = {
         'Authorization': 'Bearer ${config.token}',
         'x-dsh-token': config.token,
-      }).timeout(const Duration(seconds: 5));
+      };
 
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        return data['authenticated'] == true;
+      http.Response? res;
+      try {
+        final url = Uri.parse('${config.httpBaseUrl}/health');
+        res = await http.get(url, headers: headers).timeout(const Duration(seconds: 5));
+      } catch (_) {
+        // Fallback to /api/mobile/health
+        try {
+          final fallbackUrl = Uri.parse('${config.httpBaseUrl}/api/mobile/health');
+          res = await http.get(fallbackUrl, headers: headers).timeout(const Duration(seconds: 5));
+        } catch (_) {}
+      }
+
+      if (res != null && res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        return data['authenticated'] == true || data['ok'] == true;
       }
       return false;
     } catch (e) {
@@ -271,14 +282,6 @@ class DshService extends ChangeNotifier {
           _startSessionPolling(session.sessionId);
         } else {
           _isSending = false;
-        }
-
-        if (_messages.isEmpty) {
-          _messages.add(ChatMessage(
-            id: _uuid.v4(),
-            role: 'assistant',
-            content: '这是会话 [${session.title}]。你可以直接向 DSH 智能体下达指令。',
-          ));
         }
       } else {
         _lastError = '加载历史失败 (HTTP ${res.statusCode})';
@@ -589,8 +592,11 @@ class DshService extends ChangeNotifier {
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        if (data['settings'] != null) {
-          _settings = DshSettings.fromJson(data['settings']);
+        final sData = (data['settings'] is Map<String, dynamic>)
+            ? data['settings']
+            : (data is Map<String, dynamic> ? data : null);
+        if (sData != null) {
+          _settings = DshSettings.fromJson(sData);
           notifyListeners();
         }
       }

@@ -598,14 +598,26 @@ export function apply(ctx, config = {}, internals = {}) {
       res.end(JSON.stringify(obj));
     };
 
-    // 1. 健康探测
-    if (pathname === '/__mobile/health' || pathname === '/api/mobile/ping') {
+    // 1. 健康探测与鉴权测试 (供手机端 testConnection 测试连通性)
+    if (pathname === '/health' || pathname === '/api/mobile/health' || pathname === '/__mobile/health' || pathname === '/api/mobile/ping') {
+      let testToken = '';
+      const authHeader = req.headers['authorization'];
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        testToken = authHeader.slice(7).trim();
+      } else if (req.headers['x-dsh-token']) {
+        testToken = String(req.headers['x-dsh-token']).trim();
+      } else if (parsedUrl.query?.token) {
+        testToken = String(parsedUrl.query.token).trim();
+      }
+      const isAuthed = verifyToken(testToken);
       sendJson(200, {
+        code: isAuthed ? 0 : 401,
         ok: true,
+        authenticated: isAuthed,
         name: 'dsh-mobile-bridge',
         port: listenPort,
         dshPort: dshPort,
-        version: '1.2.8',
+        version: '1.2.9',
         time: new Date().toISOString()
       });
       return;
@@ -785,7 +797,8 @@ export function apply(ctx, config = {}, internals = {}) {
 
       // 4.2 设置与模型
       if (pathname === '/api/mobile/settings' && req.method === 'GET') {
-        sendJson(200, { ok: true, code: 0, ...getSettingsData() });
+        const sData = getSettingsData();
+        sendJson(200, { ok: true, code: 0, settings: sData, ...sData });
         return;
       }
 
