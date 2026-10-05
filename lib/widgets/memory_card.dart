@@ -111,10 +111,10 @@ class _MemoryCardState extends State<MemoryCard> {
       width: double.infinity,
       margin: const EdgeInsets.symmetric(vertical: 4),
       decoration: BoxDecoration(
-        color: const Color(0xFF181C26),
+        color: const Color(0xFFF8FAFC),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(
-          color: meta.themeColor.withOpacity(0.25),
+          color: meta.themeColor.withOpacity(0.35),
           width: 1.0,
         ),
       ),
@@ -140,7 +140,7 @@ class _MemoryCardState extends State<MemoryCard> {
                       style: const TextStyle(
                         fontSize: 12,
                         fontWeight: FontWeight.w500,
-                        color: Color(0xFFCBD5E1),
+                        color: Color(0xFF334155),
                       ),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
@@ -178,9 +178,9 @@ class _MemoryCardState extends State<MemoryCard> {
               margin: const EdgeInsets.fromLTRB(10, 0, 10, 10),
               padding: const EdgeInsets.all(10),
               decoration: BoxDecoration(
-                color: const Color(0xFF131722),
+                color: Colors.white,
                 borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: Colors.white.withOpacity(0.06)),
+                border: Border.all(color: const Color(0xFFE2E8F0)),
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -193,16 +193,17 @@ class _MemoryCardState extends State<MemoryCard> {
                           data: widget.content,
                           selectable: true,
                           styleSheet: MarkdownStyleSheet(
-                            p: const TextStyle(fontSize: 12.5, color: Color(0xFFCBD5E1), height: 1.45),
+                            p: const TextStyle(fontSize: 12.5, color: Color(0xFF334155), height: 1.45),
                             code: const TextStyle(
-                              color: Color(0xFF38BDF8),
-                              backgroundColor: Color(0xFF1A202C),
+                              color: Color(0xFF0369A1),
+                              backgroundColor: Color(0xFFF1F5F9),
                               fontSize: 11.5,
                               fontFamily: 'monospace',
                             ),
                             codeblockDecoration: BoxDecoration(
-                              color: const Color(0xFF1E293B),
+                              color: const Color(0xFFF8FAFC),
                               borderRadius: BorderRadius.circular(6),
+                              border: Border.all(color: const Color(0xFFE2E8F0)),
                             ),
                           ),
                         ),
@@ -217,7 +218,7 @@ class _MemoryCardState extends State<MemoryCard> {
                       padding: const EdgeInsets.symmetric(vertical: 5),
                       alignment: Alignment.center,
                       decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.04),
+                        color: const Color(0xFFF1F5F9),
                         borderRadius: BorderRadius.circular(6),
                       ),
                       child: Row(

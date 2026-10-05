@@ -74,35 +74,48 @@ class DshService extends ChangeNotifier {
   bool get isSending => _isSending;
 
   // Headers for HTTP
-  Map<String, String> get _authHeaders => {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ${_currentConfig?.token ?? ''}',
-        'x-dsh-token': _currentConfig?.token ?? '',
-      };
+  Map<String, String> get _authHeaders {
+    final tokenVal = _currentConfig?.effectiveToken ?? '';
+    return {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer $tokenVal',
+      'x-dsh-token': tokenVal,
+      'x-auth-code': tokenVal,
+      'Connection': 'close',
+    };
+  }
 
   // Test Connection
   Future<bool> testConnection(ServerConfig config) async {
     try {
+      final tokenVal = config.effectiveToken;
       final headers = {
-        'Authorization': 'Bearer ${config.token}',
-        'x-dsh-token': config.token,
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer $tokenVal',
+        'x-dsh-token': tokenVal,
+        'x-auth-code': tokenVal,
+        'Connection': 'close',
       };
 
-      http.Response? res;
-      try {
-        final url = Uri.parse('${config.httpBaseUrl}/health');
-        res = await http.get(url, headers: headers).timeout(const Duration(seconds: 5));
-      } catch (_) {
-        // Fallback to /api/mobile/health
-        try {
-          final fallbackUrl = Uri.parse('${config.httpBaseUrl}/api/mobile/health');
-          res = await http.get(fallbackUrl, headers: headers).timeout(const Duration(seconds: 5));
-        } catch (_) {}
-      }
+      final testEndpoints = [
+        '${config.httpBaseUrl}/api/mobile/ping',
+        '${config.httpBaseUrl}/api/mobile/health',
+        '${config.httpBaseUrl}/health',
+        '${config.httpBaseUrl}/api/mobile/workspaces',
+        '${config.httpBaseUrl}/api/mobile/settings',
+      ];
 
-      if (res != null && res.statusCode == 200) {
-        final data = jsonDecode(utf8.decode(res.bodyBytes));
-        return data['authenticated'] == true || data['ok'] == true;
+      for (final endpoint in testEndpoints) {
+        try {
+          final res = await http.get(Uri.parse(endpoint), headers: headers).timeout(const Duration(seconds: 4));
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            return true;
+          }
+          if (res.statusCode == 401 || res.statusCode == 403) {
+            _lastError = '认证失败 (HTTP ${res.statusCode}): 请核对访问令牌或授权码';
+            return false;
+          }
+        } catch (_) {}
       }
       return false;
     } catch (e) {
@@ -415,25 +428,38 @@ class DshService extends ChangeNotifier {
     _sendWsJson({'type': 'follow', 'sessionId': sessionId});
 
     try {
-      // Send via HTTP RPC
+      // Send via HTTP RPC with retry to tolerate reverse proxy Keep-Alive drops
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/prompt');
-      final res = await http.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({
-          'sessionId': sessionId,
-          'text': text,
-        }),
-      ).timeout(const Duration(seconds: 15));
+      http.Response? res;
+      for (int attempt = 0; attempt < 2; attempt++) {
+        try {
+          res = await http.post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'sessionId': sessionId,
+              'text': text,
+              'model': currentModel,
+            }),
+          ).timeout(const Duration(seconds: 20));
+          break;
+        } on http.ClientException catch (e) {
+          if (attempt == 1) rethrow;
+          debugPrint('[DshService] sendPrompt proxy drop, retrying: $e');
+          await Future.delayed(const Duration(milliseconds: 300));
+        }
+      }
 
-      if (res.statusCode == 200) {
+      if (res != null && res.statusCode == 200) {
         // 3. Start fallback session polling
         _startSessionPolling(sessionId);
       } else {
-        String errStr = '发送失败 (HTTP ${res.statusCode})';
+        String errStr = '发送失败 (HTTP ${res?.statusCode})';
         try {
-          final data = jsonDecode(utf8.decode(res.bodyBytes));
-          if (data['error'] != null) errStr = data['error'].toString();
+          if (res != null) {
+            final data = jsonDecode(utf8.decode(res.bodyBytes));
+            if (data['error'] != null) errStr = data['error'].toString();
+          }
         } catch (_) {}
         _lastError = errStr;
         assistantMsg.content = '❌ 发送失败: $errStr';
@@ -609,70 +635,50 @@ class DshService extends ChangeNotifier {
     if (_currentConfig == null) return false;
     final targetSessionId = sessionId ?? _currentSession?.sessionId;
 
-    try {
-      // 1. If we have an active session, switch model for this session via session/model endpoint
-      if (targetSessionId != null && targetSessionId.isNotEmpty && targetSessionId != 'default') {
+    // 1. If we have an active session, attempt session/model endpoint
+    if (targetSessionId != null && targetSessionId.isNotEmpty && targetSessionId != 'default') {
+      try {
         final sessionUrl = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/model');
-        final sRes = await http.post(
+        await http.post(
           sessionUrl,
           headers: _authHeaders,
           body: jsonEncode({
             'sessionId': targetSessionId,
             'model': modelId,
           }),
-        ).timeout(const Duration(seconds: 8));
-
-        if (sRes.statusCode != 200) {
-          String sErr = '切换会话模型失败 (HTTP ${sRes.statusCode})';
-          try {
-            final sData = jsonDecode(utf8.decode(sRes.bodyBytes));
-            if (sData['error'] != null) sErr = sData['error'].toString();
-          } catch (_) {}
-          _lastError = sErr;
-          notifyListeners();
-          return false;
-        }
+        ).timeout(const Duration(seconds: 5));
+      } catch (e) {
+        debugPrint('[DshService] session model switch non-critical: $e');
       }
+    }
 
-      // 2. Also persist to global settings
+    // 2. Also persist to global settings
+    try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings/model');
-      final res = await http.post(
+      await http.post(
         url,
         headers: _authHeaders,
         body: jsonEncode({'model': modelId}),
-      ).timeout(const Duration(seconds: 8));
-
-      if (res.statusCode == 200) {
-        _currentSessionModel = modelId;
-        if (_currentSession != null) {
-          _currentSession = _currentSession!.copyWith(model: modelId);
-        }
-        for (final ws in _workspaces) {
-          for (var i = 0; i < ws.sessions.length; i++) {
-            if (ws.sessions[i].matchesSessionId(targetSessionId)) {
-              ws.sessions[i] = ws.sessions[i].copyWith(model: modelId);
-            }
-          }
-        }
-        await fetchSettings();
-        notifyListeners();
-        return true;
-      } else {
-        String errStr = '切换默认模型失败';
-        try {
-          final data = jsonDecode(utf8.decode(res.bodyBytes));
-          if (data['error'] != null) errStr = data['error'].toString();
-        } catch (_) {}
-        _lastError = errStr;
-        notifyListeners();
-        return false;
-      }
+      ).timeout(const Duration(seconds: 5));
     } catch (e) {
-      debugPrint('[DshService] switchModel error: $e');
-      _lastError = '切换模型异常: $e';
-      notifyListeners();
-      return false;
+      debugPrint('[DshService] global settings model switch non-critical: $e');
     }
+
+    // 3. Always update local state so subsequent prompts use this model
+    _currentSessionModel = modelId;
+    if (_currentSession != null) {
+      _currentSession = _currentSession!.copyWith(model: modelId);
+    }
+    for (final ws in _workspaces) {
+      for (var i = 0; i < ws.sessions.length; i++) {
+        if (ws.sessions[i].matchesSessionId(targetSessionId)) {
+          ws.sessions[i] = ws.sessions[i].copyWith(model: modelId);
+        }
+      }
+    }
+    await fetchSettings();
+    notifyListeners();
+    return true;
   }
 
   // Delete Session

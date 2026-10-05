@@ -18,17 +18,17 @@ class ApprovalCard extends StatelessWidget {
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 14.0, vertical: 8.0),
       decoration: BoxDecoration(
-        color: Colors.amber.shade900.withOpacity(0.15),
-        borderRadius: BorderRadius.circular(16),
+        color: const Color(0xFFFFFBEB),
+        borderRadius: BorderRadius.circular(12),
         border: Border.all(
-          color: Colors.amber.shade600,
-          width: 1.5,
+          color: const Color(0xFFFDE68A),
+          width: 1.2,
         ),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.2),
+            color: Colors.black.withOpacity(0.03),
             blurRadius: 8,
-            offset: const Offset(0, 4),
+            offset: const Offset(0, 2),
           )
         ],
       ),
@@ -38,38 +38,38 @@ class ApprovalCard extends StatelessWidget {
           // Header strip
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            decoration: BoxDecoration(
-              color: Colors.amber.shade700.withOpacity(0.25),
-              borderRadius: const BorderRadius.vertical(top: Radius.circular(14)),
+            decoration: const BoxDecoration(
+              color: Color(0xFFFEF3C7),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(11)),
             ),
             child: Row(
               children: [
                 const Icon(
                   Icons.security_rounded,
-                  color: Colors.amber,
+                  color: Color(0xFFD97706),
                   size: 20,
                 ),
                 const SizedBox(width: 8),
                 const Text(
                   '执行权限申请 (Tool Execution Approval)',
                   style: TextStyle(
-                    color: Colors.amber,
+                    color: Color(0xFFB45309),
                     fontWeight: FontWeight.bold,
-                    fontSize: 14,
+                    fontSize: 13.5,
                   ),
                 ),
                 const Spacer(),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                   decoration: BoxDecoration(
-                    color: Colors.amber.shade800,
-                    borderRadius: BorderRadius.circular(8),
+                    color: const Color(0xFFD97706),
+                    borderRadius: BorderRadius.circular(6),
                   ),
                   child: Text(
                     request.toolName,
                     style: const TextStyle(
                       color: Colors.white,
-                      fontSize: 12,
+                      fontSize: 11.5,
                       fontWeight: FontWeight.bold,
                     ),
                   ),
@@ -86,18 +86,19 @@ class ApprovalCard extends StatelessWidget {
               children: [
                 Text(
                   request.reason.isNotEmpty ? request.reason : '智能体申请调用 ${request.toolName} 执行任务',
-                  style: theme.textTheme.bodyMedium?.copyWith(
+                  style: const TextStyle(
+                    color: Color(0xFF1F2937),
                     fontWeight: FontWeight.w600,
-                    fontSize: 14,
+                    fontSize: 13.5,
                   ),
                 ),
                 if (request.callId != null && request.callId!.isNotEmpty) ...[
                   const SizedBox(height: 6),
                   Text(
                     '调用编号: ${request.callId}',
-                    style: TextStyle(
+                    style: const TextStyle(
                       fontSize: 11,
-                      color: Colors.grey.shade400,
+                      color: Color(0xFF6B7280),
                       fontFamily: 'monospace',
                     ),
                   ),
@@ -114,13 +115,14 @@ class ApprovalCard extends StatelessWidget {
               children: [
                 OutlinedButton.icon(
                   onPressed: () => onRespond(request, 'rejected'),
-                  icon: const Icon(Icons.close_rounded, size: 16, color: Colors.redAccent),
-                  label: const Text('拒绝 (Reject)', style: TextStyle(color: Colors.redAccent)),
+                  icon: const Icon(Icons.close_rounded, size: 16, color: Color(0xFFDC2626)),
+                  label: const Text('拒绝 (Reject)', style: TextStyle(color: Color(0xFFDC2626))),
                   style: OutlinedButton.styleFrom(
-                    side: const BorderSide(color: Colors.redAccent),
+                    side: const BorderSide(color: Color(0xFFFCA5A5)),
+                    backgroundColor: Colors.white,
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                     shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
+                      borderRadius: BorderRadius.circular(8),
                     ),
                   ),
                 ),
@@ -130,10 +132,11 @@ class ApprovalCard extends StatelessWidget {
                   icon: const Icon(Icons.check_rounded, size: 16, color: Colors.white),
                   label: const Text('允许一次 (Allow)', style: TextStyle(color: Colors.white)),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.green.shade700,
+                    backgroundColor: const Color(0xFF16A34A),
+                    elevation: 0,
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
+                      borderRadius: BorderRadius.circular(8),
                     ),
                   ),
                 ),

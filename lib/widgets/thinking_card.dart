@@ -42,10 +42,10 @@ class _ThinkingCardState extends State<ThinkingCard> {
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
       decoration: BoxDecoration(
-        color: const Color(0xFF181C26),
+        color: isThinking ? const Color(0xFFF0F7FF) : const Color(0xFFF3F4F6),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(
-          color: isThinking ? const Color(0xFFC084FC).withOpacity(0.4) : Colors.white.withOpacity(0.08),
+          color: isThinking ? const Color(0xFF0078D4).withOpacity(0.3) : const Color(0xFFE5E7EB),
           width: 1.0,
         ),
       ),
@@ -62,7 +62,7 @@ class _ThinkingCardState extends State<ThinkingCard> {
                   Icon(
                     isThinking ? Icons.psychology_rounded : Icons.lightbulb_outline_rounded,
                     size: 16,
-                    color: isThinking ? const Color(0xFFC084FC) : Colors.white54,
+                    color: isThinking ? const Color(0xFF0078D4) : const Color(0xFF4B5563),
                   ),
                   const SizedBox(width: 6),
                   Text(
@@ -70,7 +70,7 @@ class _ThinkingCardState extends State<ThinkingCard> {
                     style: TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
-                      color: isThinking ? const Color(0xFFC084FC) : Colors.white70,
+                      color: isThinking ? const Color(0xFF0078D4) : const Color(0xFF374151),
                     ),
                   ),
                   if (isThinking) ...[
@@ -80,7 +80,7 @@ class _ThinkingCardState extends State<ThinkingCard> {
                       height: 10,
                       child: CircularProgressIndicator(
                         strokeWidth: 1.5,
-                        color: Color(0xFFC084FC),
+                        color: Color(0xFF0078D4),
                       ),
                     ),
                   ],
@@ -88,7 +88,7 @@ class _ThinkingCardState extends State<ThinkingCard> {
                   Icon(
                     _expanded ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded,
                     size: 16,
-                    color: Colors.white38,
+                    color: const Color(0xFF9CA3AF),
                   ),
                 ],
               ),
@@ -101,16 +101,16 @@ class _ThinkingCardState extends State<ThinkingCard> {
                 width: double.infinity,
                 padding: const EdgeInsets.all(8),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF131722),
+                  color: Colors.white,
                   borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: Colors.white.withOpacity(0.06)),
+                  border: Border.all(color: const Color(0xFFE5E7EB)),
                 ),
                 child: SelectableText(
                   widget.content.isEmpty ? '正在分析上下文并规划步骤...' : widget.content,
                   style: const TextStyle(
                     fontSize: 11.5,
                     height: 1.5,
-                    color: Colors.white70,
+                    color: Color(0xFF374151),
                     fontFamily: 'monospace',
                   ),
                 ),

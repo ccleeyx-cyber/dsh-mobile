@@ -21,10 +21,10 @@ class _ToolCallCardState extends State<ToolCallCard> {
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
       decoration: BoxDecoration(
-        color: const Color(0xFF1E2432),
+        color: const Color(0xFFF8FAFC),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(
-          color: Colors.white.withOpacity(0.08),
+          color: widget.tool.isRunning ? const Color(0xFF0078D4).withOpacity(0.4) : const Color(0xFFE2E8F0),
         ),
       ),
       child: Column(
@@ -40,7 +40,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                   const Icon(
                     Icons.terminal_rounded,
                     size: 15,
-                    color: Color(0xFF60A5FA),
+                    color: Color(0xFF0078D4),
                   ),
                   const SizedBox(width: 6),
                   Text(
@@ -48,7 +48,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                     style: const TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
-                      color: Color(0xFF93C5FD),
+                      color: Color(0xFF1E293B),
                     ),
                   ),
                   const Spacer(),
@@ -56,7 +56,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                     const SizedBox(
                       width: 10,
                       height: 10,
-                      child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF60A5FA)),
+                      child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF0078D4)),
                     )
                   else
                     const Icon(Icons.check_circle_rounded, size: 14, color: Color(0xFF10B981)),
@@ -64,7 +64,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                   Icon(
                     _expanded ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded,
                     size: 16,
-                    color: Colors.white38,
+                    color: const Color(0xFF94A3B8),
                   ),
                 ],
               ),
@@ -76,35 +76,35 @@ class _ToolCallCardState extends State<ToolCallCard> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('输入参数:', style: TextStyle(fontSize: 10.5, color: Colors.white54, fontWeight: FontWeight.w500)),
+                  const Text('输入参数:', style: TextStyle(fontSize: 10.5, color: Color(0xFF64748B), fontWeight: FontWeight.w500)),
                   Container(
                     width: double.infinity,
                     padding: const EdgeInsets.all(7),
                     margin: const EdgeInsets.only(top: 3, bottom: 6),
                     decoration: BoxDecoration(
-                      color: const Color(0xFF131722),
+                      color: Colors.white,
                       borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: Colors.white.withOpacity(0.06)),
+                      border: Border.all(color: const Color(0xFFE2E8F0)),
                     ),
                     child: SelectableText(
                       widget.tool.input,
-                      style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Colors.white70),
+                      style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Color(0xFF334155)),
                     ),
                   ),
                   if (widget.tool.output.isNotEmpty) ...[
-                    const Text('执行输出:', style: TextStyle(fontSize: 10.5, color: Colors.white54, fontWeight: FontWeight.w500)),
+                    const Text('执行输出:', style: TextStyle(fontSize: 10.5, color: Color(0xFF64748B), fontWeight: FontWeight.w500)),
                     Container(
                       width: double.infinity,
                       padding: const EdgeInsets.all(7),
                       margin: const EdgeInsets.only(top: 3),
                       decoration: BoxDecoration(
-                        color: const Color(0xFF131722),
+                        color: Colors.white,
                         borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: Colors.white.withOpacity(0.06)),
+                        border: Border.all(color: const Color(0xFFE2E8F0)),
                       ),
                       child: SelectableText(
                         widget.tool.output,
-                        style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Colors.white70),
+                        style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Color(0xFF334155)),
                       ),
                     ),
                   ]

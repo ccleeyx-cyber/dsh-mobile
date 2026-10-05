@@ -37,7 +37,7 @@ class _MainShellState extends State<MainShell> {
     final pendingCount = dsh.pendingApprovals.length;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF1E1E1E),
+      backgroundColor: const Color(0xFFF9FAFB),
       body: IndexedStack(
         index: _currentIndex,
         children: [
@@ -54,29 +54,29 @@ class _MainShellState extends State<MainShell> {
       ),
       bottomNavigationBar: Container(
         decoration: const BoxDecoration(
-          color: Color(0xFF252526),
-          border: Border(top: BorderSide(color: Color(0xFF333333), width: 0.8)),
+          color: Colors.white,
+          border: Border(top: BorderSide(color: Color(0xFFE5E7EB), width: 1.0)),
         ),
         child: SafeArea(
           child: NavigationBarTheme(
             data: NavigationBarThemeData(
-              backgroundColor: Colors.transparent,
-              indicatorColor: const Color(0xFF0078D4).withOpacity(0.2),
+              backgroundColor: Colors.white,
+              indicatorColor: const Color(0xFF0078D4).withOpacity(0.12),
               labelTextStyle: MaterialStateProperty.resolveWith<TextStyle>((states) {
                 if (states.contains(MaterialState.selected)) {
                   return const TextStyle(
                     fontSize: 12,
-                    fontWeight: FontWeight.bold,
+                    fontWeight: FontWeight.w600,
                     color: Color(0xFF0078D4),
                   );
                 }
-                return const TextStyle(fontSize: 12, color: Colors.white54);
+                return const TextStyle(fontSize: 12, color: Color(0xFF6B7280));
               }),
               iconTheme: MaterialStateProperty.resolveWith<IconThemeData>((states) {
                 if (states.contains(MaterialState.selected)) {
                   return const IconThemeData(color: Color(0xFF0078D4), size: 24);
                 }
-                return const IconThemeData(color: Colors.white54, size: 24);
+                return const IconThemeData(color: Color(0xFF6B7280), size: 24);
               }),
             ),
             child: NavigationBar(

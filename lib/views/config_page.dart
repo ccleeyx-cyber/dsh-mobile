@@ -43,13 +43,17 @@ class _ConfigPageState extends State<ConfigPage> {
   }
 
   ServerConfig _buildConfig() {
+    final tokenText = _tokenController.text.trim();
+    final authText = _authCodeController.text.trim();
+    final effectiveToken = tokenText.isNotEmpty ? tokenText : authText;
+
     return ServerConfig(
       host: _hostController.text.trim(),
       port: int.tryParse(_portController.text.trim()) ?? 3088,
-      token: _tokenController.text.trim(),
+      token: effectiveToken,
       useHttps: _useHttps,
       npsAddress: _npsController.text.trim(),
-      authCode: _authCodeController.text.trim(),
+      authCode: authText,
     );
   }
 
@@ -157,7 +161,14 @@ class _ConfigPageState extends State<ConfigPage> {
                   border: OutlineInputBorder(),
                 ),
                 obscureText: true,
-                validator: (v) => (v == null || v.trim().isEmpty) ? '请输入 Token' : null,
+                validator: (v) {
+                  final token = v?.trim() ?? '';
+                  final authCode = _authCodeController.text.trim();
+                  if (token.isEmpty && authCode.isEmpty) {
+                    return '请输入安全认证 Token 密钥或授权码';
+                  }
+                  return null;
+                },
               ),
               const SizedBox(height: 16),
               // NPS 地址 field
