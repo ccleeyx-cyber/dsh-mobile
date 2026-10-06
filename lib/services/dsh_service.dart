@@ -109,6 +109,13 @@ class DshService extends ChangeNotifier {
         try {
           final res = await http.get(Uri.parse(endpoint), headers: headers).timeout(const Duration(seconds: 4));
           if (res.statusCode >= 200 && res.statusCode < 300) {
+            try {
+              final body = jsonDecode(res.body);
+              if (body is Map && (body['authenticated'] == false || body['code'] == 401)) {
+                _lastError = '认证失败: 授权码错误或未提供有效令牌';
+                return false;
+              }
+            } catch (_) {}
             return true;
           }
           if (res.statusCode == 401 || res.statusCode == 403) {
