@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../models/dsh_settings.dart';
-import '../models/persona.dart';
 import '../services/dsh_service.dart';
 import 'config_page.dart';
 
@@ -171,143 +170,6 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     );
   }
 
-  // Add Custom Persona Bottom Sheet
-  void _openCustomPersonaDialog(BuildContext context, DshService dsh) {
-    final titleController = TextEditingController();
-    final promptController = TextEditingController();
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.white,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) {
-        return SafeArea(
-          child: Padding(
-            padding: EdgeInsets.only(
-              left: 20,
-              right: 20,
-              top: 16,
-              bottom: MediaQuery.of(context).viewInsets.bottom + 20,
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Center(
-                  child: Container(
-                    width: 40,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFD1D5DB),
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF0078D4).withOpacity(0.1),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: const Icon(Icons.person_add_alt_1_rounded, color: Color(0xFF0078D4), size: 20),
-                    ),
-                    const SizedBox(width: 10),
-                    const Text(
-                      '自定义智能体人设 (Custom Persona)',
-                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Color(0xFF111827)),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: titleController,
-                  style: const TextStyle(color: Color(0xFF111827), fontSize: 14),
-                  decoration: InputDecoration(
-                    labelText: '角色名称 (如: 游戏逻辑架构师)',
-                    labelStyle: const TextStyle(color: Color(0xFF6B7280)),
-                    filled: true,
-                    fillColor: const Color(0xFFF9FAFB),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFFE5E7EB))),
-                    enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFFE5E7EB))),
-                    focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF0078D4), width: 1.5)),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Container(
-                  height: 150,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFF9FAFB),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: const Color(0xFFE5E7EB)),
-                  ),
-                  child: TextField(
-                    controller: promptController,
-                    maxLines: null,
-                    expands: true,
-                    style: const TextStyle(color: Color(0xFF111827), fontSize: 13),
-                    decoration: const InputDecoration(
-                      hintText: '设定智能体的系统人设提示词 (System Prompt)...',
-                      hintStyle: TextStyle(color: Color(0xFF9CA3AF)),
-                      contentPadding: EdgeInsets.all(12),
-                      border: InputBorder.none,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                SizedBox(
-                  width: double.infinity,
-                  height: 44,
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF0078D4),
-                      foregroundColor: Colors.white,
-                      elevation: 0,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                    ),
-                    onPressed: () async {
-                      final title = titleController.text.trim();
-                      final prompt = promptController.text.trim();
-                      if (title.isEmpty || prompt.isEmpty) return;
-
-                      final newPersona = AgentPersona(
-                        id: 'custom_${DateTime.now().millisecondsSinceEpoch}',
-                        title: title,
-                        icon: 'person',
-                        description: '自定义人设',
-                        prompt: prompt,
-                        isCustom: true,
-                      );
-
-                      final list = List<AgentPersona>.from(dsh.personas)..add(newPersona);
-                      await dsh.savePersonas(list);
-                      if (context.mounted) {
-                        Navigator.pop(ctx);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
-                            content: Text('已添加人设: $title'),
-                            backgroundColor: const Color(0xFF10B981),
-                            behavior: SnackBarBehavior.floating,
-                          ),
-                        );
-                      }
-                    },
-                    child: const Text('保存为人设', style: TextStyle(fontWeight: FontWeight.bold)),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-
   BoxDecoration _cardDecoration() {
     return BoxDecoration(
       color: Colors.white,
@@ -328,7 +190,6 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     final dsh = Provider.of<DshService>(context);
     final settings = dsh.settings;
     final currentModel = settings?.currentModel ?? 'cn:deepseek-v4.1-flash';
-    final personas = dsh.personas;
 
     return Scaffold(
       backgroundColor: const Color(0xFFF9FAFB),
@@ -458,92 +319,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
             ),
           ),
 
-          const SizedBox(height: 24),
-
-          // 2. Personas & System Prompts Section
-          Row(
-            children: [
-              _buildSectionHeader('智能体角色人设 (Agent Personas)', Icons.psychology_rounded, const Color(0xFF0078D4)),
-              const Spacer(),
-              IconButton(
-                icon: const Icon(Icons.add_circle_outline, color: Color(0xFF0078D4), size: 22),
-                tooltip: '添加自定义人设',
-                onPressed: () => _openCustomPersonaDialog(context, dsh),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: _cardDecoration(),
-            child: ListView.separated(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: personas.length,
-              separatorBuilder: (context, index) => const Divider(color: Color(0xFFF3F4F6), height: 12),
-              itemBuilder: (context, index) {
-                final p = personas[index];
-                final isSelected = dsh.activePersonaId == p.id;
-                return ListTile(
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                  leading: Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: isSelected ? const Color(0xFF0078D4).withOpacity(0.12) : const Color(0xFFF3F4F6),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Icon(
-                      p.icon == 'bug'
-                          ? Icons.bug_report_outlined
-                          : p.icon == 'terminal'
-                              ? Icons.terminal_rounded
-                              : p.icon == 'shield'
-                                  ? Icons.shield_outlined
-                                  : Icons.code_rounded,
-                      color: isSelected ? const Color(0xFF0078D4) : const Color(0xFF6B7280),
-                      size: 20,
-                    ),
-                  ),
-                  title: Text(
-                    p.title,
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
-                      color: isSelected ? const Color(0xFF0078D4) : const Color(0xFF1F2937),
-                    ),
-                  ),
-                  subtitle: Text(
-                    p.description,
-                    style: const TextStyle(fontSize: 11, color: Color(0xFF6B7280)),
-                  ),
-                  trailing: isSelected
-                      ? const Icon(Icons.check_circle, color: Color(0xFF0078D4), size: 20)
-                      : OutlinedButton(
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: const Color(0xFF374151),
-                            side: const BorderSide(color: Color(0xFFD1D5DB)),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                          ),
-                          child: const Text('启用', style: TextStyle(fontSize: 11)),
-                          onPressed: () {
-                            dsh.setActivePersona(p.id);
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text('已启用人设: ${p.title}'),
-                                backgroundColor: const Color(0xFF0078D4),
-                                duration: const Duration(seconds: 1),
-                                behavior: SnackBarBehavior.floating,
-                              ),
-                            );
-                          },
-                        ),
-                );
-              },
-            ),
-          ),
-
-          const SizedBox(height: 24),
+          const SizedBox(height: 16),
 
           // 3. Connectivity & Network Diagnostics
           _buildSectionHeader('网络与网关诊断 (Connectivity & Diagnostics)', Icons.network_check_rounded, const Color(0xFF059669)),
