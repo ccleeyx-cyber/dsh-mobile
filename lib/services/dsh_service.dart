@@ -829,9 +829,9 @@ class DshService extends ChangeNotifier {
       }
 
       // Also dispatch over live WebSocket if active
-      if (_wsChannel != null) {
+      if (_channel != null) {
         try {
-          _wsChannel!.sink.add(jsonEncode({
+          _channel!.sink.add(jsonEncode({
             'type': 'approval_response',
             'eventId': req.eventId,
             'approvalId': req.id.isNotEmpty ? req.id : req.eventId,

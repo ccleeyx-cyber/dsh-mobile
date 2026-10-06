@@ -342,9 +342,12 @@ class _ChatViewState extends State<ChatView> {
                           elevation: 0,
                         ),
                         onPressed: () async {
-                          await dsh.setSessionPermission(sessionId, selectedPolicy);
-                          final updatedPerms = dsh.permissions.copyWith(maxSteps: maxSteps);
-                          await dsh.updatePermissions(updatedPerms);
+                          final currentSessions = Map<String, String>.from(dsh.permissions.sessionPolicies);
+                          currentSessions[sessionId] = selectedPolicy;
+                          final updatedPerms = dsh.permissions.copyWith(
+                            sessionPolicies: currentSessions,
+                            maxSteps: maxSteps,
+                          );
                           if (context.mounted) {
                             Navigator.pop(context);
                             ScaffoldMessenger.of(context).showSnackBar(
@@ -355,6 +358,7 @@ class _ChatViewState extends State<ChatView> {
                               ),
                             );
                           }
+                          await dsh.updatePermissions(updatedPerms);
                         },
                         child: const Text('保存权限策略', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
                       ),
@@ -843,6 +847,12 @@ class _ChatViewState extends State<ChatView> {
     final currentSessionId = currentSession?.sessionId;
     final isSessionRunning = (currentSession?.isRunning ?? false) ||
         (dsh.isSending && (currentSession?.matchesSessionId(dsh.currentSession?.sessionId) ?? false));
+    final activeApprovals = dsh.pendingApprovals.where((a) {
+      if (currentSessionId == null) return false;
+      final cleanCurrent = currentSessionId.replaceFirst('session-', '');
+      final cleanReq = a.sessionId.replaceFirst('session-', '');
+      return a.sessionId == currentSessionId || cleanReq == cleanCurrent || a.sessionId == 'default';
+    }).toList();
 
     // Keyboard height transitions
     final currentBottomInset = MediaQuery.of(context).viewInsets.bottom;
@@ -1164,21 +1174,64 @@ class _ChatViewState extends State<ChatView> {
           // Pending Tool Approvals Banner
           if (dsh.pendingApprovals.isNotEmpty)
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              color: const Color(0xFFFEF3C7),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [Color(0xFFFEF3C7), Color(0xFFFDE68A)],
+                ),
+                border: Border(
+                  bottom: BorderSide(color: Color(0xFFF59E0B), width: 1.0),
+                ),
+              ),
               child: Row(
                 children: [
-                  const Icon(Icons.warning_amber_rounded, color: Color(0xFFD97706), size: 20),
+                  Container(
+                    padding: const EdgeInsets.all(4),
+                    decoration: const BoxDecoration(
+                      color: Color(0xFFD97706),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(Icons.priority_high_rounded, color: Colors.white, size: 14),
+                  ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Text(
-                      '有 ${dsh.pendingApprovals.length} 个工具操作等待授权',
-                      style: const TextStyle(color: Color(0xFF92400E), fontSize: 13, fontWeight: FontWeight.bold),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          activeApprovals.isNotEmpty
+                              ? '当前会话有 ${activeApprovals.length} 个工具操作等待授权'
+                              : '其他会话有 ${dsh.pendingApprovals.length} 个工具操作等待授权',
+                          style: const TextStyle(
+                            color: Color(0xFF92400E),
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        if (activeApprovals.isNotEmpty)
+                          Text(
+                            '工具: ${activeApprovals.first.toolName}',
+                            style: const TextStyle(color: Color(0xFFB45309), fontSize: 11),
+                          ),
+                      ],
                     ),
                   ),
-                  TextButton(
-                    onPressed: widget.onOpenSecurity,
-                    child: const Text('立即审核', style: TextStyle(color: Color(0xFFB45309), fontWeight: FontWeight.w600)),
+                  TextButton.icon(
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                      backgroundColor: Colors.white.withOpacity(0.8),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                    ),
+                    onPressed: activeApprovals.isNotEmpty ? _scrollToBottom : widget.onOpenSecurity,
+                    icon: Icon(
+                      activeApprovals.isNotEmpty ? Icons.arrow_downward_rounded : Icons.shield_rounded,
+                      size: 14,
+                      color: const Color(0xFFB45309),
+                    ),
+                    label: Text(
+                      activeApprovals.isNotEmpty ? '滚动查看' : '前往审核',
+                      style: const TextStyle(color: Color(0xFFB45309), fontWeight: FontWeight.bold, fontSize: 12),
+                    ),
                   ),
                 ],
               ),
@@ -1190,7 +1243,7 @@ class _ChatViewState extends State<ChatView> {
                 ? const Center(child: CircularProgressIndicator())
                 : Stack(
                     children: [
-                      if (dsh.messages.isEmpty && dsh.pendingApprovals.isEmpty)
+                      if (dsh.messages.isEmpty && activeApprovals.isEmpty)
                         Center(
                           child: SingleChildScrollView(
                             padding: const EdgeInsets.symmetric(horizontal: 24),
@@ -1258,23 +1311,23 @@ class _ChatViewState extends State<ChatView> {
                             physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                             keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
                             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                            itemCount: dsh.messages.length + dsh.pendingApprovals.length,
+                            itemCount: dsh.messages.length + activeApprovals.length,
                             itemBuilder: (context, index) {
-                              // Inline pending approvals first
-                              if (index < dsh.pendingApprovals.length) {
-                                final req = dsh.pendingApprovals[index];
-                                return Padding(
-                                  padding: const EdgeInsets.only(bottom: 12),
-                                  child: ApprovalCard(
-                                    request: req,
-                                    onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
-                                  ),
-                                );
+                              // 1. Messages first (historical and streaming assistant response)
+                              if (index < dsh.messages.length) {
+                                return _buildMessageItem(dsh.messages[index]);
                               }
 
-                              final msgIndex = index - dsh.pendingApprovals.length;
-                              final msg = dsh.messages[msgIndex];
-                              return _buildMessageItem(msg);
+                              // 2. Pending approvals appended at the end of active chat stream
+                              final approvalIndex = index - dsh.messages.length;
+                              final req = activeApprovals[approvalIndex];
+                              return Padding(
+                                padding: const EdgeInsets.only(top: 8, bottom: 12),
+                                child: ApprovalCard(
+                                  request: req,
+                                  onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
+                                ),
+                              );
                             },
                           ),
                         ),
