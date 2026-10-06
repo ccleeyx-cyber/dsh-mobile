@@ -23,7 +23,7 @@ class PermissionConfig {
   factory PermissionConfig.fromJson(Map<String, dynamic> json) {
     final rawSessions = json['sessionPolicies'] as Map<String, dynamic>? ?? {};
     return PermissionConfig(
-      defaultPolicy: json['defaultPolicy'] ?? 'ask',
+      defaultPolicy: json['defaultPolicy'] ?? json['executionPolicy'] ?? 'ask',
       sandboxMode: json['sandboxMode'] ?? 'workspace-write',
       maxSteps: json['maxSteps'] is int ? json['maxSteps'] : 30,
       protectGit: json['protectGit'] ?? true,

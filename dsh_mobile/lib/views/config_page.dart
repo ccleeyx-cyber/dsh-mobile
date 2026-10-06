@@ -17,6 +17,8 @@ class _ConfigPageState extends State<ConfigPage> {
   final _hostController = TextEditingController(text: '');
   final _portController = TextEditingController(text: '3088');
   final _tokenController = TextEditingController(text: 'DSH_SECURE_TOKEN_2026');
+  final _npsController = TextEditingController(text: '');
+  final _authCodeController = TextEditingController(text: '');
   bool _useHttps = false;
   bool _isTesting = false;
 
@@ -34,16 +36,24 @@ class _ConfigPageState extends State<ConfigPage> {
         _portController.text = cfg.port.toString();
         _tokenController.text = cfg.token;
         _useHttps = cfg.useHttps;
+        _npsController.text = cfg.npsAddress;
+        _authCodeController.text = cfg.authCode;
       });
     }
   }
 
   ServerConfig _buildConfig() {
+    final tokenText = _tokenController.text.trim();
+    final authText = _authCodeController.text.trim();
+    final effectiveToken = tokenText.isNotEmpty ? tokenText : authText;
+
     return ServerConfig(
       host: _hostController.text.trim(),
       port: int.tryParse(_portController.text.trim()) ?? 3088,
-      token: _tokenController.text.trim(),
+      token: effectiveToken,
       useHttps: _useHttps,
+      npsAddress: _npsController.text.trim(),
+      authCode: authText,
     );
   }
 
@@ -151,7 +161,37 @@ class _ConfigPageState extends State<ConfigPage> {
                   border: OutlineInputBorder(),
                 ),
                 obscureText: true,
-                validator: (v) => (v == null || v.trim().isEmpty) ? '请输入 Token' : null,
+                validator: (v) {
+                  final token = v?.trim() ?? '';
+                  final authCode = _authCodeController.text.trim();
+                  if (token.isEmpty && authCode.isEmpty) {
+                    return '请输入安全认证 Token 密钥或授权码';
+                  }
+                  return null;
+                },
+              ),
+              const SizedBox(height: 16),
+              // NPS 地址 field
+              TextFormField(
+                controller: _npsController,
+                decoration: const InputDecoration(
+                  labelText: 'NPS 地址 (可选)',
+                  hintText: '例如 10.0.0.1 或 domain.nps.com',
+                  prefixIcon: Icon(Icons.network_check),
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 16),
+              // Auth Code field
+              TextFormField(
+                controller: _authCodeController,
+                decoration: const InputDecoration(
+                  labelText: '授权码 (可选)',
+                  hintText: '用于额外授权或审计',
+                  prefixIcon: Icon(Icons.lock),
+                  border: OutlineInputBorder(),
+                ),
+                obscureText: true,
               ),
               const SizedBox(height: 12),
               SwitchListTile(

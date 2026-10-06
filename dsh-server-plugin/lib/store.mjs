@@ -18,6 +18,20 @@ export function ensureDataDir() {
   return dir;
 }
 
+export function permissionsDir() {
+  return path.join(dshHome(), 'mobile-access');
+}
+
+export function permissionsFile() {
+  return path.join(permissionsDir(), 'permissions.json');
+}
+
+export function ensurePermissionsDir() {
+  const dir = permissionsDir();
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 const configFile = () => path.join(dataDir(), 'config.json');
 
 const DEFAULT_CONFIG = {
@@ -81,10 +95,10 @@ export function generateToken() {
 export function verifyToken(inputToken) {
   if (!inputToken || typeof inputToken !== 'string') return false;
   const trimmed = inputToken.trim();
+  if (!trimmed) return false;
   const cfg = loadConfig();
   if (trimmed === cfg.token) return true;
   if (process.env.DSH_AUTH_TOKEN && trimmed === process.env.DSH_AUTH_TOKEN) return true;
-  if (LEGACY_TOKENS.includes(trimmed)) return true;
   return false;
 }
 
@@ -92,9 +106,104 @@ export function roleCanWrite() {
   return true;
 }
 
-// 兼容保留接口，防止破坏其它模块调用
-export function audit() {}
-export function readAudit() { return []; }
+const DEFAULT_PERMISSIONS = {
+  defaultPolicy: 'auto-read',
+  executionPolicy: 'auto-read',
+  sandboxMode: 'workspace-write',
+  maxSteps: 30,
+  protectGit: true,
+  sessionPolicies: {}
+};
+
+const AUDIT_BUFFER_SIZE = 200;
+const auditBuffer = [];
+
+export function audit(action, payload = {}) {
+  const norm = typeof payload === 'object' && payload !== null ? payload : { details: payload };
+  const entry = {
+    id: norm.id || norm.approvalId || norm.eventId || `audit_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    time: typeof norm.time === 'number' ? norm.time : Date.now(),
+    action: norm.action || action,
+    event: norm.event || action,
+    sessionId: norm.sessionId || 'system',
+    toolName: norm.toolName || action || 'system',
+    command: norm.command || norm.reason || action || '',
+    outcome: norm.outcome || (String(action).includes('reject') ? 'rejected' : String(action).includes('allow') ? 'allowed-once' : 'auto-approved'),
+    reason: norm.reason || norm.error || (typeof norm === 'object' ? JSON.stringify(norm) : String(norm))
+  };
+  auditBuffer.unshift(entry);
+  if (auditBuffer.length > AUDIT_BUFFER_SIZE) auditBuffer.pop();
+  return entry;
+}
+
+export function readAudit(limit = 100) {
+  const lim = typeof limit === 'number' && limit > 0 ? limit : 100;
+  return auditBuffer.slice(0, lim);
+}
+
+export function loadPermissions() {
+  ensurePermissionsDir();
+  const f = permissionsFile();
+  if (!fs.existsSync(f)) {
+    try {
+      savePermissions(DEFAULT_PERMISSIONS);
+    } catch (_) {}
+    return { ...DEFAULT_PERMISSIONS };
+  }
+  try {
+    const raw = JSON.parse(fs.readFileSync(f, 'utf8'));
+    const defaultPolicy = raw.defaultPolicy || raw.executionPolicy || DEFAULT_PERMISSIONS.defaultPolicy;
+    const sessionPolicies = {};
+    if (raw.sessionPolicies && typeof raw.sessionPolicies === 'object') {
+      for (const [k, v] of Object.entries(raw.sessionPolicies)) {
+        if (typeof v === 'string') sessionPolicies[k] = v;
+      }
+    }
+    return {
+      defaultPolicy,
+      executionPolicy: defaultPolicy,
+      sandboxMode: raw.sandboxMode || DEFAULT_PERMISSIONS.sandboxMode,
+      maxSteps: typeof raw.maxSteps === 'number' ? raw.maxSteps : DEFAULT_PERMISSIONS.maxSteps,
+      protectGit: raw.protectGit !== false,
+      sessionPolicies
+    };
+  } catch (_) {
+    return { ...DEFAULT_PERMISSIONS };
+  }
+}
+
+export function savePermissions(perms = {}) {
+  ensurePermissionsDir();
+  const current = loadPermissions();
+  const defaultPol = perms.defaultPolicy || perms.executionPolicy || current.defaultPolicy;
+  const mergedSessionPolicies = {
+    ...current.sessionPolicies,
+    ...(perms.sessionPolicies || {})
+  };
+  const updated = {
+    defaultPolicy: defaultPol,
+    executionPolicy: defaultPol,
+    sandboxMode: perms.sandboxMode || current.sandboxMode,
+    maxSteps: typeof perms.maxSteps === 'number' ? perms.maxSteps : current.maxSteps,
+    protectGit: perms.protectGit !== undefined ? Boolean(perms.protectGit) : current.protectGit,
+    sessionPolicies: mergedSessionPolicies
+  };
+
+  const targetFile = permissionsFile();
+  const tmpFile = path.join(permissionsDir(), `permissions.json.${process.pid}.${Date.now()}.tmp`);
+  try {
+    fs.writeFileSync(tmpFile, JSON.stringify(updated, null, 2), 'utf8');
+    try {
+      fs.renameSync(tmpFile, targetFile);
+    } catch (_) {
+      fs.copyFileSync(tmpFile, targetFile);
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+    }
+  } catch (err) {
+    console.error('[Store] savePermissions error:', err);
+  }
+  return updated;
+}
 export function loadDevices() { return { version: 1, devices: [] }; }
 export function saveDevices() {}
 export function touchDevice() {}

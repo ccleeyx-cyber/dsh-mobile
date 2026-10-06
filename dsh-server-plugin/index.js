@@ -490,6 +490,18 @@ async function getSessionHistory(sessionId) {
         turn: 999999,
         isStreaming: follower.isRunning
       });
+    } else if (messages[messages.length - 1].role === 'assistant') {
+      const lastMsg = messages[messages.length - 1];
+      if (follower.textBuffer && follower.textBuffer.length > (lastMsg.content?.length || 0)) {
+        lastMsg.content = follower.textBuffer;
+      }
+      if (follower.thinkingBuffer && !lastMsg.thinking) {
+        lastMsg.thinking = follower.thinkingBuffer;
+      }
+      if (follower.tools && follower.tools.length > 0) {
+        lastMsg.tools = follower.tools;
+      }
+      lastMsg.isStreaming = follower.isRunning;
     }
   }
 
@@ -588,7 +600,14 @@ function savePermissions(newPerms) {
   try {
     const dir = path.dirname(PERMISSIONS_FILE);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(PERMISSIONS_FILE, JSON.stringify(newPerms, null, 2), 'utf8');
+    const tmpFile = path.join(dir, `permissions.json.${process.pid}.${Date.now()}.tmp`);
+    fs.writeFileSync(tmpFile, JSON.stringify(newPerms, null, 2), 'utf8');
+    try {
+      fs.renameSync(tmpFile, PERMISSIONS_FILE);
+    } catch (_) {
+      fs.copyFileSync(tmpFile, PERMISSIONS_FILE);
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+    }
     return true;
   } catch (e) {
     console.error('Error saving permissions file:', e);
@@ -670,6 +689,34 @@ function isCommandReadOnly(cmdStr, toolName) {
 
 // Active Prompts & Turn Tracking
 const activePrompts = new Map(); // sessionId -> promptTimestamp
+const sessionTurnSeqs = new Map();
+const cancelledTurnSeqs = new Map();
+const lastCancelTimes = new Map();
+
+function getTurnSeq(sId) {
+  const cleanId = (sId || '').replace('session-', '');
+  return sessionTurnSeqs.get(cleanId) || 0;
+}
+function setTurnSeq(sId, seq) {
+  const cleanId = (sId || '').replace('session-', '');
+  sessionTurnSeqs.set(cleanId, seq);
+}
+function getCancelledSeq(sId) {
+  const cleanId = (sId || '').replace('session-', '');
+  return cancelledTurnSeqs.get(cleanId) || 0;
+}
+function setCancelledSeq(sId, seq) {
+  const cleanId = (sId || '').replace('session-', '');
+  cancelledTurnSeqs.set(cleanId, seq);
+}
+function getLastCancelTime(sId) {
+  const cleanId = (sId || '').replace('session-', '');
+  return lastCancelTimes.get(cleanId) || 0;
+}
+function setLastCancelTime(sId, time) {
+  const cleanId = (sId || '').replace('session-', '');
+  lastCancelTimes.set(cleanId, time);
+}
 
 // Active session followers: sessionId -> { isRunning: boolean, thinkingBuffer: string, textBuffer: string, tools: Array, lastUpdated: number }
 const activeSessionFollowers = new Map();
@@ -738,6 +785,29 @@ const pendingApprovals = new Map(); // id -> { id, eventId, clientId, sessionId,
 
 // Connected Mobile WebSocket Clients
 const mobileClients = new Set();
+
+// Heartbeat & dead socket tracking interval (F3.5)
+const HEARTBEAT_INTERVAL_MS = 30000;
+const deadSocketInterval = setInterval(() => {
+  for (const client of mobileClients) {
+    if (client.isAlive === false) {
+      console.log(`[DSH Bridge] Pruning dead client socket: ${client._remoteIp || 'unknown'}`);
+      mobileClients.delete(client);
+      try {
+        client.terminate();
+      } catch (_) {}
+      continue;
+    }
+    client.isAlive = false;
+    try {
+      client.ping();
+    } catch (_) {
+      mobileClients.delete(client);
+      try { client.terminate(); } catch (_) {}
+    }
+  }
+}, HEARTBEAT_INTERVAL_MS);
+deadSocketInterval.unref?.();
 
 function broadcastToMobileClients(msgObj) {
   const text = JSON.stringify(msgObj);
@@ -948,12 +1018,33 @@ function connectUpstreamMux() {
             currentEventsClientId = val.clientId;
             console.log(`[DSH Events] $events stream ready with clientId: ${currentEventsClientId}`);
           }
+          // Cancel frame
+          else if (val.type === 'cancel' || val.event === 'approval/cancel') {
+            const eventId = val.eventId || val.id;
+            if (eventId) {
+              const appr = pendingApprovals.get(eventId);
+              if (appr) {
+                pendingApprovals.delete(appr.id);
+                pendingApprovals.delete(appr.eventId);
+                pendingApprovals.delete(eventId);
+                broadcastToMobileClients({
+                  type: 'approval_settled',
+                  eventId: appr.eventId || eventId,
+                  outcome: 'cancelled',
+                  reason: '上游任务已终止或取消'
+                });
+              }
+            }
+          }
           // Approval Request frame
-          else if (val.type === 'request' && val.event === 'approval/request') {
-            const toolName = val.request?.toolName || 'Unknown Tool';
-            const reason = val.request?.reason || '';
-            const sessionId = val.agent || 'default';
-            console.log(`[DSH Approval] Received approval request: id=${val.id}, agent=${sessionId}, tool=${toolName}, cmd=${reason.slice(0, 80)}`);
+          else if ((val.type === 'request' || val.type === 'waterfall') && val.event === 'approval/request') {
+            const toolName = val.request?.toolName || '工具执行';
+            const reason = val.request?.reason || '申请工具执行权限';
+            const sessionId = val.agent || val.agentId || 'default';
+            const eventId = val.id || val.eventId || val.request?.id || `appr_${Date.now()}`;
+            const input = val.request?.input ?? val.request?.arguments ?? val.request?.args ?? val.request?.command ?? '';
+            const options = val.request?.options || null;
+            console.log(`[DSH Approval] Received approval request: id=${eventId}, agent=${sessionId}, tool=${toolName}, cmd=${reason.slice(0, 80)}`);
 
             const currentPerms = getPermissions();
             const sessionPolicy = currentPerms.sessionPolicies?.[sessionId] || currentPerms.defaultPolicy || 'ask';
@@ -972,10 +1063,10 @@ function connectUpstreamMux() {
             }
 
             if (shouldAutoApprove) {
-              console.log(`[DSH Approval] AUTO-APPROVED: id=${val.id}, session=${sessionId}, reason=${autoApproveReason}`);
+              console.log(`[DSH Approval] AUTO-APPROVED: id=${eventId}, session=${sessionId}, reason=${autoApproveReason}`);
               callDshRpc('$events/result', {
                 clientId: currentEventsClientId,
-                eventId: val.id,
+                eventId: eventId,
                 outcome: {
                   kind: 'result',
                   value: 'allowed-once'
@@ -983,7 +1074,7 @@ function connectUpstreamMux() {
               }).catch(e => console.error('[DSH Approval] Auto-approve RPC error:', e));
 
               logAudit({
-                id: val.id,
+                id: eventId,
                 time: Date.now(),
                 sessionId,
                 toolName,
@@ -995,20 +1086,23 @@ function connectUpstreamMux() {
             }
 
             const approval = {
-              id: val.id,
-              eventId: val.id,
+              id: eventId,
+              eventId: eventId,
               clientId: currentEventsClientId,
               sessionId: sessionId,
               toolName: toolName,
               reason: reason,
               callId: val.request?.callId || '',
+              input: input,
+              options: options,
               createdAt: Date.now()
             };
 
-            pendingApprovals.set(val.id, approval);
+            pendingApprovals.set(approval.id, approval);
+            pendingApprovals.set(approval.eventId, approval);
 
             logAudit({
-              id: val.id,
+              id: eventId,
               time: Date.now(),
               sessionId,
               toolName,
@@ -1067,44 +1161,78 @@ function connectUpstreamMux() {
 }
 
 // Respond to an approval request
-async function respondApproval(eventId, outcome) {
-  const approval = pendingApprovals.get(eventId);
+async function respondApproval(eventId, outcome, reason = '') {
+  let approval = pendingApprovals.get(eventId);
   if (!approval) {
-    throw new Error(`Approval request with ID ${eventId} not found or expired`);
+    for (const v of pendingApprovals.values()) {
+      if (v.id === eventId || v.eventId === eventId) {
+        approval = v;
+        break;
+      }
+    }
+  }
+  if (!approval) {
+    const normalizedOutcome = (outcome === 'allow' || outcome === 'allowed-once' || outcome === 'approve')
+      ? 'allowed-once'
+      : 'rejected';
+    return {
+      ok: false,
+      code: 404,
+      approvalId: eventId,
+      eventId: eventId,
+      outcome: normalizedOutcome,
+      error: `Approval request with ID ${eventId} not found or expired`
+    };
   }
 
-  console.log(`[DSH Approval] Responding to ${eventId} with outcome: ${outcome}`);
+  const normalizedOutcome = (outcome === 'allow' || outcome === 'allowed-once' || outcome === 'approve')
+    ? 'allowed-once'
+    : 'rejected';
+
+  console.log(`[DSH Approval] Responding to ${eventId} with outcome: ${normalizedOutcome}`);
 
   // Call DSH RPC $events/result
-  const result = await callDshRpc('$events/result', {
-    clientId: approval.clientId,
-    eventId: approval.eventId,
-    outcome: {
-      kind: 'result',
-      value: outcome // 'allowed-once' or 'rejected'
-    }
-  });
+  try {
+    await callDshRpc('$events/result', {
+      clientId: approval.clientId || currentEventsClientId,
+      eventId: approval.eventId || approval.id,
+      outcome: {
+        kind: 'result',
+        value: normalizedOutcome
+      },
+      args: {
+        clientId: approval.clientId || currentEventsClientId,
+        eventId: approval.eventId || approval.id,
+        outcome: { kind: 'result', value: normalizedOutcome }
+      }
+    });
+  } catch (e) {
+    console.warn('[DSH Approval] Upstream $events/result RPC warning:', e?.message || e);
+  }
 
+  pendingApprovals.delete(approval.id);
+  pendingApprovals.delete(approval.eventId);
   pendingApprovals.delete(eventId);
 
   logAudit({
-    id: eventId,
+    id: approval.eventId || eventId,
     time: Date.now(),
     sessionId: approval.sessionId,
     toolName: approval.toolName,
     command: approval.reason,
-    outcome: outcome,
-    reason: outcome === 'allowed-once' ? '人工手机审批放行' : '人工手机拒绝执行'
+    outcome: normalizedOutcome,
+    reason: reason || (normalizedOutcome === 'allowed-once' ? '人工手机审批放行' : '人工手机拒绝执行')
   });
 
   // Broadcast settlement to all mobile clients
   broadcastToMobileClients({
     type: 'approval_settled',
-    eventId: eventId,
-    outcome: outcome
+    eventId: approval.eventId || eventId,
+    outcome: normalizedOutcome,
+    reason: reason || ''
   });
 
-  return result;
+  return { ok: true, code: 0, approvalId: approval.eventId || eventId, eventId: approval.eventId || eventId, outcome: normalizedOutcome, message: `Approval ${normalizedOutcome} recorded` };
 }
 
 // Start HTTP Server
@@ -1241,6 +1369,18 @@ const server = http.createServer(async (req, res) => {
       const fullId = normalizeSessionId(rawSessionId);
       const cleanId = fullId.replace('session-', '');
 
+      const now = Date.now();
+      const recentCancel = getLastCancelTime(fullId);
+      if (now - recentCancel < 350) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ code: 0, cancelled: true, message: 'Turn was cancelled' }));
+        return;
+      }
+
+      const turnSeq = getTurnSeq(fullId) + 1;
+      setTurnSeq(fullId, turnSeq);
+      const thisTurnSeq = turnSeq;
+
       // Follow session immediately for live token streaming
       followSession(fullId);
       const follower = getSessionFollower(fullId);
@@ -1250,10 +1390,10 @@ const server = http.createServer(async (req, res) => {
         follower.textBuffer = '';
         follower.tools = [];
         follower.activePromptText = body.text || '';
-        follower.lastUpdated = Date.now();
+        follower.lastUpdated = now;
       }
-      activePrompts.set(fullId, Date.now());
-      activePrompts.set(cleanId, Date.now());
+      activePrompts.set(fullId, now);
+      activePrompts.set(cleanId, now);
 
       broadcastToMobileClients({ type: 'session_status', sessionId: fullId, isRunning: true });
 
@@ -1268,6 +1408,25 @@ const server = http.createServer(async (req, res) => {
             }
           }
         });
+
+        const isCancelled = getCancelledSeq(fullId) >= thisTurnSeq || (Date.now() - getLastCancelTime(fullId) < 500);
+        if (isCancelled) {
+          try {
+            await callDshRpc('session/cancel', {
+              args: { request: { sessionId: fullId } }
+            });
+          } catch (_) {}
+          activePrompts.delete(fullId);
+          activePrompts.delete(cleanId);
+          if (follower) {
+            follower.isRunning = false;
+            follower.activePromptText = null;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ code: 0, cancelled: true, result }));
+          return;
+        }
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ code: 0, result }));
       } catch (err) {
@@ -1278,8 +1437,13 @@ const server = http.createServer(async (req, res) => {
         }
         activePrompts.delete(fullId);
         activePrompts.delete(cleanId);
-        broadcastToMobileClients({ type: 'session_status', sessionId: fullId, isRunning: false });
-        broadcastToMobileClients({ type: 'error', sessionId: fullId, error: err.message });
+
+        const isCancelled = getCancelledSeq(fullId) >= thisTurnSeq;
+        if (!isCancelled) {
+          broadcastToMobileClients({ type: 'session_status', sessionId: fullId, isRunning: false });
+          broadcastToMobileClients({ type: 'error', sessionId: fullId, error: err.message });
+          broadcastToMobileClients({ type: 'done', sessionId: fullId });
+        }
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ code: 500, error: err.message }));
       }
@@ -1293,12 +1457,19 @@ const server = http.createServer(async (req, res) => {
       const fullId = normalizeSessionId(rawSessionId);
       const cleanId = fullId.replace('session-', '');
 
+      const now = Date.now();
+      const cancelSeq = getTurnSeq(fullId) + 1;
+      setTurnSeq(fullId, cancelSeq);
+      setCancelledSeq(fullId, cancelSeq);
+      setLastCancelTime(fullId, now);
+
       const follower = getSessionFollower(fullId);
       if (follower) {
         follower.isRunning = false;
         follower.thinkingBuffer = '';
         follower.textBuffer = '';
         follower.tools = [];
+        follower.activePromptText = null;
       }
       activePrompts.delete(fullId);
       activePrompts.delete(cleanId);
@@ -1402,7 +1573,7 @@ const server = http.createServer(async (req, res) => {
 
     // 8. GET /api/mobile/approvals
     if (pathname === '/api/mobile/approvals' && req.method === 'GET') {
-      const list = Array.from(pendingApprovals.values());
+      const list = Array.from(new Set(pendingApprovals.values()));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ code: 0, approvals: list }));
       return;
@@ -1411,8 +1582,9 @@ const server = http.createServer(async (req, res) => {
     // 9. POST /api/mobile/approval
     if (pathname === '/api/mobile/approval' && req.method === 'POST') {
       const body = await readBody();
-      const eventId = body.eventId || body.id;
+      const eventId = body.eventId || body.approvalId || body.id;
       const outcome = body.outcome; // 'allowed-once' or 'rejected'
+      const reason = body.reason || '';
 
       if (!eventId || !outcome) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1420,9 +1592,9 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      await respondApproval(eventId, outcome);
+      const resOutcome = await respondApproval(eventId, outcome, reason);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ code: 0, message: `Approval ${outcome} recorded` }));
+      res.end(JSON.stringify(resOutcome));
       return;
     }
 
@@ -1447,15 +1619,35 @@ const server = http.createServer(async (req, res) => {
         }
       };
       savePermissions(updated);
+      broadcastToMobileClients({ type: 'permission_updated', permissions: updated });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ code: 0, permissions: updated }));
+      return;
+    }
+
+    // 11.1 POST /api/mobile/sessions/permission
+    if (pathname === '/api/mobile/sessions/permission' && req.method === 'POST') {
+      const body = await readBody();
+      const { sessionId, policy } = body;
+      const current = getPermissions();
+      const updated = {
+        ...current,
+        sessionPolicies: {
+          ...(current.sessionPolicies || {}),
+          [sessionId]: policy
+        }
+      };
+      savePermissions(updated);
+      broadcastToMobileClients({ type: 'permission_updated', permissions: updated });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, code: 0, sessionId, policy }));
       return;
     }
 
     // 12. GET /api/mobile/audit-logs
     if (pathname === '/api/mobile/audit-logs' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ code: 0, auditLogs: auditLogs }));
+      res.end(JSON.stringify({ ok: true, code: 0, auditLogs: auditLogs, logs: auditLogs }));
       return;
     }
 
@@ -1574,46 +1766,69 @@ server.on('upgrade', (request, socket, head) => {
 
 wss.on('connection', (clientWs, req) => {
   const clientIp = req.socket.remoteAddress;
+  clientWs._remoteIp = clientIp;
+  clientWs.isAlive = true;
   console.log(`[DSH Bridge] Mobile client connected from ${clientIp}`);
 
   mobileClients.add(clientWs);
 
+  clientWs.on('pong', () => {
+    clientWs.isAlive = true;
+  });
+
   // Send initial state & pending approvals
+  clientWs.send(JSON.stringify({ type: 'connected', version: '1.2.8', time: Date.now() }));
   clientWs.send(JSON.stringify({
     type: 'system',
     event: 'connected',
     message: 'Connected to DeepSeek Harness Agent',
-    pendingApprovals: Array.from(pendingApprovals.values())
+    pendingApprovals: Array.from(new Set(pendingApprovals.values()))
   }));
 
   // Handle mobile client messages
   clientWs.on('message', async (message) => {
+    clientWs.isAlive = true;
     try {
-      const msgStr = message.toString();
-      if (msgStr === 'ping') {
+      const msgStr = message.toString().trim();
+      // 1. Raw string ping support (case-insensitive)
+      if (msgStr.toLowerCase() === 'ping') {
         clientWs.send('pong');
         return;
       }
 
       const json = JSON.parse(msgStr);
 
-      // 1. Follow session request
-      if (json.type === 'follow' || json.type === 'select_session') {
+      // 2. JSON ping support ({"type": "ping"} or {"action": "ping"})
+      if (json.type === 'ping' || json.action === 'ping') {
+        clientWs.send(JSON.stringify({ type: 'pong', time: Date.now() }));
+        return;
+      }
+
+      // 3. Follow session / subscribe session request (F3.3)
+      if (json.type === 'follow' || json.type === 'select_session' || json.type === 'subscribe_session') {
         const rawId = json.sessionId || json.id;
         if (rawId) {
+          clientWs.sessionId = rawId;
           followSession(rawId);
+          const follower = getSessionFollower(rawId);
+          clientWs.send(JSON.stringify({
+            type: 'session_status',
+            sessionId: rawId,
+            isRunning: follower ? follower.isRunning : false
+          }));
           clientWs.send(JSON.stringify({ type: 'follow_ack', sessionId: rawId }));
         }
         return;
       }
 
-      // 2. Approval response from client
+      // 4. Approval response from client
       if (json.type === 'approval_response') {
-        const { eventId, outcome } = json;
+        const eventId = json.eventId || json.approvalId || json.id;
+        const outcome = json.outcome;
         if (eventId && outcome) {
           try {
-            await respondApproval(eventId, outcome);
-            clientWs.send(JSON.stringify({ type: 'approval_ack', eventId, outcome }));
+            const res = await respondApproval(eventId, outcome, json.reason);
+            clientWs.send(JSON.stringify({ type: 'approval_ack', eventId, outcome: res.outcome, ok: res.ok }));
           } catch (err) {
             clientWs.send(JSON.stringify({ type: 'error', message: err.message }));
           }
@@ -1621,7 +1836,7 @@ wss.on('connection', (clientWs, req) => {
         return;
       }
 
-      // 3. Chat prompt from client over WebSocket
+      // 5. Chat prompt from client over WebSocket
       if (json.type === 'chat' || json.method === 'session/send') {
         const rawSessionId = json.sessionId || json.params?.sessionId || 'default';
         const content = json.content || json.params?.content || json.params?.message || '';
@@ -1666,6 +1881,11 @@ wss.on('connection', (clientWs, req) => {
 
   clientWs.on('close', () => {
     console.log(`[DSH Bridge] Mobile client disconnected`);
+    mobileClients.delete(clientWs);
+  });
+
+  clientWs.on('error', (err) => {
+    console.warn(`[DSH Bridge] Mobile client socket error: ${err.message}`);
     mobileClients.delete(clientWs);
   });
 });

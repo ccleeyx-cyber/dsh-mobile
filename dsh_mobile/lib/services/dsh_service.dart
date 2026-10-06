@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -30,6 +31,19 @@ class DshService extends ChangeNotifier {
   ServerConfig? _currentConfig;
   final Uuid _uuid = const Uuid();
 
+  // Reconnection & Resilience State (F3.1, F3.2)
+  Timer? _reconnectTimer;
+  int _reconnectAttempts = 0;
+  bool _isExplicitlyDisconnected = false;
+  bool _isDisposed = false;
+  bool _isReconnecting = false;
+  DateTime? _lastResumeCheck;
+
+  static const int _baseReconnectDelayMs = 1000;
+  static const int _maxReconnectDelayMs = 12000;
+  static const double _backoffMultiplier = 1.5;
+  static const int _maxJitterMs = 400;
+
   // State
   List<Workspace> _workspaces = [];
   Workspace? _currentWorkspace;
@@ -46,8 +60,12 @@ class DshService extends ChangeNotifier {
   double _temperature = 0.7;
   bool _isLoadingHistory = false;
   bool _isSending = false;
+  bool _isCanceling = false;
+  int _activeTurnSeq = 0;
+  int _cancelledTurnSeq = 0;
   String? _currentSessionModel;
   int _sessionLoadSeq = 0;
+  int _streamRevision = 0;
 
   // Getters
   ConnectionStatus get status => _status;
@@ -72,37 +90,74 @@ class DshService extends ChangeNotifier {
   double get temperature => _temperature;
   bool get isLoadingHistory => _isLoadingHistory;
   bool get isSending => _isSending;
+  bool get isCanceling => _isCanceling;
+  int get streamRevision => _streamRevision;
+
+  // Connection Status Helpers & Reconnect Info (F3.1, F3.4)
+  int get reconnectAttempts => _reconnectAttempts;
+  bool get isReconnecting => _isReconnecting;
+  bool get isConnecting => _status == ConnectionStatus.connecting;
+  bool get isDisconnected => _status == ConnectionStatus.disconnected;
+  bool get hasError => _status == ConnectionStatus.error;
+
+  /// 手动触发网络重连 (F3.4)
+  Future<void> retryConnection() async {
+    if (_currentConfig == null) return;
+    _lastError = '';
+    _reconnectAttempts = 0;
+    _scheduleReconnect(immediate: true);
+  }
 
   // Headers for HTTP
-  Map<String, String> get _authHeaders => {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ${_currentConfig?.token ?? ''}',
-        'x-dsh-token': _currentConfig?.token ?? '',
-      };
+  Map<String, String> get _authHeaders {
+    final tokenVal = _currentConfig?.effectiveToken ?? '';
+    return {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer $tokenVal',
+      'x-dsh-token': tokenVal,
+      'x-auth-code': tokenVal,
+      'Connection': 'close',
+    };
+  }
 
   // Test Connection
   Future<bool> testConnection(ServerConfig config) async {
     try {
+      final tokenVal = config.effectiveToken;
       final headers = {
-        'Authorization': 'Bearer ${config.token}',
-        'x-dsh-token': config.token,
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer $tokenVal',
+        'x-dsh-token': tokenVal,
+        'x-auth-code': tokenVal,
+        'Connection': 'close',
       };
 
-      http.Response? res;
-      try {
-        final url = Uri.parse('${config.httpBaseUrl}/health');
-        res = await http.get(url, headers: headers).timeout(const Duration(seconds: 5));
-      } catch (_) {
-        // Fallback to /api/mobile/health
-        try {
-          final fallbackUrl = Uri.parse('${config.httpBaseUrl}/api/mobile/health');
-          res = await http.get(fallbackUrl, headers: headers).timeout(const Duration(seconds: 5));
-        } catch (_) {}
-      }
+      final testEndpoints = [
+        '${config.httpBaseUrl}/api/mobile/ping',
+        '${config.httpBaseUrl}/api/mobile/health',
+        '${config.httpBaseUrl}/health',
+        '${config.httpBaseUrl}/api/mobile/workspaces',
+        '${config.httpBaseUrl}/api/mobile/settings',
+      ];
 
-      if (res != null && res.statusCode == 200) {
-        final data = jsonDecode(utf8.decode(res.bodyBytes));
-        return data['authenticated'] == true || data['ok'] == true;
+      for (final endpoint in testEndpoints) {
+        try {
+          final res = await http.get(Uri.parse(endpoint), headers: headers).timeout(const Duration(seconds: 4));
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            try {
+              final body = jsonDecode(res.body);
+              if (body is Map && (body['authenticated'] == false || body['code'] == 401)) {
+                _lastError = '认证失败: 授权码错误或未提供有效令牌';
+                return false;
+              }
+            } catch (_) {}
+            return true;
+          }
+          if (res.statusCode == 401 || res.statusCode == 403) {
+            _lastError = '认证失败 (HTTP ${res.statusCode}): 请核对访问令牌或授权码';
+            return false;
+          }
+        } catch (_) {}
       }
       return false;
     } catch (e) {
@@ -114,10 +169,17 @@ class DshService extends ChangeNotifier {
   // Connect
   Future<void> connect(ServerConfig config) async {
     _currentConfig = config;
+    _isExplicitlyDisconnected = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempts = 0;
+
     _status = ConnectionStatus.connecting;
     notifyListeners();
 
     try {
+      await _cleanTeardownSocket();
+
       final uri = Uri.parse(config.wsUrl);
       _channel = WebSocketChannel.connect(uri);
 
@@ -125,20 +187,28 @@ class DshService extends ChangeNotifier {
         (data) {
           if (_status != ConnectionStatus.connected) {
             _status = ConnectionStatus.connected;
+            _reconnectAttempts = 0;
+            _isReconnecting = false;
             notifyListeners();
           }
           _handleRawMessage(data);
         },
         onError: (error) {
+          debugPrint('[DshService] WebSocket error: $error');
           _status = ConnectionStatus.error;
           _lastError = error.toString();
+          _isReconnecting = false;
           _stopHeartbeat();
           notifyListeners();
+          _scheduleReconnect();
         },
         onDone: () {
+          debugPrint('[DshService] WebSocket onDone closed');
           _status = ConnectionStatus.disconnected;
+          _isReconnecting = false;
           _stopHeartbeat();
           notifyListeners();
+          _scheduleReconnect();
         },
       );
 
@@ -155,7 +225,9 @@ class DshService extends ChangeNotifier {
     } catch (e) {
       _status = ConnectionStatus.error;
       _lastError = e.toString();
+      _isReconnecting = false;
       notifyListeners();
+      _scheduleReconnect();
     }
   }
 
@@ -227,6 +299,8 @@ class DshService extends ChangeNotifier {
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _currentSession = session;
+    _activeTurnSeq++;
+    _cancelledTurnSeq = _activeTurnSeq;
     _messages = []; // Clear immediately to prevent cross-contamination
     _isSending = false; // Reset sending state immediately
     _isLoadingHistory = true;
@@ -305,6 +379,8 @@ class DshService extends ChangeNotifier {
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _isSending = false;
+    _activeTurnSeq++;
+    _cancelledTurnSeq = _activeTurnSeq;
     _isLoadingHistory = false;
     _lastError = '';
 
@@ -408,32 +484,53 @@ class DshService extends ChangeNotifier {
     );
     _messages.add(assistantMsg);
 
+    final int turnId = ++_activeTurnSeq;
     _isSending = true;
+    _streamRevision++;
     notifyListeners();
 
     // Send follow event via WS
     _sendWsJson({'type': 'follow', 'sessionId': sessionId});
 
     try {
-      // Send via HTTP RPC
+      // Send via HTTP RPC with retry to tolerate reverse proxy Keep-Alive drops
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/prompt');
-      final res = await http.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({
-          'sessionId': sessionId,
-          'text': text,
-        }),
-      ).timeout(const Duration(seconds: 15));
+      http.Response? res;
+      for (int attempt = 0; attempt < 2; attempt++) {
+        try {
+          res = await http.post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'sessionId': sessionId,
+              'text': text,
+              'model': currentModel,
+            }),
+          ).timeout(const Duration(seconds: 20));
+          break;
+        } on http.ClientException catch (e) {
+          if (attempt == 1) rethrow;
+          debugPrint('[DshService] sendPrompt proxy drop, retrying: $e');
+          await Future.delayed(const Duration(milliseconds: 300));
+        }
+      }
 
-      if (res.statusCode == 200) {
+      if (_isCanceling || turnId <= _cancelledTurnSeq) {
+        debugPrint('[DshService] sendPrompt finished but turn was canceled; ignoring response.');
+        return;
+      }
+
+      if (res != null && res.statusCode == 200) {
         // 3. Start fallback session polling
         _startSessionPolling(sessionId);
       } else {
-        String errStr = '发送失败 (HTTP ${res.statusCode})';
+        if (_isCanceling || turnId <= _cancelledTurnSeq) return;
+        String errStr = '发送失败 (HTTP ${res?.statusCode})';
         try {
-          final data = jsonDecode(utf8.decode(res.bodyBytes));
-          if (data['error'] != null) errStr = data['error'].toString();
+          if (res != null) {
+            final data = jsonDecode(utf8.decode(res.bodyBytes));
+            if (data['error'] != null) errStr = data['error'].toString();
+          }
         } catch (_) {}
         _lastError = errStr;
         assistantMsg.content = '❌ 发送失败: $errStr';
@@ -442,6 +539,7 @@ class DshService extends ChangeNotifier {
         notifyListeners();
       }
     } catch (e) {
+      if (_isCanceling || turnId <= _cancelledTurnSeq) return;
       debugPrint('[DshService] sendPrompt error: $e');
       _lastError = '发送指令异常: $e';
       assistantMsg.content = '❌ 发送指令失败: $e';
@@ -482,8 +580,8 @@ class DshService extends ChangeNotifier {
         final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$sessionId');
         final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 5));
 
-        // If user changed session while HTTP was in flight, abort!
-        if (_currentSession == null || !_currentSession!.matchesSessionId(sessionId)) {
+        // If user changed session or canceled while HTTP was in flight, abort!
+        if (_isCanceling || _sessionPollTimer == null || _currentSession == null || !_currentSession!.matchesSessionId(sessionId)) {
           timer.cancel();
           _sessionPollTimer = null;
           return;
@@ -497,59 +595,7 @@ class DshService extends ChangeNotifier {
           final bool isRunning = sessionData['isRunning'] == true;
           final rawMessages = sessionData['messages'] as List<dynamic>? ?? [];
 
-          if (rawMessages.isNotEmpty && _currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
-            final parsedMessages = rawMessages.map((m) {
-              final rawTools = m['tools'] as List<dynamic>? ?? [];
-              return ChatMessage(
-                id: m['id'] ?? _uuid.v4(),
-                role: m['role'] ?? 'assistant',
-                content: m['content'] ?? '',
-                thinking: m['thinking'],
-                isMemory: m['isMemory'] == true || m['role'] == 'memory',
-                isContext: m['isContext'] == true || m['role'] == 'context',
-                tools: rawTools.map((t) => ToolExecution(
-                  name: t['name'] ?? '',
-                  input: t['input'] ?? '',
-                  output: t['output'] ?? '',
-                  isRunning: t['isRunning'] ?? false,
-                )).toList(),
-                timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
-              );
-            }).toList();
-
-            final isActivelyWsStreaming = _status == ConnectionStatus.connected && _messages.isNotEmpty && _messages.last.isStreaming;
-            if (!isActivelyWsStreaming || !isRunning) {
-              if (isRunning && parsedMessages.isNotEmpty && parsedMessages.last.isAssistant) {
-                parsedMessages.last.isStreaming = true;
-              }
-
-              // Preserve locally added user messages only if they belong to this current session
-              final serverUserTexts = parsedMessages.where((m) => m.isUser).map((m) => m.content).toSet();
-              for (final localMsg in _messages.where((m) => m.isUser)) {
-                if (localMsg.content.isNotEmpty && !serverUserTexts.contains(localMsg.content)) {
-                  if (localMsg.timestamp != null && DateTime.now().difference(localMsg.timestamp!).inSeconds < 30) {
-                    parsedMessages.add(localMsg);
-                  }
-                }
-              }
-
-              _messages = parsedMessages;
-              notifyListeners();
-            }
-          }
-
-          if (!isRunning) {
-            timer.cancel();
-            _sessionPollTimer = null;
-            if (_currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
-              _isSending = false;
-              if (_messages.isNotEmpty && _messages.last.isStreaming) {
-                _messages.last.isStreaming = false;
-              }
-              notifyListeners();
-            }
-            fetchWorkspaces();
-          }
+          _reconcileSessionMessages(rawMessages, isRunning, sessionId);
         }
       } catch (e) {
         debugPrint('[DshService] session poll tick error: $e');
@@ -557,12 +603,188 @@ class DshService extends ChangeNotifier {
     });
   }
 
+  // Active Session State & Pending Stream Chunks Resync (F3.3)
+  Future<void> _resyncActiveSession(String sessionId) async {
+    if (_currentConfig == null || _currentSession == null) return;
+    if (!_currentSession!.matchesSessionId(sessionId)) return;
+
+    final targetSessionId = _currentSession!.sessionId;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$targetSessionId');
+      final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 5));
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final sessionData = data['data'] as Map<String, dynamic>?;
+        if (sessionData == null) return;
+
+        // Guard against mid-flight session navigation
+        if (_currentSession == null || !_currentSession!.matchesSessionId(targetSessionId)) return;
+
+        final rawMessages = sessionData['messages'] as List<dynamic>? ?? [];
+        final isServerRunning = sessionData['isRunning'] == true;
+        final serverModel = sessionData['model'] as String?;
+        if (serverModel != null && serverModel.isNotEmpty) {
+          _currentSessionModel = serverModel;
+        }
+
+        _reconcileSessionMessages(rawMessages, isServerRunning, targetSessionId);
+      }
+    } catch (e) {
+      debugPrint('[DshService] _resyncActiveSession error: $e');
+    }
+  }
+
+  // Non-destructive 4-Way Stream Chunk & Session Reconciliation (F3.3)
+  void _reconcileSessionMessages(List<dynamic> rawMessages, bool isServerRunning, String targetSessionId) {
+    if (_currentSession == null || !_currentSession!.matchesSessionId(targetSessionId)) return;
+
+    final serverMessages = rawMessages.map((m) {
+      final rawTools = m['tools'] as List<dynamic>? ?? [];
+      return ChatMessage(
+        id: m['id'] ?? _uuid.v4(),
+        role: m['role'] ?? 'assistant',
+        content: m['content'] ?? '',
+        thinking: m['thinking'],
+        isMemory: m['isMemory'] == true || m['role'] == 'memory',
+        isContext: m['isContext'] == true || m['role'] == 'context',
+        tools: rawTools.map((t) => ToolExecution(
+          name: t['name'] ?? '',
+          input: t['input'] ?? '',
+          output: t['output'] ?? '',
+          isRunning: t['isRunning'] ?? false,
+        )).toList(),
+        timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
+      );
+    }).toList();
+
+    // Turn cancellation sequence fence
+    if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) {
+      isServerRunning = false;
+    }
+
+    if (isServerRunning) {
+      _isSending = true;
+
+      if (serverMessages.isNotEmpty && serverMessages.last.isAssistant) {
+        final serverAssistant = serverMessages.last;
+        serverAssistant.isStreaming = true;
+
+        final localAssistant = _messages.isNotEmpty && _messages.last.isAssistant ? _messages.last : null;
+        if (localAssistant != null) {
+          // 1. Reconcile thinking: never discard in-flight local thoughts
+          if ((localAssistant.thinking != null && localAssistant.thinking!.isNotEmpty) &&
+              (serverAssistant.thinking == null || serverAssistant.thinking!.isEmpty ||
+               localAssistant.thinking!.length > serverAssistant.thinking!.length)) {
+            serverAssistant.thinking = localAssistant.thinking;
+          }
+
+          // 2. Reconcile text content: retain live WebSocket advances
+          if (localAssistant.content.length > serverAssistant.content.length &&
+              localAssistant.content.startsWith(serverAssistant.content)) {
+            serverAssistant.content = localAssistant.content;
+          }
+        }
+      } else {
+        // Server has not emitted assistant turn yet; retain local optimistic assistant placeholder
+        if (_messages.isNotEmpty && _messages.last.isAssistant && _messages.last.isStreaming) {
+          serverMessages.add(_messages.last);
+        }
+      }
+    } else {
+      // Graceful transition to idle when turn finished on server while disconnected
+      _isSending = false;
+      _isCanceling = false;
+      _sessionPollTimer?.cancel();
+      _sessionPollTimer = null;
+
+      if (serverMessages.isNotEmpty && serverMessages.last.isAssistant) {
+        final serverAssistant = serverMessages.last;
+        serverAssistant.isStreaming = false;
+        for (final t in serverAssistant.tools) {
+          t.isRunning = false;
+        }
+
+        // Preserve local thinking if server committed record omitted reasoning
+        final localAssistant = _messages.isNotEmpty && _messages.last.isAssistant ? _messages.last : null;
+        if (localAssistant != null && (localAssistant.thinking != null && localAssistant.thinking!.isNotEmpty) &&
+            (serverAssistant.thinking == null || serverAssistant.thinking!.isEmpty)) {
+          serverAssistant.thinking = localAssistant.thinking;
+        }
+      }
+    }
+
+    // 3. Preserve recent local user prompts without duplicating or inversing order
+    final serverUserTexts = serverMessages.where((m) => m.isUser).map((m) => m.content).toSet();
+    for (final localMsg in _messages.where((m) => m.isUser)) {
+      if (localMsg.content.isNotEmpty && !serverUserTexts.contains(localMsg.content)) {
+        if (localMsg.timestamp != null && DateTime.now().difference(localMsg.timestamp!).inSeconds < 45) {
+          final assistIdx = serverMessages.indexWhere((m) => m.isAssistant && m.isStreaming);
+          if (assistIdx != -1) {
+            serverMessages.insert(assistIdx, localMsg);
+          } else {
+            serverMessages.add(localMsg);
+          }
+        }
+      }
+    }
+
+    _messages = serverMessages;
+    _streamRevision++;
+    notifyListeners();
+  }
+
   // Cancel Turn
   Future<void> cancelActiveTurn() async {
+    // 1. Immediately terminate active polling
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
+
+    // 2. Synchronous client-side state transition
+    _cancelledTurnSeq = _activeTurnSeq;
     _isSending = false;
-    if (_currentSession == null || _currentConfig == null) return;
+    _isCanceling = true;
+
+    // 3. Mark current session as not running locally
+    if (_currentSession != null) {
+      final sId = _currentSession!.sessionId;
+      _currentSession = _currentSession!.copyWith(isRunning: false);
+      for (final ws in _workspaces) {
+        for (var i = 0; i < ws.sessions.length; i++) {
+          if (ws.sessions[i].matchesSessionId(sId)) {
+            ws.sessions[i] = ws.sessions[i].copyWith(isRunning: false);
+          }
+        }
+      }
+    }
+
+    // 4. Zero orphaned stream states: finalize all active streams and running tools
+    for (final msg in _messages.reversed) {
+      if (msg.isStreaming) {
+        msg.isStreaming = false;
+        for (final tool in msg.tools) {
+          tool.isRunning = false;
+        }
+        if (msg.content.isEmpty) {
+          msg.content = (msg.thinking != null && msg.thinking!.isNotEmpty)
+              ? '*(任务已被手动停止)*'
+              : '*(已取消)*';
+        } else if (!msg.content.endsWith('*(任务已被手动停止)*') && !msg.content.endsWith('*(已取消)*')) {
+          msg.content += '\n*(任务已被手动停止)*';
+        }
+      }
+    }
+
+    _streamRevision++;
+    // 5. Instantly notify UI listeners for zero-perceived-latency transition
+    notifyListeners();
+
+    if (_currentSession == null || _currentConfig == null) {
+      _isCanceling = false;
+      notifyListeners();
+      return;
+    }
+
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/cancel');
       await http.post(
@@ -571,18 +793,17 @@ class DshService extends ChangeNotifier {
         body: jsonEncode({
           'sessionId': _currentSession!.sessionId,
         }),
-      );
-
-      if (_messages.isNotEmpty && _messages.last.isStreaming) {
-        _messages.last.isStreaming = false;
-        _messages.last.content += '\n*(任务已被手动停止)*';
-        notifyListeners();
-      }
-      fetchWorkspaces();
+      ).timeout(const Duration(seconds: 5));
     } catch (e) {
       debugPrint('[DshService] cancelTurn error: $e');
+    } finally {
+      _isCanceling = false;
+      _streamRevision++;
+      notifyListeners();
+      fetchWorkspaces();
     }
   }
+
 
   // Settings
   Future<void> fetchSettings() async {
@@ -609,70 +830,50 @@ class DshService extends ChangeNotifier {
     if (_currentConfig == null) return false;
     final targetSessionId = sessionId ?? _currentSession?.sessionId;
 
-    try {
-      // 1. If we have an active session, switch model for this session via session/model endpoint
-      if (targetSessionId != null && targetSessionId.isNotEmpty && targetSessionId != 'default') {
+    // 1. If we have an active session, attempt session/model endpoint
+    if (targetSessionId != null && targetSessionId.isNotEmpty && targetSessionId != 'default') {
+      try {
         final sessionUrl = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/model');
-        final sRes = await http.post(
+        await http.post(
           sessionUrl,
           headers: _authHeaders,
           body: jsonEncode({
             'sessionId': targetSessionId,
             'model': modelId,
           }),
-        ).timeout(const Duration(seconds: 8));
-
-        if (sRes.statusCode != 200) {
-          String sErr = '切换会话模型失败 (HTTP ${sRes.statusCode})';
-          try {
-            final sData = jsonDecode(utf8.decode(sRes.bodyBytes));
-            if (sData['error'] != null) sErr = sData['error'].toString();
-          } catch (_) {}
-          _lastError = sErr;
-          notifyListeners();
-          return false;
-        }
+        ).timeout(const Duration(seconds: 5));
+      } catch (e) {
+        debugPrint('[DshService] session model switch non-critical: $e');
       }
+    }
 
-      // 2. Also persist to global settings
+    // 2. Also persist to global settings
+    try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings/model');
-      final res = await http.post(
+      await http.post(
         url,
         headers: _authHeaders,
         body: jsonEncode({'model': modelId}),
-      ).timeout(const Duration(seconds: 8));
-
-      if (res.statusCode == 200) {
-        _currentSessionModel = modelId;
-        if (_currentSession != null) {
-          _currentSession = _currentSession!.copyWith(model: modelId);
-        }
-        for (final ws in _workspaces) {
-          for (var i = 0; i < ws.sessions.length; i++) {
-            if (ws.sessions[i].matchesSessionId(targetSessionId)) {
-              ws.sessions[i] = ws.sessions[i].copyWith(model: modelId);
-            }
-          }
-        }
-        await fetchSettings();
-        notifyListeners();
-        return true;
-      } else {
-        String errStr = '切换默认模型失败';
-        try {
-          final data = jsonDecode(utf8.decode(res.bodyBytes));
-          if (data['error'] != null) errStr = data['error'].toString();
-        } catch (_) {}
-        _lastError = errStr;
-        notifyListeners();
-        return false;
-      }
+      ).timeout(const Duration(seconds: 5));
     } catch (e) {
-      debugPrint('[DshService] switchModel error: $e');
-      _lastError = '切换模型异常: $e';
-      notifyListeners();
-      return false;
+      debugPrint('[DshService] global settings model switch non-critical: $e');
     }
+
+    // 3. Always update local state so subsequent prompts use this model
+    _currentSessionModel = modelId;
+    if (_currentSession != null) {
+      _currentSession = _currentSession!.copyWith(model: modelId);
+    }
+    for (final ws in _workspaces) {
+      for (var i = 0; i < ws.sessions.length; i++) {
+        if (ws.sessions[i].matchesSessionId(targetSessionId)) {
+          ws.sessions[i] = ws.sessions[i].copyWith(model: modelId);
+        }
+      }
+    }
+    await fetchSettings();
+    notifyListeners();
+    return true;
   }
 
   // Delete Session
@@ -739,21 +940,40 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  Future<void> respondApproval(ApprovalRequest req, String outcome) async {
+  Future<void> respondApproval(ApprovalRequest req, String outcome, {String? reason}) async {
     if (_currentConfig == null) return;
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approval');
+      final Map<String, dynamic> body = {
+        'eventId': req.eventId,
+        'approvalId': req.id.isNotEmpty ? req.id : req.eventId,
+        'outcome': outcome, // 'allowed-once' or 'rejected'
+      };
+      if (reason != null && reason.trim().isNotEmpty) {
+        body['reason'] = reason.trim();
+      }
+
+      // Also dispatch over live WebSocket if active
+      if (_channel != null) {
+        try {
+          _channel!.sink.add(jsonEncode({
+            'type': 'approval_response',
+            'eventId': req.eventId,
+            'approvalId': req.id.isNotEmpty ? req.id : req.eventId,
+            'outcome': outcome,
+            if (reason != null && reason.trim().isNotEmpty) 'reason': reason.trim(),
+          }));
+        } catch (_) {}
+      }
+
       final res = await http.post(
         url,
         headers: _authHeaders,
-        body: jsonEncode({
-          'eventId': req.eventId,
-          'outcome': outcome, // 'allowed-once' or 'rejected'
-        }),
+        body: jsonEncode(body),
       ).timeout(const Duration(seconds: 8));
 
       if (res.statusCode == 200) {
-        _pendingApprovals.removeWhere((a) => a.eventId == req.eventId);
+        _pendingApprovals.removeWhere((a) => a.eventId == req.eventId || a.id == req.id);
         notifyListeners();
       }
     } catch (e) {
@@ -781,6 +1001,10 @@ class DshService extends ChangeNotifier {
 
   Future<bool> updatePermissions(PermissionConfig newConfig) async {
     if (_currentConfig == null) return false;
+    final oldConfig = _permissions;
+    // 乐观更新本地状态，即时反映 UI
+    _permissions = newConfig;
+    notifyListeners();
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/permissions');
       final res = await http.post(
@@ -795,10 +1019,15 @@ class DshService extends ChangeNotifier {
           notifyListeners();
           return true;
         }
+        return true;
       }
+      _permissions = oldConfig;
+      notifyListeners();
       return false;
     } catch (e) {
       debugPrint('[DshService] updatePermissions error: $e');
+      _permissions = oldConfig;
+      notifyListeners();
       return false;
     }
   }
@@ -822,7 +1051,7 @@ class DshService extends ChangeNotifier {
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        final list = data['auditLogs'] as List<dynamic>? ?? [];
+        final list = (data['auditLogs'] ?? data['logs']) as List<dynamic>? ?? [];
         _auditLogs = list.map((a) => AuditLogItem.fromJson(a as Map<String, dynamic>)).toList();
         notifyListeners();
       }
@@ -946,6 +1175,7 @@ class DshService extends ChangeNotifier {
       if (json is! Map<String, dynamic>) return;
 
       final type = json['type'] ?? json['event'];
+      if (type == 'pong') return;
 
       // 1. Initial pending approvals from server
       if (type == 'system' && json['pendingApprovals'] is List) {
@@ -969,7 +1199,14 @@ class DshService extends ChangeNotifier {
       // 3. Approval Settled
       if (type == 'approval_settled') {
         final eventId = json['eventId'];
-        _pendingApprovals.removeWhere((a) => a.eventId == eventId);
+        _pendingApprovals.removeWhere((a) => a.eventId == eventId || a.id == eventId);
+        notifyListeners();
+        return;
+      }
+
+      // Real-time Permission Update Broadcast
+      if (type == 'permission_updated' && json['permissions'] != null) {
+        _permissions = PermissionConfig.fromJson(json['permissions'] as Map<String, dynamic>);
         notifyListeners();
         return;
       }
@@ -989,9 +1226,21 @@ class DshService extends ChangeNotifier {
           }
         }
         if (_currentSession != null && _currentSession!.matchesSessionId(sId)) {
-          _isSending = isRunning;
-          if (!isRunning && _messages.isNotEmpty && _messages.last.isAssistant) {
-            _messages.last.isStreaming = false;
+          if (!isRunning) {
+            _isSending = false;
+            _isCanceling = false;
+            _sessionPollTimer?.cancel();
+            _sessionPollTimer = null;
+            if (_messages.isNotEmpty && _messages.last.isAssistant) {
+              _messages.last.isStreaming = false;
+              for (final t in _messages.last.tools) {
+                t.isRunning = false;
+              }
+            }
+          } else {
+            if (_activeTurnSeq > _cancelledTurnSeq && !_isCanceling) {
+              _isSending = true;
+            }
           }
           changed = true;
         }
@@ -1042,6 +1291,9 @@ class DshService extends ChangeNotifier {
           return;
         }
 
+        // Drop lingering stream chunks if user canceled this turn or turn sequence mismatch
+        if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) return;
+
         if (_messages.isEmpty || !_messages.last.isAssistant) {
           _messages.add(ChatMessage(
             id: _uuid.v4(),
@@ -1060,10 +1312,12 @@ class DshService extends ChangeNotifier {
         if (type == 'thinking' || json.containsKey('thinking')) {
           final text = json['delta'] ?? json['thinking'] ?? '';
           current.thinking = (current.thinking ?? '') + text.toString();
+          _streamRevision++;
           notifyListeners();
         } else {
           final text = json['delta'] ?? json['content'] ?? json['text'] ?? '';
           current.content += text.toString();
+          _streamRevision++;
           notifyListeners();
         }
         return;
@@ -1075,6 +1329,10 @@ class DshService extends ChangeNotifier {
         if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
           return;
         }
+
+        // Drop tool start if canceled or turn sequence mismatch
+        if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) return;
+
         if (_messages.isEmpty || !_messages.last.isAssistant) {
           _messages.add(ChatMessage(
             id: _uuid.v4(),
@@ -1090,6 +1348,7 @@ class DshService extends ChangeNotifier {
         _messages.last.tools.add(ToolExecution(name: toolName, input: toolInput, isRunning: true));
         _messages.last.isStreaming = true;
         _isSending = true;
+        _streamRevision++;
         notifyListeners();
         return;
       }
@@ -1103,6 +1362,7 @@ class DshService extends ChangeNotifier {
           final lastTool = _messages.last.tools.last;
           lastTool.isRunning = false;
           lastTool.output = json['output']?.toString() ?? json['result']?.toString() ?? '完成';
+          _streamRevision++;
           notifyListeners();
         }
         return;
@@ -1121,11 +1381,16 @@ class DshService extends ChangeNotifier {
             t.isRunning = false;
           }
         }
+        _sessionPollTimer?.cancel();
+        _sessionPollTimer = null;
         _isSending = false;
+        _isCanceling = false;
+        _streamRevision++;
         notifyListeners();
         fetchWorkspaces();
         return;
       }
+
     } catch (e) {
       debugPrint('[DshService] JSON parse error: $e');
     }
@@ -1148,7 +1413,166 @@ class DshService extends ChangeNotifier {
     _heartbeatTimer = null;
   }
 
+  // Clean Socket Teardown (F4.4 / F3.1)
+  Future<void> _cleanTeardownSocket() async {
+    _stopHeartbeat();
+    if (_channel != null) {
+      try {
+        await _channel!.sink.close(ws_status.goingAway).timeout(
+          const Duration(milliseconds: 500),
+          onTimeout: () {},
+        );
+      } catch (e) {
+        debugPrint('[DshService] Socket teardown notice: $e');
+      }
+      _channel = null;
+    }
+  }
+
+  // Automatic Reconnection Loop with Exponential Backoff & Jitter (F3.1)
+  void _scheduleReconnect({bool immediate = false}) {
+    if (_isExplicitlyDisconnected || _isDisposed || _currentConfig == null) {
+      return;
+    }
+
+    _reconnectTimer?.cancel();
+
+    if (immediate) {
+      _reconnectAttempts = 0;
+      _executeReconnect();
+      return;
+    }
+
+    final int delayMs;
+    if (_reconnectAttempts == 0) {
+      // First retry: fast turnaround (1000-1300ms) to guarantee <= 5s reconnection
+      delayMs = _baseReconnectDelayMs + (DateTime.now().millisecondsSinceEpoch % 300);
+    } else {
+      final double calculated = (_baseReconnectDelayMs * math.pow(_backoffMultiplier, math.min(_reconnectAttempts, 6))).toDouble();
+      final int capped = math.min(calculated.toInt(), _maxReconnectDelayMs);
+      final int jitter = (DateTime.now().millisecondsSinceEpoch % _maxJitterMs);
+      delayMs = capped + jitter;
+    }
+
+    _reconnectAttempts++;
+    debugPrint('[DshService] Scheduling reconnect attempt #$_reconnectAttempts in ${delayMs}ms');
+
+    _reconnectTimer = Timer(Duration(milliseconds: delayMs), () {
+      _executeReconnect();
+    });
+  }
+
+  Future<void> _executeReconnect() async {
+    if (_isExplicitlyDisconnected || _isDisposed || _currentConfig == null) {
+      return;
+    }
+    if (_isReconnecting) return;
+
+    _isReconnecting = true;
+    _status = ConnectionStatus.connecting;
+    notifyListeners();
+
+    try {
+      await _cleanTeardownSocket();
+
+      final uri = Uri.parse(_currentConfig!.wsUrl);
+      _channel = WebSocketChannel.connect(uri);
+
+      _channel!.stream.listen(
+        (data) {
+          if (_status != ConnectionStatus.connected) {
+            _status = ConnectionStatus.connected;
+            _reconnectAttempts = 0;
+            _isReconnecting = false;
+            _onReconnected();
+            notifyListeners();
+          }
+          _handleRawMessage(data);
+        },
+        onError: (error) {
+          debugPrint('[DshService] Reconnect socket error: $error');
+          _status = ConnectionStatus.error;
+          _lastError = error.toString();
+          _isReconnecting = false;
+          _stopHeartbeat();
+          notifyListeners();
+          _scheduleReconnect();
+        },
+        onDone: () {
+          debugPrint('[DshService] Reconnect socket onDone closed');
+          _status = ConnectionStatus.disconnected;
+          _isReconnecting = false;
+          _stopHeartbeat();
+          notifyListeners();
+          _scheduleReconnect();
+        },
+      );
+
+      _startHeartbeat();
+      _sendWsJson({'type': 'ping'});
+    } catch (e) {
+      debugPrint('[DshService] _executeReconnect failed: $e');
+      _status = ConnectionStatus.error;
+      _lastError = e.toString();
+      _isReconnecting = false;
+      notifyListeners();
+      _scheduleReconnect();
+    }
+  }
+
+  void _onReconnected() {
+    debugPrint('[DshService] Reconnected successfully. Re-syncing session & state...');
+    if (_currentSession != null) {
+      _sendWsJson({'type': 'follow', 'sessionId': _currentSession!.sessionId});
+      _resyncActiveSession(_currentSession!.sessionId);
+    }
+    fetchWorkspaces();
+    fetchApprovals();
+    fetchPermissions();
+    fetchSettings();
+    measurePing();
+  }
+
+  // App Lifecycle Handling (F3.2)
+  void handleAppResumed() {
+    final now = DateTime.now();
+    if (_lastResumeCheck != null && now.difference(_lastResumeCheck!).inMilliseconds < 500) {
+      return; // Debounce
+    }
+    _lastResumeCheck = now;
+    debugPrint('[DshService] App resumed to foreground');
+
+    if (_status != ConnectionStatus.connected || _channel == null) {
+      debugPrint('[DshService] Resumed while disconnected/error: triggering immediate reconnect');
+      _scheduleReconnect(immediate: true);
+    } else {
+      debugPrint('[DshService] Resumed while connected: checking socket liveness');
+      try {
+        _channel?.sink.add('ping');
+      } catch (_) {
+        _scheduleReconnect(immediate: true);
+        return;
+      }
+      fetchApprovals();
+      fetchWorkspaces();
+      if (_currentSession != null) {
+        _resyncActiveSession(_currentSession!.sessionId);
+      }
+    }
+  }
+
+  void handleAppPaused() {
+    debugPrint('[DshService] App paused to background');
+    _sessionPollTimer?.cancel();
+    _sessionPollTimer = null;
+  }
+
   void disconnect() {
+    _isExplicitlyDisconnected = true;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempts = 0;
+    _isReconnecting = false;
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _stopHeartbeat();
@@ -1160,6 +1584,7 @@ class DshService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _isDisposed = true;
     disconnect();
     super.dispose();
   }

@@ -13,8 +13,31 @@ class MainShell extends StatefulWidget {
   State<MainShell> createState() => _MainShellState();
 }
 
-class _MainShellState extends State<MainShell> {
+class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   int _currentIndex = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    final dsh = Provider.of<DshService>(context, listen: false);
+    if (state == AppLifecycleState.resumed) {
+      dsh.handleAppResumed();
+    } else if (state == AppLifecycleState.paused) {
+      dsh.handleAppPaused();
+    }
+  }
 
   void _setIndex(int index) {
     setState(() {
@@ -31,13 +54,47 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
+  Widget _buildNavBadge(Widget icon, int count) {
+    if (count <= 0) return icon;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        icon,
+        Positioned(
+          right: -8,
+          top: -4,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+            decoration: BoxDecoration(
+              color: const Color(0xFFD97706),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.white, width: 1.5),
+            ),
+            constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
+            child: Text(
+              count > 9 ? '9+' : '$count',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 9.5,
+                fontWeight: FontWeight.bold,
+                height: 1.0,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final dsh = Provider.of<DshService>(context);
     final pendingCount = dsh.pendingApprovals.length;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF1E1E1E),
+      resizeToAvoidBottomInset: false,
+      backgroundColor: const Color(0xFFF9FAFB),
       body: IndexedStack(
         index: _currentIndex,
         children: [
@@ -54,29 +111,29 @@ class _MainShellState extends State<MainShell> {
       ),
       bottomNavigationBar: Container(
         decoration: const BoxDecoration(
-          color: Color(0xFF252526),
-          border: Border(top: BorderSide(color: Color(0xFF333333), width: 0.8)),
+          color: Colors.white,
+          border: Border(top: BorderSide(color: Color(0xFFE5E7EB), width: 1.0)),
         ),
         child: SafeArea(
           child: NavigationBarTheme(
             data: NavigationBarThemeData(
-              backgroundColor: Colors.transparent,
-              indicatorColor: const Color(0xFF0078D4).withOpacity(0.2),
+              backgroundColor: Colors.white,
+              indicatorColor: const Color(0xFF0078D4).withOpacity(0.12),
               labelTextStyle: MaterialStateProperty.resolveWith<TextStyle>((states) {
                 if (states.contains(MaterialState.selected)) {
                   return const TextStyle(
                     fontSize: 12,
-                    fontWeight: FontWeight.bold,
+                    fontWeight: FontWeight.w600,
                     color: Color(0xFF0078D4),
                   );
                 }
-                return const TextStyle(fontSize: 12, color: Colors.white54);
+                return const TextStyle(fontSize: 12, color: Color(0xFF6B7280));
               }),
               iconTheme: MaterialStateProperty.resolveWith<IconThemeData>((states) {
                 if (states.contains(MaterialState.selected)) {
                   return const IconThemeData(color: Color(0xFF0078D4), size: 24);
                 }
-                return const IconThemeData(color: Colors.white54, size: 24);
+                return const IconThemeData(color: Color(0xFF6B7280), size: 24);
               }),
             ),
             child: NavigationBar(
@@ -88,56 +145,14 @@ class _MainShellState extends State<MainShell> {
                   selectedIcon: Icon(Icons.chat_bubble_rounded),
                   label: '对话',
                 ),
-                const NavigationDestination(
-                  icon: Icon(Icons.folder_outlined),
-                  selectedIcon: Icon(Icons.folder_rounded),
+                NavigationDestination(
+                  icon: _buildNavBadge(const Icon(Icons.folder_outlined), pendingCount),
+                  selectedIcon: _buildNavBadge(const Icon(Icons.folder_rounded), pendingCount),
                   label: '工作区',
                 ),
                 NavigationDestination(
-                  icon: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      const Icon(Icons.security_outlined),
-                      if (pendingCount > 0)
-                        Positioned(
-                          right: -6,
-                          top: -4,
-                          child: Container(
-                            padding: const EdgeInsets.all(4),
-                            decoration: const BoxDecoration(
-                              color: Colors.amberAccent,
-                              shape: BoxShape.circle,
-                            ),
-                            child: Text(
-                              '$pendingCount',
-                              style: const TextStyle(color: Colors.black, fontSize: 9, fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                  selectedIcon: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      const Icon(Icons.security_rounded),
-                      if (pendingCount > 0)
-                        Positioned(
-                          right: -6,
-                          top: -4,
-                          child: Container(
-                            padding: const EdgeInsets.all(4),
-                            decoration: const BoxDecoration(
-                              color: Colors.amberAccent,
-                              shape: BoxShape.circle,
-                            ),
-                            child: Text(
-                              '$pendingCount',
-                              style: const TextStyle(color: Colors.black, fontSize: 9, fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
+                  icon: _buildNavBadge(const Icon(Icons.security_outlined), pendingCount),
+                  selectedIcon: _buildNavBadge(const Icon(Icons.security_rounded), pendingCount),
                   label: '权限安全',
                 ),
                 const NavigationDestination(
