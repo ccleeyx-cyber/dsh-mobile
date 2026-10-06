@@ -805,6 +805,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
           ],
         ),
         onTap: () async {
+          HapticFeedback.selectionClick();
           dsh.selectWorkspace(ws);
           await dsh.selectSession(s);
           widget.onSwitchToChat?.call();

@@ -46,8 +46,12 @@ class DshService extends ChangeNotifier {
   double _temperature = 0.7;
   bool _isLoadingHistory = false;
   bool _isSending = false;
+  bool _isCanceling = false;
+  int _activeTurnSeq = 0;
+  int _cancelledTurnSeq = 0;
   String? _currentSessionModel;
   int _sessionLoadSeq = 0;
+  int _streamRevision = 0;
 
   // Getters
   ConnectionStatus get status => _status;
@@ -72,6 +76,8 @@ class DshService extends ChangeNotifier {
   double get temperature => _temperature;
   bool get isLoadingHistory => _isLoadingHistory;
   bool get isSending => _isSending;
+  bool get isCanceling => _isCanceling;
+  int get streamRevision => _streamRevision;
 
   // Headers for HTTP
   Map<String, String> get _authHeaders {
@@ -247,6 +253,8 @@ class DshService extends ChangeNotifier {
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _currentSession = session;
+    _activeTurnSeq++;
+    _cancelledTurnSeq = _activeTurnSeq;
     _messages = []; // Clear immediately to prevent cross-contamination
     _isSending = false; // Reset sending state immediately
     _isLoadingHistory = true;
@@ -325,6 +333,8 @@ class DshService extends ChangeNotifier {
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _isSending = false;
+    _activeTurnSeq++;
+    _cancelledTurnSeq = _activeTurnSeq;
     _isLoadingHistory = false;
     _lastError = '';
 
@@ -428,7 +438,9 @@ class DshService extends ChangeNotifier {
     );
     _messages.add(assistantMsg);
 
+    final int turnId = ++_activeTurnSeq;
     _isSending = true;
+    _streamRevision++;
     notifyListeners();
 
     // Send follow event via WS
@@ -457,10 +469,16 @@ class DshService extends ChangeNotifier {
         }
       }
 
+      if (_isCanceling || turnId <= _cancelledTurnSeq) {
+        debugPrint('[DshService] sendPrompt finished but turn was canceled; ignoring response.');
+        return;
+      }
+
       if (res != null && res.statusCode == 200) {
         // 3. Start fallback session polling
         _startSessionPolling(sessionId);
       } else {
+        if (_isCanceling || turnId <= _cancelledTurnSeq) return;
         String errStr = '发送失败 (HTTP ${res?.statusCode})';
         try {
           if (res != null) {
@@ -475,6 +493,7 @@ class DshService extends ChangeNotifier {
         notifyListeners();
       }
     } catch (e) {
+      if (_isCanceling || turnId <= _cancelledTurnSeq) return;
       debugPrint('[DshService] sendPrompt error: $e');
       _lastError = '发送指令异常: $e';
       assistantMsg.content = '❌ 发送指令失败: $e';
@@ -515,8 +534,8 @@ class DshService extends ChangeNotifier {
         final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$sessionId');
         final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 5));
 
-        // If user changed session while HTTP was in flight, abort!
-        if (_currentSession == null || !_currentSession!.matchesSessionId(sessionId)) {
+        // If user changed session or canceled while HTTP was in flight, abort!
+        if (_isCanceling || _sessionPollTimer == null || _currentSession == null || !_currentSession!.matchesSessionId(sessionId)) {
           timer.cancel();
           _sessionPollTimer = null;
           return;
@@ -592,10 +611,55 @@ class DshService extends ChangeNotifier {
 
   // Cancel Turn
   Future<void> cancelActiveTurn() async {
+    // 1. Immediately terminate active polling
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
+
+    // 2. Synchronous client-side state transition
+    _cancelledTurnSeq = _activeTurnSeq;
     _isSending = false;
-    if (_currentSession == null || _currentConfig == null) return;
+    _isCanceling = true;
+
+    // 3. Mark current session as not running locally
+    if (_currentSession != null) {
+      final sId = _currentSession!.sessionId;
+      _currentSession = _currentSession!.copyWith(isRunning: false);
+      for (final ws in _workspaces) {
+        for (var i = 0; i < ws.sessions.length; i++) {
+          if (ws.sessions[i].matchesSessionId(sId)) {
+            ws.sessions[i] = ws.sessions[i].copyWith(isRunning: false);
+          }
+        }
+      }
+    }
+
+    // 4. Zero orphaned stream states: finalize all active streams and running tools
+    for (final msg in _messages.reversed) {
+      if (msg.isStreaming) {
+        msg.isStreaming = false;
+        for (final tool in msg.tools) {
+          tool.isRunning = false;
+        }
+        if (msg.content.isEmpty) {
+          msg.content = (msg.thinking != null && msg.thinking!.isNotEmpty)
+              ? '*(任务已被手动停止)*'
+              : '*(已取消)*';
+        } else if (!msg.content.endsWith('*(任务已被手动停止)*') && !msg.content.endsWith('*(已取消)*')) {
+          msg.content += '\n*(任务已被手动停止)*';
+        }
+      }
+    }
+
+    _streamRevision++;
+    // 5. Instantly notify UI listeners for zero-perceived-latency transition
+    notifyListeners();
+
+    if (_currentSession == null || _currentConfig == null) {
+      _isCanceling = false;
+      notifyListeners();
+      return;
+    }
+
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/cancel');
       await http.post(
@@ -604,18 +668,17 @@ class DshService extends ChangeNotifier {
         body: jsonEncode({
           'sessionId': _currentSession!.sessionId,
         }),
-      );
-
-      if (_messages.isNotEmpty && _messages.last.isStreaming) {
-        _messages.last.isStreaming = false;
-        _messages.last.content += '\n*(任务已被手动停止)*';
-        notifyListeners();
-      }
-      fetchWorkspaces();
+      ).timeout(const Duration(seconds: 5));
     } catch (e) {
       debugPrint('[DshService] cancelTurn error: $e');
+    } finally {
+      _isCanceling = false;
+      _streamRevision++;
+      notifyListeners();
+      fetchWorkspaces();
     }
   }
+
 
   // Settings
   Future<void> fetchSettings() async {
@@ -752,21 +815,40 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  Future<void> respondApproval(ApprovalRequest req, String outcome) async {
+  Future<void> respondApproval(ApprovalRequest req, String outcome, {String? reason}) async {
     if (_currentConfig == null) return;
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approval');
+      final Map<String, dynamic> body = {
+        'eventId': req.eventId,
+        'approvalId': req.id.isNotEmpty ? req.id : req.eventId,
+        'outcome': outcome, // 'allowed-once' or 'rejected'
+      };
+      if (reason != null && reason.trim().isNotEmpty) {
+        body['reason'] = reason.trim();
+      }
+
+      // Also dispatch over live WebSocket if active
+      if (_wsChannel != null) {
+        try {
+          _wsChannel!.sink.add(jsonEncode({
+            'type': 'approval_response',
+            'eventId': req.eventId,
+            'approvalId': req.id.isNotEmpty ? req.id : req.eventId,
+            'outcome': outcome,
+            if (reason != null && reason.trim().isNotEmpty) 'reason': reason.trim(),
+          }));
+        } catch (_) {}
+      }
+
       final res = await http.post(
         url,
         headers: _authHeaders,
-        body: jsonEncode({
-          'eventId': req.eventId,
-          'outcome': outcome, // 'allowed-once' or 'rejected'
-        }),
+        body: jsonEncode(body),
       ).timeout(const Duration(seconds: 8));
 
       if (res.statusCode == 200) {
-        _pendingApprovals.removeWhere((a) => a.eventId == req.eventId);
+        _pendingApprovals.removeWhere((a) => a.eventId == req.eventId || a.id == req.id);
         notifyListeners();
       }
     } catch (e) {
@@ -794,6 +876,10 @@ class DshService extends ChangeNotifier {
 
   Future<bool> updatePermissions(PermissionConfig newConfig) async {
     if (_currentConfig == null) return false;
+    final oldConfig = _permissions;
+    // 乐观更新本地状态，即时反映 UI
+    _permissions = newConfig;
+    notifyListeners();
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/permissions');
       final res = await http.post(
@@ -808,10 +894,15 @@ class DshService extends ChangeNotifier {
           notifyListeners();
           return true;
         }
+        return true;
       }
+      _permissions = oldConfig;
+      notifyListeners();
       return false;
     } catch (e) {
       debugPrint('[DshService] updatePermissions error: $e');
+      _permissions = oldConfig;
+      notifyListeners();
       return false;
     }
   }
@@ -835,7 +926,7 @@ class DshService extends ChangeNotifier {
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        final list = data['auditLogs'] as List<dynamic>? ?? [];
+        final list = (data['auditLogs'] ?? data['logs']) as List<dynamic>? ?? [];
         _auditLogs = list.map((a) => AuditLogItem.fromJson(a as Map<String, dynamic>)).toList();
         notifyListeners();
       }
@@ -982,7 +1073,14 @@ class DshService extends ChangeNotifier {
       // 3. Approval Settled
       if (type == 'approval_settled') {
         final eventId = json['eventId'];
-        _pendingApprovals.removeWhere((a) => a.eventId == eventId);
+        _pendingApprovals.removeWhere((a) => a.eventId == eventId || a.id == eventId);
+        notifyListeners();
+        return;
+      }
+
+      // Real-time Permission Update Broadcast
+      if (type == 'permission_updated' && json['permissions'] != null) {
+        _permissions = PermissionConfig.fromJson(json['permissions'] as Map<String, dynamic>);
         notifyListeners();
         return;
       }
@@ -1002,9 +1100,16 @@ class DshService extends ChangeNotifier {
           }
         }
         if (_currentSession != null && _currentSession!.matchesSessionId(sId)) {
-          _isSending = isRunning;
-          if (!isRunning && _messages.isNotEmpty && _messages.last.isAssistant) {
-            _messages.last.isStreaming = false;
+          if (!isRunning) {
+            _isSending = false;
+            _isCanceling = false;
+            if (_messages.isNotEmpty && _messages.last.isAssistant) {
+              _messages.last.isStreaming = false;
+            }
+          } else {
+            if (_activeTurnSeq > _cancelledTurnSeq && !_isCanceling) {
+              _isSending = true;
+            }
           }
           changed = true;
         }
@@ -1055,6 +1160,9 @@ class DshService extends ChangeNotifier {
           return;
         }
 
+        // Drop lingering stream chunks if user canceled this turn or turn sequence mismatch
+        if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) return;
+
         if (_messages.isEmpty || !_messages.last.isAssistant) {
           _messages.add(ChatMessage(
             id: _uuid.v4(),
@@ -1073,10 +1181,12 @@ class DshService extends ChangeNotifier {
         if (type == 'thinking' || json.containsKey('thinking')) {
           final text = json['delta'] ?? json['thinking'] ?? '';
           current.thinking = (current.thinking ?? '') + text.toString();
+          _streamRevision++;
           notifyListeners();
         } else {
           final text = json['delta'] ?? json['content'] ?? json['text'] ?? '';
           current.content += text.toString();
+          _streamRevision++;
           notifyListeners();
         }
         return;
@@ -1088,6 +1198,10 @@ class DshService extends ChangeNotifier {
         if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
           return;
         }
+
+        // Drop tool start if canceled or turn sequence mismatch
+        if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) return;
+
         if (_messages.isEmpty || !_messages.last.isAssistant) {
           _messages.add(ChatMessage(
             id: _uuid.v4(),
@@ -1103,6 +1217,7 @@ class DshService extends ChangeNotifier {
         _messages.last.tools.add(ToolExecution(name: toolName, input: toolInput, isRunning: true));
         _messages.last.isStreaming = true;
         _isSending = true;
+        _streamRevision++;
         notifyListeners();
         return;
       }
@@ -1116,6 +1231,7 @@ class DshService extends ChangeNotifier {
           final lastTool = _messages.last.tools.last;
           lastTool.isRunning = false;
           lastTool.output = json['output']?.toString() ?? json['result']?.toString() ?? '完成';
+          _streamRevision++;
           notifyListeners();
         }
         return;
@@ -1135,10 +1251,13 @@ class DshService extends ChangeNotifier {
           }
         }
         _isSending = false;
+        _isCanceling = false;
+        _streamRevision++;
         notifyListeners();
         fetchWorkspaces();
         return;
       }
+
     } catch (e) {
       debugPrint('[DshService] JSON parse error: $e');
     }

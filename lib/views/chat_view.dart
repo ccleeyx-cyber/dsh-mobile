@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
@@ -28,39 +30,99 @@ class ChatView extends StatefulWidget {
 
 class _ChatViewState extends State<ChatView> {
   final TextEditingController _inputController = TextEditingController();
+  final FocusNode _inputFocusNode = FocusNode();
   final ScrollController _scrollController = ScrollController();
   String? _lastSessionId;
   bool _showScrollToBottom = false;
   int _lastMessageCount = 0;
   bool _wasLoadingHistory = false;
 
+  // Keyboard & viewport avoidance state
+  double _lastBottomInset = 0.0;
+  bool _wasNearBottomBeforeKeyboard = true;
+
+  // User interaction & streaming auto-scroll state
+  bool _userScrolledUp = false;
+  bool _isUserInteracting = false;
+  bool _isAutoScrollScheduled = false;
+  int _lastStreamRevision = 0;
+  int _lastStreamContentLength = 0;
+
   @override
   void initState() {
     super.initState();
     _scrollController.addListener(_onScroll);
+    _inputFocusNode.addListener(_onInputFocusChange);
   }
 
   @override
   void dispose() {
+    _inputFocusNode.removeListener(_onInputFocusChange);
     _scrollController.removeListener(_onScroll);
+    _inputFocusNode.dispose();
     _inputController.dispose();
     _scrollController.dispose();
     super.dispose();
+  }
+
+  void _onInputFocusChange() {
+    if (_inputFocusNode.hasFocus && !_userScrolledUp) {
+      _scrollToBottom();
+    }
   }
 
   void _onScroll() {
     if (!_scrollController.hasClients) return;
     final maxScroll = _scrollController.position.maxScrollExtent;
     final currentOffset = _scrollController.offset;
-    final show = (maxScroll - currentOffset) > 160;
+    final distFromBottom = maxScroll - currentOffset;
+    final show = distFromBottom > 160;
     if (show != _showScrollToBottom) {
       setState(() {
         _showScrollToBottom = show;
       });
     }
+    if (distFromBottom < 40 && _userScrolledUp) {
+      _userScrolledUp = false;
+    }
+  }
+
+  bool _onScrollNotification(ScrollNotification notification) {
+    if (notification is ScrollStartNotification) {
+      if (notification.dragDetails != null) {
+        _isUserInteracting = true;
+      }
+    } else if (notification is ScrollUpdateNotification) {
+      if (notification.dragDetails != null) {
+        _isUserInteracting = true;
+        final maxScroll = notification.metrics.maxScrollExtent;
+        final currentOffset = notification.metrics.pixels;
+        final distFromBottom = maxScroll - currentOffset;
+        if (distFromBottom > 120) {
+          _userScrolledUp = true;
+        } else if (distFromBottom < 40) {
+          _userScrolledUp = false;
+        }
+      }
+    } else if (notification is ScrollEndNotification) {
+      _isUserInteracting = false;
+      final maxScroll = notification.metrics.maxScrollExtent;
+      final currentOffset = notification.metrics.pixels;
+      if (maxScroll - currentOffset < 40) {
+        _userScrolledUp = false;
+      }
+    } else if (notification is UserScrollNotification) {
+      if (notification.direction == ScrollDirection.idle) {
+        _isUserInteracting = false;
+      } else {
+        _isUserInteracting = true;
+      }
+    }
+    return false;
   }
 
   void _jumpToBottom() {
+    _userScrolledUp = false;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
         _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
@@ -68,14 +130,42 @@ class _ChatViewState extends State<ChatView> {
     });
   }
 
-  void _scrollToBottom() {
+  void _scrollToBottom({Duration duration = const Duration(milliseconds: 300), Curve curve = Curves.easeOutCubic}) {
+    _userScrolledUp = false;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
           _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
+          duration: duration,
+          curve: curve,
         );
+      }
+    });
+  }
+
+  void _scheduleAutoScroll() {
+    if (_isAutoScrollScheduled) return;
+    _isAutoScrollScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _isAutoScrollScheduled = false;
+      if (!mounted) return;
+      if (_userScrolledUp || _isUserInteracting) return;
+      if (!_scrollController.hasClients) return;
+
+      final maxScroll = _scrollController.position.maxScrollExtent;
+      final currentOffset = _scrollController.offset;
+      final diff = maxScroll - currentOffset;
+
+      if (diff > 0) {
+        if (diff > 250) {
+          _scrollController.animateTo(
+            maxScroll,
+            duration: const Duration(milliseconds: 150),
+            curve: Curves.easeOutCubic,
+          );
+        } else {
+          _scrollController.jumpTo(maxScroll);
+        }
       }
     });
   }
@@ -84,10 +174,12 @@ class _ChatViewState extends State<ChatView> {
     final text = _inputController.text.trim();
     if (text.isEmpty) return;
 
+    HapticFeedback.lightImpact();
     _inputController.clear();
     dsh.sendChatMessage(text);
     _scrollToBottom();
   }
+
 
   String _formatTime(DateTime? dt) {
     if (dt == null) return '';
@@ -497,6 +589,7 @@ class _ChatViewState extends State<ChatView> {
                         borderRadius: BorderRadius.circular(10),
                         onTap: () async {
                           Navigator.pop(ctx);
+                          HapticFeedback.selectionClick();
                           final ok = await dsh.switchModel(m.id, sessionId: currentSession?.sessionId);
                           if (context.mounted) {
                             if (ok) {
@@ -723,6 +816,7 @@ class _ChatViewState extends State<ChatView> {
                           style: const TextStyle(color: Color(0xFF9CA3AF), fontSize: 12),
                         ),
                         onTap: () {
+                          HapticFeedback.selectionClick();
                           Navigator.pop(ctx);
                           dsh.selectWorkspace(ws);
                         },
@@ -750,18 +844,51 @@ class _ChatViewState extends State<ChatView> {
     final isSessionRunning = (currentSession?.isRunning ?? false) ||
         (dsh.isSending && (currentSession?.matchesSessionId(dsh.currentSession?.sessionId) ?? false));
 
-    // Auto-scroll logic: jump to bottom on session change or after history loaded
+    // Keyboard height transitions
+    final currentBottomInset = MediaQuery.of(context).viewInsets.bottom;
+    if (currentBottomInset != _lastBottomInset) {
+      final isKeyboardOpening = currentBottomInset > _lastBottomInset;
+      if (isKeyboardOpening && _lastBottomInset == 0) {
+        _wasNearBottomBeforeKeyboard = !_userScrolledUp;
+      }
+      if (isKeyboardOpening && _wasNearBottomBeforeKeyboard && !_userScrolledUp) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_scrollController.hasClients && !_userScrolledUp && !_isUserInteracting) {
+            _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+          }
+        });
+      }
+      _lastBottomInset = currentBottomInset;
+    }
+
+    // Stream content growth detection (fallback alongside streamRevision)
+    final lastMsg = dsh.messages.isNotEmpty ? dsh.messages.last : null;
+    final isStreaming = lastMsg != null && lastMsg.isStreaming;
+    final currentContentLen = (lastMsg?.content.length ?? 0) + (lastMsg?.thinking?.length ?? 0);
+    final hasStreamContentGrowth = isStreaming && currentContentLen != _lastStreamContentLength;
+    _lastStreamContentLength = currentContentLen;
+
     if (currentSessionId != _lastSessionId) {
       _lastSessionId = currentSessionId;
       _lastMessageCount = dsh.messages.length;
+      _lastStreamRevision = dsh.streamRevision;
+      _userScrolledUp = false;
       _jumpToBottom();
     } else if (_wasLoadingHistory && !dsh.isLoadingHistory) {
+      _lastStreamRevision = dsh.streamRevision;
+      _userScrolledUp = false;
       _jumpToBottom();
     } else if (dsh.messages.length != _lastMessageCount) {
-      final wasNearBottom = !_showScrollToBottom;
+      final wasNearBottom = !_userScrolledUp;
       _lastMessageCount = dsh.messages.length;
+      _lastStreamRevision = dsh.streamRevision;
       if (wasNearBottom) {
         _scrollToBottom();
+      }
+    } else if (dsh.streamRevision != _lastStreamRevision || hasStreamContentGrowth) {
+      _lastStreamRevision = dsh.streamRevision;
+      if (!_userScrolledUp && !_isUserInteracting) {
+        _scheduleAutoScroll();
       }
     }
     _wasLoadingHistory = dsh.isLoadingHistory;
@@ -1124,28 +1251,34 @@ class _ChatViewState extends State<ChatView> {
                           ),
                         )
                       else
-                        ListView.builder(
-                          controller: _scrollController,
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                          itemCount: dsh.messages.length + dsh.pendingApprovals.length,
-                          itemBuilder: (context, index) {
-                            // Inline pending approvals first
-                            if (index < dsh.pendingApprovals.length) {
-                              final req = dsh.pendingApprovals[index];
-                              return Padding(
-                                padding: const EdgeInsets.only(bottom: 12),
-                                child: ApprovalCard(
-                                  request: req,
-                                  onRespond: (r, outcome) => dsh.respondApproval(r, outcome),
-                                ),
-                              );
-                            }
+                        NotificationListener<ScrollNotification>(
+                          onNotification: _onScrollNotification,
+                          child: ListView.builder(
+                            controller: _scrollController,
+                            physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+                            keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                            itemCount: dsh.messages.length + dsh.pendingApprovals.length,
+                            itemBuilder: (context, index) {
+                              // Inline pending approvals first
+                              if (index < dsh.pendingApprovals.length) {
+                                final req = dsh.pendingApprovals[index];
+                                return Padding(
+                                  padding: const EdgeInsets.only(bottom: 12),
+                                  child: ApprovalCard(
+                                    request: req,
+                                    onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
+                                  ),
+                                );
+                              }
 
-                            final msgIndex = index - dsh.pendingApprovals.length;
-                            final msg = dsh.messages[msgIndex];
-                            return _buildMessageItem(msg);
-                          },
+                              final msgIndex = index - dsh.pendingApprovals.length;
+                              final msg = dsh.messages[msgIndex];
+                              return _buildMessageItem(msg);
+                            },
+                          ),
                         ),
+
                       if (_showScrollToBottom)
                         Positioned(
                           right: 16,
@@ -1432,6 +1565,7 @@ class _ChatViewState extends State<ChatView> {
                 child: Center(
                   child: TextField(
                     controller: _inputController,
+                    focusNode: _inputFocusNode,
                     style: const TextStyle(color: Color(0xFF111827), fontSize: 14),
                     maxLines: 4,
                     minLines: 1,
@@ -1449,23 +1583,37 @@ class _ChatViewState extends State<ChatView> {
             ),
             const SizedBox(width: 10),
             // Send / Cancel Action Button
-            if (dsh.isSending)
+            if (dsh.isSending || dsh.isCanceling)
               Container(
                 width: 44,
                 height: 44,
                 decoration: BoxDecoration(
-                  color: const Color(0xFFFEE2E2),
+                  color: dsh.isCanceling ? const Color(0xFFF3F4F6) : const Color(0xFFFEE2E2),
                   shape: BoxShape.circle,
-                  border: Border.all(color: const Color(0xFFFCA5A5)),
+                  border: Border.all(
+                    color: dsh.isCanceling ? const Color(0xFFD1D5DB) : const Color(0xFFFCA5A5),
+                  ),
                 ),
-                child: IconButton(
-                  padding: EdgeInsets.zero,
-                  icon: const Icon(Icons.stop_rounded, color: Color(0xFFDC2626), size: 24),
-                  tooltip: '停止生成',
-                  onPressed: () => dsh.cancelActiveTurn(),
-                ),
+                child: dsh.isCanceling
+                    ? const Padding(
+                        padding: EdgeInsets.all(12.0),
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Color(0xFFDC2626),
+                        ),
+                      )
+                    : IconButton(
+                        padding: EdgeInsets.zero,
+                        icon: const Icon(Icons.stop_rounded, color: Color(0xFFDC2626), size: 24),
+                        tooltip: '停止生成',
+                        onPressed: () {
+                          HapticFeedback.mediumImpact();
+                          dsh.cancelActiveTurn();
+                        },
+                      ),
               )
             else
+
               Container(
                 width: 44,
                 height: 44,

@@ -124,7 +124,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                 padding: const EdgeInsets.only(bottom: 12),
                 child: ApprovalCard(
                   request: req,
-                  onRespond: (r, outcome) => dsh.respondApproval(r, outcome),
+                  onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
                 ),
               );
             }),

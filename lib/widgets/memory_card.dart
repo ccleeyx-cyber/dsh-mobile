@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 
 class _ContextMeta {
@@ -31,6 +32,13 @@ typedef CollapsibleContextCard = MemoryCard;
 
 class _MemoryCardState extends State<MemoryCard> {
   bool _expanded = false;
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
 
   _ContextMeta _extractMeta(String text) {
     final fileMatch = RegExp(r'Instructions from:\s*([^\r\n]+)').firstMatch(text) ??
@@ -122,7 +130,10 @@ class _MemoryCardState extends State<MemoryCard> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           InkWell(
-            onTap: () => setState(() => _expanded = !_expanded),
+            onTap: () {
+              HapticFeedback.selectionClick();
+              setState(() => _expanded = !_expanded);
+            },
             borderRadius: BorderRadius.circular(8),
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
@@ -187,8 +198,10 @@ class _MemoryCardState extends State<MemoryCard> {
                 children: [
                   Flexible(
                     child: Scrollbar(
+                      controller: _scrollController,
                       thumbVisibility: true,
                       child: SingleChildScrollView(
+                        controller: _scrollController,
                         child: MarkdownBody(
                           data: widget.content,
                           selectable: true,
@@ -212,8 +225,12 @@ class _MemoryCardState extends State<MemoryCard> {
                   ),
                   const SizedBox(height: 8),
                   InkWell(
-                    onTap: () => setState(() => _expanded = false),
+                    onTap: () {
+                      HapticFeedback.selectionClick();
+                      setState(() => _expanded = false);
+                    },
                     borderRadius: BorderRadius.circular(6),
+
                     child: Container(
                       padding: const EdgeInsets.symmetric(vertical: 5),
                       alignment: Alignment.center,

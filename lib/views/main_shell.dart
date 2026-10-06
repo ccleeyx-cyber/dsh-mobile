@@ -31,12 +31,46 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
+  Widget _buildNavBadge(Widget icon, int count) {
+    if (count <= 0) return icon;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        icon,
+        Positioned(
+          right: -8,
+          top: -4,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+            decoration: BoxDecoration(
+              color: const Color(0xFFD97706),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.white, width: 1.5),
+            ),
+            constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
+            child: Text(
+              count > 9 ? '9+' : '$count',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 9.5,
+                fontWeight: FontWeight.bold,
+                height: 1.0,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final dsh = Provider.of<DshService>(context);
     final pendingCount = dsh.pendingApprovals.length;
 
     return Scaffold(
+      resizeToAvoidBottomInset: false,
       backgroundColor: const Color(0xFFF9FAFB),
       body: IndexedStack(
         index: _currentIndex,
@@ -88,56 +122,14 @@ class _MainShellState extends State<MainShell> {
                   selectedIcon: Icon(Icons.chat_bubble_rounded),
                   label: '对话',
                 ),
-                const NavigationDestination(
-                  icon: Icon(Icons.folder_outlined),
-                  selectedIcon: Icon(Icons.folder_rounded),
+                NavigationDestination(
+                  icon: _buildNavBadge(const Icon(Icons.folder_outlined), pendingCount),
+                  selectedIcon: _buildNavBadge(const Icon(Icons.folder_rounded), pendingCount),
                   label: '工作区',
                 ),
                 NavigationDestination(
-                  icon: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      const Icon(Icons.security_outlined),
-                      if (pendingCount > 0)
-                        Positioned(
-                          right: -6,
-                          top: -4,
-                          child: Container(
-                            padding: const EdgeInsets.all(4),
-                            decoration: const BoxDecoration(
-                              color: Colors.amberAccent,
-                              shape: BoxShape.circle,
-                            ),
-                            child: Text(
-                              '$pendingCount',
-                              style: const TextStyle(color: Colors.black, fontSize: 9, fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                  selectedIcon: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      const Icon(Icons.security_rounded),
-                      if (pendingCount > 0)
-                        Positioned(
-                          right: -6,
-                          top: -4,
-                          child: Container(
-                            padding: const EdgeInsets.all(4),
-                            decoration: const BoxDecoration(
-                              color: Colors.amberAccent,
-                              shape: BoxShape.circle,
-                            ),
-                            child: Text(
-                              '$pendingCount',
-                              style: const TextStyle(color: Colors.black, fontSize: 9, fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
+                  icon: _buildNavBadge(const Icon(Icons.security_outlined), pendingCount),
+                  selectedIcon: _buildNavBadge(const Icon(Icons.security_rounded), pendingCount),
                   label: '权限安全',
                 ),
                 const NavigationDestination(
