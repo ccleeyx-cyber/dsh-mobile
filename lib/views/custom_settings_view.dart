@@ -27,6 +27,8 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
             ModelItem(id: 'cn:kimi-k3-1', name: 'Kimi K3.1', contextWindow: 1000000, maxTokens: 32768),
           ];
 
+    String filter = '';
+
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -71,46 +73,95 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                   ],
                 ),
                 const SizedBox(height: 14),
-                ConstrainedBox(
-                  constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.55),
-                  child: ListView.separated(
-                    shrinkWrap: true,
-                    separatorBuilder: (_, __) => const SizedBox(height: 6),
-                    itemCount: modelList.length,
-                    itemBuilder: (context, index) {
-                      final m = modelList[index];
-                      final isSelected = m.id == currentModel || (m.id.replaceFirst('cn:', '') == currentModel.replaceFirst('cn:', ''));
-                      return ListTile(
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                        tileColor: isSelected ? const Color(0xFF0078D4).withOpacity(0.08) : null,
-                        title: Text(
-                          m.name,
-                          style: TextStyle(
-                            color: isSelected ? const Color(0xFF0078D4) : const Color(0xFF1F2937),
-                            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                StatefulBuilder(
+                  builder: (context, setModalState) {
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        TextField(
+                          decoration: InputDecoration(
+                            hintText: '搜索模型 (如 deepseek, glm, gpt, qwen...)',
+                            hintStyle: const TextStyle(fontSize: 13, color: Color(0xFF9CA3AF)),
+                            prefixIcon: const Icon(Icons.search, size: 20, color: Color(0xFF6B7280)),
+                            filled: true,
+                            fillColor: const Color(0xFFF3F4F6),
+                            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(8),
+                              borderSide: BorderSide.none,
+                            ),
+                          ),
+                          onChanged: (val) {
+                            setModalState(() {
+                              filter = val.trim().toLowerCase();
+                            });
+                          },
+                        ),
+                        const SizedBox(height: 10),
+                        ConstrainedBox(
+                          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.5),
+                          child: Builder(
+                            builder: (context) {
+                              final filtered = modelList.where((m) {
+                                if (filter.isEmpty) return true;
+                                return m.name.toLowerCase().contains(filter) || m.id.toLowerCase().contains(filter);
+                              }).toList();
+
+                              if (filtered.isEmpty) {
+                                return const Padding(
+                                  padding: EdgeInsets.symmetric(vertical: 24),
+                                  child: Center(
+                                    child: Text('未找到匹配的模型', style: TextStyle(color: Color(0xFF9CA3AF))),
+                                  ),
+                                );
+                              }
+
+                              return ListView.separated(
+                                shrinkWrap: true,
+                                separatorBuilder: (_, __) => const SizedBox(height: 6),
+                                itemCount: filtered.length,
+                                itemBuilder: (context, index) {
+                                  final m = filtered[index];
+                                  final isSelected = m.id == currentModel || (m.id.replaceFirst('cn:', '') == currentModel.replaceFirst('cn:', ''));
+                                  return ListTile(
+                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                                    tileColor: isSelected ? const Color(0xFF0078D4).withOpacity(0.08) : null,
+                                    title: Text(
+                                      m.name,
+                                      style: TextStyle(
+                                        color: isSelected ? const Color(0xFF0078D4) : const Color(0xFF1F2937),
+                                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                      ),
+                                    ),
+                                    subtitle: Text(
+                                      'ID: ${m.id} | 上下文: ${(m.contextWindow ?? 0) ~/ 1000}k',
+                                      style: const TextStyle(fontSize: 12, color: Color(0xFF6B7280)),
+                                    ),
+                                    trailing: isSelected ? const Icon(Icons.check_circle, color: Color(0xFF0078D4)) : null,
+                                    onTap: () async {
+                                      Navigator.pop(ctx);
+                                      final ok = await dsh.switchModel(m.id);
+                                      if (ok && context.mounted) {
+                                        ScaffoldMessenger.of(context).clearSnackBars();
+                                        ScaffoldMessenger.of(context).showSnackBar(
+                                          SnackBar(
+                                            content: Text('已切换默认模型至: ${m.name}'),
+                                            backgroundColor: const Color(0xFF10B981),
+                                            behavior: SnackBarBehavior.floating,
+                                            duration: const Duration(seconds: 2),
+                                          ),
+                                        );
+                                      }
+                                    },
+                                  );
+                                },
+                              );
+                            },
                           ),
                         ),
-                        subtitle: Text(
-                          '上下文: ${(m.contextWindow ?? 0) ~/ 1000}k | 最大输出: ${(m.maxTokens ?? 0) ~/ 1000}k',
-                          style: const TextStyle(fontSize: 12, color: Color(0xFF6B7280)),
-                        ),
-                        trailing: isSelected ? const Icon(Icons.check_circle, color: Color(0xFF0078D4)) : null,
-                        onTap: () async {
-                          Navigator.pop(ctx);
-                          final ok = await dsh.switchModel(m.id);
-                          if (ok && context.mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text('已切换默认模型至: ${m.name}'),
-                                backgroundColor: const Color(0xFF10B981),
-                                behavior: SnackBarBehavior.floating,
-                              ),
-                            );
-                          }
-                        },
-                      );
-                    },
-                  ),
+                      ],
+                    );
+                  },
                 ),
               ],
             ),

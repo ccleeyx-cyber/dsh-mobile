@@ -15,6 +15,17 @@ class SecurityPermissionsView extends StatefulWidget {
 }
 
 class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final dsh = Provider.of<DshService>(context, listen: false);
+      dsh.fetchPermissions();
+      dsh.fetchApprovals();
+      dsh.fetchAuditLogs();
+    });
+  }
+
   String _formatTime(int timestamp) {
     final dt = DateTime.fromMillisecondsSinceEpoch(timestamp);
     final now = DateTime.now();
@@ -152,9 +163,20 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                   subtitle: '最安全。任何工具执行均触发手机审批通知',
                   value: 'ask',
                   groupValue: permissions.defaultPolicy,
-                  onChanged: (val) {
+                  onChanged: (val) async {
+                    if (val == null) return;
                     final updated = permissions.copyWith(defaultPolicy: val);
-                    dsh.updatePermissions(updated);
+                    final ok = await dsh.updatePermissions(updated);
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).clearSnackBars();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(ok ? '已切换默认策略为: 每次询问' : '切换失败: ${dsh.lastError}'),
+                          duration: const Duration(seconds: 2),
+                          behavior: SnackBarBehavior.floating,
+                        ),
+                      );
+                    }
                   },
                 ),
 
@@ -164,9 +186,20 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                   subtitle: '推荐。ls, grep, cat, dir, find, git status 免确认运行',
                   value: 'auto-read',
                   groupValue: permissions.defaultPolicy,
-                  onChanged: (val) {
+                  onChanged: (val) async {
+                    if (val == null) return;
                     final updated = permissions.copyWith(defaultPolicy: val);
-                    dsh.updatePermissions(updated);
+                    final ok = await dsh.updatePermissions(updated);
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).clearSnackBars();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(ok ? '已切换默认策略为: 自动放行只读' : '切换失败: ${dsh.lastError}'),
+                          duration: const Duration(seconds: 2),
+                          behavior: SnackBarBehavior.floating,
+                        ),
+                      );
+                    }
                   },
                 ),
 
@@ -176,9 +209,20 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                   subtitle: '全自动执行所有命令，无需人工确认',
                   value: 'danger-full-access',
                   groupValue: permissions.defaultPolicy,
-                  onChanged: (val) {
+                  onChanged: (val) async {
+                    if (val == null) return;
                     final updated = permissions.copyWith(defaultPolicy: val);
-                    dsh.updatePermissions(updated);
+                    final ok = await dsh.updatePermissions(updated);
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).clearSnackBars();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(ok ? '已切换默认策略为: 全信任全自动' : '切换失败: ${dsh.lastError}'),
+                          duration: const Duration(seconds: 2),
+                          behavior: SnackBarBehavior.floating,
+                        ),
+                      );
+                    }
                   },
                 ),
 
@@ -193,11 +237,21 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                   title: const Text('允许沙箱提权执行 (Privilege Escalation)', style: TextStyle(fontSize: 14, color: Color(0xFF1F2937))),
                   subtitle: const Text('允许 DSH 智能体执行需要管理员权限的命令', style: TextStyle(fontSize: 12, color: Color(0xFF6B7280))),
                   value: permissions.sandboxMode == 'danger-full-access',
-                  onChanged: (val) {
+                  onChanged: (val) async {
                     final updated = permissions.copyWith(
                       sandboxMode: val ? 'danger-full-access' : 'workspace-write',
                     );
-                    dsh.updatePermissions(updated);
+                    final ok = await dsh.updatePermissions(updated);
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).clearSnackBars();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(ok ? (val ? '已开启沙箱提权执行' : '已关闭沙箱提权执行') : '更新失败: ${dsh.lastError}'),
+                          duration: const Duration(seconds: 2),
+                          behavior: SnackBarBehavior.floating,
+                        ),
+                      );
+                    }
                   },
                 ),
 
@@ -208,9 +262,19 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                   title: const Text('敏感目录防护 (Protected Path Guard)', style: TextStyle(fontSize: 14, color: Color(0xFF1F2937))),
                   subtitle: const Text('拦截对 .git, .dsh, 系统根目录等敏感路径的覆盖写操作', style: TextStyle(fontSize: 12, color: Color(0xFF6B7280))),
                   value: permissions.protectGit,
-                  onChanged: (val) {
+                  onChanged: (val) async {
                     final updated = permissions.copyWith(protectGit: val);
-                    dsh.updatePermissions(updated);
+                    final ok = await dsh.updatePermissions(updated);
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).clearSnackBars();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(ok ? (val ? '已开启敏感目录保护' : '已关闭敏感目录保护') : '更新失败: ${dsh.lastError}'),
+                          duration: const Duration(seconds: 2),
+                          behavior: SnackBarBehavior.floating,
+                        ),
+                      );
+                    }
                   },
                 ),
               ],

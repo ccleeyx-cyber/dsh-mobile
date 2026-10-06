@@ -7,7 +7,7 @@
 
     <!-- 允许非加密明文流量(ws:// 和 http://)，方便公网 IP 直接连接 -->
     <application
-        android:label="WorkBuddy"
+        android:label="DSH Mobile"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">

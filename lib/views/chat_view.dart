@@ -373,6 +373,8 @@ class _ChatViewState extends State<ChatView> {
             ModelItem(id: 'cn:kimi-k3-1', name: 'Kimi K3.1', contextWindow: 1000000, maxTokens: 32768),
           ];
 
+    String filter = '';
+
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -445,14 +447,51 @@ class _ChatViewState extends State<ChatView> {
                     ),
                   ),
                 const SizedBox(height: 12),
-                ConstrainedBox(
-                  constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.5),
-                  child: ListView.separated(
-                    shrinkWrap: true,
-                    separatorBuilder: (_, __) => const SizedBox(height: 6),
-                    itemCount: modelList.length,
-                    itemBuilder: (context, index) {
-                      final m = modelList[index];
+                StatefulBuilder(
+                  builder: (context, setModalState) {
+                    final filtered = modelList.where((m) {
+                      if (filter.isEmpty) return true;
+                      return m.name.toLowerCase().contains(filter) || m.id.toLowerCase().contains(filter);
+                    }).toList();
+
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        TextField(
+                          decoration: InputDecoration(
+                            hintText: '搜索模型 (如 deepseek, glm, gpt, qwen...)',
+                            hintStyle: const TextStyle(fontSize: 13, color: Color(0xFF9CA3AF)),
+                            prefixIcon: const Icon(Icons.search, size: 20, color: Color(0xFF6B7280)),
+                            filled: true,
+                            fillColor: const Color(0xFFF3F4F6),
+                            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(8),
+                              borderSide: BorderSide.none,
+                            ),
+                          ),
+                          onChanged: (val) {
+                            setModalState(() {
+                              filter = val.trim().toLowerCase();
+                            });
+                          },
+                        ),
+                        const SizedBox(height: 10),
+                        ConstrainedBox(
+                          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.45),
+                          child: filtered.isEmpty
+                              ? const Padding(
+                                  padding: EdgeInsets.symmetric(vertical: 24),
+                                  child: Center(
+                                    child: Text('未找到匹配的模型', style: TextStyle(color: Color(0xFF9CA3AF))),
+                                  ),
+                                )
+                              : ListView.separated(
+                                  shrinkWrap: true,
+                                  separatorBuilder: (_, __) => const SizedBox(height: 6),
+                                  itemCount: filtered.length,
+                                  itemBuilder: (context, index) {
+                                    final m = filtered[index];
                       final isSelected = m.id == activeModel || (m.id.replaceFirst('cn:', '') == activeModel.replaceFirst('cn:', ''));
                       return InkWell(
                         borderRadius: BorderRadius.circular(10),
@@ -534,6 +573,10 @@ class _ChatViewState extends State<ChatView> {
                   ),
                 ),
               ],
+            );
+          },
+        ),
+      ],
             ),
           ),
         );
@@ -584,11 +627,13 @@ class _ChatViewState extends State<ChatView> {
                 dsh.currentWorkspace?.workspaceId,
               );
               if (context.mounted) {
+                ScaffoldMessenger.of(context).clearSnackBars();
                 if (ok) {
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
                       content: Text('已删除会话: ${currentSession.title}'),
                       behavior: SnackBarBehavior.floating,
+                      duration: const Duration(seconds: 2),
                     ),
                   );
                 } else {
@@ -597,6 +642,7 @@ class _ChatViewState extends State<ChatView> {
                       content: Text('删除会话失败: ${dsh.lastError}'),
                       backgroundColor: const Color(0xFFDC2626),
                       behavior: SnackBarBehavior.floating,
+                      duration: const Duration(seconds: 3),
                     ),
                   );
                 }

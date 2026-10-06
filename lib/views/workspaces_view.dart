@@ -101,8 +101,13 @@ class _WorkspacesViewState extends State<WorkspacesView> {
               Navigator.pop(ctx);
               final ok = await dsh.deleteSession(s.sessionId, ws.workspaceId);
               if (context.mounted) {
+                ScaffoldMessenger.of(context).clearSnackBars();
                 ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text(ok ? '会话「${s.title}」已删除' : '删除失败: ${dsh.lastError}')),
+                  SnackBar(
+                    content: Text(ok ? '会话「${s.title}」已删除' : '删除失败: ${dsh.lastError}'),
+                    duration: const Duration(seconds: 2),
+                    behavior: SnackBarBehavior.floating,
+                  ),
                 );
               }
             },
