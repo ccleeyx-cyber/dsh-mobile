@@ -174,6 +174,25 @@ class _ChatViewState extends State<ChatView> {
     final text = _inputController.text.trim();
     if (text.isEmpty) return;
 
+    // Graceful offline degradation guard (F3.4)
+    if (!dsh.isConnected) {
+      HapticFeedback.heavyImpact();
+      ScaffoldMessenger.of(context).removeCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('网络已断开，请先重试连接'),
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+          action: SnackBarAction(
+            label: '点击重试',
+            textColor: const Color(0xFF60A5FA),
+            onPressed: () => dsh.retryConnection(),
+          ),
+        ),
+      );
+      return;
+    }
+
     HapticFeedback.lightImpact();
     _inputController.clear();
     dsh.sendChatMessage(text);
@@ -834,6 +853,139 @@ class _ChatViewState extends State<ChatView> {
         );
       },
     );
+  /// 离线 / 正在重连状态横幅 (F3.4)
+  Widget _buildOfflineBanner(BuildContext context, DshService dsh) {
+    final isConnecting = dsh.status == ConnectionStatus.connecting;
+
+    final bgColor = isConnecting ? const Color(0xFFFFFBEB) : const Color(0xFFFEF2F2);
+    final borderColor = isConnecting ? const Color(0xFFFDE68A) : const Color(0xFFFECACA);
+    final textColor = isConnecting ? const Color(0xFF92400E) : const Color(0xFF991B1B);
+    final accentColor = isConnecting ? const Color(0xFFD97706) : const Color(0xFFDC2626);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: bgColor,
+        border: Border(
+          bottom: BorderSide(color: borderColor, width: 1.0),
+        ),
+      ),
+      child: Row(
+        children: [
+          // Visual Status Indicator
+          Container(
+            padding: const EdgeInsets.all(5),
+            decoration: BoxDecoration(
+              color: accentColor.withOpacity(0.12),
+              shape: BoxShape.circle,
+            ),
+            child: isConnecting
+                ? SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.0,
+                      color: accentColor,
+                    ),
+                  )
+                : Icon(
+                    Icons.wifi_off_rounded,
+                    size: 15,
+                    color: accentColor,
+                  ),
+          ),
+          const SizedBox(width: 10),
+
+          // Status Information
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  isConnecting ? '网络已断开，正在尝试重连...' : '网络连接已断开',
+                  style: TextStyle(
+                    color: textColor,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (!isConnecting && dsh.lastError.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 1),
+                    child: Text(
+                      dsh.lastError,
+                      style: TextStyle(
+                        color: textColor.withOpacity(0.85),
+                        fontSize: 11,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+
+          const SizedBox(width: 8),
+
+          // Manual Retry Button ("点击重试")
+          InkWell(
+            onTap: () async {
+              HapticFeedback.lightImpact();
+              ScaffoldMessenger.of(context).removeCurrentSnackBar();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('正在尝试重新连接服务器...'),
+                  duration: Duration(seconds: 1),
+                  behavior: SnackBarBehavior.floating,
+                ),
+              );
+              await dsh.retryConnection();
+            },
+            borderRadius: BorderRadius.circular(6),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: isConnecting ? Colors.white.withOpacity(0.7) : Colors.white,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(
+                  color: isConnecting ? const Color(0xFFFDE68A) : const Color(0xFFFCA5A5),
+                  width: 1.0,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.04),
+                    blurRadius: 2,
+                    offset: const Offset(0, 1),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.refresh_rounded,
+                    size: 13,
+                    color: accentColor,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    isConnecting ? '重连中...' : '点击重试',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: accentColor,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -1138,8 +1290,12 @@ class _ChatViewState extends State<ChatView> {
       ),
       body: Column(
         children: [
-          // Global Error Alert Bar
-          if (dsh.lastError.isNotEmpty)
+          // 1. Offline & Reconnecting Status Banner (F3.4)
+          if (!dsh.isConnected)
+            _buildOfflineBanner(context, dsh),
+
+          // Global Error Alert Bar (Only when connected, preventing duplicate red alerts)
+          if (dsh.lastError.isNotEmpty && dsh.isConnected)
             Container(
               margin: const EdgeInsets.fromLTRB(14, 8, 14, 0),
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),

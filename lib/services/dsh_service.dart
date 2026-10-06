@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -29,6 +30,19 @@ class DshService extends ChangeNotifier {
   String _lastError = '';
   ServerConfig? _currentConfig;
   final Uuid _uuid = const Uuid();
+
+  // Reconnection & Resilience State (F3.1, F3.2)
+  Timer? _reconnectTimer;
+  int _reconnectAttempts = 0;
+  bool _isExplicitlyDisconnected = false;
+  bool _isDisposed = false;
+  bool _isReconnecting = false;
+  DateTime? _lastResumeCheck;
+
+  static const int _baseReconnectDelayMs = 1000;
+  static const int _maxReconnectDelayMs = 12000;
+  static const double _backoffMultiplier = 1.5;
+  static const int _maxJitterMs = 400;
 
   // State
   List<Workspace> _workspaces = [];
@@ -78,6 +92,21 @@ class DshService extends ChangeNotifier {
   bool get isSending => _isSending;
   bool get isCanceling => _isCanceling;
   int get streamRevision => _streamRevision;
+
+  // Connection Status Helpers & Reconnect Info (F3.1, F3.4)
+  int get reconnectAttempts => _reconnectAttempts;
+  bool get isReconnecting => _isReconnecting;
+  bool get isConnecting => _status == ConnectionStatus.connecting;
+  bool get isDisconnected => _status == ConnectionStatus.disconnected;
+  bool get hasError => _status == ConnectionStatus.error;
+
+  /// 手动触发网络重连 (F3.4)
+  Future<void> retryConnection() async {
+    if (_currentConfig == null) return;
+    _lastError = '';
+    _reconnectAttempts = 0;
+    _scheduleReconnect(immediate: true);
+  }
 
   // Headers for HTTP
   Map<String, String> get _authHeaders {
@@ -140,10 +169,17 @@ class DshService extends ChangeNotifier {
   // Connect
   Future<void> connect(ServerConfig config) async {
     _currentConfig = config;
+    _isExplicitlyDisconnected = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempts = 0;
+
     _status = ConnectionStatus.connecting;
     notifyListeners();
 
     try {
+      await _cleanTeardownSocket();
+
       final uri = Uri.parse(config.wsUrl);
       _channel = WebSocketChannel.connect(uri);
 
@@ -151,20 +187,28 @@ class DshService extends ChangeNotifier {
         (data) {
           if (_status != ConnectionStatus.connected) {
             _status = ConnectionStatus.connected;
+            _reconnectAttempts = 0;
+            _isReconnecting = false;
             notifyListeners();
           }
           _handleRawMessage(data);
         },
         onError: (error) {
+          debugPrint('[DshService] WebSocket error: $error');
           _status = ConnectionStatus.error;
           _lastError = error.toString();
+          _isReconnecting = false;
           _stopHeartbeat();
           notifyListeners();
+          _scheduleReconnect();
         },
         onDone: () {
+          debugPrint('[DshService] WebSocket onDone closed');
           _status = ConnectionStatus.disconnected;
+          _isReconnecting = false;
           _stopHeartbeat();
           notifyListeners();
+          _scheduleReconnect();
         },
       );
 
@@ -181,7 +225,9 @@ class DshService extends ChangeNotifier {
     } catch (e) {
       _status = ConnectionStatus.error;
       _lastError = e.toString();
+      _isReconnecting = false;
       notifyListeners();
+      _scheduleReconnect();
     }
   }
 
@@ -549,64 +595,143 @@ class DshService extends ChangeNotifier {
           final bool isRunning = sessionData['isRunning'] == true;
           final rawMessages = sessionData['messages'] as List<dynamic>? ?? [];
 
-          if (rawMessages.isNotEmpty && _currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
-            final parsedMessages = rawMessages.map((m) {
-              final rawTools = m['tools'] as List<dynamic>? ?? [];
-              return ChatMessage(
-                id: m['id'] ?? _uuid.v4(),
-                role: m['role'] ?? 'assistant',
-                content: m['content'] ?? '',
-                thinking: m['thinking'],
-                isMemory: m['isMemory'] == true || m['role'] == 'memory',
-                isContext: m['isContext'] == true || m['role'] == 'context',
-                tools: rawTools.map((t) => ToolExecution(
-                  name: t['name'] ?? '',
-                  input: t['input'] ?? '',
-                  output: t['output'] ?? '',
-                  isRunning: t['isRunning'] ?? false,
-                )).toList(),
-                timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
-              );
-            }).toList();
-
-            final isActivelyWsStreaming = _status == ConnectionStatus.connected && _messages.isNotEmpty && _messages.last.isStreaming;
-            if (!isActivelyWsStreaming || !isRunning) {
-              if (isRunning && parsedMessages.isNotEmpty && parsedMessages.last.isAssistant) {
-                parsedMessages.last.isStreaming = true;
-              }
-
-              // Preserve locally added user messages only if they belong to this current session
-              final serverUserTexts = parsedMessages.where((m) => m.isUser).map((m) => m.content).toSet();
-              for (final localMsg in _messages.where((m) => m.isUser)) {
-                if (localMsg.content.isNotEmpty && !serverUserTexts.contains(localMsg.content)) {
-                  if (localMsg.timestamp != null && DateTime.now().difference(localMsg.timestamp!).inSeconds < 30) {
-                    parsedMessages.add(localMsg);
-                  }
-                }
-              }
-
-              _messages = parsedMessages;
-              notifyListeners();
-            }
-          }
-
-          if (!isRunning) {
-            timer.cancel();
-            _sessionPollTimer = null;
-            if (_currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
-              _isSending = false;
-              if (_messages.isNotEmpty && _messages.last.isStreaming) {
-                _messages.last.isStreaming = false;
-              }
-              notifyListeners();
-            }
-            fetchWorkspaces();
-          }
+          _reconcileSessionMessages(rawMessages, isRunning, sessionId);
         }
       } catch (e) {
         debugPrint('[DshService] session poll tick error: $e');
       }
     });
+  }
+
+  // Active Session State & Pending Stream Chunks Resync (F3.3)
+  Future<void> _resyncActiveSession(String sessionId) async {
+    if (_currentConfig == null || _currentSession == null) return;
+    if (!_currentSession!.matchesSessionId(sessionId)) return;
+
+    final targetSessionId = _currentSession!.sessionId;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$targetSessionId');
+      final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 5));
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final sessionData = data['data'] as Map<String, dynamic>?;
+        if (sessionData == null) return;
+
+        // Guard against mid-flight session navigation
+        if (_currentSession == null || !_currentSession!.matchesSessionId(targetSessionId)) return;
+
+        final rawMessages = sessionData['messages'] as List<dynamic>? ?? [];
+        final isServerRunning = sessionData['isRunning'] == true;
+        final serverModel = sessionData['model'] as String?;
+        if (serverModel != null && serverModel.isNotEmpty) {
+          _currentSessionModel = serverModel;
+        }
+
+        _reconcileSessionMessages(rawMessages, isServerRunning, targetSessionId);
+      }
+    } catch (e) {
+      debugPrint('[DshService] _resyncActiveSession error: $e');
+    }
+  }
+
+  // Non-destructive 4-Way Stream Chunk & Session Reconciliation (F3.3)
+  void _reconcileSessionMessages(List<dynamic> rawMessages, bool isServerRunning, String targetSessionId) {
+    if (_currentSession == null || !_currentSession!.matchesSessionId(targetSessionId)) return;
+
+    final serverMessages = rawMessages.map((m) {
+      final rawTools = m['tools'] as List<dynamic>? ?? [];
+      return ChatMessage(
+        id: m['id'] ?? _uuid.v4(),
+        role: m['role'] ?? 'assistant',
+        content: m['content'] ?? '',
+        thinking: m['thinking'],
+        isMemory: m['isMemory'] == true || m['role'] == 'memory',
+        isContext: m['isContext'] == true || m['role'] == 'context',
+        tools: rawTools.map((t) => ToolExecution(
+          name: t['name'] ?? '',
+          input: t['input'] ?? '',
+          output: t['output'] ?? '',
+          isRunning: t['isRunning'] ?? false,
+        )).toList(),
+        timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
+      );
+    }).toList();
+
+    // Turn cancellation sequence fence
+    if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) {
+      isServerRunning = false;
+    }
+
+    if (isServerRunning) {
+      _isSending = true;
+
+      if (serverMessages.isNotEmpty && serverMessages.last.isAssistant) {
+        final serverAssistant = serverMessages.last;
+        serverAssistant.isStreaming = true;
+
+        final localAssistant = _messages.isNotEmpty && _messages.last.isAssistant ? _messages.last : null;
+        if (localAssistant != null) {
+          // 1. Reconcile thinking: never discard in-flight local thoughts
+          if ((localAssistant.thinking != null && localAssistant.thinking!.isNotEmpty) &&
+              (serverAssistant.thinking == null || serverAssistant.thinking!.isEmpty ||
+               localAssistant.thinking!.length > serverAssistant.thinking!.length)) {
+            serverAssistant.thinking = localAssistant.thinking;
+          }
+
+          // 2. Reconcile text content: retain live WebSocket advances
+          if (localAssistant.content.length > serverAssistant.content.length &&
+              localAssistant.content.startsWith(serverAssistant.content)) {
+            serverAssistant.content = localAssistant.content;
+          }
+        }
+      } else {
+        // Server has not emitted assistant turn yet; retain local optimistic assistant placeholder
+        if (_messages.isNotEmpty && _messages.last.isAssistant && _messages.last.isStreaming) {
+          serverMessages.add(_messages.last);
+        }
+      }
+    } else {
+      // Graceful transition to idle when turn finished on server while disconnected
+      _isSending = false;
+      _isCanceling = false;
+      _sessionPollTimer?.cancel();
+      _sessionPollTimer = null;
+
+      if (serverMessages.isNotEmpty && serverMessages.last.isAssistant) {
+        final serverAssistant = serverMessages.last;
+        serverAssistant.isStreaming = false;
+        for (final t in serverAssistant.tools) {
+          t.isRunning = false;
+        }
+
+        // Preserve local thinking if server committed record omitted reasoning
+        final localAssistant = _messages.isNotEmpty && _messages.last.isAssistant ? _messages.last : null;
+        if (localAssistant != null && (localAssistant.thinking != null && localAssistant.thinking!.isNotEmpty) &&
+            (serverAssistant.thinking == null || serverAssistant.thinking!.isEmpty)) {
+          serverAssistant.thinking = localAssistant.thinking;
+        }
+      }
+    }
+
+    // 3. Preserve recent local user prompts without duplicating or inversing order
+    final serverUserTexts = serverMessages.where((m) => m.isUser).map((m) => m.content).toSet();
+    for (final localMsg in _messages.where((m) => m.isUser)) {
+      if (localMsg.content.isNotEmpty && !serverUserTexts.contains(localMsg.content)) {
+        if (localMsg.timestamp != null && DateTime.now().difference(localMsg.timestamp!).inSeconds < 45) {
+          final assistIdx = serverMessages.indexWhere((m) => m.isAssistant && m.isStreaming);
+          if (assistIdx != -1) {
+            serverMessages.insert(assistIdx, localMsg);
+          } else {
+            serverMessages.add(localMsg);
+          }
+        }
+      }
+    }
+
+    _messages = serverMessages;
+    _streamRevision++;
+    notifyListeners();
   }
 
   // Cancel Turn
@@ -1050,6 +1175,7 @@ class DshService extends ChangeNotifier {
       if (json is! Map<String, dynamic>) return;
 
       final type = json['type'] ?? json['event'];
+      if (type == 'pong') return;
 
       // 1. Initial pending approvals from server
       if (type == 'system' && json['pendingApprovals'] is List) {
@@ -1103,8 +1229,13 @@ class DshService extends ChangeNotifier {
           if (!isRunning) {
             _isSending = false;
             _isCanceling = false;
+            _sessionPollTimer?.cancel();
+            _sessionPollTimer = null;
             if (_messages.isNotEmpty && _messages.last.isAssistant) {
               _messages.last.isStreaming = false;
+              for (final t in _messages.last.tools) {
+                t.isRunning = false;
+              }
             }
           } else {
             if (_activeTurnSeq > _cancelledTurnSeq && !_isCanceling) {
@@ -1250,6 +1381,8 @@ class DshService extends ChangeNotifier {
             t.isRunning = false;
           }
         }
+        _sessionPollTimer?.cancel();
+        _sessionPollTimer = null;
         _isSending = false;
         _isCanceling = false;
         _streamRevision++;
@@ -1280,7 +1413,166 @@ class DshService extends ChangeNotifier {
     _heartbeatTimer = null;
   }
 
+  // Clean Socket Teardown (F4.4 / F3.1)
+  Future<void> _cleanTeardownSocket() async {
+    _stopHeartbeat();
+    if (_channel != null) {
+      try {
+        await _channel!.sink.close(ws_status.goingAway).timeout(
+          const Duration(milliseconds: 500),
+          onTimeout: () {},
+        );
+      } catch (e) {
+        debugPrint('[DshService] Socket teardown notice: $e');
+      }
+      _channel = null;
+    }
+  }
+
+  // Automatic Reconnection Loop with Exponential Backoff & Jitter (F3.1)
+  void _scheduleReconnect({bool immediate = false}) {
+    if (_isExplicitlyDisconnected || _isDisposed || _currentConfig == null) {
+      return;
+    }
+
+    _reconnectTimer?.cancel();
+
+    if (immediate) {
+      _reconnectAttempts = 0;
+      _executeReconnect();
+      return;
+    }
+
+    final int delayMs;
+    if (_reconnectAttempts == 0) {
+      // First retry: fast turnaround (1000-1300ms) to guarantee <= 5s reconnection
+      delayMs = _baseReconnectDelayMs + (DateTime.now().millisecondsSinceEpoch % 300);
+    } else {
+      final double calculated = _baseReconnectDelayMs * math.pow(_backoffMultiplier, math.min(_reconnectAttempts, 6));
+      final int capped = math.min(calculated.toInt(), _maxReconnectDelayMs);
+      final int jitter = (DateTime.now().millisecondsSinceEpoch % _maxJitterMs);
+      delayMs = capped + jitter;
+    }
+
+    _reconnectAttempts++;
+    debugPrint('[DshService] Scheduling reconnect attempt #$_reconnectAttempts in ${delayMs}ms');
+
+    _reconnectTimer = Timer(Duration(milliseconds: delayMs), () {
+      _executeReconnect();
+    });
+  }
+
+  Future<void> _executeReconnect() async {
+    if (_isExplicitlyDisconnected || _isDisposed || _currentConfig == null) {
+      return;
+    }
+    if (_isReconnecting) return;
+
+    _isReconnecting = true;
+    _status = ConnectionStatus.connecting;
+    notifyListeners();
+
+    try {
+      await _cleanTeardownSocket();
+
+      final uri = Uri.parse(_currentConfig!.wsUrl);
+      _channel = WebSocketChannel.connect(uri);
+
+      _channel!.stream.listen(
+        (data) {
+          if (_status != ConnectionStatus.connected) {
+            _status = ConnectionStatus.connected;
+            _reconnectAttempts = 0;
+            _isReconnecting = false;
+            _onReconnected();
+            notifyListeners();
+          }
+          _handleRawMessage(data);
+        },
+        onError: (error) {
+          debugPrint('[DshService] Reconnect socket error: $error');
+          _status = ConnectionStatus.error;
+          _lastError = error.toString();
+          _isReconnecting = false;
+          _stopHeartbeat();
+          notifyListeners();
+          _scheduleReconnect();
+        },
+        onDone: () {
+          debugPrint('[DshService] Reconnect socket onDone closed');
+          _status = ConnectionStatus.disconnected;
+          _isReconnecting = false;
+          _stopHeartbeat();
+          notifyListeners();
+          _scheduleReconnect();
+        },
+      );
+
+      _startHeartbeat();
+      _sendWsJson({'type': 'ping'});
+    } catch (e) {
+      debugPrint('[DshService] _executeReconnect failed: $e');
+      _status = ConnectionStatus.error;
+      _lastError = e.toString();
+      _isReconnecting = false;
+      notifyListeners();
+      _scheduleReconnect();
+    }
+  }
+
+  void _onReconnected() {
+    debugPrint('[DshService] Reconnected successfully. Re-syncing session & state...');
+    if (_currentSession != null) {
+      _sendWsJson({'type': 'follow', 'sessionId': _currentSession!.sessionId});
+      _resyncActiveSession(_currentSession!.sessionId);
+    }
+    fetchWorkspaces();
+    fetchApprovals();
+    fetchPermissions();
+    fetchSettings();
+    measurePing();
+  }
+
+  // App Lifecycle Handling (F3.2)
+  void handleAppResumed() {
+    final now = DateTime.now();
+    if (_lastResumeCheck != null && now.difference(_lastResumeCheck!).inMilliseconds < 500) {
+      return; // Debounce
+    }
+    _lastResumeCheck = now;
+    debugPrint('[DshService] App resumed to foreground');
+
+    if (_status != ConnectionStatus.connected || _channel == null) {
+      debugPrint('[DshService] Resumed while disconnected/error: triggering immediate reconnect');
+      _scheduleReconnect(immediate: true);
+    } else {
+      debugPrint('[DshService] Resumed while connected: checking socket liveness');
+      try {
+        _channel?.sink.add('ping');
+      } catch (_) {
+        _scheduleReconnect(immediate: true);
+        return;
+      }
+      fetchApprovals();
+      fetchWorkspaces();
+      if (_currentSession != null) {
+        _resyncActiveSession(_currentSession!.sessionId);
+      }
+    }
+  }
+
+  void handleAppPaused() {
+    debugPrint('[DshService] App paused to background');
+    _sessionPollTimer?.cancel();
+    _sessionPollTimer = null;
+  }
+
   void disconnect() {
+    _isExplicitlyDisconnected = true;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempts = 0;
+    _isReconnecting = false;
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _stopHeartbeat();
@@ -1292,6 +1584,7 @@ class DshService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _isDisposed = true;
     disconnect();
     super.dispose();
   }

@@ -13,8 +13,31 @@ class MainShell extends StatefulWidget {
   State<MainShell> createState() => _MainShellState();
 }
 
-class _MainShellState extends State<MainShell> {
+class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   int _currentIndex = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    final dsh = Provider.of<DshService>(context, listen: false);
+    if (state == AppLifecycleState.resumed) {
+      dsh.handleAppResumed();
+    } else if (state == AppLifecycleState.paused) {
+      dsh.handleAppPaused();
+    }
+  }
 
   void _setIndex(int index) {
     setState(() {
