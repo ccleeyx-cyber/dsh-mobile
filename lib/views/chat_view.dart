@@ -853,6 +853,8 @@ class _ChatViewState extends State<ChatView> {
         );
       },
     );
+  }
+
   /// 离线 / 正在重连状态横幅 (F3.4)
   Widget _buildOfflineBanner(BuildContext context, DshService dsh) {
     final isConnecting = dsh.status == ConnectionStatus.connecting;

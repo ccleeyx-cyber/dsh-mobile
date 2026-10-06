@@ -1448,7 +1448,7 @@ class DshService extends ChangeNotifier {
       // First retry: fast turnaround (1000-1300ms) to guarantee <= 5s reconnection
       delayMs = _baseReconnectDelayMs + (DateTime.now().millisecondsSinceEpoch % 300);
     } else {
-      final double calculated = _baseReconnectDelayMs * math.pow(_backoffMultiplier, math.min(_reconnectAttempts, 6));
+      final double calculated = (_baseReconnectDelayMs * math.pow(_backoffMultiplier, math.min(_reconnectAttempts, 6))).toDouble();
       final int capped = math.min(calculated.toInt(), _maxReconnectDelayMs);
       final int jitter = (DateTime.now().millisecondsSinceEpoch % _maxJitterMs);
       delayMs = capped + jitter;
