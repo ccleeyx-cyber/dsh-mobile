@@ -5,6 +5,6 @@
 class AppVersion {
   const AppVersion._();
 
-  static const String version = '1.2.9';
-  static const String buildNumber = '12';
+  static const String version = '1.3.0';
+  static const String buildNumber = '13';
 }
