@@ -31,6 +31,11 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     });
     // Periodically refresh workspaces for real-time running animation and approvals
     _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (!mounted) {
+        _refreshTimer?.cancel();
+        _refreshTimer = null;
+        return;
+      }
       if (mounted) {
         Provider.of<DshService>(context, listen: false).fetchWorkspaces();
       }
@@ -40,6 +45,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
   @override
   void dispose() {
     _refreshTimer?.cancel();
+    _refreshTimer = null;
     _searchController.dispose();
     super.dispose();
   }
@@ -124,7 +130,10 @@ class _WorkspacesViewState extends State<WorkspacesView> {
     final content = await dsh.fetchWorkspaceMemory(ws.path);
     final textController = TextEditingController(text: content);
 
-    if (!context.mounted) return;
+    if (!context.mounted) {
+      textController.dispose();
+      return;
+    }
 
     showModalBottomSheet(
       context: context,
@@ -227,7 +236,7 @@ class _WorkspacesViewState extends State<WorkspacesView> {
           ),
         );
       },
-    );
+    ).whenComplete(() => textController.dispose());
   }
 
   @override

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { homedir } from 'node:os';
+import { createAuditSink } from './core.mjs';
 
 export function dshHome() {
   return process.env.DSH_HOME || path.join(homedir(), '.dsh');
@@ -34,39 +35,48 @@ export function ensurePermissionsDir() {
 
 const configFile = () => path.join(dataDir(), 'config.json');
 
+/**
+ * Fallback config used only on a fresh install.
+ *
+ * The token is NOT a usable secret — it is a well-known literal that used to be
+ * hard-coded here, which meant anyone with the source could authenticate. On a
+ * fresh install we therefore generate a random token and persist it, so the
+ * bridge is never reachable with a published credential. Operators can change it
+ * later from the DSH settings page (or the config file) as usual.
+ */
 const DEFAULT_CONFIG = {
-  token: 'DSH_SECURE_TOKEN_2026',
+  token: '',
   port: 3088,
   npsHost: 'n.cnm.asia',
   npsPort: 3088,
   useHttps: false
 };
 
-const LEGACY_TOKENS = [
-  'DSH_SECURE_TOKEN_2026',
-  'dsh_19f234dcf9fe14fc2409901e6a7bbe7e73b1'
-];
-
 export function loadConfig() {
   ensureDataDir();
   const f = configFile();
   if (!fs.existsSync(f)) {
+    // Fresh install: mint a random token instead of shipping a known default.
+    const fresh = { ...DEFAULT_CONFIG, token: generateToken() };
     try {
-      fs.writeFileSync(f, JSON.stringify(DEFAULT_CONFIG, null, 2), 'utf8');
+      fs.writeFileSync(f, JSON.stringify(fresh, null, 2), 'utf8');
     } catch (_) {}
-    return { ...DEFAULT_CONFIG };
+    return fresh;
   }
   try {
     const raw = JSON.parse(fs.readFileSync(f, 'utf8'));
+    const token = (raw.token && String(raw.token).trim())
+      || process.env.DSH_AUTH_TOKEN
+      || generateToken();
     return {
-      token: (raw.token && String(raw.token).trim()) || DEFAULT_CONFIG.token,
+      token,
       port: Number(raw.port) || DEFAULT_CONFIG.port,
       npsHost: (raw.npsHost && String(raw.npsHost).trim()) || DEFAULT_CONFIG.npsHost,
       npsPort: Number(raw.npsPort) || DEFAULT_CONFIG.npsPort,
       useHttps: Boolean(raw.useHttps)
     };
   } catch {
-    return { ...DEFAULT_CONFIG };
+    return { ...DEFAULT_CONFIG, token: generateToken() };
   }
 }
 
@@ -118,27 +128,18 @@ const DEFAULT_PERMISSIONS = {
 const AUDIT_BUFFER_SIZE = 200;
 const auditBuffer = [];
 
+/**
+ * The record/read logic lives in core so both entry points share one audit
+ * implementation; store owns the buffer and the on-disk permission state.
+ */
+const auditSink = createAuditSink({ auditBuffer, size: AUDIT_BUFFER_SIZE });
+
 export function audit(action, payload = {}) {
-  const norm = typeof payload === 'object' && payload !== null ? payload : { details: payload };
-  const entry = {
-    id: norm.id || norm.approvalId || norm.eventId || `audit_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    time: typeof norm.time === 'number' ? norm.time : Date.now(),
-    action: norm.action || action,
-    event: norm.event || action,
-    sessionId: norm.sessionId || 'system',
-    toolName: norm.toolName || action || 'system',
-    command: norm.command || norm.reason || action || '',
-    outcome: norm.outcome || (String(action).includes('reject') ? 'rejected' : String(action).includes('allow') ? 'allowed-once' : 'auto-approved'),
-    reason: norm.reason || norm.error || (typeof norm === 'object' ? JSON.stringify(norm) : String(norm))
-  };
-  auditBuffer.unshift(entry);
-  if (auditBuffer.length > AUDIT_BUFFER_SIZE) auditBuffer.pop();
-  return entry;
+  return auditSink.record(action, payload);
 }
 
 export function readAudit(limit = 100) {
-  const lim = typeof limit === 'number' && limit > 0 ? limit : 100;
-  return auditBuffer.slice(0, lim);
+  return auditSink.read(limit);
 }
 
 export function loadPermissions() {
@@ -204,9 +205,91 @@ export function savePermissions(perms = {}) {
   }
   return updated;
 }
-export function loadDevices() { return { version: 1, devices: [] }; }
-export function saveDevices() {}
-export function touchDevice() {}
-export function newPairCode() { return '000000'; }
+/* ------------------------------------------------------------------ *
+ * paired devices
+ *
+ * These used to be stubs — loadDevices() always returned an empty list,
+ * saveDevices() threw the data away, and newPairCode() always returned '000000'.
+ * Pairing therefore issued a token that was never persisted, so every paired
+ * device stopped working after a restart, and the 6-digit code was guessable.
+ * ------------------------------------------------------------------ */
+
+function devicesFile() {
+  return path.join(dataDir(), 'devices.json');
+}
+
+const PAIR_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const MAX_DEVICES = 20;
+
+export function loadDevices() {
+  ensureDataDir();
+  const f = devicesFile();
+  if (!fs.existsSync(f)) return { version: 1, devices: [] };
+  try {
+    const raw = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (!raw || typeof raw !== 'object') return { version: 1, devices: [] };
+    return {
+      version: raw.version ?? 1,
+      devices: Array.isArray(raw.devices) ? raw.devices : []
+    };
+  } catch {
+    return { version: 1, devices: [] };
+  }
+}
+
+export function saveDevices(state) {
+  ensureDataDir();
+  const payload = {
+    version: 1,
+    devices: Array.isArray(state?.devices) ? state.devices.slice(-MAX_DEVICES) : []
+  };
+  const f = devicesFile();
+  const tmp = `${f}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+    try {
+      fs.renameSync(tmp, f);
+    } catch {
+      fs.copyFileSync(tmp, f);
+      try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+    }
+  } catch (err) {
+    console.error('[Store] saveDevices error:', err);
+    return false;
+  }
+  return true;
+}
+
+/** Record that a device just talked to the bridge. */
+export function touchDevice(deviceId, ip = '') {
+  const state = loadDevices();
+  const dev = state.devices.find((d) => d.id === deviceId);
+  if (!dev) return false;
+  dev.lastSeenAt = Date.now();
+  if (ip) dev.lastIp = ip;
+  return saveDevices(state);
+}
+
+export function revokeDevice(deviceId) {
+  const state = loadDevices();
+  const before = state.devices.length;
+  state.devices = state.devices.filter((d) => d.id !== deviceId);
+  if (state.devices.length === before) return false;
+  return saveDevices(state);
+}
+
+/**
+ * Generate a 6-digit pairing code.
+ * Uses crypto randomness (the old '000000' was a fixed, publicly known value)
+ * and expires it, so a stale code cannot be replayed later.
+ */
+export function newPairCode() {
+  return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+}
+
+export function pairCodeTtlMs() {
+  return PAIR_CODE_TTL_MS;
+}
+
 export function newToken() { return generateToken(); }
 export function hashToken(t) { return crypto.createHash('sha256').update(t || '').digest('hex'); }

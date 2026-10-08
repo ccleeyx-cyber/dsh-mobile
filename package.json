@@ -1,0 +1,30 @@
+{
+  "name": "dsh-mobile-bridge-tests",
+  "version": "1.2.9",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "npm run test:unit && npm run test:e2e && npm run test:challenger",
+    "test:unit": "node --test --test-concurrency=1 tests/unit/core.test.mjs tests/unit/delete-session.test.mjs tests/unit/smoke-bridge.test.mjs",
+    "test:e2e": "node --test --test-concurrency=1 \"tests/e2e/**/*.test.js\"",
+    "test:tier1": "node --test --test-concurrency=1 \"tests/e2e/tier1-features/**/*.test.js\"",
+    "test:tier2": "node --test --test-concurrency=1 \"tests/e2e/tier2-boundary/**/*.test.js\"",
+    "test:tier3": "node --test --test-concurrency=1 \"tests/e2e/tier3-cross-feature/**/*.test.js\"",
+    "test:tier4": "node --test --test-concurrency=1 \"tests/e2e/tier4-workloads/**/*.test.js\"",
+
+    "test:challenger": "npm run test:challenger:unit && npm run test:challenger:e2e && npm run test:challenger:race",
+    "test:challenger:unit": "node --test --test-concurrency=1 tests/m1_adversarial_stress.test.js tests/m1_stress_challenge.test.js tests/m4_stress_challenge.test.js",
+    "test:challenger:e2e": "node --test --test-concurrency=1 tests/m2_stress_challenge.test.js tests/m3_stress_challenge.test.js tests/m3_1_reconnect_churn_challenge.test.js tests/m4_adversarial_boundary_challenge.test.js tests/m4_empirical_boundary_stress.test.js",
+    "test:challenger:race": "node tests/stress_cancel.mjs && node tests/r3_adversarial_verify.mjs",
+
+    "bench": "npm run bench:policy && npm run bench:burst",
+    "bench:policy": "node tests/e2e/tier4-workloads/benchmark-policy-sync.mjs",
+    "bench:burst": "node tests/e2e/tier4-workloads/burst-concurrency-stress.mjs",
+    "probe:dsh": "node tests/probe_dsh.cjs",
+
+    "verify": "npm test && npm run bench"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

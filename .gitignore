@@ -27,3 +27,21 @@ build/
 .vscode/
 *.iml
 cookie.txt
+
+# Agent orchestration scratch — contains sub-agent transcripts with live
+# tokens (GitHub PATs, bridge tokens, engine secrets). Never commit.
+.agents/
+
+# Superseded implementation kept only for reference.
+dsh-server-plugin/index.js.legacy
+
+# Local environment overrides
+.env
+.env.local
+*.local
+
+# Test leftovers
+_diag*.log
+_run*.log
+_u.log
+_t.log

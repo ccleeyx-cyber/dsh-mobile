@@ -18,14 +18,21 @@ class AuditLogItem {
   });
 
   factory AuditLogItem.fromJson(Map<String, dynamic> json) {
+    int parseTime(dynamic v) {
+      if (v is int) return v;
+      if (v is num) return v.toInt();
+      if (v is String) return int.tryParse(v) ?? DateTime.now().millisecondsSinceEpoch;
+      return DateTime.now().millisecondsSinceEpoch;
+    }
+
     return AuditLogItem(
-      id: json['id'] ?? '',
-      time: json['time'] is int ? json['time'] : DateTime.now().millisecondsSinceEpoch,
-      sessionId: json['sessionId'] ?? 'default',
-      toolName: json['toolName'] ?? 'tool',
-      command: json['command'] ?? '',
-      outcome: json['outcome'] ?? 'pending',
-      reason: json['reason'],
+      id: json['id']?.toString() ?? '',
+      time: parseTime(json['time']),
+      sessionId: json['sessionId']?.toString() ?? 'default',
+      toolName: json['toolName']?.toString() ?? 'tool',
+      command: json['command']?.toString() ?? '',
+      outcome: json['outcome']?.toString() ?? 'pending',
+      reason: json['reason']?.toString(),
     );
   }
 

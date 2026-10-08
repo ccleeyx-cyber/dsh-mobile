@@ -18,10 +18,42 @@ import { createRequire } from 'node:module';
 
 import {
   loadConfig, saveConfig, verifyToken, ensureDataDir, dshHome, audit, readAudit,
-  loadDevices, saveDevices, newToken, hashToken,
+  loadDevices, saveDevices, touchDevice, revokeDevice,
+  newPairCode, pairCodeTtlMs, newToken, hashToken,
   loadPermissions, savePermissions, permissionsFile
 } from './store.mjs';
 import { installRpc, RPC_CHANNEL, ENDPOINTS } from './rpc.mjs';
+import {
+  BRIDGE_VERSION,
+  MAX_BODY_SIZE,
+  HEARTBEAT_INTERVAL_MS,
+  createApprovalQueue,
+  createFollowerRegistry,
+  createTurnRegistry,
+  createPersonaStore,
+  createPathSanitizer,
+  createPermissionStore,
+  createCookieFactory,
+  createRpcCaller,
+  isCommandReadOnly,
+  coerceToolInput,
+  isCarriedContext,
+  authenticateRequest,
+  readBodyWithLimit,
+  parseJsonBody,
+  deleteSession,
+  configurePersistence,
+  configurePermissionsPersistence
+} from './core.mjs';
+
+// Inject the persistence helpers core needs; core must not import store.mjs
+// because store imports core (audit sink).
+configurePersistence({ verifyToken });
+configurePermissionsPersistence({
+  load: loadPermissions,
+  save: savePermissions,
+  file: permissionsFile
+});
 
 const require = createRequire(import.meta.url);
 const WebSocket = require('ws');
@@ -42,25 +74,59 @@ try {
 const name = 'dsh-mobile-bridge';
 const inject = ['connection', 'webServer'];
 
-// 默认兼容令牌与内建 Secret
-const DEFAULT_AUTH_TOKENS = [
-  process.env.DSH_AUTH_TOKEN,
-  'DSH_SECURE_TOKEN_2026',
-  'dsh_19f234dcf9fe14fc2409901e6a7bbe7e73b1'
-].filter(Boolean);
+/**
+ * HMAC secret used to mint the signed cookie that lets the bridge talk to the
+ * engine's own HTTP/RPC surface.
+ *
+ * This used to be a literal in source control, which published the engine's
+ * signing key. It must resolve to whatever the engine actually uses, or every
+ * RPC call comes back `unauthorized`.
+ *
+ * Resolution order:
+ *   1. DSH_SECRET / DSH_INTERNAL_SECRET environment variable
+ *   2. the engine's own credentials file (~/.dsh/.credentials.yaml)
+ *   3. the generated secret file the bridge writes on first run
+ *
+ * NOTE: do not invent a random secret as a silent fallback — the engine will
+ * reject every signed cookie. If none of the above yield a value we keep the
+ * generated one only as a last resort and log loudly.
+ */
+function resolveInternalSecret() {
+  const fromEnv = process.env.DSH_SECRET || process.env.DSH_INTERNAL_SECRET;
+  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
 
-const DEFAULT_SECRET = process.env.DSH_SECRET || 'Ci223VxbS2XsFJm0pUnm3eU_PPhG4L1A9T6AWaTu4pA';
+  // The engine stores its auth secret here.
+  for (const rel of ['.credentials.yaml', 'credentials.yaml', 'settings.yaml']) {
+    try {
+      const file = path.join(dshHome(), rel);
+      if (!fs.existsSync(file)) continue;
+      const m = fs.readFileSync(file, 'utf8')
+        .match(/^\s*secret\s*:\s*['"]?([^'"\s#]+)/mi);
+      if (m?.[1]) return m[1];
+    } catch { /* try the next candidate */ }
+  }
 
-function encodeBase64Url(value) {
-  return Buffer.from(value).toString('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '');
-}
-
-function decodeBase64Url(value) {
-  const BASE64URL_PATTERN = /^[A-Za-z0-9_-]*$/;
-  if (!BASE64URL_PATTERN.test(value) || value.length % 4 === 1) return void 0;
-  const padding = '='.repeat((4 - value.length % 4) % 4);
-  const decoded = Buffer.from(value.replaceAll('-', '+').replaceAll('_', '/') + padding, 'base64');
-  return encodeBase64Url(decoded) === value ? decoded : void 0;
+  // Fall back to the bridge's own generated secret so cookie minting at least
+  // works for this install (requires DSH_SECRET to match on the engine side).
+  try {
+    const dir = path.join(dshHome(), 'mobile-bridge');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'internal-secret');
+    if (fs.existsSync(file)) {
+      const v = fs.readFileSync(file, 'utf8').trim();
+      if (v) return v;
+    }
+    const generated = crypto.randomBytes(32).toString('base64url');
+    fs.writeFileSync(file, generated, 'utf8');
+    try { fs.chmodSync(file, 0o600); } catch { /* best effort on Windows */ }
+    console.warn(
+      '[dsh-mobile-bridge] 未找到引擎密钥（~/.dsh/.credentials.yaml）。' +
+      '已生成本地密钥；若 RPC 返回 unauthorized，请设置环境变量 DSH_SECRET 为引擎实际密钥。'
+    );
+    return generated;
+  } catch {
+    return crypto.randomBytes(32).toString('base64url');
+  }
 }
 
 export function apply(ctx, config = {}, internals = {}) {
@@ -73,146 +139,89 @@ export function apply(ctx, config = {}, internals = {}) {
 
   ensureDataDir();
 
+  let isDisposed = false; // Lifecycle flag to prevent zombie reconnects (F4.4)
+
+  let lastWorkspaces = [];
+
+  /**
+   * Path guard for the workspace-memory API (F4.5).
+   * Implemented in core; the registered-workspace source stays here because
+   * getWorkspacesData() reads live DSH state owned by this entry.
+   */
+  const sanitizeWorkspaceFilePath = createPathSanitizer({
+    getRegisteredWorkspaces: () => {
+      try {
+        const live = getWorkspacesData();
+        if (Array.isArray(live) && live.length > 0) {
+          lastWorkspaces = live;
+          return live;
+        }
+      } catch { /* fall back to the last known snapshot */ }
+      return Array.isArray(lastWorkspaces) ? lastWorkspaces : [];
+    }
+  });
+
   let pairSession = internals.pairSession ?? null;
-  let dshCookie = '';
 
-  function generateDshCookie(authority) {
-    const secret = decodeBase64Url(DEFAULT_SECRET);
-    const cookieName = 'dsh-auth-' + encodeBase64Url(crypto.createHash('sha256').update(authority).digest());
-    const issuedAt = Date.now();
-    const expiresAt = issuedAt + 86400 * 1000;
-    const payload = { version: 1, authority, issuedAt, expiresAt };
-    const body = encodeBase64Url(Buffer.from(JSON.stringify(payload), 'utf8'));
-    const sig = crypto.createHmac('sha256', secret).update(body).digest();
-    return `${cookieName}=v1.${body}.${encodeBase64Url(sig)}`;
-  }
-
+  /**
+   * Signed-cookie minting and unary RPC live in core so both entry points speak
+   * to the engine identically.  [unified]
+   */
+  const cookieFactory = createCookieFactory({ dshPort, secret: resolveInternalSecret() });
   const refreshCookie = async () => {
     try {
-      const authority = `127.0.0.1:${dshPort}`;
-      dshCookie = generateDshCookie(authority);
-      return dshCookie;
+      return cookieFactory.refresh();
     } catch (e) {
       logger.warn('[dsh-mobile-bridge] 刷新 cookie 异常:', e?.message || e);
       return '';
     }
   };
 
-  function callDshRpc(method, payload) {
-    return new Promise((resolve, reject) => {
-      const authority = `127.0.0.1:${dshPort}`;
-      const cookie = dshCookie || generateDshCookie(authority);
-      const rpcId = crypto.randomUUID();
-
-      const postData = JSON.stringify({
-        type: 'client-request',
-        rpcId: rpcId,
-        method: method,
-        payload: payload || { args: {} }
-      });
-
-      const req = http.request({
-        host: '127.0.0.1',
-        port: dshPort,
-        path: `/api/${method}`,
-        method: 'POST',
-        headers: {
-          'Host': authority,
-          'Cookie': cookie,
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(postData)
-        },
-        timeout: 10000
-      }, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed.result && parsed.result.ok === true) {
-              resolve(parsed.result.value);
-            } else {
-              const err = (parsed.result && parsed.result.error) || { message: 'RPC Error: ' + data };
-              reject(new Error(err.message || JSON.stringify(err)));
-            }
-          } catch (e) {
-            reject(new Error(`Failed to parse RPC response: ${data.slice(0, 100)}`));
-          }
-        });
-      });
-
-      req.on('error', reject);
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error(`DSH RPC ${method} timed out`));
-      });
-      req.write(postData);
-      req.end();
-    });
-  }
+  const callDshRpc = createRpcCaller({ dshPort, cookieFactory });
 
   const activePrompts = new Map();
   const sessionTurnSeqs = new Map();
   const cancelledTurnSeqs = new Map();
   const lastCancelTimes = new Map();
 
-  function normalizeSessionKey(sId) {
-    if (!sId) return '';
-    return sId.startsWith('session-') ? sId.replace('session-', '') : sId;
-  }
-  function getTurnSeq(sessionId) {
-    return sessionTurnSeqs.get(normalizeSessionKey(sessionId)) || 0;
-  }
-  function setTurnSeq(sessionId, seq) {
-    sessionTurnSeqs.set(normalizeSessionKey(sessionId), seq);
-  }
-  function getCancelledSeq(sessionId) {
-    return cancelledTurnSeqs.get(normalizeSessionKey(sessionId)) || 0;
-  }
-  function setCancelledSeq(sessionId, seq) {
-    cancelledTurnSeqs.set(normalizeSessionKey(sessionId), seq);
-  }
-  function getLastCancelTime(sessionId) {
-    return lastCancelTimes.get(normalizeSessionKey(sessionId)) || 0;
-  }
-  function setLastCancelTime(sessionId, time) {
-    lastCancelTimes.set(normalizeSessionKey(sessionId), time);
-  }
   const sessionFollowers = new Map();
   const pendingApprovals = new Map();
   let approvalCounter = 1;
+
+  /* -------------------------------------------------------------- *
+   * Shared core wiring (see lib/core.mjs).
+   *
+   * The registries above stay as the live objects this entry has always used;
+   * core's helpers wrap the same Maps so the logic itself lives in one place.
+   * -------------------------------------------------------------- */
+  const coreTurns = createTurnRegistry({
+    sessionTurnSeqs,
+    cancelledTurnSeqs,
+    lastCancelTimes,
+    activePrompts
+  });
+  const coreApprovals = createApprovalQueue({ pendingApprovals });
+  const coreFollowers = createFollowerRegistry({
+    sessionFollowers,
+    // Stream opens are issued by followSession / connectUpstreamMux below.
+    onSubscribe: null
+  });
+  /** Agent personas were only served by the standalone gateway. [unified] */
+  const personaStore = createPersonaStore({ home: dshHomeDir });
+  /** Single permission store; persists to ~/.dsh/mobile-access/permissions.json. */
+  const permStore = createPermissionStore();
   const connectedClients = new Set();
   let currentEventsClientId = null;
 
-  const initialPerms = loadPermissions();
-  const globalPermissions = {
-    executionPolicy: initialPerms.defaultPolicy || initialPerms.executionPolicy || 'auto-read',
-    maxSteps: initialPerms.maxSteps ?? 30,
-    sandboxMode: initialPerms.sandboxMode || 'workspace-write',
-    protectGit: initialPerms.protectGit !== false
-  };
-  const sessionPermissions = new Map(
-    Object.entries(initialPerms.sessionPolicies || {})
-  );
+  const globalPermissions = permStore.global;
+  const sessionPermissions = permStore.sessions;
 
   function getPermissionsPayload() {
-    const sessionPoliciesObj = {};
-    for (const [k, v] of sessionPermissions.entries()) {
-      sessionPoliciesObj[k] = v;
-    }
-    return {
-      defaultPolicy: globalPermissions.executionPolicy,
-      executionPolicy: globalPermissions.executionPolicy,
-      sandboxMode: globalPermissions.sandboxMode,
-      maxSteps: globalPermissions.maxSteps,
-      protectGit: globalPermissions.protectGit !== false,
-      sessionPolicies: sessionPoliciesObj
-    };
+    return permStore.payload();
   }
 
   function persistAndBroadcastPermissions() {
-    const payload = getPermissionsPayload();
-    savePermissions(payload);
+    const payload = permStore.persist();
     broadcastToMobileClients({
       type: 'permission_updated',
       permissions: payload
@@ -220,66 +229,38 @@ export function apply(ctx, config = {}, internals = {}) {
     return payload;
   }
 
-  function isCommandReadOnly(cmdStr, toolName) {
-    if (toolName === 'read_file' || toolName === 'view_file' || toolName === 'search_web' || toolName === 'list_dir') return true;
-    if (!cmdStr) return false;
-    const safePrefixes = ['ls', 'dir', 'cat', 'grep', 'find', 'head', 'tail', 'wc', 'git status', 'git log', 'git diff', 'pwd', 'echo', 'which', 'where'];
-    const trimmed = String(cmdStr).trim().toLowerCase();
-    return safePrefixes.some(p => trimmed === p || trimmed.startsWith(p + ' '));
-  }
-
+  /**
+   * Ensure a live stream is open for this session.
+   * Buffer creation and the open-frame payload live in core; whether the
+   * upstream link is actually connected is decided here.
+   */
   function followSession(sId) {
     if (!sId) return;
-    const cleanId = sId.startsWith('session-') ? sId.replace('session-', '') : sId;
     const fullId = sId.startsWith('session-') ? sId : `session-${sId}`;
-    let follower = sessionFollowers.get(cleanId) || sessionFollowers.get(fullId);
-    if (follower && follower.subscribed) return;
+    const follower = coreFollowers.ensure(fullId);
+    if (follower.subscribed) return;
 
-    if (!follower) {
-      follower = {
-        sessionId: fullId,
-        streamId: `follow-${fullId}`,
-        isRunning: false,
-        thinkingBuffer: '',
-        textBuffer: '',
-        tools: [],
-        subscribed: false,
-        lastUpdated: Date.now()
-      };
-      sessionFollowers.set(cleanId, follower);
-      sessionFollowers.set(fullId, follower);
-    }
-
-    if (upstreamMuxWs && upstreamMuxWs.readyState === WebSocket.OPEN && !follower.subscribed) {
-      try {
-        upstreamMuxWs.send(JSON.stringify({
-          type: 'open',
-          streamId: `follow-${fullId}`,
-          endpoint: 'session/follow',
-          payload: { args: { request: { address: { kind: 'session', sessionId: fullId }, assistantStream: true } } }
-        }));
-        follower.subscribed = true;
-      } catch (_) {}
+    if (upstreamMuxWs && upstreamMuxWs.readyState === WebSocket.OPEN) {
+      coreFollowers.follow(fullId, (open) => {
+        upstreamMuxWs.send(JSON.stringify(open));
+      });
     }
   }
 
   function getSessionPermission(sessionId) {
-    if (!sessionId) return globalPermissions.executionPolicy;
-    return sessionPermissions.get(sessionId) || globalPermissions.executionPolicy;
+    return permStore.forSession(sessionId);
   }
 
   function setSessionPermission(sessionId, policy) {
     if (sessionId) {
-      sessionPermissions.set(sessionId, policy);
+      permStore.setSession(sessionId, policy);
       audit('permission/session', { sessionId, policy });
       persistAndBroadcastPermissions();
     }
   }
 
   function getSessionFollower(sessionId) {
-    if (!sessionId) return null;
-    const cleanId = sessionId.startsWith('session-') ? sessionId.replace('session-', '') : sessionId;
-    return sessionFollowers.get(cleanId) || sessionFollowers.get(sessionId) || sessionFollowers.get(`session-${cleanId}`) || null;
+    return coreFollowers.get(sessionId);
   }
 
   function getSettingsData() {
@@ -525,7 +506,7 @@ export function apply(ctx, config = {}, internals = {}) {
           if (!sessionMeta.model) {
             sessionMeta.model = getSettingsData().currentModel || 'cn:deepseek-v4.1-flash';
           }
-          const pendingForSession = Array.from(pendingApprovals.values()).filter(a => {
+          const pendingForSession = coreApprovals.list().filter(a => {
             const aId = a.sessionId || '';
             return aId === sId || aId === cleanId || aId === `session-${cleanId}`;
           });
@@ -629,7 +610,11 @@ export function apply(ctx, config = {}, internals = {}) {
             }
 
             // 过滤系统注入的元信息与内部记忆快照
-            if (text.startsWith('MNEMON RUNTIME MEMORY SNAPSHOT') || 
+            // isCarriedContext (core) recognises the full set of injected blocks,
+            // including Mnemon plugin-sourced snapshots that the previous inline
+            // prefix check missed — those were being shown to the user as if they
+            // had typed them.  [unified]
+            if (isCarriedContext(text, ev) ||
                 text.startsWith('Time sampled while preparing turn') ||
                 text.startsWith('Memory recall guidance') ||
                 text.includes('<system_information>')) {
@@ -682,7 +667,7 @@ export function apply(ctx, config = {}, internals = {}) {
             if (currentAssistantMsg && callData?.name) {
               currentAssistantMsg.tools.push({
                 name: callData.name,
-                input: callData.arguments,
+                input: coerceToolInput(callData.arguments),
                 id: callData.callId
               });
             }
@@ -772,13 +757,18 @@ export function apply(ctx, config = {}, internals = {}) {
   let muxReconnectTimer = null;
 
   function connectUpstreamMux() {
+    if (isDisposed) return;
     if (upstreamMuxWs) {
+      // Detach listeners and keep an error sink so a close that races an
+      // in-flight handshake cannot surface as an uncaught exception.
+      try { upstreamMuxWs.removeAllListeners(); } catch (_) {}
+      try { upstreamMuxWs.on('error', () => {}); } catch (_) {}
       try { upstreamMuxWs.close(); } catch (_) {}
       upstreamMuxWs = null;
     }
 
     const authority = `127.0.0.1:${dshPort}`;
-    const cookie = dshCookie || generateDshCookie(authority);
+    const cookie = cookieFactory.current();
     const muxUrl = `ws://127.0.0.1:${dshPort}/api/remote.mux`;
 
     upstreamMuxWs = new WebSocket(muxUrl, {
@@ -823,12 +813,15 @@ export function apply(ctx, config = {}, internals = {}) {
     });
 
     upstreamMuxWs.on('close', () => {
+      if (isDisposed) return;
       currentEventsClientId = null;
       for (const follower of sessionFollowers.values()) {
         follower.subscribed = false;
       }
       if (muxReconnectTimer) clearTimeout(muxReconnectTimer);
       muxReconnectTimer = setTimeout(connectUpstreamMux, 3000);
+      // Don't hold the event loop open just to retry an upstream link.
+      muxReconnectTimer.unref?.();
     });
 
     upstreamMuxWs.on('error', (err) => {
@@ -913,7 +906,7 @@ export function apply(ctx, config = {}, internals = {}) {
             const toolObj = {
               id: ev.data?.id || `tool_${Date.now()}`,
               name: ev.data?.name || 'tool',
-              input: ev.data?.arguments || '',
+              input: coerceToolInput(ev.data?.arguments),
               output: '',
               isRunning: true
             };
@@ -944,11 +937,9 @@ export function apply(ctx, config = {}, internals = {}) {
         if (val.type === 'cancel' || val.event === 'approval/cancel') {
           const eventId = val.eventId || val.id;
           if (eventId) {
-            const appr = pendingApprovals.get(eventId);
+            const appr = coreApprovals.get(eventId);
             if (appr) {
-              pendingApprovals.delete(appr.id);
-              pendingApprovals.delete(appr.eventId);
-              pendingApprovals.delete(eventId);
+              coreApprovals.remove(appr, eventId);
               broadcastToMobileClients({
                 type: 'approval_settled',
                 eventId: appr.eventId || eventId,
@@ -967,7 +958,7 @@ export function apply(ctx, config = {}, internals = {}) {
           const toolName = val.request?.toolName || '工具执行';
           const reason = val.request?.reason || '申请工具执行权限';
           const callId = val.request?.callId || '';
-          const input = val.request?.input ?? val.request?.arguments ?? val.request?.args ?? val.request?.command ?? '';
+          const input = coerceToolInput(val.request?.input ?? val.request?.arguments ?? val.request?.args ?? val.request?.command);
           const options = val.request?.options || null;
 
           const sessionPolicy = getSessionPermission(sessionId);
@@ -978,7 +969,10 @@ export function apply(ctx, config = {}, internals = {}) {
             shouldAutoApprove = true;
             autoApproveReason = '全信任模式 (Danger Full Access) 自动放行';
           } else if (sessionPolicy === 'auto-read' || globalPermissions.executionPolicy === 'auto-read') {
-            if (isCommandReadOnly(reason, toolName)) {
+            let cmdToCheck = reason;
+            if (typeof val.request?.command === 'string') cmdToCheck = val.request.command;
+            else if (typeof input === 'string' && input) cmdToCheck = input;
+            if (isCommandReadOnly(cmdToCheck, toolName)) {
               shouldAutoApprove = true;
               autoApproveReason = '安全策略: 只读指令自动放行';
             }
@@ -1008,8 +1002,7 @@ export function apply(ctx, config = {}, internals = {}) {
             createdAt: Date.now()
           };
 
-          pendingApprovals.set(approval.id, approval);
-          pendingApprovals.set(approval.eventId, approval);
+          coreApprovals.put(approval);
           audit('approval/requested', approval);
           broadcastToMobileClients({
             type: 'approval_request',
@@ -1048,15 +1041,14 @@ export function apply(ctx, config = {}, internals = {}) {
           options: ev.options || null,
           createdAt: Date.now()
         };
-        pendingApprovals.set(approval.id, approval);
-        pendingApprovals.set(approval.eventId, approval);
+        coreApprovals.put(approval);
         broadcastToMobileClients({
           type: 'approval_request',
           approval
         });
         audit('approval/requested', approval);
       } else if (ev.type === 'session_status') {
-        const isCancelled = getCancelledSeq(sId) > 0 && (Date.now() - getLastCancelTime(sId) < 1000);
+        const isCancelled = coreTurns.getCancelledSeq(sId) > 0 && (Date.now() - coreTurns.getLastCancelTime(sId) < 1000);
         const follower = getSessionFollower(sId);
         const shouldRun = Boolean(ev.isRunning && !isCancelled && (follower ? follower.isRunning : true));
         broadcastToMobileClients({
@@ -1069,15 +1061,7 @@ export function apply(ctx, config = {}, internals = {}) {
   }
 
   async function handleApprovalRespond(eventId, outcome, reason = '') {
-    let appr = pendingApprovals.get(eventId);
-    if (!appr) {
-      for (const v of pendingApprovals.values()) {
-        if (v.id === eventId || v.eventId === eventId) {
-          appr = v;
-          break;
-        }
-      }
-    }
+    const appr = coreApprovals.get(eventId);
     if (!appr) {
       const normalizedOutcome = (outcome === 'allow' || outcome === 'allowed-once' || outcome === 'approve')
         ? 'allowed-once'
@@ -1096,9 +1080,7 @@ export function apply(ctx, config = {}, internals = {}) {
       ? 'allowed-once'
       : 'rejected';
 
-    pendingApprovals.delete(appr.id);
-    pendingApprovals.delete(appr.eventId);
-    pendingApprovals.delete(eventId);
+    coreApprovals.remove(appr, eventId);
 
     audit('approval/respond', {
       approvalId: appr.eventId || eventId,
@@ -1138,29 +1120,7 @@ export function apply(ctx, config = {}, internals = {}) {
     };
   }
 
-  function authenticateRequest(req) {
-    const parsed = url.parse(req.url, true);
-    let token = '';
-
-    const authHeader = req.headers['authorization'];
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      token = authHeader.slice(7).trim();
-    } else if (req.headers['x-dsh-token']) {
-      token = String(req.headers['x-dsh-token']).trim();
-    } else if (req.headers['x-auth-code']) {
-      token = String(req.headers['x-auth-code']).trim();
-    } else if (parsed.query?.token) {
-      token = String(parsed.query.token).trim();
-    }
-
-    if (!token) return { ok: false, code: 401, error: '缺少认证授权码 (Authorization Token Required)' };
-
-    if (verifyToken(token)) {
-      return { ok: true, device: { id: 'admin', name: '移动终端', role: 'readwrite' } };
-    }
-
-    return { ok: false, code: 401, error: '授权码错误，请在 DSH 设置中查看正确授权码' };
-  }
+  // authenticateRequest now lives in core; call sites pass the parsed URL through.
 
   const server = createServer(async (req, res) => {
     const parsedUrl = url.parse(req.url, true);
@@ -1203,7 +1163,7 @@ export function apply(ctx, config = {}, internals = {}) {
           error: '认证失败: 授权码无效或为空 (Unauthorized)',
           name: 'dsh-mobile-bridge',
           port: listenPort,
-          version: '1.2.9'
+          version: BRIDGE_VERSION
         });
         return;
       }
@@ -1214,7 +1174,7 @@ export function apply(ctx, config = {}, internals = {}) {
         name: 'dsh-mobile-bridge',
         port: listenPort,
         dshPort: dshPort,
-        version: '1.2.9',
+        version: BRIDGE_VERSION,
         time: new Date().toISOString()
       });
       return;
@@ -1251,11 +1211,51 @@ export function apply(ctx, config = {}, internals = {}) {
       return;
     }
 
+    // 3a. 生成配对码（供 DSH 设置页 / 运维调用，短期有效）
+    if ((pathname === '/__mobile/pair/code' || pathname === '/api/mobile/pair/code') && req.method === 'POST') {
+      // Already authenticated above? No — this route sits before the auth block,
+      // so require the shared token explicitly.
+      const authOk = authenticateRequest(req, parsedUrl);
+      if (!authOk.ok) {
+        sendJson(401, { ok: false, error: 'Unauthorized' });
+        return;
+      }
+      const code = newPairCode();
+      const expiresAt = Date.now() + pairCodeTtlMs();
+      pairSession = { code, expiresAt };
+      audit('pair/code-generated', { expiresAt });
+      sendJson(200, { ok: true, code, expiresAt, ttlMs: pairCodeTtlMs() });
+      return;
+    }
+
     // 3. 手机配对接口
     if (pathname === '/__mobile/pair' && req.method === 'POST') {
+      const cl = parseInt(req.headers['content-length'], 10);
+      if (!isNaN(cl) && cl > MAX_BODY_SIZE) {
+        sendJson(413, { error: 'Payload Too Large: Request body exceeds 2MB limit' });
+        req.on('data', () => {});
+        req.resume();
+        res.on('finish', () => { setTimeout(() => { try { req.destroy(); } catch (_) {} }, 50); });
+        return;
+      }
       let body = '';
-      req.on('data', chunk => body += chunk);
+      let bytesRecv = 0;
+      let aborted = false;
+      req.on('data', chunk => {
+        if (aborted) return;
+        bytesRecv += chunk.length;
+        if (bytesRecv > MAX_BODY_SIZE) {
+          aborted = true;
+          sendJson(413, { error: 'Payload Too Large: Request body exceeds 2MB limit' });
+          req.on('data', () => {});
+          req.resume();
+          res.on('finish', () => { setTimeout(() => { try { req.destroy(); } catch (_) {} }, 50); });
+          return;
+        }
+        body += chunk;
+      });
       req.on('end', () => {
+        if (aborted) return;
         try {
           const { code, name: clientName, platform } = JSON.parse(body || '{}');
           if (!pairSession || !pairSession.code || pairSession.expiresAt < Date.now()) {
@@ -1293,7 +1293,7 @@ export function apply(ctx, config = {}, internals = {}) {
             deviceId,
             dshPort,
             bridgePort: listenPort,
-            version: '1.2.7'
+            version: BRIDGE_VERSION
           });
         } catch (e) {
           sendJson(500, { ok: false, error: e?.message || '配对处理失败' });
@@ -1303,21 +1303,29 @@ export function apply(ctx, config = {}, internals = {}) {
     }
 
     // 4. REST 业务接口鉴权
-    const auth = authenticateRequest(req);
+    const auth = authenticateRequest(req, parsedUrl);
     if (!auth.ok) {
       sendJson(401, { error: 'Unauthorized', message: '缺少有效令牌或设备未配对' });
       return;
     }
+    // Keep the device's lastSeenAt fresh so the settings page can show real usage.
+    if (auth.device?.id) touchDevice(auth.device.id, req.socket?.remoteAddress || '');
 
     let jsonBody = {};
     if (req.method === 'POST' || req.method === 'PUT') {
-      let raw = '';
-      await new Promise(r => {
-        req.on('data', chunk => raw += chunk);
-        req.on('end', r);
-      });
-      try { jsonBody = JSON.parse(raw || '{}'); } catch (_) {}
+      // Body buffering with the 2MB cap lives in core; on overflow it answers 413
+      // and destroys the socket only after the response flushes, so the client
+      // sees 413 instead of ECONNRESET.
+      let raw;
+      try {
+        raw = await readBodyWithLimit(req, res, { sendJson });
+      } catch (err) {
+        if (err?.aborted || res.headersSent) return;
+        throw err;
+      }
+      jsonBody = parseJsonBody(raw);
     }
+
 
     try {
       // 4.1 工作区与会话
@@ -1345,14 +1353,30 @@ export function apply(ctx, config = {}, internals = {}) {
       }
 
       if (pathname === '/api/mobile/sessions/prompt' && req.method === 'POST') {
-        const { sessionId, text } = jsonBody;
-        if (!sessionId || !text) {
-          sendJson(400, { error: 'Missing sessionId or text' });
+        let rawSessionId = jsonBody.sessionId;
+        let promptText = jsonBody.text ?? jsonBody.prompt;
+        if (typeof promptText === 'object' && promptText !== null) {
+          if (typeof promptText.text === 'string') promptText = promptText.text;
+          else if (typeof promptText.content === 'string') promptText = promptText.content;
+          else { try { promptText = JSON.stringify(promptText); } catch (_) { promptText = ''; } }
+        } else if (promptText != null) {
+          promptText = String(promptText);
+        } else {
+          promptText = '';
+        }
+        const sessionId = typeof rawSessionId === 'string' ? rawSessionId.trim() : (rawSessionId != null ? String(rawSessionId).trim() : '');
+        if (!sessionId) {
+          sendJson(400, { error: 'Missing or empty sessionId' });
+          return;
+        }
+        const text = promptText;
+        if (!text.trim()) {
+          sendJson(400, { error: 'Missing or empty prompt text' });
           return;
         }
 
         const now = Date.now();
-        const recentCancel = getLastCancelTime(sessionId);
+        const recentCancel = coreTurns.getLastCancelTime(sessionId);
         // Turn sequence fencing: if a cancellation was recorded very recently (e.g. within 350ms)
         // for this session due to concurrent prompt/cancel race, treat this prompt as canceled immediately
         if (now - recentCancel < 350) {
@@ -1360,9 +1384,7 @@ export function apply(ctx, config = {}, internals = {}) {
           return;
         }
 
-        const turnSeq = getTurnSeq(sessionId) + 1;
-        setTurnSeq(sessionId, turnSeq);
-        const thisTurnSeq = turnSeq;
+        const thisTurnSeq = coreTurns.nextTurnSeq(sessionId);
 
         activePrompts.set(sessionId, now);
         const follower = getSessionFollower(sessionId);
@@ -1390,18 +1412,25 @@ export function apply(ctx, config = {}, internals = {}) {
           });
 
           // Check if session was cancelled while prompt RPC was awaiting
-          const isCancelled = getCancelledSeq(sessionId) >= thisTurnSeq || (Date.now() - getLastCancelTime(sessionId) < 500);
+          const isCancelled = coreTurns.getCancelledSeq(sessionId) >= thisTurnSeq || (Date.now() - coreTurns.getLastCancelTime(sessionId) < 500);
           if (isCancelled) {
             try {
               await callDshRpc('session/cancel', {
                 args: { request: { sessionId } }
               });
-            } catch (_) {}
+            } catch (cancelErr) {
+              // The UI has already flipped to idle; if the engine cancel fails the
+              // turn may still be running upstream. Surface it instead of pretending.
+              logger.warn('[dsh-mobile-bridge] 取消补偿失败 %s: %s', sessionId, cancelErr?.message || cancelErr);
+              audit('session/cancel-compensate-failed', { sessionId, error: cancelErr?.message });
+            }
             activePrompts.delete(sessionId);
             if (follower) {
               follower.isRunning = false;
               follower.activePromptText = null;
             }
+            broadcastToMobileClients({ type: 'session_status', sessionId, isRunning: false });
+            broadcastToMobileClients({ type: 'done', sessionId });
             sendJson(200, { ok: true, code: 0, cancelled: true, result: promptRes });
             return;
           }
@@ -1416,7 +1445,7 @@ export function apply(ctx, config = {}, internals = {}) {
             follower.activePromptText = null;
           }
 
-          const isCancelled = getCancelledSeq(sessionId) >= thisTurnSeq;
+          const isCancelled = coreTurns.getCancelledSeq(sessionId) >= thisTurnSeq;
           if (!isCancelled) {
             broadcastToMobileClients({ type: 'session_status', sessionId, isRunning: false });
             broadcastToMobileClients({ type: 'error', sessionId, error: err?.message || 'Prompt execution failed' });
@@ -1429,17 +1458,15 @@ export function apply(ctx, config = {}, internals = {}) {
       }
 
       if (pathname === '/api/mobile/sessions/cancel' && req.method === 'POST') {
-        const { sessionId } = jsonBody;
-        if (!sessionId) {
-          sendJson(400, { error: 'Missing sessionId' });
+        const rawSessionId = jsonBody.sessionId;
+        if (!rawSessionId || !String(rawSessionId).trim()) {
+          sendJson(400, { error: 'Missing or empty sessionId' });
           return;
         }
+        const sessionId = String(rawSessionId).trim();
 
         const now = Date.now();
-        const cancelSeq = getTurnSeq(sessionId) + 1;
-        setTurnSeq(sessionId, cancelSeq);
-        setCancelledSeq(sessionId, cancelSeq);
-        setLastCancelTime(sessionId, now);
+        coreTurns.recordCancel(sessionId, now);
 
         activePrompts.delete(sessionId);
         const follower = getSessionFollower(sessionId);
@@ -1462,7 +1489,19 @@ export function apply(ctx, config = {}, internals = {}) {
               }
             }
           });
-        } catch (_) {}
+        } catch (cancelErr) {
+          // Report the real outcome — a 200 "Cancelled" here would leave the turn
+          // running upstream while the phone shows it as stopped.
+          logger.warn('[dsh-mobile-bridge] session/cancel 失败 %s: %s', sessionId, cancelErr?.message || cancelErr);
+          audit('session/cancel-failed', { sessionId, error: cancelErr?.message });
+          sendJson(502, {
+            ok: false,
+            code: 502,
+            sessionId,
+            error: cancelErr?.message || 'Upstream cancel failed'
+          });
+          return;
+        }
 
         sendJson(200, { ok: true, code: 0, message: 'Cancelled' });
         return;
@@ -1470,10 +1509,29 @@ export function apply(ctx, config = {}, internals = {}) {
 
       if (pathname === '/api/mobile/sessions/delete' && req.method === 'POST') {
         const { sessionId, workspaceId } = jsonBody;
-        try {
-          await callDshRpc('session/delete', { args: { sessionId, workspaceId } });
-        } catch (_) {}
-        sendJson(200, { ok: true, code: 0, message: 'Deleted' });
+        // Implemented bridge-side: the engine has no session/delete RPC, so the
+        // old callDshRpc('session/delete') + `catch(_){}` returned 200 "Deleted"
+        // while removing nothing. [fixed]
+        const result = deleteSession({ home: dshHomeDir, sessionId, workspaceId });
+
+        if (!result.ok) {
+          audit('session/delete-failed', { sessionId, error: result.error });
+          sendJson(500, { ok: false, code: 500, sessionId, error: result.error });
+          return;
+        }
+
+        // Purge live state so a later reconnect cannot resurrect the session.
+        activePrompts.delete(sessionId);
+        coreFollowers.map.delete(sessionId);
+        coreFollowers.map.delete(sessionId.replace(/^session-/, ''));
+        coreApprovals.removeBySession(sessionId);
+        if (coreFollowers.get(sessionId)) {
+          coreFollowers.get(sessionId).isRunning = false;
+        }
+
+        audit('session/delete', { sessionId, workspaceId, detached: result.detached });
+        broadcastToMobileClients({ type: 'session_deleted', sessionId });
+        sendJson(200, { ok: true, code: 0, message: 'Deleted', sessionId, detached: result.detached });
         return;
       }
 
@@ -1528,7 +1586,7 @@ export function apply(ctx, config = {}, internals = {}) {
 
       // 4.4 审批交互
       if (pathname === '/api/mobile/approvals' && req.method === 'GET') {
-        sendJson(200, { ok: true, code: 0, approvals: Array.from(new Set(pendingApprovals.values())) });
+        sendJson(200, { ok: true, code: 0, approvals: coreApprovals.list() });
         return;
       }
 
@@ -1545,25 +1603,40 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
 
-      // 4.5 项目说明文档 (MEMORY.md)
-      if (pathname === '/api/mobile/workspace/memory' && req.method === 'GET') {
-        const wsPath = parsedUrl.query?.workspacePath;
-        const fileName = parsedUrl.query?.fileName || 'USER.MD';
-        if (!wsPath) { sendJson(400, { error: 'Missing workspacePath' }); return; }
-        const targetFile = path.join(wsPath, fileName);
+      // 4.5 项目说明文档 (MEMORY.md / USER.MD) - Directory Traversal Hardened (F4.5)
+      if ((pathname === '/api/mobile/workspace/memory' || pathname === '/api/mobile/memory') && req.method === 'GET') {
+        const wsPath = parsedUrl.query?.workspacePath || parsedUrl.query?.path;
+        const fileName = parsedUrl.query?.fileName || parsedUrl.query?.file || 'USER.MD';
+        const check = sanitizeWorkspaceFilePath(wsPath, fileName);
+        if (check.error) {
+          sendJson(check.status, { ok: false, error: check.error });
+          return;
+        }
         let content = '';
-        if (fs.existsSync(targetFile)) content = fs.readFileSync(targetFile, 'utf8');
-        sendJson(200, { ok: true, code: 0, fileName, content, exists: fs.existsSync(targetFile) });
+        const exists = fs.existsSync(check.targetFile);
+        if (exists) content = fs.readFileSync(check.targetFile, 'utf8');
+        sendJson(200, { ok: true, code: 0, fileName, content, exists, filePath: check.targetFile });
         return;
       }
 
-      if (pathname === '/api/mobile/workspace/memory' && req.method === 'POST') {
-        const { workspacePath, fileName, content } = jsonBody;
-        if (!workspacePath || !fileName) { sendJson(400, { error: 'Missing parameters' }); return; }
-        const targetFile = path.join(workspacePath, fileName);
-        fs.writeFileSync(targetFile, content || '', 'utf8');
-        sendJson(200, { ok: true, code: 0, fileName, message: 'Saved successfully' });
-        audit('memory/update', { action: 'memory/update', event: 'memory/update', workspacePath, fileName });
+      if ((pathname === '/api/mobile/workspace/memory' || pathname === '/api/mobile/memory') && req.method === 'POST') {
+        const wsPath = jsonBody.workspacePath || jsonBody.path;
+        const fileName = jsonBody.fileName || jsonBody.file;
+        const content = jsonBody.content;
+        if (!wsPath || !fileName) {
+          sendJson(400, { ok: false, error: 'Missing parameters (workspacePath and fileName required)' });
+          return;
+        }
+        const check = sanitizeWorkspaceFilePath(wsPath, fileName);
+        if (check.error) {
+          sendJson(check.status, { ok: false, error: check.error });
+          return;
+        }
+        const dir = path.dirname(check.targetFile);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(check.targetFile, content || '', 'utf8');
+        sendJson(200, { ok: true, code: 0, fileName, message: 'Saved successfully', filePath: check.targetFile });
+        audit('memory/update', { action: 'memory/update', event: 'memory/update', workspacePath: wsPath, fileName });
         return;
       }
 
@@ -1578,8 +1651,29 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
 
+      // Agent personas.  [unified] This route only existed on the standalone
+      // gateway; the Flutter client calls it unconditionally on connect, so the
+      // Cordis-hosted bridge used to answer 404 here.
+      if (pathname === '/api/mobile/personas' && req.method === 'GET') {
+        sendJson(200, { ok: true, code: 0, personas: personaStore.get() });
+        return;
+      }
+
+      if (pathname === '/api/mobile/personas' && req.method === 'POST') {
+        const list = Array.isArray(jsonBody.personas) ? jsonBody.personas : null;
+        if (!list) {
+          sendJson(400, { ok: false, error: 'personas must be an array' });
+          return;
+        }
+        const okSave = personaStore.save(list);
+        audit('personas/update', { count: list.length, saved: okSave });
+        sendJson(okSave ? 200 : 500, { ok: okSave, code: okSave ? 0 : 500, personas: okSave ? list : personaStore.get() });
+        return;
+      }
+
       sendJson(404, { error: 'Not found', path: pathname });
     } catch (err) {
+      if (res.headersSent) return;
       logger.error('[dsh-mobile-bridge] API error:', pathname, err);
       sendJson(500, { error: err?.message || 'Internal server error' });
     }
@@ -1592,7 +1686,7 @@ export function apply(ctx, config = {}, internals = {}) {
     const pathname = parsed.pathname;
 
     if (pathname === '/mobile-ws' || pathname === '/api/mobile/ws') {
-      const auth = authenticateRequest(req);
+      const auth = authenticateRequest(req, parsed);
       if (!auth.ok) {
         socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
         socket.destroy();
@@ -1609,8 +1703,7 @@ export function apply(ctx, config = {}, internals = {}) {
     socket.destroy();
   });
 
-  // Heartbeat & dead socket tracking interval (F3.5)
-  const HEARTBEAT_INTERVAL_MS = 30000;
+  // Heartbeat & dead socket tracking interval (F3.5) — constant lives in core.
   const heartbeatInterval = setInterval(() => {
     for (const ws of connectedClients) {
       if (ws.isAlive === false) {
@@ -1642,12 +1735,12 @@ export function apply(ctx, config = {}, internals = {}) {
       ws.isAlive = true;
     });
 
-    ws.send(JSON.stringify({ type: 'connected', version: '1.2.8', time: Date.now() }));
+    ws.send(JSON.stringify({ type: 'connected', version: BRIDGE_VERSION, time: Date.now() }));
     ws.send(JSON.stringify({
       type: 'system',
       event: 'connected',
       message: 'Connected to DeepSeek Harness Agent',
-      pendingApprovals: Array.from(new Set(pendingApprovals.values()))
+      pendingApprovals: coreApprovals.list()
     }));
 
     ws.on('message', async (raw) => {
@@ -1718,15 +1811,25 @@ export function apply(ctx, config = {}, internals = {}) {
     connectUpstreamMux();
   });
 
-  ctx.effect(() => async () => {
+  const cleanupGateway = async () => {
+    if (isDisposed) return;
+    isDisposed = true;
     logger.info('dsh-mobile-bridge: 正在关闭网关服务...');
-    if (muxReconnectTimer) clearTimeout(muxReconnectTimer);
+    if (muxReconnectTimer) { clearTimeout(muxReconnectTimer); muxReconnectTimer = null; }
     if (heartbeatInterval) clearInterval(heartbeatInterval);
+    try { upstreamMuxWs?.removeAllListeners(); } catch (_) {}
+    // Keep an error sink attached while closing: removing every listener first
+    // turns the close-time "WebSocket was closed before the connection was
+    // established" into an uncaught exception that can abort the host process.
+    try { upstreamMuxWs?.on('error', () => {}); } catch (_) {}
     try { upstreamMuxWs?.close(); } catch (_) {}
+    upstreamMuxWs = null;
     for (const ws of connectedClients) {
       try { ws.close(); } catch (_) {}
     }
     connectedClients.clear();
+    try { wss.close(); } catch (_) {}
+    try { server.closeAllConnections?.(); } catch (_) {}
     await new Promise((resolve) => {
       server.close(() => resolve());
       setTimeout(() => {
@@ -1735,11 +1838,19 @@ export function apply(ctx, config = {}, internals = {}) {
       }, 1000).unref?.();
     });
     await disposeRpc();
+    activePrompts.clear();
+    sessionFollowers.clear();
+    pendingApprovals.clear();
     audit('gateway/stop', {});
-  }, 'dsh-mobile-bridge: 关闭网关');
+  };
+
+  if (typeof ctx.on === 'function') {
+    ctx.on('dispose', cleanupGateway);
+  }
+  ctx.effect(() => () => { cleanupGateway(); }, 'dsh-mobile-bridge: 关闭网关');
 
   return () => {
-    try { server.close(); } catch (_) {}
+    cleanupGateway();
   };
 }
 

@@ -11,12 +11,19 @@ class ModelItem {
     this.maxTokens,
   });
 
+  static int? _parseInt(dynamic v) {
+    if (v == null) return null;
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    return int.tryParse(v.toString());
+  }
+
   factory ModelItem.fromJson(Map<String, dynamic> json) {
     return ModelItem(
-      id: json['id'] ?? '',
-      name: json['name'] ?? json['id'] ?? '',
-      contextWindow: json['contextWindow'],
-      maxTokens: json['maxTokens'],
+      id: json['id']?.toString() ?? '',
+      name: json['name']?.toString() ?? json['id']?.toString() ?? '',
+      contextWindow: _parseInt(json['contextWindow']),
+      maxTokens: _parseInt(json['maxTokens']),
     );
   }
 
@@ -46,11 +53,14 @@ class DshSettings {
   factory DshSettings.fromJson(Map<String, dynamic> json) {
     final rawList = json['availableModels'] as List<dynamic>? ?? [];
     return DshSettings(
-      currentModel: json['currentModel'] ?? 'cn:deepseek-v4.1-flash',
-      currentProvider: json['currentProvider'] ?? 'wb',
-      availableModels: rawList.map((m) => ModelItem.fromJson(m as Map<String, dynamic>)).toList(),
-      dshHost: json['dshHost'] ?? '127.0.0.1:3080',
-      bridgePort: json['bridgePort'] ?? 3088,
+      currentModel: json['currentModel']?.toString() ?? 'cn:deepseek-v4.1-flash',
+      currentProvider: json['currentProvider']?.toString() ?? 'wb',
+      availableModels: rawList
+          .whereType<Map>()
+          .map((m) => ModelItem.fromJson(Map<String, dynamic>.from(m)))
+          .toList(),
+      dshHost: json['dshHost']?.toString() ?? '127.0.0.1:3080',
+      bridgePort: ModelItem._parseInt(json['bridgePort']) ?? 3088,
     );
   }
 }

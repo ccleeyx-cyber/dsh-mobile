@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 class ToolExecution {
   final String name;
   final String input;
@@ -6,10 +8,24 @@ class ToolExecution {
 
   ToolExecution({
     required this.name,
-    required this.input,
-    this.output = '',
+    dynamic input = '',
+    dynamic output = '',
     this.isRunning = true,
-  });
+  })  : input = _safeFormat(input),
+        output = _safeFormat(output);
+
+  static String _safeFormat(dynamic val) {
+    if (val == null) return '';
+    if (val is String) return val;
+    if (val is Map || val is List) {
+      try {
+        return const JsonEncoder.withIndent('  ').convert(val);
+      } catch (_) {
+        return val.toString();
+      }
+    }
+    return val.toString();
+  }
 }
 
 class ChatMessage {

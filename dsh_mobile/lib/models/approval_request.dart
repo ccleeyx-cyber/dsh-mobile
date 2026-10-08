@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 class ApprovalRequest {
   final String id;
   final String eventId;
@@ -34,7 +36,16 @@ class ApprovalRequest {
       command = rawInput['command']?.toString() ?? rawInput['cmd']?.toString();
     }
     if (command == null && rawInput is String && rawInput.trim().isNotEmpty) {
-      command = rawInput.trim();
+      final trimmed = rawInput.trim();
+      if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        try {
+          final decoded = jsonDecode(trimmed);
+          if (decoded is Map) {
+            command = decoded['command']?.toString() ?? decoded['cmd']?.toString();
+          }
+        } catch (_) {}
+      }
+      command ??= trimmed;
     }
 
     return ApprovalRequest(

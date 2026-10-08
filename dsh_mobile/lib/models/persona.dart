@@ -17,12 +17,12 @@ class AgentPersona {
 
   factory AgentPersona.fromJson(Map<String, dynamic> json) {
     return AgentPersona(
-      id: json['id'] ?? '',
-      title: json['title'] ?? '',
-      icon: json['icon'] ?? 'code',
-      description: json['description'] ?? '',
-      prompt: json['prompt'] ?? '',
-      isCustom: json['isCustom'] ?? false,
+      id: json['id']?.toString() ?? '',
+      title: json['title']?.toString() ?? '',
+      icon: json['icon']?.toString() ?? 'code',
+      description: json['description']?.toString() ?? '',
+      prompt: json['prompt']?.toString() ?? '',
+      isCustom: json['isCustom'] == true || json['isCustom'] == 'true',
     );
   }
 

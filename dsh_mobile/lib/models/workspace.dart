@@ -48,16 +48,24 @@ class SessionMeta {
     );
   }
 
+  static int _parseInt(dynamic v, [int defaultValue = 0]) {
+    if (v == null) return defaultValue;
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    if (v is String) return int.tryParse(v) ?? defaultValue;
+    return defaultValue;
+  }
+
   factory SessionMeta.fromJson(Map<String, dynamic> json) {
     return SessionMeta(
-      sessionId: json['sessionId'] ?? '',
-      title: json['title'] ?? json['sessionId'] ?? '未命名对话',
-      firstPrompt: json['firstPrompt'] ?? '',
-      lastPromptAt: json['lastPromptAt'] is int ? json['lastPromptAt'] : 0,
-      model: json['model'] ?? '',
-      lastSeq: json['lastSeq'] is int ? json['lastSeq'] : 0,
-      isRunning: json['isRunning'] == true,
-      pendingApprovals: json['pendingApprovals'] is int ? json['pendingApprovals'] : 0,
+      sessionId: json['sessionId']?.toString() ?? '',
+      title: json['title']?.toString() ?? json['sessionId']?.toString() ?? '未命名对话',
+      firstPrompt: json['firstPrompt']?.toString() ?? '',
+      lastPromptAt: _parseInt(json['lastPromptAt']),
+      model: json['model']?.toString() ?? '',
+      lastSeq: _parseInt(json['lastSeq']),
+      isRunning: json['isRunning'] == true || json['isRunning'] == 'true',
+      pendingApprovals: _parseInt(json['pendingApprovals']),
     );
   }
 
@@ -99,15 +107,18 @@ class Workspace {
   factory Workspace.fromJson(Map<String, dynamic> json) {
     final rawSessions = json['sessions'] as List<dynamic>? ?? [];
     return Workspace(
-      workspaceId: json['workspaceId'] ?? '',
-      title: json['title'] ?? '默认工作区',
-      path: json['path'] ?? '',
-      createdAt: json['createdAt'] ?? '',
-      updatedAt: json['updatedAt'] ?? '',
-      sessionCount: json['sessionCount'] ?? rawSessions.length,
-      pendingApprovals: json['pendingApprovals'] is int ? json['pendingApprovals'] : 0,
-      hasRunning: json['hasRunning'] == true,
-      sessions: rawSessions.map((s) => SessionMeta.fromJson(s as Map<String, dynamic>)).toList(),
+      workspaceId: json['workspaceId']?.toString() ?? '',
+      title: json['title']?.toString() ?? '默认工作区',
+      path: json['path']?.toString() ?? '',
+      createdAt: json['createdAt']?.toString() ?? '',
+      updatedAt: json['updatedAt']?.toString() ?? '',
+      sessionCount: SessionMeta._parseInt(json['sessionCount'], rawSessions.length),
+      pendingApprovals: SessionMeta._parseInt(json['pendingApprovals']),
+      hasRunning: json['hasRunning'] == true || json['hasRunning'] == 'true',
+      sessions: rawSessions
+          .whereType<Map>()
+          .map((s) => SessionMeta.fromJson(Map<String, dynamic>.from(s)))
+          .toList(),
     );
   }
 

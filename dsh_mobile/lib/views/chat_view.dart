@@ -13,6 +13,8 @@ import '../widgets/thinking_card.dart';
 import '../widgets/tool_call_card.dart';
 import '../widgets/approval_card.dart';
 import '../widgets/memory_card.dart';
+import '../widgets/safe_markdown.dart';
+import 'config_page.dart';
 
 class ChatView extends StatefulWidget {
   final VoidCallback? onOpenWorkspaces;
@@ -855,8 +857,74 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
-  /// 离线 / 正在重连状态横幅 (F3.4)
+  /// 离线 / 正在重连状态横幅 (F3.4, F4.3)
   Widget _buildOfflineBanner(BuildContext context, DshService dsh) {
+    if (dsh.isTokenInvalid) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+        decoration: const BoxDecoration(
+          color: Color(0xFFFEF2F2),
+          border: Border(bottom: BorderSide(color: Color(0xFFFECACA), width: 1.0)),
+        ),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(5),
+              decoration: BoxDecoration(
+                color: const Color(0xFFDC2626).withOpacity(0.12),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(Icons.key_off_rounded, size: 15, color: Color(0xFFDC2626)),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: const [
+                  Text(
+                    '访问令牌已失效 (HTTP 401)',
+                    style: TextStyle(color: Color(0xFF991B1B), fontSize: 12.5, fontWeight: FontWeight.bold),
+                  ),
+                  Text(
+                    '服务器拒绝访问，已暂停自动重连。请前往重新配置令牌。',
+                    style: TextStyle(color: Color(0xFFB91C1C), fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            InkWell(
+              onTap: () {
+                HapticFeedback.lightImpact();
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const ConfigPage()),
+                );
+              },
+              borderRadius: BorderRadius.circular(6),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: const Color(0xFFFCA5A5)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: const [
+                    Icon(Icons.settings_outlined, size: 13, color: Color(0xFFDC2626)),
+                    SizedBox(width: 4),
+                    Text('前往配置', style: TextStyle(fontSize: 11.5, color: Color(0xFFDC2626), fontWeight: FontWeight.bold)),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     final isConnecting = dsh.status == ConnectionStatus.connecting;
 
     final bgColor = isConnecting ? const Color(0xFFFFFBEB) : const Color(0xFFFEF2F2);
@@ -1679,9 +1747,14 @@ class _ChatViewState extends State<ChatView> {
                         ),
                       ],
                     ),
-                    child: MarkdownBody(
+                    child: SafeMarkdown(
                       data: displayContent,
                       selectable: true,
+                      fallbackTextStyle: TextStyle(
+                        fontSize: 14,
+                        color: isUser ? Colors.white : const Color(0xFF1F2937),
+                        height: 1.45,
+                      ),
                       styleSheet: MarkdownStyleSheet(
                         p: TextStyle(fontSize: 14, color: isUser ? Colors.white : const Color(0xFF1F2937), height: 1.45),
                         code: TextStyle(

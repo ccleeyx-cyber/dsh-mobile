@@ -1,6 +1,7 @@
 // dsh-server-plugin RPC 通道：为 DSH 设置页提供网关、授权码与 NPS 配置管理
 import os from 'node:os';
-import { loadConfig, saveConfig, generateToken } from './store.mjs';
+import { loadConfig, saveConfig, generateToken, loadDevices, revokeDevice, newPairCode, pairCodeTtlMs } from './store.mjs';
+import { BRIDGE_VERSION } from './core.mjs';
 
 export const RPC_CHANNEL = '/dsh-mobile-bridge';
 
@@ -8,7 +9,8 @@ export const ENDPOINTS = {
   status: 'status',
   getConfig: 'config/get',
   updateConfig: 'config/update',
-  generateToken: 'token/generate'
+  generateToken: 'token/generate',
+  generatePairCode: 'pair/code'
 };
 
 function getLocalIp() {
@@ -60,7 +62,7 @@ async function dispatch(endpoint, payload, deps) {
         npsUrl: `${npsScheme}://${cfg.npsHost}:${cfg.npsPort}`,
         apkUrl: `http://${localIp}:${cfg.port}/dsh-agent.apk`,
         npsApkUrl: `${npsScheme}://${cfg.npsHost}:${cfg.npsPort}/dsh-agent.apk`,
-        version: '1.2.8'
+        version: BRIDGE_VERSION
       };
     }
 
@@ -82,8 +84,26 @@ async function dispatch(endpoint, payload, deps) {
       return { token };
     }
 
-    // 兼容老前端请求
-    case 'devices/list':
+    // Pairing: mint a short-lived 6-digit code for the settings page to show.
+    case ENDPOINTS.generatePairCode: {
+      const code = newPairCode();
+      const expiresAt = Date.now() + pairCodeTtlMs();
+      return { code, expiresAt, ttlMs: pairCodeTtlMs() };
+    }
+
+    case 'devices/list': {
+      // Never return token hashes to the client.
+      const state = loadDevices();
+      return state.devices.map(({ tokenHash, ...rest }) => rest);
+    }
+
+    case 'devices/revoke': {
+      const id = payload?.deviceId;
+      if (!id) throw new Error('deviceId is required');
+      const ok = revokeDevice(id);
+      return { ok, deviceId: id };
+    }
+
     case 'audit/list':
       return [];
 

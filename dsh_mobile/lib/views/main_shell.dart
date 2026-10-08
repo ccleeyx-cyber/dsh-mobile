@@ -5,6 +5,7 @@ import 'chat_view.dart';
 import 'workspaces_view.dart';
 import 'security_permissions_view.dart';
 import 'custom_settings_view.dart';
+import 'config_page.dart';
 
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
@@ -95,18 +96,55 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     return Scaffold(
       resizeToAvoidBottomInset: false,
       backgroundColor: const Color(0xFFF9FAFB),
-      body: IndexedStack(
-        index: _currentIndex,
+      body: Column(
         children: [
-          ChatView(
-            onOpenWorkspaces: () => _setIndex(1),
-            onOpenSecurity: () => _setIndex(2),
+          if (dsh.isTokenInvalid)
+            Container(
+              width: double.infinity,
+              color: const Color(0xFFFEF2F2),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              child: Row(
+                children: [
+                  const Icon(Icons.key_off_rounded, color: Color(0xFFDC2626), size: 16),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      '访问令牌已失效 (401 Unauthorized)。请更新服务器访问令牌。',
+                      style: TextStyle(color: Color(0xFF991B1B), fontSize: 12, fontWeight: FontWeight.w500),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const ConfigPage()),
+                      );
+                    },
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    child: const Text('更新令牌', style: TextStyle(color: Color(0xFFDC2626), fontWeight: FontWeight.bold, fontSize: 12)),
+                  ),
+                ],
+              ),
+            ),
+          Expanded(
+            child: IndexedStack(
+              index: _currentIndex,
+              children: [
+                ChatView(
+                  onOpenWorkspaces: () => _setIndex(1),
+                  onOpenSecurity: () => _setIndex(2),
+                ),
+                WorkspacesView(
+                  onSwitchToChat: () => _setIndex(0),
+                ),
+                const SecurityPermissionsView(),
+                const CustomSettingsView(),
+              ],
+            ),
           ),
-          WorkspacesView(
-            onSwitchToChat: () => _setIndex(0),
-          ),
-          const SecurityPermissionsView(),
-          const CustomSettingsView(),
         ],
       ),
       bottomNavigationBar: Container(

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../models/dsh_settings.dart';
+import '../models/app_version.dart';
 import '../services/dsh_service.dart';
 import 'config_page.dart';
 
@@ -330,7 +331,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _buildInfoRow('网关地址 (Gateway)', dsh.currentConfig?.host ?? 'n.cnm.asia:3088'),
+                _buildInfoRow('网关地址 (Gateway)', dsh.currentConfig?.httpBaseUrl ?? '未配置'),
                 const SizedBox(height: 8),
                 _buildInfoRow('DSH 本地上游', settings?.dshHost ?? '127.0.0.1:3080'),
                 const SizedBox(height: 8),
@@ -449,12 +450,17 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                       child: const Icon(Icons.layers_rounded, color: Colors.white, size: 22),
                     ),
                     const SizedBox(width: 12),
-                    const Column(
+                    Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text('DSH Mobile Pro', style: TextStyle(color: Color(0xFF111827), fontWeight: FontWeight.bold, fontSize: 14)),
-                        SizedBox(height: 2),
-                        Text('版本: v1.2.1 (Build 4)', style: TextStyle(color: Color(0xFF6B7280), fontSize: 12)),
+                        const Text('DSH Mobile Pro', style: TextStyle(color: Color(0xFF111827), fontWeight: FontWeight.bold, fontSize: 14)),
+                        const SizedBox(height: 2),
+                        // Single source of truth is lib/models/app_version.dart,
+                        // which mirrors pubspec.yaml — no stale literal here.
+                        Text(
+                          '版本: v${AppVersion.version} (Build ${AppVersion.buildNumber})',
+                          style: TextStyle(color: Color(0xFF6B7280), fontSize: 12),
+                        ),
                       ],
                     ),
                   ],
@@ -467,11 +473,15 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                         icon: const Icon(Icons.download_rounded, size: 16, color: Color(0xFF0078D4)),
                         label: const Text('复制 APK 下载直链', style: TextStyle(color: Color(0xFF0078D4), fontSize: 12, fontWeight: FontWeight.w600)),
                         onPressed: () {
-                          const apkUrl = 'http://n.cnm.asia:3088/dsh-agent.apk';
-                          Clipboard.setData(const ClipboardData(text: apkUrl));
+                          // Build the download URL from the gateway the user is
+                          // actually connected to, instead of a baked-in host
+                          // that silently breaks on LAN / tunnel / port changes.
+                          final cfg = dsh.currentConfig;
+                          final apkUrl = '${cfg?.httpBaseUrl ?? 'http://127.0.0.1:3088'}/dsh-agent.apk';
+                          Clipboard.setData(ClipboardData(text: apkUrl));
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text('已复制直链: http://n.cnm.asia:3088/dsh-agent.apk'),
+                            SnackBar(
+                              content: Text('已复制直链: $apkUrl'),
                               backgroundColor: Color(0xFF0078D4),
                               behavior: SnackBarBehavior.floating,
                             ),

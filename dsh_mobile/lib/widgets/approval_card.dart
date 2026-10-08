@@ -26,6 +26,19 @@ class ApprovalCard extends StatefulWidget {
 class _ApprovalCardState extends State<ApprovalCard> {
   bool _isInputExpanded = false;
 
+  String _formatInput(dynamic input) {
+    if (input == null) return '';
+    if (input is String) return input;
+    if (input is Map || input is List) {
+      try {
+        return const JsonEncoder.withIndent('  ').convert(input);
+      } catch (_) {
+        return input.toString();
+      }
+    }
+    return input.toString();
+  }
+
   void _copyToClipboard(BuildContext context, String text, String label) {
     Clipboard.setData(ClipboardData(text: text));
     HapticFeedback.lightImpact();
@@ -428,9 +441,7 @@ class _ApprovalCardState extends State<ApprovalCard> {
                             child: SingleChildScrollView(
                               padding: const EdgeInsets.all(10),
                               child: SelectableText(
-                                req.input is Map || req.input is List
-                                    ? const JsonEncoder.withIndent('  ').convert(req.input)
-                                    : req.input.toString(),
+                                _formatInput(req.input),
                                 style: const TextStyle(
                                   fontSize: 11,
                                   fontFamily: 'monospace',

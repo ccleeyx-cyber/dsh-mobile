@@ -37,6 +37,8 @@ class DshService extends ChangeNotifier {
   bool _isExplicitlyDisconnected = false;
   bool _isDisposed = false;
   bool _isReconnecting = false;
+  bool _isTokenInvalid = false;
+  StreamSubscription? _channelSubscription;
   DateTime? _lastResumeCheck;
 
   static const int _baseReconnectDelayMs = 1000;
@@ -99,11 +101,54 @@ class DshService extends ChangeNotifier {
   bool get isConnecting => _status == ConnectionStatus.connecting;
   bool get isDisconnected => _status == ConnectionStatus.disconnected;
   bool get hasError => _status == ConnectionStatus.error;
+  bool get isTokenInvalid => _isTokenInvalid;
+  bool get hasAuthError => _isTokenInvalid;
+
+  void handleAuthFailure(String reason) {
+    _isTokenInvalid = true;
+    _lastError = reason;
+    _status = ConnectionStatus.error;
+    _isReconnecting = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _sessionPollTimer?.cancel();
+    _sessionPollTimer = null;
+    _stopHeartbeat();
+    notifyListeners();
+  }
+
+  void clearAuthError() {
+    _isTokenInvalid = false;
+    _lastError = '';
+    notifyListeners();
+  }
+
+  bool _checkResponseAuth(http.Response res) {
+    if (res.statusCode == 401 || res.statusCode == 403) {
+      handleAuthFailure('Token已失效或无访问权限 (HTTP ${res.statusCode})');
+      return true;
+    }
+    return false;
+  }
+
+  String _coerceToolInput(dynamic raw) {
+    if (raw == null) return '';
+    if (raw is String) return raw;
+    if (raw is Map || raw is List) {
+      try {
+        return const JsonEncoder.withIndent('  ').convert(raw);
+      } catch (_) {
+        return raw.toString();
+      }
+    }
+    return raw.toString();
+  }
 
   /// 手动触发网络重连 (F3.4)
   Future<void> retryConnection() async {
     if (_currentConfig == null) return;
     _lastError = '';
+    _isTokenInvalid = false;
     _reconnectAttempts = 0;
     _scheduleReconnect(immediate: true);
   }
@@ -170,6 +215,7 @@ class DshService extends ChangeNotifier {
   Future<void> connect(ServerConfig config) async {
     _currentConfig = config;
     _isExplicitlyDisconnected = false;
+    _isTokenInvalid = false;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _reconnectAttempts = 0;
@@ -183,7 +229,7 @@ class DshService extends ChangeNotifier {
       final uri = Uri.parse(config.wsUrl);
       _channel = WebSocketChannel.connect(uri);
 
-      _channel!.stream.listen(
+      _channelSubscription = _channel!.stream.listen(
         (data) {
           if (_status != ConnectionStatus.connected) {
             _status = ConnectionStatus.connected;
@@ -195,6 +241,11 @@ class DshService extends ChangeNotifier {
         },
         onError: (error) {
           debugPrint('[DshService] WebSocket error: $error');
+          final errStr = error.toString().toLowerCase();
+          if (errStr.contains('401') || errStr.contains('unauthorized')) {
+            handleAuthFailure('WebSocket认证失败: 访问令牌无效');
+            return;
+          }
           _status = ConnectionStatus.error;
           _lastError = error.toString();
           _isReconnecting = false;
@@ -204,6 +255,11 @@ class DshService extends ChangeNotifier {
         },
         onDone: () {
           debugPrint('[DshService] WebSocket onDone closed');
+          final code = _channel?.closeCode;
+          if (code == 4001 || code == 4401 || code == 1008) {
+            handleAuthFailure('连接已关闭: 认证失败或Token过期 (Code: $code)');
+            return;
+          }
           _status = ConnectionStatus.disconnected;
           _isReconnecting = false;
           _stopHeartbeat();
@@ -237,6 +293,7 @@ class DshService extends ChangeNotifier {
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces');
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
+      if (_checkResponseAuth(res)) return;
 
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -313,6 +370,7 @@ class DshService extends ChangeNotifier {
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/${session.sessionId}');
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
+      if (_checkResponseAuth(res)) return;
 
       // Guard: if user switched to another session while HTTP was in flight, discard!
       if (currentSeq != _sessionLoadSeq) return;
@@ -342,8 +400,8 @@ class DshService extends ChangeNotifier {
             isContext: m['isContext'] == true || m['role'] == 'context',
             tools: rawTools.map((t) => ToolExecution(
               name: t['name'] ?? '',
-              input: t['input'] ?? '',
-              output: t['output'] ?? '',
+              input: _coerceToolInput(t['input']),
+              output: _coerceToolInput(t['output']),
               isRunning: t['isRunning'] ?? false,
             )).toList(),
             timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
@@ -425,6 +483,7 @@ class DshService extends ChangeNotifier {
           'workspaceId': _currentWorkspace!.workspaceId,
         }),
       ).timeout(const Duration(seconds: 8));
+      if (_checkResponseAuth(res)) return;
 
       // Guard: if user switched to another session while request was in-flight, discard
       if (currentSeq != _sessionLoadSeq) return;
@@ -520,6 +579,8 @@ class DshService extends ChangeNotifier {
         return;
       }
 
+      if (res != null && _checkResponseAuth(res)) return;
+
       if (res != null && res.statusCode == 200) {
         // 3. Start fallback session polling
         _startSessionPolling(sessionId);
@@ -557,7 +618,7 @@ class DshService extends ChangeNotifier {
 
     _sessionPollTimer = Timer.periodic(const Duration(milliseconds: 700), (timer) async {
       ticks++;
-      if (ticks > maxTicks || _currentSession == null || !_currentSession!.matchesSessionId(sessionId)) {
+      if (_isDisposed || ticks > maxTicks || _currentSession == null || !_currentSession!.matchesSessionId(sessionId)) {
         timer.cancel();
         _sessionPollTimer = null;
         if (_currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
@@ -579,6 +640,11 @@ class DshService extends ChangeNotifier {
       try {
         final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$sessionId');
         final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 5));
+        if (_checkResponseAuth(res)) {
+          timer.cancel();
+          _sessionPollTimer = null;
+          return;
+        }
 
         // If user changed session or canceled while HTTP was in flight, abort!
         if (_isCanceling || _sessionPollTimer == null || _currentSession == null || !_currentSession!.matchesSessionId(sessionId)) {
@@ -612,6 +678,7 @@ class DshService extends ChangeNotifier {
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$targetSessionId');
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 5));
+      if (_checkResponseAuth(res)) return;
 
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -650,8 +717,8 @@ class DshService extends ChangeNotifier {
         isContext: m['isContext'] == true || m['role'] == 'context',
         tools: rawTools.map((t) => ToolExecution(
           name: t['name'] ?? '',
-          input: t['input'] ?? '',
-          output: t['output'] ?? '',
+          input: _coerceToolInput(t['input']),
+          output: _coerceToolInput(t['output']),
           isRunning: t['isRunning'] ?? false,
         )).toList(),
         timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
@@ -811,6 +878,7 @@ class DshService extends ChangeNotifier {
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings');
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final sData = (data['settings'] is Map<String, dynamic>)
@@ -834,7 +902,7 @@ class DshService extends ChangeNotifier {
     if (targetSessionId != null && targetSessionId.isNotEmpty && targetSessionId != 'default') {
       try {
         final sessionUrl = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/model');
-        await http.post(
+        final res = await http.post(
           sessionUrl,
           headers: _authHeaders,
           body: jsonEncode({
@@ -842,6 +910,7 @@ class DshService extends ChangeNotifier {
             'model': modelId,
           }),
         ).timeout(const Duration(seconds: 5));
+        if (_checkResponseAuth(res)) return false;
       } catch (e) {
         debugPrint('[DshService] session model switch non-critical: $e');
       }
@@ -850,11 +919,12 @@ class DshService extends ChangeNotifier {
     // 2. Also persist to global settings
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings/model');
-      await http.post(
+      final res = await http.post(
         url,
         headers: _authHeaders,
         body: jsonEncode({'model': modelId}),
       ).timeout(const Duration(seconds: 5));
+      if (_checkResponseAuth(res)) return false;
     } catch (e) {
       debugPrint('[DshService] global settings model switch non-critical: $e');
     }
@@ -889,6 +959,7 @@ class DshService extends ChangeNotifier {
           'workspaceId': workspaceId ?? _currentWorkspace?.workspaceId ?? '',
         }),
       ).timeout(const Duration(seconds: 8));
+      if (_checkResponseAuth(res)) return false;
 
       if (res.statusCode == 200) {
         for (final ws in _workspaces) {
@@ -929,6 +1000,7 @@ class DshService extends ChangeNotifier {
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approvals');
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final list = data['approvals'] as List<dynamic>? ?? [];
@@ -971,6 +1043,7 @@ class DshService extends ChangeNotifier {
         headers: _authHeaders,
         body: jsonEncode(body),
       ).timeout(const Duration(seconds: 8));
+      if (_checkResponseAuth(res)) return;
 
       if (res.statusCode == 200) {
         _pendingApprovals.removeWhere((a) => a.eventId == req.eventId || a.id == req.id);
@@ -987,6 +1060,7 @@ class DshService extends ChangeNotifier {
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/permissions');
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         if (data['permissions'] != null) {
@@ -1012,6 +1086,7 @@ class DshService extends ChangeNotifier {
         headers: _authHeaders,
         body: jsonEncode(newConfig.toJson()),
       ).timeout(const Duration(seconds: 6));
+      if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         if (data['permissions'] != null) {
@@ -1049,6 +1124,7 @@ class DshService extends ChangeNotifier {
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/audit-logs');
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final list = (data['auditLogs'] ?? data['logs']) as List<dynamic>? ?? [];
@@ -1066,6 +1142,7 @@ class DshService extends ChangeNotifier {
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/personas');
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final list = data['personas'] as List<dynamic>? ?? [];
@@ -1086,6 +1163,7 @@ class DshService extends ChangeNotifier {
         headers: _authHeaders,
         body: jsonEncode({'personas': list.map((p) => p.toJson()).toList()}),
       ).timeout(const Duration(seconds: 6));
+      if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
         _personas = list;
         notifyListeners();
@@ -1139,6 +1217,7 @@ class DshService extends ChangeNotifier {
         queryParameters: {'path': workspacePath},
       );
       final res = await http.get(uri, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      if (_checkResponseAuth(res)) return '';
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         return data['content'] ?? '';
@@ -1158,6 +1237,7 @@ class DshService extends ChangeNotifier {
         headers: _authHeaders,
         body: jsonEncode({'path': workspacePath, 'content': content}),
       ).timeout(const Duration(seconds: 6));
+      if (_checkResponseAuth(res)) return false;
       return res.statusCode == 200;
     } catch (e) {
       debugPrint('[DshService] saveWorkspaceMemory error: $e');
@@ -1176,6 +1256,12 @@ class DshService extends ChangeNotifier {
 
       final type = json['type'] ?? json['event'];
       if (type == 'pong') return;
+
+      // Auth error check from WS frame
+      if (json['code'] == 401 || json['type'] == 'unauthorized' || json['status'] == 401) {
+        handleAuthFailure(json['error']?.toString() ?? json['message']?.toString() ?? '认证失败: Token无效');
+        return;
+      }
 
       // 1. Initial pending approvals from server
       if (type == 'system' && json['pendingApprovals'] is List) {
@@ -1292,7 +1378,8 @@ class DshService extends ChangeNotifier {
         }
 
         // Drop lingering stream chunks if user canceled this turn or turn sequence mismatch
-        if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) return;
+        if (_isCanceling) return;
+        if (_activeTurnSeq <= _cancelledTurnSeq) return;
 
         if (_messages.isEmpty || !_messages.last.isAssistant) {
           _messages.add(ChatMessage(
@@ -1331,7 +1418,8 @@ class DshService extends ChangeNotifier {
         }
 
         // Drop tool start if canceled or turn sequence mismatch
-        if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) return;
+        if (_isCanceling) return;
+        if (_activeTurnSeq <= _cancelledTurnSeq) return;
 
         if (_messages.isEmpty || !_messages.last.isAssistant) {
           _messages.add(ChatMessage(
@@ -1344,7 +1432,7 @@ class DshService extends ChangeNotifier {
           ));
         }
         final toolName = json['tool'] ?? json['name'] ?? 'tool';
-        final toolInput = json['input'] ?? json['args']?.toString() ?? '';
+        final toolInput = _coerceToolInput(json['input'] ?? json['args']);
         _messages.last.tools.add(ToolExecution(name: toolName, input: toolInput, isRunning: true));
         _messages.last.isStreaming = true;
         _isSending = true;
@@ -1354,14 +1442,20 @@ class DshService extends ChangeNotifier {
       }
 
       if (type == 'tool_result' || type == 'tool_end') {
+        if (_isCanceling) return;
+        if (_activeTurnSeq <= _cancelledTurnSeq) return;
+
         final sId = json['sessionId']?.toString();
         if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
           return;
         }
+
         if (_messages.isNotEmpty && _messages.last.isAssistant && _messages.last.tools.isNotEmpty) {
+
+
           final lastTool = _messages.last.tools.last;
           lastTool.isRunning = false;
-          lastTool.output = json['output']?.toString() ?? json['result']?.toString() ?? '完成';
+          lastTool.output = _coerceToolInput(json['output'] ?? json['result'] ?? '完成');
           _streamRevision++;
           notifyListeners();
         }
@@ -1399,7 +1493,11 @@ class DshService extends ChangeNotifier {
   // Heartbeat
   void _startHeartbeat() {
     _stopHeartbeat();
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
+      if (_isDisposed) {
+        timer.cancel();
+        return;
+      }
       if (_status == ConnectionStatus.connected) {
         try {
           _channel?.sink.add('ping');
@@ -1416,6 +1514,8 @@ class DshService extends ChangeNotifier {
   // Clean Socket Teardown (F4.4 / F3.1)
   Future<void> _cleanTeardownSocket() async {
     _stopHeartbeat();
+    await _channelSubscription?.cancel();
+    _channelSubscription = null;
     if (_channel != null) {
       try {
         await _channel!.sink.close(ws_status.goingAway).timeout(
@@ -1431,7 +1531,10 @@ class DshService extends ChangeNotifier {
 
   // Automatic Reconnection Loop with Exponential Backoff & Jitter (F3.1)
   void _scheduleReconnect({bool immediate = false}) {
-    if (_isExplicitlyDisconnected || _isDisposed || _currentConfig == null) {
+    if (_isExplicitlyDisconnected || _isDisposed || _isTokenInvalid || _currentConfig == null) {
+      return;
+    }
+    if (_isReconnecting || (_reconnectTimer != null && _reconnectTimer!.isActive)) {
       return;
     }
 
@@ -1463,7 +1566,7 @@ class DshService extends ChangeNotifier {
   }
 
   Future<void> _executeReconnect() async {
-    if (_isExplicitlyDisconnected || _isDisposed || _currentConfig == null) {
+    if (_isExplicitlyDisconnected || _isDisposed || _isTokenInvalid || _currentConfig == null) {
       return;
     }
     if (_isReconnecting) return;
@@ -1478,7 +1581,7 @@ class DshService extends ChangeNotifier {
       final uri = Uri.parse(_currentConfig!.wsUrl);
       _channel = WebSocketChannel.connect(uri);
 
-      _channel!.stream.listen(
+      _channelSubscription = _channel!.stream.listen(
         (data) {
           if (_status != ConnectionStatus.connected) {
             _status = ConnectionStatus.connected;
@@ -1491,6 +1594,11 @@ class DshService extends ChangeNotifier {
         },
         onError: (error) {
           debugPrint('[DshService] Reconnect socket error: $error');
+          final errStr = error.toString().toLowerCase();
+          if (errStr.contains('401') || errStr.contains('unauthorized')) {
+            handleAuthFailure('WebSocket认证失败: 访问令牌无效');
+            return;
+          }
           _status = ConnectionStatus.error;
           _lastError = error.toString();
           _isReconnecting = false;
@@ -1500,6 +1608,11 @@ class DshService extends ChangeNotifier {
         },
         onDone: () {
           debugPrint('[DshService] Reconnect socket onDone closed');
+          final code = _channel?.closeCode;
+          if (code == 4001 || code == 4401 || code == 1008) {
+            handleAuthFailure('连接已关闭: 认证失败或Token过期 (Code: $code)');
+            return;
+          }
           _status = ConnectionStatus.disconnected;
           _isReconnecting = false;
           _stopHeartbeat();
@@ -1569,6 +1682,8 @@ class DshService extends ChangeNotifier {
 
   void disconnect() {
     _isExplicitlyDisconnected = true;
+    _channelSubscription?.cancel();
+    _channelSubscription = null;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _reconnectAttempts = 0;

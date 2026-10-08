@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'safe_markdown.dart';
 
 class _ContextMeta {
   final String title;
@@ -27,8 +28,6 @@ class MemoryCard extends StatefulWidget {
   @override
   State<MemoryCard> createState() => _MemoryCardState();
 }
-
-typedef CollapsibleContextCard = MemoryCard;
 
 class _MemoryCardState extends State<MemoryCard> {
   bool _expanded = false;
@@ -202,7 +201,7 @@ class _MemoryCardState extends State<MemoryCard> {
                       thumbVisibility: true,
                       child: SingleChildScrollView(
                         controller: _scrollController,
-                        child: MarkdownBody(
+                        child: SafeMarkdown(
                           data: widget.content,
                           selectable: true,
                           styleSheet: MarkdownStyleSheet(

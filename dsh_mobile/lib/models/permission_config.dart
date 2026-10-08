@@ -21,13 +21,23 @@ class PermissionConfig {
   }
 
   factory PermissionConfig.fromJson(Map<String, dynamic> json) {
-    final rawSessions = json['sessionPolicies'] as Map<String, dynamic>? ?? {};
+    final rawSessions = json['sessionPolicies'] is Map
+        ? Map<String, dynamic>.from(json['sessionPolicies'] as Map)
+        : <String, dynamic>{};
+
+    int parseSteps(dynamic v) {
+      if (v is int) return v;
+      if (v is num) return v.toInt();
+      if (v is String) return int.tryParse(v) ?? 30;
+      return 30;
+    }
+
     return PermissionConfig(
-      defaultPolicy: json['defaultPolicy'] ?? json['executionPolicy'] ?? 'ask',
-      sandboxMode: json['sandboxMode'] ?? 'workspace-write',
-      maxSteps: json['maxSteps'] is int ? json['maxSteps'] : 30,
-      protectGit: json['protectGit'] ?? true,
-      sessionPolicies: rawSessions.map((k, v) => MapEntry(k, v.toString())),
+      defaultPolicy: json['defaultPolicy']?.toString() ?? json['executionPolicy']?.toString() ?? 'ask',
+      sandboxMode: json['sandboxMode']?.toString() ?? 'workspace-write',
+      maxSteps: parseSteps(json['maxSteps']),
+      protectGit: json['protectGit'] == null ? true : (json['protectGit'] == true || json['protectGit'] == 'true'),
+      sessionPolicies: rawSessions.map((k, v) => MapEntry(k.toString(), v.toString())),
     );
   }
 

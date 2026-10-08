@@ -16,7 +16,9 @@ class _ConfigPageState extends State<ConfigPage> {
   final _formKey = GlobalKey<FormState>();
   final _hostController = TextEditingController(text: '');
   final _portController = TextEditingController(text: '3088');
-  final _tokenController = TextEditingController(text: 'DSH_SECURE_TOKEN_2026');
+  // No pre-filled token: the gateway generates a random one on first install,
+  // so a hard-coded default here would only mislead the user.
+  final _tokenController = TextEditingController();
   final _npsController = TextEditingController(text: '');
   final _authCodeController = TextEditingController(text: '');
   bool _useHttps = false;
@@ -67,6 +69,9 @@ class _ConfigPageState extends State<ConfigPage> {
 
     if (!mounted) return;
     setState(() => _isTesting = false);
+    if (ok) {
+      dshService.clearAuthError();
+    }
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -86,12 +91,17 @@ class _ConfigPageState extends State<ConfigPage> {
 
     if (!mounted) return;
     final dshService = Provider.of<DshService>(context, listen: false);
+    dshService.clearAuthError();
     await dshService.connect(config);
 
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(
-      MaterialPageRoute(builder: (_) => const MainShell()),
-    );
+    if (Navigator.of(context).canPop()) {
+      Navigator.of(context).pop();
+    } else {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const MainShell()),
+      );
+    }
   }
 
   @override

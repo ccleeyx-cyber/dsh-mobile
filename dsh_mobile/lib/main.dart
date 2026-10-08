@@ -8,6 +8,25 @@ import 'views/main_shell.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // F4.2: Defensive error boundary preventing red screen of death
+  ErrorWidget.builder = (FlutterErrorDetails details) {
+    debugPrint('[ErrorWidget.builder] Handled layout/rendering error: ${details.exception}');
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: const Color(0xFFF8FAFC),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: const Color(0xFFE2E8F0)),
+        ),
+        child: SelectableText(
+          details.exceptionAsString(),
+          style: const TextStyle(fontSize: 12, color: Color(0xFF64748B), fontFamily: 'monospace'),
+        ),
+      ),
+    );
+  };
   final savedConfig = await StorageService.loadConfig();
 
   runApp(
