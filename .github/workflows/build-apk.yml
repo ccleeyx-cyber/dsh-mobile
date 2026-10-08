@@ -25,6 +25,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # The signing secrets are surfaced ONCE, here, as plain environment
+    # variables. GitHub rejects the `secrets` context inside a step-level `env:`
+    # or `if:` expression with
+    #   Unrecognized named-value: 'secrets'. Located at position 1 within
+    #   expression: secrets.ANDROID_KEYSTORE_BASE64 != ''
+    # and that rejection is fatal for the entire file — the workflow run is
+    # created with ZERO jobs, so nothing gets built and the failure shows up as a
+    # run named after the file path with no steps to inspect. Reading the secrets
+    # through the environment instead also keeps credential material off the
+    # shell command line, where `${{ }}` interpolation would otherwise expand a
+    # base64 keystore into the process arguments.
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -34,8 +51,16 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          # Missing before — every run re-downloaded the Gradle distribution.
-          cache: 'gradle'
+          # `cache: 'gradle'` must stay OFF here. setup-java hashes the Gradle
+          # build files to build its cache key, and it FAILS THE JOB when none
+          # match:
+          #   No file in /home/runner/work/... matched to
+          #   [**/*.gradle*,**/gradle-wrapper.properties,...]
+          # This repo commits only android/app/src/main/AndroidManifest.xml — the
+          # rest of the Gradle project is synthesised later by `flutter create .`,
+          # i.e. after this step has already run. Re-enable the cache once
+          # android/ is committed properly (ANALYSIS §1.1); until then it can only
+          # ever break the build.
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -85,31 +110,34 @@ jobs:
       # situation visible on every run instead of silently shipping
       # uninstall-only APKs.
       - name: Warn if release signing is not configured
-        # The secret is passed through `env` rather than interpolated into the
-        # run script: expanding a base64 keystore onto a shell command line both
-        # risks hitting length limits and puts credential material where it does
-        # not belong, even though Actions masks it in the log.
-        env:
-          HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        # Tests the job-level env var instead of a `${{ secrets.* != '' }}`
+        # expression, which GitHub does not accept in a step-level `env:`/`if:`.
         run: |
-          if [ "$HAS_KEYSTORE" != "true" ]; then
-            echo "::warning title=Unsigned release build::ANDROID_KEYSTORE_BASE64 is not set and dsh_mobile/android/ is not committed. This APK is signed with the runner's ephemeral debug key, so it CANNOT be installed over a previous build - the user must uninstall first, losing their saved gateway address and token. See ANALYSIS-优化与新增功能.md §1.1."
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::warning title=Unsigned release build::ANDROID_KEYSTORE_BASE64 is not set and dsh_mobile/android/ is not committed. This APK is signed with the runner's ephemeral debug key, so it CANNOT be installed over a previous build - the user must uninstall first, losing their saved gateway address and token. The fix is committing dsh_mobile/android/ together with a signingConfig that reads key.properties."
           else
             echo "ANDROID_KEYSTORE_BASE64 is set."
           fi
 
       - name: Write signing material (when provided)
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
         working-directory: ./dsh_mobile
+        # No step-level `if:` — same `secrets` context restriction. The guard
+        # lives in the script, so the step is a no-op when nothing is configured.
         run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "ANDROID_KEYSTORE_BASE64 is not set - nothing to write."
+            exit 0
+          fi
           mkdir -p android/keystore
-          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/keystore/release.jks
+          # printf, not echo: echo would append a newline to the base64 payload.
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/keystore/release.jks
           cat > android/key.properties <<EOF
-          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
-          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
           storeFile=keystore/release.jks
           EOF
+          chmod 600 android/key.properties android/keystore/release.jks
           echo "Signing material written. Takes effect once android/app/build.gradle is committed with a signingConfig that reads key.properties."
 
       - name: Build APK (Release, split per ABI)
@@ -142,6 +170,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Job level for the same reason as the build job: keep `secrets` out of
+    # step-level expressions. `softprops/action-gh-release` picks GITHUB_TOKEN up
+    # from the environment on its own, so nothing has to be repeated per step.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout Repository
@@ -174,5 +207,3 @@ jobs:
           # the commit list since the previous tag.
           generate_release_notes: true
           files: dist/*.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

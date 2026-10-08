@@ -78,8 +78,23 @@ jobs:
         # No `|| npm install` fallback: that silently downgraded to a resolved
         # install whenever the lockfile drifted, so CI could test a different
         # dependency tree than the one that was committed. Drift should fail
-        # loudly here, not hide.
-        run: npm ci --omit=dev
+        # loudly here, not hide — and it did, on this job's very first run:
+        #   Missing: @deepseek-ai/cordis@4.0.4 from lock file
+        #   Missing: @deepseek-ai/cosmokit@1.8.5 from lock file
+        #   Missing: @standard-schema/spec@1.1.0 from lock file
+        #
+        # None of those are real dependencies of the plugin. package.json declares
+        # only ws + yaml; cordis is a peerDependency, supplied at runtime by the
+        # dsh host that loads this plugin. npm >= 7 auto-installs peers, so
+        # `npm ci` demands the whole cordis tree be pinned in a lockfile that was
+        # generated without it.
+        #
+        # --legacy-peer-deps restores the correct semantics — do not install the
+        # peer, the host provides it — while keeping the strict lockfile check for
+        # the dependencies that DO matter (ws, yaml). Regenerating
+        # package-lock.json would also work, but that file belongs to the plugin
+        # and is being held back with the rest of the gateway changes.
+        run: npm ci --omit=dev --legacy-peer-deps
 
       - name: Run hermetic unit tests
         # Runs from the repo root; the root package.json has no dependencies of
@@ -100,7 +115,12 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle'
+          # No `cache: 'gradle'`: setup-java fails the job with "No file in
+          # /home/runner/work/... matched to [**/*.gradle*, ...]" when it finds no
+          # Gradle build file to hash, and this repo commits only
+          # android/app/src/main/AndroidManifest.xml. The Gradle project is
+          # synthesised by `flutter create .` further down, i.e. after this step.
+          # Re-enable it once android/ is committed properly.
 
       - uses: subosito/flutter-action@v2
         with:
