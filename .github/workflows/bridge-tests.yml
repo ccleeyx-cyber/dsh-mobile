@@ -143,31 +143,48 @@ jobs:
         # AndroidManifest.xml is. CI has to synthesise the rest, and the manifest
         # has to survive that. Committing android/ properly (ANALYSIS §1.1) would
         # let this whole dance and the cp hack disappear.
+        #
+        # `flutter create .` also synthesises two files that must NOT survive,
+        # because neither is part of this repo and both change what gets judged:
+        #
+        #   - analysis_options.yaml. Its presence activates the `flutter_lints`
+        #     package that pubspec declares but the repo has never configured, and
+        #     `flutter analyze` treats infos as fatal by default. Measured on the
+        #     first run of this gate: 33 prefer_const_constructors /
+        #     prefer_const_literals_to_create_immutables infos, all fatal, so the
+        #     job died before reaching a single real problem.
+        #   - test/widget_test.dart, the stock counter-increment smoke test. This
+        #     app has no counter, so that test can only ever fail. It never
+        #     surfaced before because no workflow ran a Dart test at all.
+        #
+        # Deleting both makes CI analyze and test exactly the committed sources,
+        # which is also what a local `flutter analyze` / `flutter test` sees.
         run: |
           cp android/app/src/main/AndroidManifest.xml /tmp/AndroidManifest.xml || true
           flutter create . --platforms=android --project-name=dsh_mobile
           cp /tmp/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          rm -f analysis_options.yaml test/widget_test.dart
           flutter pub get
 
       - name: Analyze
         working-directory: ./dsh_mobile
         # Was `--no-fatal-infos --no-fatal-warnings` while the comment above it
         # claimed "treat analyzer infos as failures" — the flag and the comment
-        # were exact opposites, so the gate caught nothing at all.
+        # were exact opposites, so the gate caught nothing at all. Both are fatal
+        # now; infos are fatal by default, so the old invocation was actively
+        # switching the stricter half off.
         #
-        # Warnings are fatal now. Infos are deliberately still non-fatal for one
-        # more step: this repo has no analysis_options.yaml, so pubspec's
-        # declared `flutter_lints` dependency has never actually been activated,
-        # and turning infos fatal at the same time as enabling flutter_lints
-        # would fail on roughly every widget (use_key_in_widget_constructors —
-        # the entire lib contains exactly ONE `key:`) plus ~56 prefer_const
-        # hits from withOpacity().
+        # This is only survivable because the Prepare step deletes the
+        # analysis_options.yaml that `flutter create .` synthesises — see the
+        # measured 33-info failure documented there.
         #
-        # Plan: (1) land an analysis_options.yaml that enables flutter_lints with
-        # the high-volume rules explicitly waived and justified, (2) burn down
-        # the deprecated_member_use infos (MaterialStateProperty ×4 in
-        # main_shell.dart, ColorScheme.fromSeed(background:) ×2 in main.dart,
-        # Radio(activeColor:) ×1), (3) then flip this to --fatal-infos.
+        # Plan from here: (1) commit an analysis_options.yaml that enables
+        # flutter_lints with the high-volume rules explicitly waived and
+        # justified, (2) the deprecated_member_use burn-down is already done —
+        # MaterialStateProperty ×4 in main_shell.dart and
+        # ColorScheme.fromSeed(background:) ×2 in main.dart are gone, and
+        # Radio(activeColor:) turns out not to be flagged on 3.24, (3) then stop
+        # deleting the generated file and let the lints apply for real.
         run: flutter analyze --fatal-warnings
 
       # NEW: the repo has 3 Dart test files / 12 tests / 244 lines, and no
