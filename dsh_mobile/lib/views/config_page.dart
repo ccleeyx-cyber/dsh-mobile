@@ -24,6 +24,18 @@ class _ConfigPageState extends State<ConfigPage> {
   bool _useHttps = false;
   bool _isTesting = false;
 
+  /// Saved gateways, for the switcher at the top of the page.
+  List<ServerConfig> _profiles = [];
+
+  /// Identity of the entry the form is currently showing. Null until the async
+  /// load finishes, or when nothing has ever been saved.
+  String? _activeProfileId;
+  String _activeName = '';
+
+  /// Gates the "尚无已保存的网关" empty state so it cannot flash while
+  /// SharedPreferences is still being read.
+  bool _profilesLoaded = false;
+
   @override
   void initState() {
     super.initState();
@@ -45,19 +57,49 @@ class _ConfigPageState extends State<ConfigPage> {
 
   void _loadInitialConfig() async {
     final cfg = await StorageService.loadConfig();
-    // loadConfig() 读 SharedPreferences，是异步的。若用户在它返回之前就退出本页，
+    // 这三次读取都走 SharedPreferences，是异步的。若用户在它们返回之前就退出本页，
     // State 已经 dispose，此时再 setState() 会抛 "setState() called after dispose()"。
     // 必须加 mounted 守卫 —— 同文件的 _testConnection()/_saveAndConnect() 都加了，
     // 唯独这个启动路径漏了。
-    if (!mounted || cfg == null) return;
+    final profiles = await StorageService.loadProfiles();
+    final storedActiveId = await StorageService.activeProfileId();
+    if (!mounted) return;
+
     setState(() {
-      _hostController.text = cfg.host;
-      _portController.text = cfg.port.toString();
-      _tokenController.text = cfg.token;
-      _useHttps = cfg.useHttps;
-      _npsController.text = cfg.npsAddress;
-      _authCodeController.text = cfg.authCode;
+      _profiles = profiles;
+      _profilesLoaded = true;
+
+      // 存下来的 active id 可能指向一个已被删除的网关，而 DropdownButton 会断言
+      // value 必须存在于 items 中，所以用之前必须先校验。
+      final ids = profiles.map((p) => p.id).toSet();
+      String? active = (storedActiveId != null && ids.contains(storedActiveId)) ? storedActiveId : null;
+      active ??= (cfg != null && ids.contains(cfg.id)) ? cfg.id : null;
+      active ??= profiles.isEmpty ? null : profiles.first.id;
+      _activeProfileId = active;
+
+      ServerConfig? match;
+      for (final p in profiles) {
+        if (p.id == active) {
+          match = p;
+          break;
+        }
+      }
+      _activeName = match?.name ?? cfg?.name ?? '';
+
+      // 用 active config 而不是列表项来填表单：前者才是 App 真正拿去连接的那份，
+      // 且可能含有列表写入之后的修改。
+      final fill = cfg ?? match;
+      if (fill != null) _fillForm(fill);
     });
+  }
+
+  void _fillForm(ServerConfig cfg) {
+    _hostController.text = cfg.host;
+    _portController.text = cfg.port.toString();
+    _tokenController.text = cfg.token;
+    _useHttps = cfg.useHttps;
+    _npsController.text = cfg.npsAddress;
+    _authCodeController.text = cfg.authCode;
   }
 
   ServerConfig _buildConfig() {
@@ -66,12 +108,232 @@ class _ConfigPageState extends State<ConfigPage> {
     final effectiveToken = tokenText.isNotEmpty ? tokenText : authText;
 
     return ServerConfig(
+      // 带上当前选中的身份，这样「保存并进入聊天」是修改这个网关，
+      // 而不是悄悄新建一个重复项。
+      id: _activeProfileId ?? '',
+      name: _activeName,
       host: _hostController.text.trim(),
       port: int.tryParse(_portController.text.trim()) ?? 3088,
       token: effectiveToken,
       useHttps: _useHttps,
       npsAddress: _npsController.text.trim(),
       authCode: authText,
+    );
+  }
+
+  // ------------------------------------------------- 多网关：切换 / 增删改 --
+
+  /// Loads a saved gateway into the form. Deliberately does NOT persist: merely
+  /// browsing the dropdown must not silently change which gateway the app starts
+  /// with next launch. `保存并进入聊天` is what commits it.
+  void _onProfileSelected(String? id) {
+    if (id == null) return;
+    ServerConfig? found;
+    for (final c in _profiles) {
+      if (c.id == id) {
+        found = c;
+        break;
+      }
+    }
+    // 必须先落到一个 final 局部量再进闭包：Dart 不会对「在循环里被赋值过的可空
+    // 局部变量」在闭包内做类型提升（闭包可能在后续赋值之后才执行），直接用会报
+    // unchecked_use_of_nullable_value。
+    final p = found;
+    if (p == null) return;
+    setState(() {
+      _activeProfileId = id;
+      _activeName = p.name;
+      _fillForm(p);
+    });
+  }
+
+  Future<void> _saveAsNewProfile() async {
+    if (!_formKey.currentState!.validate()) return;
+    final name = await _promptName(title: '另存为新网关', initial: _hostController.text.trim());
+    if (name == null || !mounted) return;
+
+    final cfg = _buildConfig();
+    cfg.id = ''; // 强制分配新身份，否则会覆盖正在编辑的那个
+    cfg.name = name;
+    final profiles = await StorageService.upsertProfile(cfg);
+    if (!mounted) return;
+
+    setState(() {
+      _profiles = profiles;
+      _activeProfileId = cfg.id;
+      _activeName = cfg.name;
+    });
+    _toast('已保存为「${cfg.displayName}」，点「保存并进入聊天」即可连接');
+  }
+
+  Future<void> _renameActiveProfile() async {
+    final id = _activeProfileId;
+    if (id == null) return;
+    final name = await _promptName(title: '重命名网关', initial: _activeName);
+    if (name == null || !mounted) return;
+    final profiles = await StorageService.renameProfile(id, name);
+    if (!mounted) return;
+    setState(() {
+      _profiles = profiles;
+      _activeName = name;
+    });
+  }
+
+  Future<void> _deleteActiveProfile() async {
+    final id = _activeProfileId;
+    if (id == null) return;
+    ServerConfig? target;
+    for (final c in _profiles) {
+      if (c.id == id) {
+        target = c;
+        break;
+      }
+    }
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除已保存的网关？'),
+        content: Text('将删除「${target?.displayName ?? ''}」。这只移除手机上保存的连接信息，'
+            '不会影响宿主机上的会话与数据。'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('删除')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    final profiles = await StorageService.deleteProfile(id);
+    if (!mounted) return;
+    setState(() {
+      _profiles = profiles;
+      if (profiles.isEmpty) {
+        _activeProfileId = null;
+        _activeName = '';
+      } else {
+        _activeProfileId = profiles.first.id;
+        _activeName = profiles.first.name;
+        _fillForm(profiles.first);
+      }
+    });
+    _toast(profiles.isEmpty ? '已删除，列表已空' : '已删除，切换到「${profiles.first.displayName}」');
+  }
+
+  /// Name prompt shared by 另存 and 重命名. Returns null on cancel or blank.
+  Future<String?> _promptName({required String title, required String initial}) async {
+    final ctrl = TextEditingController(text: initial);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '网关名称',
+            hintText: '如 家里台式机 / 公司笔记本 / nps 隧道',
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()), child: const Text('确定')),
+        ],
+      ),
+    );
+    // 这个 controller 由本方法创建、不属于 State，所以要在 dialog future 落定后
+    // 释放 —— 和 approval_card.dart 里修掉的是同一种泄漏。
+    ctrl.dispose();
+    final trimmed = result?.trim() ?? '';
+    return trimmed.isEmpty ? null : trimmed;
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  /// The gateway switcher row. Rendered above the form so switching is the first
+  /// thing available on the page.
+  Widget _buildGatewaySwitcher() {
+    final ids = _profiles.map((p) => p.id).toSet();
+    // 再校验一次：删除后 _activeProfileId 可能短暂指向不存在的项，
+    // 而 DropdownButton 对 value 不在 items 中会直接断言失败。
+    final selected = (_activeProfileId != null && ids.contains(_activeProfileId)) ? _activeProfileId : null;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.fromLTRB(14, 10, 6, 6),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFE5E7EB)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.dns_outlined, size: 18, color: Color(0xFF6B7280)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: !_profilesLoaded
+                    ? const SizedBox(height: 22)
+                    : _profiles.isEmpty
+                        ? const Text('尚无已保存的网关',
+                            style: TextStyle(fontSize: 13, color: Color(0xFF9CA3AF)))
+                        : DropdownButton<String>(
+                            isExpanded: true,
+                            isDense: true,
+                            value: selected,
+                            hint: const Text('选择已保存的网关', style: TextStyle(fontSize: 13)),
+                            underline: const SizedBox.shrink(),
+                            style: const TextStyle(fontSize: 13.5, color: Color(0xFF1F2937)),
+                            items: _profiles
+                                .map((p) => DropdownMenuItem<String>(
+                                      value: p.id,
+                                      child: Text(p.displayName, overflow: TextOverflow.ellipsis),
+                                    ))
+                                .toList(),
+                            onChanged: _onProfileSelected,
+                          ),
+              ),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.drive_file_rename_outline, size: 18),
+                tooltip: '重命名',
+                onPressed: selected == null ? null : _renameActiveProfile,
+              ),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.delete_outline, size: 18),
+                tooltip: '删除',
+                onPressed: selected == null ? null : _deleteActiveProfile,
+              ),
+            ],
+          ),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: _saveAsNewProfile,
+              icon: const Icon(Icons.add, size: 16),
+              label: const Text('把当前填写内容另存为新网关', style: TextStyle(fontSize: 12.5)),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
+          ),
+          if (selected != null)
+            const Padding(
+              padding: EdgeInsets.only(left: 10, bottom: 6),
+              child: Text(
+                '切换只填入下方表单；点「保存并进入聊天」才会连接并记住。',
+                style: TextStyle(fontSize: 11, color: Color(0xFF9CA3AF)),
+              ),
+            ),
+        ],
+      ),
     );
   }
 
@@ -134,6 +396,9 @@ class _ConfigPageState extends State<ConfigPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              // 网关切换器放在最上面：多网关时「换一台电脑」应该是进页面第一件事，
+              // 而不是先翻过说明卡再手改 host 输入框。
+              _buildGatewaySwitcher(),
               Card(
                 elevation: 0,
                 color: Theme.of(context).colorScheme.primaryContainer.withOpacity(0.3),

@@ -1,4 +1,15 @@
 class ServerConfig {
+  /// Stable identity used by the saved-gateway list.
+  ///
+  /// Empty for a config written before multi-gateway support existed;
+  /// `StorageService` assigns one when it loads or saves, so callers never have
+  /// to invent an id themselves.
+  String id;
+
+  /// User-visible label in the gateway switcher. May be empty — see
+  /// [displayName] for the fallback.
+  String name;
+
   String host;
   int port;
   String token;
@@ -8,6 +19,8 @@ class ServerConfig {
   String authCode;
 
   ServerConfig({
+    this.id = '',
+    this.name = '',
     required this.host,
     this.port = 3088,
     required this.token,
@@ -15,6 +28,28 @@ class ServerConfig {
     this.npsAddress = '',
     this.authCode = '',
   });
+
+  /// What the switcher shows. Falls back to the host so an unnamed gateway is
+  /// still distinguishable, and to a literal only when there is nothing at all.
+  String get displayName {
+    final n = name.trim();
+    if (n.isNotEmpty) return n;
+    final h = host.trim();
+    return h.isEmpty ? '未命名网关' : h;
+  }
+
+  /// An independent copy. Pass [id]: '' to force a fresh identity, which is how
+  /// "save as new gateway" avoids overwriting the one being edited.
+  ServerConfig clone({String? id, String? name}) => ServerConfig(
+        id: id ?? this.id,
+        name: name ?? this.name,
+        host: host,
+        port: port,
+        token: token,
+        useHttps: useHttps,
+        npsAddress: npsAddress,
+        authCode: authCode,
+      );
 
   String get _normalizedHost {
     var h = host.trim();
@@ -67,6 +102,8 @@ class ServerConfig {
   }
 
   Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
     'host': host,
     'port': port,
     'token': token,
@@ -75,12 +112,27 @@ class ServerConfig {
     'authCode': authCode,
   };
 
+  // Tolerant readers. A config written by an older build has no id/name at all,
+  // and SharedPreferences gives back whatever JSON produced, so a numeric port
+  // or a non-string field must not throw the whole load away — the previous
+  // `json['host'] ?? ''` form did exactly that.
+  static String _str(dynamic v) => v == null ? '' : v.toString();
+
+  static int _int(dynamic v, int fallback) {
+    if (v == null) return fallback;
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    return int.tryParse(v.toString().trim()) ?? fallback;
+  }
+
   factory ServerConfig.fromJson(Map<String, dynamic> json) => ServerConfig(
-    host: json['host'] ?? '',
-    port: json['port'] ?? 3088,
-    token: json['token'] ?? '',
-    useHttps: json['useHttps'] ?? false,
-    npsAddress: json['npsAddress'] ?? '',
-    authCode: json['authCode'] ?? '',
+    id: _str(json['id']),
+    name: _str(json['name']),
+    host: _str(json['host']),
+    port: _int(json['port'], 3088),
+    token: _str(json['token']),
+    useHttps: json['useHttps'] == true || json['useHttps'] == 'true',
+    npsAddress: _str(json['npsAddress']),
+    authCode: _str(json['authCode']),
   );
 }

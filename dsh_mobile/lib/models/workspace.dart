@@ -8,6 +8,13 @@ class SessionMeta {
   final bool isRunning;
   final int pendingApprovals;
 
+  /// 该会话是否在引擎的 `global.archivedSessionIds` 名单里。
+  ///
+  /// 网关在所有模式下都会带上这个字段，所以 `include` 的响应是自描述的。
+  /// 旧网关不返回它 → 回落 false，但那只会发生在 `exclude` 模式下
+  /// （见 [DshService.archivedFilterSupported] 的能力探测），语义仍然正确。
+  final bool archived;
+
   SessionMeta({
     required this.sessionId,
     required this.title,
@@ -17,6 +24,7 @@ class SessionMeta {
     this.lastSeq = 0,
     this.isRunning = false,
     this.pendingApprovals = 0,
+    this.archived = false,
   });
 
   bool matchesSessionId(String? otherId) {
@@ -35,6 +43,7 @@ class SessionMeta {
     int? lastSeq,
     bool? isRunning,
     int? pendingApprovals,
+    bool? archived,
   }) {
     return SessionMeta(
       sessionId: sessionId ?? this.sessionId,
@@ -45,6 +54,7 @@ class SessionMeta {
       lastSeq: lastSeq ?? this.lastSeq,
       isRunning: isRunning ?? this.isRunning,
       pendingApprovals: pendingApprovals ?? this.pendingApprovals,
+      archived: archived ?? this.archived,
     );
   }
 
@@ -66,6 +76,7 @@ class SessionMeta {
       lastSeq: _parseInt(json['lastSeq']),
       isRunning: json['isRunning'] == true || json['isRunning'] == 'true',
       pendingApprovals: _parseInt(json['pendingApprovals']),
+      archived: json['archived'] == true || json['archived'] == 'true',
     );
   }
 
@@ -78,6 +89,7 @@ class SessionMeta {
         'lastSeq': lastSeq,
         'isRunning': isRunning,
         'pendingApprovals': pendingApprovals,
+        'archived': archived,
       };
 }
 
@@ -90,6 +102,12 @@ class Workspace {
   final int sessionCount;
   final int pendingApprovals;
   final bool hasRunning;
+
+  /// 本工作区在引擎归档名单里的会话总数，**与当前筛选模式无关**。
+  /// 这样在「未归档」视图下也能直接显示「已归档 N 条」，不必再发一次请求。
+  /// 旧网关不返回该字段 → 0。
+  final int archivedCount;
+
   final List<SessionMeta> sessions;
 
   Workspace({
@@ -101,6 +119,7 @@ class Workspace {
     this.sessionCount = 0,
     this.pendingApprovals = 0,
     this.hasRunning = false,
+    this.archivedCount = 0,
     List<SessionMeta>? sessions,
   }) : sessions = sessions ?? [];
 
@@ -115,6 +134,7 @@ class Workspace {
       sessionCount: SessionMeta._parseInt(json['sessionCount'], rawSessions.length),
       pendingApprovals: SessionMeta._parseInt(json['pendingApprovals']),
       hasRunning: json['hasRunning'] == true || json['hasRunning'] == 'true',
+      archivedCount: SessionMeta._parseInt(json['archivedCount']),
       sessions: rawSessions
           .whereType<Map>()
           .map((s) => SessionMeta.fromJson(Map<String, dynamic>.from(s)))
@@ -131,6 +151,7 @@ class Workspace {
     'sessionCount': sessionCount,
     'pendingApprovals': pendingApprovals,
     'hasRunning': hasRunning,
+    'archivedCount': archivedCount,
     'sessions': sessions.map((s) => s.toJson()).toList(),
   };
 }

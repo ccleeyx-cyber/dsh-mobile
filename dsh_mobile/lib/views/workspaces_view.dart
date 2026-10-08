@@ -58,7 +58,8 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     }
   }
 
-  /// 只在「本页可见 且 App 在前台」时运行 3 秒轮询（驱动运行中动画与审批角标）。
+  /// 只在「本页可见 且 App 在前台 且 处于未归档视图」时运行 3 秒轮询
+  /// （驱动运行中动画与审批角标）。
   ///
   /// 此前 Timer.periodic 在 initState 里无条件启动，而 IndexedStack 让本页 State
   /// 永不 dispose，结果是：
@@ -66,11 +67,23 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
   ///   - App 切到后台也照拉不误 —— MainShell 的 didChangeAppLifecycleState 只调
   ///     DshService.handleAppPaused()，而后者仅取消服务自己的 _sessionPollTimer
   ///     （dsh_service.dart:1677-1681），管不到这里 widget 级的 Timer。
-  /// 代价不只是流量：网关侧 getWorkspacesData() 是 O(会话数 × 2 次 YAML 解析)
-  /// 的全同步扫描（见 ANALYSIS §1.7），实测环境有 2321 个会话，等于每 3 秒把
-  /// 整个工作区存储同步扫一遍，期间阻塞 Node 事件循环。
+  /// 代价不只是流量：网关侧 getWorkspacesData() 是全同步扫描（见 ANALYSIS §1.7），
+  /// 期间阻塞 Node 事件循环。
+  ///
+  /// 归档视图额外停掉轮询，理由有两条且都成立：
+  ///   - 已归档会话按定义不在运行，实时刷新不会产生任何变化；
+  ///   - 本机 2322 个会话里 1338 个已归档，归档响应约为未归档的 2.4 倍，
+  ///     每 3 秒重传一次纯属浪费。
+  /// 归档视图改为进入时拉一次 + 下拉/手动刷新，语义上完全够用。
+  ///
+  /// 本方法是幂等的：条件满足且已在跑就立即返回，条件不满足就取消（取消 null
+  /// 计时器是 no-op），所以可以安全地从 build() 里调用以响应筛选模式变化。
   void _syncRefreshTimer() {
-    if (widget.active && _appResumed) {
+    final dsh = context.mounted ? Provider.of<DshService>(context, listen: false) : null;
+    final archivedMode = dsh?.archivedFilter ?? 'exclude';
+    final shouldRun = widget.active && _appResumed && archivedMode == 'exclude';
+
+    if (shouldRun) {
       if (_refreshTimer != null) return;
       _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
         if (!mounted) {
@@ -286,11 +299,87 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     ).whenComplete(() => textController.dispose());
   }
 
+  /// 归档筛选分段控件（未归档 / 已归档 / 全部）。
+  ///
+  /// 「已归档」那一片带上总数：`archivedCount` 是网关在**所有模式**下都返回的、
+  /// 与当前筛选无关的工作区级计数，所以这个数字在任何视图下都准确，用户不必
+  /// 先切过去才知道有多少条。
+  Widget _buildArchivedFilter(DshService dsh) {
+    const modes = <String, String>{
+      'exclude': '未归档',
+      'only': '已归档',
+      'include': '全部',
+    };
+    final totalArchived = dsh.workspaces.fold<int>(0, (sum, w) => sum + w.archivedCount);
+
+    return Row(
+      children: [
+        const Icon(Icons.inventory_2_outlined, size: 15, color: Color(0xFF9CA3AF)),
+        const SizedBox(width: 8),
+        for (final entry in modes.entries) ...[
+          ChoiceChip(
+            label: Text(
+              entry.key == 'only' && totalArchived > 0
+                  ? '${entry.value} · $totalArchived'
+                  : entry.value,
+            ),
+            selected: dsh.archivedFilter == entry.key,
+            onSelected: (_) => dsh.setArchivedFilter(entry.key),
+            showCheckmark: false,
+            visualDensity: VisualDensity.compact,
+            labelStyle: const TextStyle(fontSize: 11.5),
+            backgroundColor: Colors.white,
+            side: const BorderSide(color: Color(0xFFE5E7EB)),
+          ),
+          const SizedBox(width: 6),
+        ],
+      ],
+    );
+  }
+
+  /// 网关不支持归档筛选时的显式降级提示。
+  ///
+  /// 只在用户真的切到了非默认模式时才出现，所以旧网关 + 默认视图下没有任何
+  /// 视觉噪音。出现时必须说清一件事：**下面列出的并不是已归档会话** ——
+  /// 旧网关会静默忽略 `?archived=` 参数、照常返回未归档列表，如果客户端不校验
+  /// 回显就直接渲染，等于把未归档会话贴上「已归档」标签骗用户。
+  Widget _buildArchivedUnsupportedNotice() {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(14, 0, 14, 6),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFFBEB),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFFFDE68A)),
+      ),
+      child: const Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.warning_amber_rounded, size: 16, color: Color(0xFFB45309)),
+          SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '网关没有回显归档筛选模式，说明它仍是旧版本：它忽略了这个参数，'
+              '返回的还是未归档会话。下面列出的并不是已归档内容。\n'
+              '需要在宿主机上重启 dsh web，让新版网关生效后此筛选才可用。',
+              style: TextStyle(fontSize: 11.5, height: 1.5, color: Color(0xFF92400E)),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final dsh = Provider.of<DshService>(context);
     final workspaces = dsh.workspaces;
     final currentWs = dsh.currentWorkspace;
+
+    // 幂等，用于响应归档筛选模式的变化：切到 only/include 时停掉 3 秒轮询，
+    // 切回 exclude 时恢复。放在 build 里是因为筛选状态在 DshService 上，
+    // 本页正是通过 listen:true 的 Provider.of 收到它的变更通知。
+    _syncRefreshTimer();
 
     // Filter workspaces
     final filteredWorkspaces = workspaces.where((ws) {
@@ -422,6 +511,17 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
               ),
             ),
           ),
+
+          // 归档筛选：未归档 / 已归档 / 全部
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 2, 14, 6),
+            child: _buildArchivedFilter(dsh),
+          ),
+
+          // 只有「用户切到了非默认模式」且「网关没回显 mode」时才出现，
+          // 所以旧网关配默认视图时页面与改动前完全一致，没有多余噪音。
+          if (dsh.archivedFilter != 'exclude' && !dsh.archivedFilterSupported)
+            _buildArchivedUnsupportedNotice(),
 
           // Workspace List
           Expanded(
@@ -616,8 +716,16 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 ],
               ),
               const SizedBox(height: 2),
+              // 工作区卡片默认是折叠的（initiallyExpanded: isCurrent），所以这行
+              // subtitle 往往是不点开就能看到的唯一信息 —— 它必须说清楚这个数字
+              // 数的是什么，否则「已归档」视图下显示「共 1275 个历史对话」会让人
+              // 以为未归档的会话凭空多出来了。
               Text(
-                '共 ${ws.sessions.length} 个历史对话',
+                dsh.archivedFilter == 'only'
+                    ? '共 ${ws.sessions.length} 个已归档对话'
+                    : dsh.archivedFilter == 'include'
+                        ? '共 ${ws.sessions.length} 个对话（含已归档）'
+                        : '共 ${ws.sessions.length} 个历史对话',
                 style: const TextStyle(fontSize: 10.5, color: Color(0xFF9CA3AF)),
               ),
             ],
@@ -677,9 +785,14 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
 
             // Sessions List inside workspace
             if (ws.sessions.isEmpty)
-              const Padding(
-                padding: EdgeInsets.all(16),
-                child: Text('此工作区暂无会话', style: TextStyle(color: Color(0xFF9CA3AF), fontSize: 12)),
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  // 「已归档」视图下必须换说法：本机 GZ 工作区一条归档都没有，
+                  // 若仍显示「暂无会话」会让人以为会话丢了。
+                  dsh.archivedFilter == 'only' ? '此工作区没有已归档的会话' : '此工作区暂无会话',
+                  style: const TextStyle(color: Color(0xFF9CA3AF), fontSize: 12),
+                ),
               )
             else
               ListView.builder(
@@ -772,6 +885,23 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 overflow: TextOverflow.ellipsis,
               ),
             ),
+            // 只在「全部」视图下打标：在「已归档」视图里每一行都是归档的，
+            // 1338 行全部挂一个「已归档」徽章纯属噪音。
+            if (s.archived && dsh.archivedFilter == 'include') ...[
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF3F4F6),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: const Color(0xFFD1D5DB)),
+                ),
+                child: const Text(
+                  '已归档',
+                  style: TextStyle(fontSize: 10, color: Color(0xFF6B7280)),
+                ),
+              ),
+            ],
             if (isRunning) ...[
               const SizedBox(width: 6),
               Container(

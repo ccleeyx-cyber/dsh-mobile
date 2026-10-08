@@ -1,6 +1,6 @@
 /// Build identity for the app.
 ///
-/// Keep in sync with `pubspec.yaml` (`version: 1.3.1+14`). The bridge exposes a
+/// Keep in sync with `pubspec.yaml` (`version: 1.4.0+15`). The bridge exposes a
 /// comparable value via `GET /api/mobile/health` as `version`, so the two can be
 /// checked against each other.
 ///
@@ -8,9 +8,15 @@
 /// its own `1.2.9` while the app reported `1.3.0`, and the download page said
 /// `v1.1.0`. Consolidating the 13 version sites onto a single source of truth is
 /// tracked in ANALYSIS-优化与新增功能.md §1.8.
+///
+/// Do NOT use these strings to decide whether the gateway supports a feature.
+/// They drift, and the bridge keeps its own independent numbering. Negotiate by
+/// capability instead — e.g. `DshService.archivedFilterSupported`, which is
+/// driven by the `archivedMode` the gateway echoes back on
+/// `GET /api/mobile/workspaces`.
 class AppVersion {
   const AppVersion._();
 
-  static const String version = '1.3.1';
-  static const String buildNumber = '14';
+  static const String version = '1.4.0';
+  static const String buildNumber = '15';
 }

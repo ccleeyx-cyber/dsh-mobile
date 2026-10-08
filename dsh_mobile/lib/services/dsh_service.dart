@@ -48,6 +48,20 @@ class DshService extends ChangeNotifier {
 
   // State
   List<Workspace> _workspaces = [];
+
+  /// 会话列表的归档筛选模式，原样作为 `?archived=` 传给网关。
+  /// 'exclude' = 未归档（默认，也是接入该功能之前的历史行为）
+  /// 'only'    = 已归档
+  /// 'include' = 全部
+  String _archivedFilter = 'exclude';
+
+  /// 网关是否真的执行了归档筛选。
+  ///
+  /// 判据是响应里的 `archivedMode` 回显是否等于我们请求的模式。旧网关会静默
+  /// 忽略 `?archived=` 并照常返回未归档列表；若客户端不校验这一点，就会把那批
+  /// 未归档会话标成「已归档」展示给用户 —— 那不是功能缺失，是主动误导。
+  /// 所以宁可显式降级成「当前网关不支持」。
+  bool _archivedFilterSupported = false;
   Workspace? _currentWorkspace;
   SessionMeta? _currentSession;
   List<ChatMessage> _messages = [];
@@ -78,6 +92,13 @@ class DshService extends ChangeNotifier {
   ServerConfig? get currentConfig => _currentConfig;
 
   List<Workspace> get workspaces => _workspaces;
+
+  /// 当前的归档筛选模式：'exclude' / 'only' / 'include'。
+  String get archivedFilter => _archivedFilter;
+
+  /// 网关是否支持归档筛选。为 false 时 UI 必须把筛选器藏起来或禁用，
+  /// 而不是显示一个点了没反应的开关。
+  bool get archivedFilterSupported => _archivedFilterSupported;
   Workspace? get currentWorkspace => _currentWorkspace;
   SessionMeta? get currentSession => _currentSession;
   List<ChatMessage> get messages => _messages;
@@ -291,7 +312,10 @@ class DshService extends ChangeNotifier {
   Future<void> fetchWorkspaces() async {
     if (_currentConfig == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces');
+      // 归档过滤交给网关做，而不是拉全量回来在客户端筛：本机 2322 个会话里有
+      // 1338 个已归档，全量传输会把一个定时轮询的响应放大到 2.4 倍。
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces')
+          .replace(queryParameters: {'archived': _archivedFilter});
       final res = await http.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return;
 
@@ -300,27 +324,70 @@ class DshService extends ChangeNotifier {
         final list = data['workspaces'] as List<dynamic>? ?? [];
         _workspaces = list.map((w) => Workspace.fromJson(w as Map<String, dynamic>)).toList();
 
-        if (_currentWorkspace != null) {
-          final matched = _workspaces.firstWhere(
-            (w) => w.workspaceId == _currentWorkspace!.workspaceId,
-            orElse: () => _workspaces.first,
-          );
-          _currentWorkspace = matched;
-          // Preserve unsaved/active new session in the workspace session list
-          if (_currentSession != null && !_currentWorkspace!.sessions.any((s) => s.matchesSessionId(_currentSession!.sessionId))) {
-            _currentWorkspace!.sessions.insert(0, _currentSession!);
+        // 能力探测：只有网关如实回显了我们请求的模式，才算筛选真的生效了。
+        _archivedFilterSupported = data['archivedMode']?.toString() == _archivedFilter;
+
+        // 归档筛选只影响列表展示，不应该动用户正在看的会话。所以只有默认的
+        // exclude 模式才做「当前工作区/会话」对账 —— 否则切一次筛选就会把正在
+        // 读的会话顶掉，甚至把一条未归档会话塞进已归档列表里。
+        if (_archivedFilter == 'exclude') {
+          if (_currentWorkspace != null && _workspaces.isNotEmpty) {
+            final matched = _workspaces.firstWhere(
+              (w) => w.workspaceId == _currentWorkspace!.workspaceId,
+              orElse: () => _workspaces.first,
+            );
+            _currentWorkspace = matched;
+            // Preserve unsaved/active new session in the workspace session list
+            final cur = _currentSession;
+            if (cur != null && !matched.sessions.any((s) => s.matchesSessionId(cur.sessionId))) {
+              matched.sessions.insert(0, cur);
+            }
+          } else if (_workspaces.isNotEmpty) {
+            _currentWorkspace = _workspaces.first;
+            if (_currentWorkspace!.sessions.isNotEmpty && _currentSession == null) {
+              await selectSession(_currentWorkspace!.sessions.first);
+            }
           }
-        } else if (_workspaces.isNotEmpty) {
-          _currentWorkspace = _workspaces.first;
-          if (_currentWorkspace!.sessions.isNotEmpty && _currentSession == null) {
-            await selectSession(_currentWorkspace!.sessions.first);
-          }
+          // _workspaces 为空时（workspace.json 缺失）两个分支都不进：保持原有的
+          // 当前工作区不动。此前 orElse: () => _workspaces.first 在空列表上会直接
+          // 抛 StateError，是一条已存在的崩溃路径。
         }
         notifyListeners();
       }
     } catch (e) {
       debugPrint('[DshService] fetchWorkspaces error: $e');
     }
+  }
+
+  /// 切换归档筛选并立刻重新拉取。
+  ///
+  /// 传入非法值会归一化为 'exclude'，与网关侧的归一化规则保持一致，
+  /// 这样客户端请求的模式永远等于网关回显的模式。
+  Future<void> setArchivedFilter(String mode) async {
+    final next = (mode == 'only' || mode == 'include') ? mode : 'exclude';
+    if (next == _archivedFilter) return;
+    _archivedFilter = next;
+    // 先通知一次，让筛选器的高亮立刻跟上，不必等网络往返。
+    notifyListeners();
+    await fetchWorkspaces();
+  }
+
+  /// 测试注入点：直接替换工作区列表与归档能力标志，完全不走网络。
+  ///
+  /// 需要它的理由：`_workspaces` 是私有的，且只有 fetchWorkspaces() 一条写入
+  /// 路径，而后者必须联网。没有这个 seam，归档筛选就只能测数据层 —— 但
+  /// 「服务端返回了几条」和「UI 实际渲染了几行」是两件事，中间还隔着过滤、
+  /// 分组与折叠。只测前者会得出假的通过结论。
+  @visibleForTesting
+  void debugSetWorkspaces(
+    List<Workspace> workspaces, {
+    bool? archivedFilterSupported,
+    String? archivedFilter,
+  }) {
+    _workspaces = workspaces;
+    if (archivedFilterSupported != null) _archivedFilterSupported = archivedFilterSupported;
+    if (archivedFilter != null) _archivedFilter = archivedFilter;
+    notifyListeners();
   }
 
   void selectWorkspace(Workspace ws, {bool autoSelectSession = true}) {
