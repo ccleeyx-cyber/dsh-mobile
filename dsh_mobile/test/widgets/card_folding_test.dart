@@ -21,7 +21,17 @@ void main() {
 
       // 2. User collapses thinking card
       await tester.tap(find.text('深度思考中...'));
-      await tester.pumpAndSettle();
+      // 这里必须用 pump() 而不是 pumpAndSettle()。
+      //
+      // isThinking: true 时卡片头部渲染 CircularProgressIndicator
+      // （thinking_card.dart:118），那是永久重复动画，pumpAndSettle() 会一直
+      // 推进到超时并抛错。而折叠动作本身只是 setState + `if (_expanded)` 条件
+      // 渲染，没有过渡动画，推进一帧就足够。
+      //
+      // 这是既有缺陷而非本次改动引入：本文件此前从未在 CI 中运行过（
+      // bridge-tests.yml 里的 flutter test 步骤是新加的），所以一直没暴露。
+      // 已用 `git show HEAD:` 的原版 thinking_card.dart 复核，改动前同样失败。
+      await tester.pump();
       expect(find.text('Initial thoughts...'), findsNothing);
 
       // 3. New token chunk arrives (rebuild with new content & isThinking: true)

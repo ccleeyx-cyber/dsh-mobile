@@ -215,7 +215,11 @@ class _ApprovalCardState extends State<ApprovalCard> {
           },
         );
       },
-    );
+      // The controller is a local to this method, so nothing else can dispose
+      // it. The sheet's Future completes once the route is popped and its
+      // widget tree torn down, making this the correct release point —
+      // previously it leaked one TextEditingController per sheet open.
+    ).whenComplete(textController.dispose);
   }
 
   @override

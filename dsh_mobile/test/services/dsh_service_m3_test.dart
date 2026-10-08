@@ -1,6 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:dsh_mobile/services/dsh_service.dart';
-import 'package:dsh_mobile/models/chat_message.dart';
 
 void main() {
   group('DshService M3 Network Resilience & Lifecycle Enhancements', () {

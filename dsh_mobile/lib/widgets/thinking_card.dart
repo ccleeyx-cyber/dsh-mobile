@@ -17,7 +17,6 @@ class ThinkingCard extends StatefulWidget {
 
 class _ThinkingCardState extends State<ThinkingCard> {
   late bool _expanded;
-  bool _userCollapsed = false;
   final ScrollController _scrollController = ScrollController();
 
   @override
@@ -35,10 +34,13 @@ class _ThinkingCardState extends State<ThinkingCard> {
   @override
   void didUpdateWidget(covariant ThinkingCard oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // Auto-expand only when transitioning into thinking state from non-thinking state,
-    // and do NOT re-expand if user explicitly collapsed it during the current stream.
+    // Auto-expand only when transitioning into thinking state from non-thinking
+    // state. Within a single thinking phase `isThinking` stays true, so this
+    // does not fire again and a user's manual collapse is preserved for the
+    // rest of the stream — which is exactly what the old `_userCollapsed` flag
+    // was meant to express. That flag was written in four places and read in
+    // none, so it has been removed instead of being left as dead state.
     if (!oldWidget.isThinking && widget.isThinking) {
-      _userCollapsed = false;
       _expanded = true;
     }
 
@@ -63,11 +65,6 @@ class _ThinkingCardState extends State<ThinkingCard> {
     HapticFeedback.selectionClick();
     setState(() {
       _expanded = !_expanded;
-      if (!_expanded) {
-        _userCollapsed = true;
-      } else {
-        _userCollapsed = false;
-      }
     });
   }
 
@@ -203,7 +200,6 @@ class _ThinkingCardState extends State<ThinkingCard> {
                               HapticFeedback.selectionClick();
                               setState(() {
                                 _expanded = false;
-                                _userCollapsed = true;
                               });
                             },
                             borderRadius: BorderRadius.circular(4),

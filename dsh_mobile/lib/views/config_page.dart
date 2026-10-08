@@ -30,18 +30,34 @@ class _ConfigPageState extends State<ConfigPage> {
     _loadInitialConfig();
   }
 
+  @override
+  void dispose() {
+    // 本页持有 5 个 TextEditingController，此前完全没有 dispose() 覆写。
+    // 每个 controller 都带 ChangeNotifier 监听者与一条原生文本输入连接，
+    // 而 ConfigPage 可从 MainShell 反复进入，所以是每次进入泄漏 5 个。
+    _hostController.dispose();
+    _portController.dispose();
+    _tokenController.dispose();
+    _npsController.dispose();
+    _authCodeController.dispose();
+    super.dispose();
+  }
+
   void _loadInitialConfig() async {
     final cfg = await StorageService.loadConfig();
-    if (cfg != null) {
-      setState(() {
-        _hostController.text = cfg.host;
-        _portController.text = cfg.port.toString();
-        _tokenController.text = cfg.token;
-        _useHttps = cfg.useHttps;
-        _npsController.text = cfg.npsAddress;
-        _authCodeController.text = cfg.authCode;
-      });
-    }
+    // loadConfig() 读 SharedPreferences，是异步的。若用户在它返回之前就退出本页，
+    // State 已经 dispose，此时再 setState() 会抛 "setState() called after dispose()"。
+    // 必须加 mounted 守卫 —— 同文件的 _testConnection()/_saveAndConnect() 都加了，
+    // 唯独这个启动路径漏了。
+    if (!mounted || cfg == null) return;
+    setState(() {
+      _hostController.text = cfg.host;
+      _portController.text = cfg.port.toString();
+      _tokenController.text = cfg.token;
+      _useHttps = cfg.useHttps;
+      _npsController.text = cfg.npsAddress;
+      _authCodeController.text = cfg.authCode;
+    });
   }
 
   ServerConfig _buildConfig() {

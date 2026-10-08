@@ -72,7 +72,6 @@ class _ToolCallCardState extends State<ToolCallCard> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final isRunning = widget.tool.isRunning;
 
     return Container(

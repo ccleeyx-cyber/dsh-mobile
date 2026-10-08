@@ -9,43 +9,90 @@ import '../services/dsh_service.dart';
 class WorkspacesView extends StatefulWidget {
   final VoidCallback? onSwitchToChat;
 
-  const WorkspacesView({super.key, this.onSwitchToChat});
+  /// 本页当前是否可见。
+  ///
+  /// MainShell 用 IndexedStack 同时保活 4 个子页，子页的 State 与 MainShell 同
+  /// 生命周期、永不 dispose，所以可见性必须由父级显式传进来，否则轮询会在用户
+  /// 处于其它 tab 时照跑。默认 true，以便单独使用本页时行为不变。
+  final bool active;
+
+  const WorkspacesView({super.key, this.onSwitchToChat, this.active = true});
 
   @override
   State<WorkspacesView> createState() => _WorkspacesViewState();
 }
 
-class _WorkspacesViewState extends State<WorkspacesView> {
+class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObserver {
   final TextEditingController _searchController = TextEditingController();
   String _searchFilter = '';
   Timer? _refreshTimer;
+  bool _appResumed = true;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        Provider.of<DshService>(context, listen: false).fetchWorkspaces();
-        Provider.of<DshService>(context, listen: false).fetchApprovals();
-      }
+      if (!mounted) return;
+      Provider.of<DshService>(context, listen: false).fetchWorkspaces();
+      Provider.of<DshService>(context, listen: false).fetchApprovals();
     });
-    // Periodically refresh workspaces for real-time running animation and approvals
-    _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-      if (!mounted) {
-        _refreshTimer?.cancel();
-        _refreshTimer = null;
-        return;
-      }
-      if (mounted) {
+    _syncRefreshTimer();
+  }
+
+  @override
+  void didUpdateWidget(covariant WorkspacesView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.active != widget.active) _syncRefreshTimer();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final resumed = state == AppLifecycleState.resumed;
+    if (resumed == _appResumed) return;
+    _appResumed = resumed;
+    _syncRefreshTimer();
+    // 回到前台时立刻补一次，避免用户看到最长 3 秒的过期数据。
+    if (resumed && widget.active && mounted) {
+      Provider.of<DshService>(context, listen: false).fetchWorkspaces();
+    }
+  }
+
+  /// 只在「本页可见 且 App 在前台」时运行 3 秒轮询（驱动运行中动画与审批角标）。
+  ///
+  /// 此前 Timer.periodic 在 initState 里无条件启动，而 IndexedStack 让本页 State
+  /// 永不 dispose，结果是：
+  ///   - 用户停在对话/权限/设置 tab 时，仍然每 3 秒拉一次全量工作区；
+  ///   - App 切到后台也照拉不误 —— MainShell 的 didChangeAppLifecycleState 只调
+  ///     DshService.handleAppPaused()，而后者仅取消服务自己的 _sessionPollTimer
+  ///     （dsh_service.dart:1677-1681），管不到这里 widget 级的 Timer。
+  /// 代价不只是流量：网关侧 getWorkspacesData() 是 O(会话数 × 2 次 YAML 解析)
+  /// 的全同步扫描（见 ANALYSIS §1.7），实测环境有 2321 个会话，等于每 3 秒把
+  /// 整个工作区存储同步扫一遍，期间阻塞 Node 事件循环。
+  void _syncRefreshTimer() {
+    if (widget.active && _appResumed) {
+      if (_refreshTimer != null) return;
+      _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+        if (!mounted) {
+          _stopRefreshTimer();
+          return;
+        }
         Provider.of<DshService>(context, listen: false).fetchWorkspaces();
-      }
-    });
+      });
+    } else {
+      _stopRefreshTimer();
+    }
+  }
+
+  void _stopRefreshTimer() {
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
   }
 
   @override
   void dispose() {
-    _refreshTimer?.cancel();
-    _refreshTimer = null;
+    WidgetsBinding.instance.removeObserver(this);
+    _stopRefreshTimer();
     _searchController.dispose();
     super.dispose();
   }

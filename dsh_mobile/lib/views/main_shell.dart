@@ -90,15 +90,23 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    final dsh = Provider.of<DshService>(context);
-    final pendingCount = dsh.pendingApprovals.length;
+    // 只订阅 build() 真正用到的两个值。
+    //
+    // 原来这里是 Provider.of<DshService>(context)（listen: true），意味着
+    // DshService 每调一次 notifyListeners() 就重建整个 MainShell —— 而流式输出
+    // 期间它是按 token 触发的。每次重建都会重新构造 IndexedStack 的全部 4 个
+    // 子树（ChatView / WorkspacesView / SecurityPermissionsView /
+    // CustomSettingsView），而这些子页自己本来就在监听 DshService，于是同一份
+    // 数据被重复构建两遍。context.select 只在被选中的值变化时才重建。
+    final pendingCount = context.select<DshService, int>((d) => d.pendingApprovals.length);
+    final isTokenInvalid = context.select<DshService, bool>((d) => d.isTokenInvalid);
 
     return Scaffold(
       resizeToAvoidBottomInset: false,
       backgroundColor: const Color(0xFFF9FAFB),
       body: Column(
         children: [
-          if (dsh.isTokenInvalid)
+          if (isTokenInvalid)
             Container(
               width: double.infinity,
               color: const Color(0xFFFEF2F2),
@@ -139,6 +147,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 ),
                 WorkspacesView(
                   onSwitchToChat: () => _setIndex(0),
+                  // IndexedStack 会保活全部 4 个子页，必须显式告知可见性，
+                  // 否则本页的 3 秒轮询会在用户处于其它 tab 时继续跑。
+                  active: _currentIndex == 1,
                 ),
                 const SecurityPermissionsView(),
                 const CustomSettingsView(),
@@ -157,8 +168,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             data: NavigationBarThemeData(
               backgroundColor: Colors.white,
               indicatorColor: const Color(0xFF0078D4).withOpacity(0.12),
-              labelTextStyle: MaterialStateProperty.resolveWith<TextStyle>((states) {
-                if (states.contains(MaterialState.selected)) {
+              labelTextStyle: WidgetStateProperty.resolveWith<TextStyle>((states) {
+                if (states.contains(WidgetState.selected)) {
                   return const TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
@@ -167,8 +178,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 }
                 return const TextStyle(fontSize: 12, color: Color(0xFF6B7280));
               }),
-              iconTheme: MaterialStateProperty.resolveWith<IconThemeData>((states) {
-                if (states.contains(MaterialState.selected)) {
+              iconTheme: WidgetStateProperty.resolveWith<IconThemeData>((states) {
+                if (states.contains(WidgetState.selected)) {
                   return const IconThemeData(color: Color(0xFF0078D4), size: 24);
                 }
                 return const IconThemeData(color: Color(0xFF6B7280), size: 24);

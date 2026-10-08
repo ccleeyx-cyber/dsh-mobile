@@ -785,7 +785,10 @@ class DshService extends ChangeNotifier {
     final serverUserTexts = serverMessages.where((m) => m.isUser).map((m) => m.content).toSet();
     for (final localMsg in _messages.where((m) => m.isUser)) {
       if (localMsg.content.isNotEmpty && !serverUserTexts.contains(localMsg.content)) {
-        if (localMsg.timestamp != null && DateTime.now().difference(localMsg.timestamp!).inSeconds < 45) {
+        // ChatMessage.timestamp is a non-nullable DateTime (the constructor
+        // defaults it to DateTime.now()), so the old `timestamp != null` guard
+        // was dead code and the `!` was a no-op.
+        if (DateTime.now().difference(localMsg.timestamp).inSeconds < 45) {
           final assistIdx = serverMessages.indexWhere((m) => m.isAssistant && m.isStreaming);
           if (assistIdx != -1) {
             serverMessages.insert(assistIdx, localMsg);

@@ -7,13 +7,23 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+# Least privilege: only the release job needs to write. `contents: write` used
+# to be set at the workflow level, which granted it to pull_request runs from
+# forks as well.
 permissions:
-  contents: write
+  contents: read
+
+# An APK build is 10-20 minutes of Gradle. Two rapid pushes used to run two of
+# them side by side on the same runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     name: Build Release APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Repository
@@ -24,6 +34,8 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+          # Missing before — every run re-downloaded the Gradle distribution.
+          cache: 'gradle'
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -31,6 +43,28 @@ jobs:
           flutter-version: '3.24.x'
           channel: 'stable'
           cache: true
+
+      - name: Cache pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('dsh_mobile/pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
+
+      # pubspec.yaml is the single source of truth. tag_name / release name /
+      # artifact name below all read from here, so bumping the version is a
+      # one-line change instead of the 13-site hunt described in ANALYSIS §1.8.
+      - name: Read version from pubspec.yaml
+        id: ver
+        working-directory: ./dsh_mobile
+        run: |
+          RAW=$(grep -E '^version:' pubspec.yaml | head -1 | sed 's/^version:[[:space:]]*//')
+          VERSION="${RAW%%+*}"
+          BUILD="${RAW##*+}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD"     >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION"     >> "$GITHUB_OUTPUT"
+          echo "APK version=$VERSION build=$BUILD tag=v$VERSION"
 
       - name: Prepare Android Project & Dependencies
         working-directory: ./dsh_mobile
@@ -41,50 +75,104 @@ jobs:
           cp /tmp/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
           flutter pub get
 
-      - name: Build APK (Release)
+      # Until android/ is committed to this repo, `flutter create .` above
+      # regenerates a stock Gradle project whose release build type falls back to
+      # signingConfigs.debug. The keystore is ephemeral per runner, so EVERY
+      # build is signed with a different key and Android refuses an in-place
+      # upgrade — the user has to uninstall, which also wipes the saved host and
+      # token. This check cannot fix that (the fix is committing android/ plus a
+      # signingConfig that reads key.properties, ANALYSIS §1.1) but it makes the
+      # situation visible on every run instead of silently shipping
+      # uninstall-only APKs.
+      - name: Warn if release signing is not configured
+        # The secret is passed through `env` rather than interpolated into the
+        # run script: expanding a base64 keystore onto a shell command line both
+        # risks hitting length limits and puts credential material where it does
+        # not belong, even though Actions masks it in the log.
+        env:
+          HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        run: |
+          if [ "$HAS_KEYSTORE" != "true" ]; then
+            echo "::warning title=Unsigned release build::ANDROID_KEYSTORE_BASE64 is not set and dsh_mobile/android/ is not committed. This APK is signed with the runner's ephemeral debug key, so it CANNOT be installed over a previous build - the user must uninstall first, losing their saved gateway address and token. See ANALYSIS-优化与新增功能.md §1.1."
+          else
+            echo "ANDROID_KEYSTORE_BASE64 is set."
+          fi
+
+      - name: Write signing material (when provided)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
         working-directory: ./dsh_mobile
         run: |
-          flutter build apk --release
+          mkdir -p android/keystore
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/keystore/release.jks
+          cat > android/key.properties <<EOF
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          storeFile=keystore/release.jks
+          EOF
+          echo "Signing material written. Takes effect once android/app/build.gradle is committed with a signingConfig that reads key.properties."
 
-      - name: Upload APK Artifact
+      - name: Build APK (Release, split per ABI)
+        working-directory: ./dsh_mobile
+        # --split-per-abi was missing: the fat APK carries armv7 + arm64 + x64
+        # native libraries and measured 22.0-22.8 MB on disk. Per-ABI builds are
+        # roughly a third of that. Output filenames change from
+        # app-release.apk to app-<abi>-release.apk, hence the glob in the upload
+        # and release steps below.
+        run: |
+          flutter build apk --release --split-per-abi
+
+      - name: List produced APKs
+        working-directory: ./dsh_mobile
+        run: ls -lh build/app/outputs/flutter-apk/
+
+      - name: Upload APK Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dsh-agent-release-apk
-          path: dsh_mobile/build/app/outputs/flutter-apk/app-release.apk
+          name: dsh-agent-release-apk-${{ steps.ver.outputs.version }}
+          # Glob, not a fixed filename: --split-per-abi emits one APK per ABI.
+          path: dsh_mobile/build/app/outputs/flutter-apk/*.apk
           retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Read version from pubspec.yaml
+        id: ver
+        working-directory: ./dsh_mobile
+        run: |
+          RAW=$(grep -E '^version:' pubspec.yaml | head -1 | sed 's/^version:[[:space:]]*//')
+          echo "version=${RAW%%+*}" >> "$GITHUB_OUTPUT"
+
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dsh-agent-release-apk-${{ steps.ver.outputs.version }}
+          path: dist
 
       - name: Create GitHub Release
-        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.3.0
-          name: "DSH Mobile v1.3.0 - 网关核心统一、删除功能修复与凭据治理"
-          body: |
-            ### 🚀 DSH Mobile v1.3.0 发布说明
-
-            本次为**服务端桥接层重构版本**，配套客户端做了少量配套修复。
-
-            #### 🔧 服务端桥接重构（dsh-server-plugin）
-            - **核心逻辑统一**: 新增共享层 `lib/core.mjs`，消除 Cordis 插件入口与独立网关入口的实现分叉；独立网关从 1888 行收薄为 56 行薄壳，两份代码不再各自演进。
-            - **补齐缺失端点**: `/api/mobile/personas`（智能体人设）此前仅独立网关提供，客户端连接时无条件调用该接口，在 DSH 内嵌模式下恒返回 404 —— 现已补齐。
-            - **修复"删除会话"无效**: 引擎侧不存在 `session/delete` RPC，旧实现吞掉 404 后仍返回 `200 Deleted`，实际未删除任何数据。改为桥接侧真实删除（归档 + 摘除索引 + 清理投影缓存），并对失败如实返回错误。
-            - **消除"谎报成功"**: `sessions/delete`、`sessions/cancel` 及取消补偿路径在失败时不再返回 200，改为 5xx 并写入审计日志。
-            - **凭据治理**: 移除源码中的明文访问令牌与引擎 HMAC 签名密钥，改为运行时读取 `~/.dsh/.credentials.yaml`；新装环境自动生成随机令牌。
-
-            #### 🔒 安全加固
-            - **审批策略绕过修复**: `auto-read` 策略原先按命令前缀白名单放行，`echo hi > out.txt`、`cat x | sh` 这类**写操作/命令注入**可绕过人工审批。现增加 Shell 元字符检测，含重定向、管道、链式与命令替换的命令一律不自动放行。
-            - **工作区路径穿越**: 三层校验（`..`/绝对路径/盘符拦截 → 已注册工作区白名单 → 解析后逃逸检查），非法访问返回 403。
-            - **请求体上限**: 2MB 限制，超限返回 413 且不再触发客户端 `ECONNRESET`。
-
-            #### 🐛 客户端修复
-            - **会话识别统一**: 会话 ID 比较与大小写规则对齐服务端，避免同一会话被误判为两个导致流式状态丢失。
-            - **凭据不再预填**: 连接页移除硬编码的默认令牌占位符；APK 下载直链按实际连接的网关动态生成（此前写死 `n.cnm.asia`）。
-            - **版本号单一来源**: 版本信息统一由 `pubspec.yaml` 提供，`app_version.dart` 与之保持一致（此前 UI 显示 v1.2.1，实际为 v1.2.9）。
-
-            #### 🧹 工程整理
-            - 移除无引用的死代码（`chat_page.dart`、`settings_view.dart`，约 920 行）。
-            - 补齐设备配对功能：设备列表真实落盘，配对码改用密码学随机生成（此前恒为 `000000`）。
-            - 新增单元测试与 GitHub Actions CI（单元测试 + Flutter 静态分析）。
-          files: dsh_mobile/build/app/outputs/flutter-apk/app-release.apk
+          # Was the literal `v1.3.0`. Every push to main upserted the SAME
+          # release, overwriting the previous version's notes and assets — so
+          # there was no way to answer "what changed in v1.2.6?".
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: "DSH Mobile v${{ steps.ver.outputs.version }}"
+          # Notes belong in a committed CHANGELOG.md, not inlined in CI YAML
+          # where their diff is mixed into workflow changes and they are lost
+          # whenever the tag is reused. Until CHANGELOG.md exists, fall back to
+          # the commit list since the previous tag.
+          generate_release_notes: true
+          files: dist/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

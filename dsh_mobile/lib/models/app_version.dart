@@ -1,10 +1,16 @@
 /// Build identity for the app.
 ///
-/// Keep in sync with `pubspec.yaml` (`version:`). The bridge exposes the same
-/// value via `GET /api/mobile/health` as `version`, so the two can be compared.
+/// Keep in sync with `pubspec.yaml` (`version: 1.3.1+14`). The bridge exposes a
+/// comparable value via `GET /api/mobile/health` as `version`, so the two can be
+/// checked against each other.
+///
+/// NOTE: this duplication is manual and has already drifted — the bridge reports
+/// its own `1.2.9` while the app reported `1.3.0`, and the download page said
+/// `v1.1.0`. Consolidating the 13 version sites onto a single source of truth is
+/// tracked in ANALYSIS-优化与新增功能.md §1.8.
 class AppVersion {
   const AppVersion._();
 
-  static const String version = '1.3.0';
-  static const String buildNumber = '13';
+  static const String version = '1.3.1';
+  static const String buildNumber = '14';
 }

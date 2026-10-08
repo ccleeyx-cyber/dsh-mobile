@@ -5,8 +5,6 @@ import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../models/chat_message.dart';
-import '../models/workspace.dart';
-import '../models/permission_config.dart';
 import '../models/dsh_settings.dart';
 import '../services/dsh_service.dart';
 import '../widgets/thinking_card.dart';
@@ -217,7 +215,11 @@ class _ChatViewState extends State<ChatView> {
     final sessionId = currentSession?.sessionId ?? 'default';
     final currentPolicy = dsh.getSessionPermission(sessionId);
     String selectedPolicy = currentPolicy;
-    String sandboxMode = dsh.permissions.sandboxMode;
+    // NOTE: `dsh.permissions.sandboxMode` used to be read into a local here and
+    // then never rendered — the session sheet only ever let the user pick an
+    // execution policy. Surfacing sandboxMode/maxSteps in this sheet is a real
+    // UI gap (tracked in ANALYSIS-优化与新增功能.md §1.13), not something to
+    // silently reintroduce as another dead local.
     int maxSteps = dsh.permissions.maxSteps;
 
     showModalBottomSheet(
@@ -1796,15 +1798,17 @@ class _ChatViewState extends State<ChatView> {
                     ),
                   ),
 
-                // Timestamp
-                if (msg.timestamp != null)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 4),
-                    child: Text(
-                      _formatTime(msg.timestamp),
-                      style: const TextStyle(color: Color(0xFF9CA3AF), fontSize: 10),
-                    ),
+                // Timestamp — ChatMessage.timestamp is a non-nullable DateTime
+                // (the constructor defaults it to DateTime.now()), so the old
+                // `if (msg.timestamp != null)` guard was always true and the
+                // timestamp always rendered. Behaviour is unchanged.
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(
+                    _formatTime(msg.timestamp),
+                    style: const TextStyle(color: Color(0xFF9CA3AF), fontSize: 10),
                   ),
+                ),
               ],
             ),
           ),
