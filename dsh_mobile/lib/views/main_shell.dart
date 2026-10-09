@@ -113,6 +113,19 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final pendingCount = context.select<DshService, int>((d) => d.pendingApprovals.length);
     final isTokenInvalid = context.select<DshService, bool>((d) => d.isTokenInvalid);
 
+    // 键盘弹出时隐藏底部导航栏 —— 这是修一个真实的布局缺陷，不是装饰性调整。
+    //
+    // 成因：chat_view 内部有自己的 Scaffold（未显式设置，因此
+    // resizeToAvoidBottomInset 取默认的 true），它会按**完整**键盘高度抬高内容；
+    // 而外层这个 Scaffold 关掉了 resize，底部导航栏仍占着屏幕最下方。于是内层
+    // Scaffold 的底边比屏幕底边高出一个导航栏的高度，却仍按整段键盘高度抬高 →
+    // 输入框被多抬了"一个导航栏"的高度，输入框与键盘之间就空出一条和导航栏
+    // 一样高的空白。
+    //
+    // 去掉导航栏后，内层底边 == 屏幕底边，抬高量恰好等于键盘高度，空白消失。
+    // 顺带这也是聊天类 App 的常规行为（打字时让出空间）。
+    final keyboardOpen = MediaQuery.of(context).viewInsets.bottom > 0;
+
     return Scaffold(
       resizeToAvoidBottomInset: false,
       backgroundColor: context.c.surfaceMuted,
@@ -170,7 +183,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           ),
         ],
       ),
-      bottomNavigationBar: Container(
+      // 键盘弹出时置空 —— 见上面 keyboardOpen 处的说明，这是修输入框下方
+      // 那条空白的必要一步。
+      bottomNavigationBar: keyboardOpen ? null : Container(
         decoration: BoxDecoration(
           color: context.c.surface,
           border: Border(top: BorderSide(color: context.c.border, width: 1.0)),

@@ -64,7 +64,29 @@ class VoiceInputService {
       debugPrint('[VoiceInput] 初始化失败: $e');
       _available = false;
     }
+    // 探测失败**不永久缓存**。
+    //
+    // 这一行是修一个真实缺陷：原先 _initialized 一旦置 true，失败结果就被记死，
+    // 之后每次点击都直接返回"不可用"，用户哪怕去系统设置里开了麦克风权限，
+    // 回到 App 也依然点不动 —— 只能重装。清掉标记后，下次点击会重新探测。
+    if (!_available) _initialized = false;
     return _available;
+  }
+
+  /// 语音不可用的**具体原因**，用于给用户可执行的指引。
+  ///
+  /// 必须把「没授权麦克风」和「设备没有识别服务」分开：前者的修复动作是去系统
+  /// 设置开权限，后者只能换设备。混成一句"不可用"会让用户在设置里白找一圈，
+  /// 而这正是"点了没反应、也没弹权限"那种体验的来源。
+  Future<String> unavailableReason() async {
+    try {
+      if (!await _speech.hasPermission) {
+        return '未获得麦克风权限：请到「系统设置 → 应用 → DSH Mobile → 权限」中允许麦克风，然后回到这里再点一次';
+      }
+    } catch (e) {
+      debugPrint('[VoiceInput] 权限查询失败: $e');
+    }
+    return '这台设备没有可用的语音识别服务（部分精简版系统不带识别引擎）';
   }
 
   /// 开始识别。
@@ -81,7 +103,7 @@ class VoiceInputService {
     String localeId = defaultLocaleId,
   }) async {
     if (!_available && !await init(localeId: localeId)) {
-      onError?.call('这台设备没有可用的语音识别服务');
+      onError?.call(await unavailableReason());
       return false;
     }
 

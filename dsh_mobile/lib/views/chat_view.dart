@@ -1230,65 +1230,77 @@ class _ChatViewState extends State<ChatView> {
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // 两个胶囊都必须包 Flexible。
+            //
+            // 它们的自然宽度之和约 300px（工作区胶囊 110 + 图标/箭头/内边距，
+            // 模型胶囊同理），而 AppBar 的 title 在 400dp 宽的手机上只剩 232px ——
+            // 实测会 RenderFlex overflowed by 23 pixels，画出黄黑条纹并把内容裁掉。
+            // 这正是用户说的「图标挤在一起」。
+            //
+            // Flexible 默认是 loose 的：空间够时按内容自然宽度渲染（不浪费），
+            // 不够时收缩到分到的宽度，里面的 Text 已经设了 ellipsis，于是优雅截断
+            // 而不是溢出。
             Row(
               children: [
                 // Workspace Selector Pill (Fluent Command Style)
-                GestureDetector(
-                  onTap: () => _showWorkspaceSwitchSheet(context, dsh),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: context.c.accent.withOpacity(0.08),
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: context.c.accent.withOpacity(0.25)),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.folder_rounded, size: 12, color: context.c.accent),
-                        const SizedBox(width: 4),
-                        ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 110),
-                          child: Text(
-                            currentWs?.title ?? '选择工作区',
-                            style: TextStyle(fontSize: 11.5, color: context.c.textPrimary, fontWeight: FontWeight.w600),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                Flexible(
+                  child: GestureDetector(
+                    onTap: () => _showWorkspaceSwitchSheet(context, dsh),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: context.c.accent.withOpacity(0.08),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: context.c.accent.withOpacity(0.25)),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.folder_rounded, size: 12, color: context.c.accent),
+                          const SizedBox(width: 4),
+                          Flexible(
+                            child: Text(
+                              currentWs?.title ?? '选择工作区',
+                              style: TextStyle(fontSize: 11.5, color: context.c.textPrimary, fontWeight: FontWeight.w600),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
-                        ),
-                        Icon(Icons.arrow_drop_down, size: 14, color: context.c.textSecondary),
-                      ],
+                          Icon(Icons.arrow_drop_down, size: 14, color: context.c.textSecondary),
+                        ],
+                      ),
                     ),
                   ),
                 ),
                 const SizedBox(width: 6),
 
                 // Model Selector Pill (Fluent Command Style)
-                GestureDetector(
-                  onTap: () => _showModelSwitchSheet(context, dsh),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: context.c.surfaceMuted,
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: context.c.border),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.smart_toy_outlined, size: 12, color: context.c.textPrimary),
-                        const SizedBox(width: 4),
-                        ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 95),
-                          child: Text(
-                            modelName.replaceFirst('cn:', ''),
-                            style: TextStyle(fontSize: 11.5, color: context.c.textPrimary, fontWeight: FontWeight.w600),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                Flexible(
+                  child: GestureDetector(
+                    onTap: () => _showModelSwitchSheet(context, dsh),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: context.c.surfaceMuted,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: context.c.border),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.smart_toy_outlined, size: 12, color: context.c.textPrimary),
+                          const SizedBox(width: 4),
+                          Flexible(
+                            child: Text(
+                              modelName.replaceFirst('cn:', ''),
+                              style: TextStyle(fontSize: 11.5, color: context.c.textPrimary, fontWeight: FontWeight.w600),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
-                        ),
-                        Icon(Icons.arrow_drop_down, size: 14, color: context.c.textSecondary),
-                      ],
+                          Icon(Icons.arrow_drop_down, size: 14, color: context.c.textSecondary),
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -1297,6 +1309,15 @@ class _ChatViewState extends State<ChatView> {
             const SizedBox(height: 2),
             Row(
               children: [
+                // 当前权限状态色点。它原本是顶栏那个盾牌按钮的一部分；盾牌移进
+                // 「更多」菜单后，用这个 7px 的点保住「当前是什么权限」的一眼信息，
+                // 否则用户必须打开菜单才知道。
+                Container(
+                  width: 7,
+                  height: 7,
+                  margin: const EdgeInsets.only(right: 5),
+                  decoration: BoxDecoration(color: _getPolicyColor(policy), shape: BoxShape.circle),
+                ),
                 ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 160),
                   child: Text(
@@ -1333,31 +1354,16 @@ class _ChatViewState extends State<ChatView> {
             ),
           ],
         ),
+        // 顶栏只保留 3 个高频按钮（新建 / 查找 / 更多）。
+        //
+        // 原先有 5 个：权限、新建、主题、查找、更多。再叠加两行标题（句柄选择 +
+        // 模型胶囊 / 会话名 + 执行中徽标），在 360dp 宽的手机上必然挤成一团。
+        // 而且其中两个功能本来就是重复的 ——「对话权限」在「更多」菜单里已有
+        // 同名项，「切换模型」既在标题的胶囊上、又在菜单里。
+        //
+        // 处理：权限与主题移进「更多」菜单；权限状态改用会话名旁边的一个小色点
+        // 表示，这样「当前是什么权限」这个一眼信息没有丢。
         actions: [
-          // Session Permission Shield Button
-          IconButton(
-            tooltip: '设置对话权限',
-            icon: Stack(
-              clipBehavior: Clip.none,
-              children: [
-                Icon(Icons.shield_rounded, color: _getPolicyColor(policy), size: 22),
-                Positioned(
-                  right: -2,
-                  bottom: -2,
-                  child: Container(
-                    width: 7,
-                    height: 7,
-                    decoration: BoxDecoration(
-                      color: _getPolicyColor(policy),
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            onPressed: () => _showSessionPermissionSheet(context, dsh),
-          ),
-
           // New Session Button
           IconButton(
             tooltip: '新建对话',
@@ -1373,22 +1379,6 @@ class _ChatViewState extends State<ChatView> {
               await dsh.createNewSession();
               _scrollToBottom();
             },
-          ),
-
-          // 主题快速切换（v1.6.0）。与"会话内查找"并列：两个都是高频、
-          // 低认知负担的图标按钮；"选一个具体主题"在设置页的分段控件里。
-          IconButton(
-            tooltip: '切换主题（${context.watch<ThemeController>().label}）',
-            icon: Icon(
-              switch (context.watch<ThemeController>().mode) {
-                'dark' => Icons.dark_mode_rounded,
-                'light' => Icons.light_mode_rounded,
-                _ => Icons.brightness_auto_rounded,
-              },
-              color: context.c.textSecondary,
-              size: 21,
-            ),
-            onPressed: () => context.read<ThemeController>().cycle(),
           ),
 
           // 会话内查找
@@ -1418,6 +1408,19 @@ class _ChatViewState extends State<ChatView> {
                   break;
                 case 'permission':
                   _showSessionPermissionSheet(context, dsh);
+                  break;
+                case 'theme':
+                  // 从顶栏移进菜单后，必须回显切换结果 —— 原先按钮的颜色/图标
+                  // 本身就是反馈，菜单项点击后菜单就关了，不给提示会让人不确定。
+                  final theme = context.read<ThemeController>();
+                  theme.cycle();
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('主题：${theme.label}'),
+                      duration: const Duration(seconds: 1),
+                      behavior: SnackBarBehavior.floating,
+                    ),
+                  );
                   break;
                 case 'workspaces':
                   widget.onOpenWorkspaces?.call();
@@ -1458,6 +1461,16 @@ class _ChatViewState extends State<ChatView> {
                     Icon(Icons.folder_outlined, color: context.c.accent, size: 18),
                     const SizedBox(width: 10),
                     Text('工作区与会话', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'theme',
+                child: Row(
+                  children: [
+                    Icon(Icons.brightness_6_outlined, color: context.c.accent, size: 18),
+                    const SizedBox(width: 10),
+                    Text('切换主题', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
                   ],
                 ),
               ),
@@ -2046,24 +2059,24 @@ class _ChatViewState extends State<ChatView> {
   ///   「不知道它有没有在听」，不给出视觉反馈会让人反复点。
   /// * **识别结果替换整个输入框**而不是追加。流式识别的中间结果是累积的，
   ///   追加会得到「你好你好你好世界世界」这种叠字。
-  /// * **设备不支持时如实说明**并禁用按钮，而不是点了没反应。
+  /// * **永远可点**，且在不可用时说明具体原因（见下）。
+  ///
+  /// ## 这里修的是一个真实缺陷
+  ///
+  /// 上一版在「未探测完成」时返回空白 SizedBox、在「不可用」时返回**不带 onTap
+  /// 的图标**。后果是：按钮要么看不见，要么看着是个按钮、点下去毫无反应，
+  /// 而麦克风权限弹窗也永远不会出现 —— 用户描述的就是「有按钮但没法点击，
+  /// 也没弹出什么权限设置」。
+  ///
+  /// 根因是把「申请权限」和「探测能力」合并成了一次性的初始化，且失败后永久
+  /// 记为不可用。现在无论什么状态都保持可点：点下去会重新探测并触发权限申请；
+  /// 确实不行时用 SnackBar 说清是哪种原因，给出可执行的下一步。
   Widget _buildMicButton(DshService dsh) {
-    if (_voiceSupported == null) {
-      // 可用性尚未探测完成。先渲染成不可点，避免"按钮能点但点了必然失败"。
-      return const SizedBox(width: 44, height: 44);
-    }
-    if (!_voiceSupported!) {
-      return Tooltip(
-        message: '这台设备没有可用的语音识别服务',
-        child: SizedBox(
-          width: 44,
-          height: 44,
-          child: Icon(Icons.mic_off_rounded, size: 20, color: context.c.textTertiary.withOpacity(0.5)),
-        ),
-      );
-    }
-
     final listening = _voiceListening;
+    // 只有"已探测且确定不可用"才显示划掉的麦克风。未探测完成时显示正常图标 ——
+    // 用空白会让功能看起来不存在。
+    final unavailable = _voiceSupported == false;
+
     return InkWell(
       onTap: () => listening ? _stopVoice(dsh) : _startVoice(dsh),
       borderRadius: BorderRadius.circular(22),
@@ -2083,7 +2096,11 @@ class _ChatViewState extends State<ChatView> {
                 padding: const EdgeInsets.all(13),
                 child: CircularProgressIndicator(strokeWidth: 2, color: context.c.danger),
               )
-            : Icon(Icons.mic_none_rounded, size: 20, color: context.c.textSecondary),
+            : Icon(
+                unavailable ? Icons.mic_off_rounded : Icons.mic_none_rounded,
+                size: 20,
+                color: unavailable ? context.c.textTertiary : context.c.textSecondary,
+              ),
       ),
     );
   }
@@ -2098,7 +2115,14 @@ class _ChatViewState extends State<ChatView> {
         if (mounted) setState(() => _voiceListening = false);
       },
     );
-    if (mounted) setState(() => _voiceListening = ok);
+    if (mounted) {
+      setState(() {
+        _voiceListening = ok;
+        // 成功说明设备可用（可能用户刚在系统设置里开了麦克风权限），把状态纠正
+        // 回来，否则图标会一直停在"划掉的麦克风"上，看起来仍然不可用。
+        if (ok) _voiceSupported = true;
+      });
+    }
   }
 
   Future<void> _stopVoice(DshService dsh) async {
@@ -2120,7 +2144,8 @@ class _ChatViewState extends State<ChatView> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(msg),
-        duration: const Duration(seconds: 2),
+        // 「去系统设置里开麦克风」这类指引必须能读完，2 秒不够；短提示保持轻快。
+        duration: Duration(seconds: msg.length > 24 ? 6 : 2),
         behavior: SnackBarBehavior.floating,
       ),
     );
@@ -2128,6 +2153,9 @@ class _ChatViewState extends State<ChatView> {
 
   Widget _buildInputBar(DshService dsh) {
     return Container(
+      // 测试用来量输入栏的实际位置：键盘弹出后它的底边必须紧贴键盘顶边，
+      // 中间不允许出现空白（这正是用户报的那个问题）。
+      key: const ValueKey('chat-input-bar'),
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
       decoration: BoxDecoration(
         color: context.c.surface,
