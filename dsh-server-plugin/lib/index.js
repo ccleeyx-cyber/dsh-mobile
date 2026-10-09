@@ -2155,6 +2155,43 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
 
+      // ---- 跨会话搜索（标题 + 首条 prompt）----
+      //
+      // ⚠️ 必须排在下面的 startsWith('/api/mobile/sessions/') 通配路由之前：
+      // 它也是 GET，晚于通配时 'search' 会被当成 sessionId 送进
+      // getSessionHistory，搜索永远返回空历史（这就是"搜索没生效"的根因）。
+      if (pathname === '/api/mobile/sessions/search' && req.method === 'GET') {
+        const q = String(parsedUrl.query?.q || '').trim();
+        if (!q) {
+          sendJson(400, { ok: false, error: 'q is required' });
+          return;
+        }
+        const max = Math.min(Number(parsedUrl.query?.limit) || 30, 100);
+        const needle = q.toLowerCase();
+        const results = [];
+        for (const ws of getWorkspacesData({ archived: 'include' })) {
+          for (const s of ws.sessions) {
+            const title = (s.title || '').toLowerCase();
+            const first = (s.firstPrompt || '').toLowerCase();
+            if (title.includes(needle) || first.includes(needle)) {
+              results.push({
+                workspaceId: ws.workspaceId,
+                workspaceTitle: ws.title,
+                sessionId: s.sessionId,
+                title: s.title,
+                firstPrompt: s.firstPrompt,
+                lastPromptAt: s.lastPromptAt,
+                archived: !!s.archived
+              });
+              if (results.length >= max) break;
+            }
+          }
+          if (results.length >= max) break;
+        }
+        sendJson(200, { ok: true, code: 0, query: q, results });
+        return;
+      }
+
       if (pathname.startsWith('/api/mobile/sessions/') && req.method === 'GET') {
         const sessionId = pathname.replace('/api/mobile/sessions/', '').trim();
         const history = await getSessionHistory(sessionId);
@@ -2604,39 +2641,6 @@ export function apply(ctx, config = {}, internals = {}) {
         audit('session/rename', { sessionId: jsonBody.sessionId });
         broadcastToMobileClients({ type: 'session_renamed', sessionId: result.sessionId, title: result.title });
         sendJson(200, { ok: true, code: 0, sessionId: result.sessionId, title: result.title });
-        return;
-      }
-
-      // ---- 跨会话搜索（标题 + 首条 prompt）----
-      if (pathname === '/api/mobile/sessions/search' && req.method === 'GET') {
-        const q = String(parsedUrl.query?.q || '').trim();
-        if (!q) {
-          sendJson(400, { ok: false, error: 'q is required' });
-          return;
-        }
-        const max = Math.min(Number(parsedUrl.query?.limit) || 30, 100);
-        const needle = q.toLowerCase();
-        const results = [];
-        for (const ws of getWorkspacesData({ archived: 'include' })) {
-          for (const s of ws.sessions) {
-            const title = (s.title || '').toLowerCase();
-            const first = (s.firstPrompt || '').toLowerCase();
-            if (title.includes(needle) || first.includes(needle)) {
-              results.push({
-                workspaceId: ws.workspaceId,
-                workspaceTitle: ws.title,
-                sessionId: s.sessionId,
-                title: s.title,
-                firstPrompt: s.firstPrompt,
-                lastPromptAt: s.lastPromptAt,
-                archived: !!s.archived
-              });
-              if (results.length >= max) break;
-            }
-          }
-          if (results.length >= max) break;
-        }
-        sendJson(200, { ok: true, code: 0, query: q, results });
         return;
       }
 

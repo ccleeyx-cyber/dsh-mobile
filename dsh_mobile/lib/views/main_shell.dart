@@ -143,7 +143,18 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     // 顺带这也是聊天类 App 的常规行为（打字时让出空间）。
     final keyboardOpen = MediaQuery.of(context).viewInsets.bottom > 0;
 
-    return Scaffold(
+    // 侧滑返回拦截：MainShell 是 home 路由，没有可 pop 的上一级 —— 系统
+    // 预测性返回手势会直接退出 App。用户预期是"回到工作区"（聊天 App 的
+    // 常规动线），所以非工作区 tab 时侧滑 = 切到工作区（index 1）；
+    // 已经在工作区（或权限/设置页）时才放行为真正的退出。
+    final canExit = _currentIndex == 1 || _currentIndex == 2 || _currentIndex == 3;
+
+    return PopScope(
+      canPop: canExit,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _setIndex(1);
+      },
+      child: Scaffold(
       resizeToAvoidBottomInset: false,
       backgroundColor: context.c.surfaceMuted,
       body: Column(
@@ -257,6 +268,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             ),
           ),
         ),
+      ),
       ),
     );
   }

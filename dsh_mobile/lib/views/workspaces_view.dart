@@ -133,109 +133,25 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
   }
 
   /// 全库搜索浮层：网关 /api/mobile/sessions/search，命中即跳转会话。
-  Future<void> _showGlobalSearchSheet(BuildContext context, DshService dsh) async {
-    final queryController = TextEditingController();
-    List<SessionSearchHit> results = const [];
-    bool searching = false;
-
+  ///
+  /// [initialQuery] 非空时打开即自动执行一次搜索（从搜索框回车进来就是这个
+  /// 路径），不用再点一次。
+  Future<void> _showGlobalSearchSheet(BuildContext context, DshService dsh, {String? initialQuery}) async {
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: context.c.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (sheetCtx) => StatefulBuilder(
-        builder: (sheetCtx, setSheetState) => Padding(
-          padding: EdgeInsets.only(bottom: MediaQuery.of(sheetCtx).viewInsets.bottom),
-          child: SizedBox(
-            height: MediaQuery.of(sheetCtx).size.height * 0.75,
-            child: Column(
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
-                  child: Row(
-                    children: [
-                      Icon(Icons.travel_explore_rounded, size: 20, color: context.c.accent),
-                      const SizedBox(width: 8),
-                      Text('全库搜索会话', style: TextStyle(color: context.c.textPrimary, fontSize: 15, fontWeight: FontWeight.bold)),
-                      const Spacer(),
-                      IconButton(
-                        icon: Icon(Icons.close, size: 18, color: context.c.textTertiary),
-                        onPressed: () => Navigator.pop(sheetCtx),
-                      ),
-                    ],
-                  ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                  child: TextField(
-                    controller: queryController,
-                    autofocus: true,
-                    style: TextStyle(color: context.c.textPrimary, fontSize: 14),
-                    decoration: InputDecoration(
-                      hintText: '按标题或首条消息搜索（含已归档）',
-                      hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 12.5),
-                      prefixIcon: Icon(Icons.search, size: 18, color: context.c.textTertiary),
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
-                    ),
-                    onSubmitted: (q) async {
-                      if (q.trim().isEmpty) return;
-                      setSheetState(() => searching = true);
-                      results = await dsh.searchSessions(q);
-                      setSheetState(() => searching = false);
-                    },
-                  ),
-                ),
-                Expanded(
-                  child: searching
-                      ? const Center(child: CircularProgressIndicator())
-                      : results.isEmpty
-                          ? Center(
-                              child: Text(
-                                queryController.text.trim().isEmpty ? '输入关键词后回车搜索' : '没有命中会话',
-                                style: TextStyle(color: context.c.textTertiary, fontSize: 12.5),
-                              ),
-                            )
-                          : ListView.builder(
-                              itemCount: results.length,
-                              itemBuilder: (itemCtx, i) {
-                                final hit = results[i];
-                                return ListTile(
-                                  dense: true,
-                                  leading: Icon(
-                                    hit.archived ? Icons.archive_outlined : Icons.chat_bubble_outline_rounded,
-                                    size: 20,
-                                    color: hit.archived ? context.c.textTertiary : context.c.accent,
-                                  ),
-                                  title: Text(
-                                    hit.title,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(color: context.c.textPrimary, fontSize: 13.5),
-                                  ),
-                                  subtitle: Text(
-                                    '${hit.workspaceTitle} · ${hit.firstPrompt.isEmpty ? '无预览' : hit.firstPrompt}',
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(color: context.c.textSecondary, fontSize: 11.5),
-                                  ),
-                                  onTap: () {
-                                    Navigator.pop(sheetCtx);
-                                    dsh.openSessionById(hit.sessionId, title: hit.title);
-                                    widget.onSwitchToChat?.call();
-                                  },
-                                );
-                              },
-                            ),
-                ),
-              ],
-            ),
-          ),
-        ),
+      backgroundColor: Colors.transparent,
+      // backgroundColor 透明 + sheet 自己画圆角容器，保证 20px 圆角可见。
+      builder: (sheetCtx) => _GlobalSearchSheet(
+        dsh: dsh,
+        initialQuery: initialQuery,
+        onOpenSession: (sessionId, title) {
+          Navigator.pop(sheetCtx);
+          dsh.openSessionById(sessionId, title: title);
+          widget.onSwitchToChat?.call();
+        },
       ),
     );
-    queryController.dispose();
   }
 
   /// 重命名会话：调网关 /api/mobile/sessions/rename。
@@ -544,12 +460,14 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     // 本页正是通过 listen:true 的 Provider.of 收到它的变更通知。
     _syncRefreshTimer();
 
-    // Filter workspaces
+    // Filter workspaces（本地即时过滤：工作区名/路径/会话标题/首条消息）
     final filteredWorkspaces = workspaces.where((ws) {
       if (_searchFilter.isEmpty) return true;
       final q = _searchFilter.toLowerCase();
       final matchWs = ws.title.toLowerCase().contains(q) || ws.path.toLowerCase().contains(q);
-      final matchSession = ws.sessions.any((s) => s.title.toLowerCase().contains(q));
+      final matchSession = ws.sessions.any(
+        (s) => s.title.toLowerCase().contains(q) || s.firstPrompt.toLowerCase().contains(q),
+      );
       return matchWs || matchSession;
     }).toList();
 
@@ -641,29 +559,38 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
             ),
           ),
 
-          // Search Bar
+          // Search Bar：统一的搜索入口。
+          //
+          // 两种模式用同一根输入框：
+          //  * 边打字边本地过滤（当前列表里筛工作区/标题）；
+          //  * 点右侧「全库搜」或键盘搜索键 → 网关全库搜索（含已归档），
+          //    结果以浮层展示。两个概念分两个按钮曾经让人分不清"搜哪个"。
           Padding(
             padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
             child: Row(
               children: [
                 Expanded(
                   child: Container(
-                    height: 38,
+                    height: 42,
                     decoration: BoxDecoration(
                       color: context.c.surface,
-                      borderRadius: BorderRadius.circular(8),
+                      borderRadius: BorderRadius.circular(21),
                       border: Border.all(color: context.c.border),
                     ),
                     child: TextField(
                       controller: _searchController,
-                      style: TextStyle(color: context.c.textPrimary, fontSize: 13),
+                      style: TextStyle(color: context.c.textPrimary, fontSize: 13.5),
+                      textInputAction: TextInputAction.search,
+                      onSubmitted: (q) {
+                        if (q.trim().isNotEmpty) _showGlobalSearchSheet(context, dsh, initialQuery: q.trim());
+                      },
                       decoration: InputDecoration(
-                        hintText: '搜索工作区、路径或历史对话...',
+                        hintText: '搜索会话：本页即时筛选，回车全库搜索',
                         hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 12.5),
-                        prefixIcon: Icon(Icons.search, size: 17, color: context.c.textTertiary),
+                        prefixIcon: Icon(Icons.search_rounded, size: 19, color: context.c.textTertiary),
                         suffixIcon: _searchFilter.isNotEmpty
                             ? IconButton(
-                                icon: Icon(Icons.clear, size: 15, color: context.c.textTertiary),
+                                icon: Icon(Icons.cancel_rounded, size: 18, color: context.c.textTertiary),
                                 onPressed: () {
                                   _searchController.clear();
                                   setState(() => _searchFilter = '');
@@ -671,27 +598,29 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                               )
                             : null,
                         border: InputBorder.none,
-                        contentPadding: const EdgeInsets.symmetric(vertical: 9),
+                        contentPadding: const EdgeInsets.symmetric(vertical: 11),
                       ),
                       onChanged: (val) => setState(() => _searchFilter = val.trim()),
                     ),
                   ),
                 ),
                 const SizedBox(width: 8),
-                // 全局搜索：本地过滤只看得到当前筛选模式下已加载的列表；
-                // 这个按钮打网关的 /api/mobile/sessions/search，全库（含归档）按
-                // 标题+首条 prompt 搜。
                 SizedBox(
-                  height: 38,
-                  child: OutlinedButton.icon(
-                    style: OutlinedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
-                      side: BorderSide(color: context.c.border),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  height: 42,
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: context.c.accent.withOpacity(0.12),
+                      foregroundColor: context.c.accent,
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(21)),
                     ),
-                    onPressed: () => _showGlobalSearchSheet(context, dsh),
-                    icon: Icon(Icons.travel_explore_rounded, size: 16, color: context.c.accent),
-                    label: Text('全库', style: TextStyle(color: context.c.accent, fontSize: 12, fontWeight: FontWeight.w600)),
+                    onPressed: () {
+                      final q = _searchController.text.trim();
+                      _showGlobalSearchSheet(context, dsh, initialQuery: q);
+                    },
+                    icon: const Icon(Icons.travel_explore_rounded, size: 17),
+                    label: const Text('全库搜', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
                   ),
                 ),
               ],
@@ -1207,6 +1136,209 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           await dsh.selectSession(s);
           widget.onSwitchToChat?.call();
         },
+      ),
+    );
+  }
+}
+
+/// 全库搜索浮层（StatefulWidget）。
+///
+/// 拆成独立 State 而不是 StatefulBuilder 闭包，是因为 initialQuery 的自动
+/// 首搜需要 postFrameCallback + 受控的生命周期：闭包版在浮层被秒关时对
+/// 已 dispose 的 controller/text 触发更新，只能靠 try/catch 兜底；State
+/// 版 `mounted` 检查就够了。
+class _GlobalSearchSheet extends StatefulWidget {
+  final DshService dsh;
+  final String? initialQuery;
+  final void Function(String sessionId, String title) onOpenSession;
+
+  const _GlobalSearchSheet({
+    required this.dsh,
+    required this.onOpenSession,
+    this.initialQuery,
+  });
+
+  @override
+  State<_GlobalSearchSheet> createState() => _GlobalSearchSheetState();
+}
+
+class _GlobalSearchSheetState extends State<_GlobalSearchSheet> {
+  final TextEditingController _controller = TextEditingController();
+  final List<SessionSearchHit> _results = [];
+  bool _searched = false;
+  bool _searching = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final q = widget.initialQuery;
+    if (q != null && q.isNotEmpty) {
+      _controller.text = q;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _search(q));
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _search(String q) async {
+    if (q.trim().isEmpty) return;
+    setState(() => _searching = true);
+    final hits = await widget.dsh.searchSessions(q);
+    if (!mounted) return;
+    setState(() {
+      _searching = false;
+      _searched = true;
+      _results
+        ..clear()
+        ..addAll(hits);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: Container(
+        height: MediaQuery.of(context).size.height * 0.8,
+        decoration: BoxDecoration(
+          color: context.c.surface,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+        child: Column(
+          children: [
+            // 抓手 + 标题
+            const SizedBox(height: 10),
+            Container(
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                color: context.c.border,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 12, 12, 4),
+              child: Row(
+                children: [
+                  Icon(Icons.travel_explore_rounded, size: 20, color: context.c.accent),
+                  const SizedBox(width: 8),
+                  Text('全库搜索', style: TextStyle(color: context.c.textPrimary, fontSize: 16, fontWeight: FontWeight.bold)),
+                  const SizedBox(width: 6),
+                  Text('含已归档 · 按标题与首条消息', style: TextStyle(color: context.c.textTertiary, fontSize: 11)),
+                  const Spacer(),
+                  IconButton(
+                    icon: Icon(Icons.close_rounded, size: 20, color: context.c.textTertiary),
+                    onPressed: () => Navigator.pop(context),
+                  ),
+                ],
+              ),
+            ),
+            // 搜索输入
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 6, 18, 8),
+              child: Container(
+                height: 44,
+                decoration: BoxDecoration(
+                  color: context.c.surfaceMuted,
+                  borderRadius: BorderRadius.circular(22),
+                  border: Border.all(color: context.c.border),
+                ),
+                child: TextField(
+                  controller: _controller,
+                  autofocus: widget.initialQuery == null || widget.initialQuery!.isEmpty,
+                  style: TextStyle(color: context.c.textPrimary, fontSize: 14),
+                  textInputAction: TextInputAction.search,
+                  onSubmitted: _search,
+                  decoration: InputDecoration(
+                    hintText: '输入关键词，回车搜索全部会话',
+                    hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 13),
+                    prefixIcon: Icon(Icons.search_rounded, size: 20, color: context.c.textTertiary),
+                    border: InputBorder.none,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                ),
+              ),
+            ),
+            // 结果区
+            Expanded(
+              child: _searching
+                  ? const Center(child: CircularProgressIndicator(strokeWidth: 2.5))
+                  : !_searched
+                      ? Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.manage_search_rounded, size: 44, color: context.c.textTertiary.withOpacity(0.5)),
+                              const SizedBox(height: 10),
+                              Text('搜索全部工作区的历史会话', style: TextStyle(color: context.c.textTertiary, fontSize: 13)),
+                            ],
+                          ),
+                        )
+                      : _results.isEmpty
+                          ? Center(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(Icons.search_off_rounded, size: 44, color: context.c.textTertiary.withOpacity(0.5)),
+                                  const SizedBox(height: 10),
+                                  Text('没有命中会话', style: TextStyle(color: context.c.textTertiary, fontSize: 13)),
+                                ],
+                              ),
+                            )
+                          : ListView.separated(
+                              padding: const EdgeInsets.fromLTRB(10, 4, 10, 16),
+                              itemCount: _results.length,
+                              separatorBuilder: (_, __) => Divider(height: 1, color: context.c.border.withOpacity(0.5)),
+                              itemBuilder: (itemCtx, i) {
+                                final hit = _results[i];
+                                return ListTile(
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+                                  leading: CircleAvatar(
+                                    radius: 17,
+                                    backgroundColor: (hit.archived ? context.c.textTertiary : context.c.accent).withOpacity(0.12),
+                                    child: Icon(
+                                      hit.archived ? Icons.archive_outlined : Icons.chat_bubble_outline_rounded,
+                                      size: 17,
+                                      color: hit.archived ? context.c.textTertiary : context.c.accent,
+                                    ),
+                                  ),
+                                  title: Text(
+                                    hit.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(color: context.c.textPrimary, fontSize: 14, fontWeight: FontWeight.w500),
+                                  ),
+                                  subtitle: Padding(
+                                    padding: const EdgeInsets.only(top: 2),
+                                    child: Row(
+                                      children: [
+                                        Flexible(
+                                          child: Text(
+                                            hit.firstPrompt.isEmpty ? hit.workspaceTitle : hit.firstPrompt,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(color: context.c.textSecondary, fontSize: 12),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 6),
+                                        Text(
+                                          hit.archived ? '· 已归档' : '· ${hit.workspaceTitle}',
+                                          style: TextStyle(color: context.c.textTertiary, fontSize: 11),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  onTap: () => widget.onOpenSession(hit.sessionId, hit.title),
+                                );
+                              },
+                            ),
+            ),
+          ],
+        ),
       ),
     );
   }

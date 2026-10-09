@@ -80,7 +80,8 @@ void main() {
       VoiceInputService.instance.debugSetAvailable(true);
       await pumpChat(tester);
 
-      final icon = find.byIcon(Icons.mic_none_rounded);
+      // v1.11.1 起正常态图标换成了实心 mic_rounded（按钮加大到 44px 的一部分）。
+      final icon = find.byIcon(Icons.mic_rounded);
       expect(icon, findsOneWidget);
 
       final ink = tester.widget<InkWell>(
@@ -310,7 +311,7 @@ void main() {
           find.byWidgetPredicate(
             (w) =>
                 w is Icon &&
-                (w.icon == Icons.mic_none_rounded || w.icon == Icons.mic_off_rounded),
+                (w.icon == Icons.mic_rounded || w.icon == Icons.mic_none_rounded || w.icon == Icons.mic_off_rounded),
           )
         ),
         ('发送', find.byIcon(Icons.arrow_upward_rounded)),
@@ -397,7 +398,7 @@ void main() {
       final mic = find.byWidgetPredicate(
         (w) =>
             w is Icon &&
-            (w.icon == Icons.mic_none_rounded || w.icon == Icons.mic_off_rounded),
+            (w.icon == Icons.mic_rounded || w.icon == Icons.mic_none_rounded || w.icon == Icons.mic_off_rounded),
       );
       expect(mic, findsOneWidget);
 

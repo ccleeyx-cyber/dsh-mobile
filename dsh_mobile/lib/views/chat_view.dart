@@ -2192,19 +2192,21 @@ class _ChatViewState extends State<ChatView> {
         // 它们在用户眼里**都只是"点了没反应"**。让 App 把自己每一步的实测结果
         // 直接说出来，比一轮轮猜快得多。
         onLongPress: _showVoiceDiagnose,
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(20),
+        // 44x44：Material 推荐的最小可触达尺寸。36px 在手机上确实偏小，
+        // 语音又是个高频入口（用户报"按钮有点小"）。
         child: SizedBox(
-          width: 36,
-          height: 36,
+          width: 44,
+          height: 44,
           child: listening
               ? Padding(
-                  padding: const EdgeInsets.all(9),
-                  child: CircularProgressIndicator(strokeWidth: 2, color: context.c.danger),
+                  padding: const EdgeInsets.all(10),
+                  child: CircularProgressIndicator(strokeWidth: 2.2, color: context.c.danger),
                 )
               : Center(
                   child: Icon(
-                    unavailable ? Icons.mic_off_rounded : Icons.mic_none_rounded,
-                    size: 21,
+                    unavailable ? Icons.mic_off_rounded : Icons.mic_rounded,
+                    size: 24,
                     color: listening
                         ? context.c.danger
                         : (unavailable ? context.c.textTertiary : context.c.textSecondary),
@@ -2461,8 +2463,8 @@ class _ChatViewState extends State<ChatView> {
   Widget _buildSendButton(DshService dsh) {
     if (dsh.isSending || dsh.isCanceling) {
       return SizedBox(
-        width: 38,
-        height: 38,
+        width: 44,
+        height: 44,
         child: dsh.isCanceling
             ? Padding(
                 padding: const EdgeInsets.all(10),
@@ -2473,7 +2475,7 @@ class _ChatViewState extends State<ChatView> {
                   HapticFeedback.mediumImpact();
                   dsh.cancelActiveTurn();
                 },
-                borderRadius: BorderRadius.circular(19),
+                borderRadius: BorderRadius.circular(22),
                 child: Container(
                   decoration: BoxDecoration(
                     color: context.c.dangerSurface,
@@ -2492,11 +2494,11 @@ class _ChatViewState extends State<ChatView> {
       builder: (context, value, _) {
         final canSend = value.text.trim().isNotEmpty || _pendingAttachments.isNotEmpty;
         return SizedBox(
-          width: 38,
-          height: 38,
+          width: 44,
+          height: 44,
           child: InkWell(
             onTap: canSend ? () => _sendMessage(dsh) : null,
-            borderRadius: BorderRadius.circular(19),
+            borderRadius: BorderRadius.circular(22),
             child: Container(
               decoration: BoxDecoration(
                 color: canSend ? context.c.accent : context.c.border,
@@ -2504,7 +2506,7 @@ class _ChatViewState extends State<ChatView> {
               ),
               child: Icon(
                 Icons.arrow_upward_rounded,
-                size: 20,
+                size: 22,
                 color: canSend ? Colors.white : context.c.textTertiary,
               ),
             ),
