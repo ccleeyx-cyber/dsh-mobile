@@ -45,6 +45,12 @@ class NotificationService {
   /// 初始化/发送过程中最近一次的失败原因，供 UI 如实告知用户。
   String? _lastError;
 
+  /// 通知被点按时的回调（payload 见 show 的文档：`session:<kind>:<id>`）。
+  ///
+  /// 由 App 顶层注入 —— 通知点击时 App 可能冷启动，回调必须挂在比
+  /// MainShell 更早、且不依赖 BuildContext 的位置（main() 里）。
+  void Function(String payload)? onSelectNotification;
+
   /// 是否已拉起前台保活服务。
   bool get backgroundEnabled => _backgroundOn;
 
@@ -95,6 +101,14 @@ class NotificationService {
           android: AndroidInitializationSettings('@mipmap/ic_launcher'),
           iOS: DarwinInitializationSettings(),
         ),
+        onDidReceiveNotificationResponse: (response) {
+          // 点按通知 → 回调（App 在前台/后台运行时走这里；冷启动的终止态
+          // 由原生 launch intent 携带，见 MainActivity 的处理）。
+          final payload = response.payload;
+          if (payload != null && payload.isNotEmpty) {
+            onSelectNotification?.call(payload);
+          }
+        },
       );
       _pluginReady = true;
       _lastError = null;
@@ -152,11 +166,15 @@ class NotificationService {
   /// * 高重要性渠道只用于「需要用户立刻处理」的事件（审批、提问），其余用低重要性，
   ///   否则每条消息都弹横幅会让人关掉通知。
   /// * 不使用 [title] 为空的调用；空标题在某些 ROM 上会显示成应用名，体验很差。
+  ///
+  /// [payloadSessionId]：点按通知要直达的会话 id。编码进 payload
+  /// （`session:<id>`），由 App 顶层的通知点击监听解码并导航。
   Future<void> show({
     required String title,
     required String body,
     NotificationKind kind = NotificationKind.info,
     bool onlyWhenBackground = true,
+    String? payloadSessionId,
   }) async {
     if (!_granted) {
       _lastError = '没有通知权限，通知未发出';
@@ -190,7 +208,9 @@ class NotificationService {
             autoCancel: true,
           ),
         ),
-        payload: kind.name,
+        payload: payloadSessionId != null && payloadSessionId.isNotEmpty
+            ? 'session:${kind.name}:$payloadSessionId'
+            : kind.name,
       );
       _lastError = null;
     } catch (e) {

@@ -8,6 +8,14 @@ import assert from 'node:assert/strict';
 import { apiRequest } from '../helpers/client.js';
 import { CONFIG } from '../helpers/fixtures.js';
 
+// Derive the expected port from BRIDGE_URL instead of hardcoding 3088.
+// These two assertions used to be `assert.equal(res.data.port, 3088)`, which
+// vetoed the very override mechanism fixtures.js provides: point BRIDGE_URL at
+// any other port (a container, a second instance, an ephemeral port) and TC1/TC2
+// failed even though the bridge behaved correctly. That is the single biggest
+// blocker to running the e2e suite in CI against a throwaway stack.
+const EXPECTED_PORT = Number(new URL(CONFIG.BRIDGE_URL).port || 3088);
+
 describe('Tier 1 - Health & Authentication', () => {
 
   it('TC1: Unauthenticated GET /health returns HTTP 401 with code 401 and authenticated: false', async () => {
@@ -17,7 +25,7 @@ describe('Tier 1 - Health & Authentication', () => {
     assert.equal(res.data.authenticated, false);
     assert.equal(res.data.code, 401);
     assert.equal(typeof res.data.name, 'string');
-    assert.equal(res.data.port, 3088);
+    assert.equal(res.data.port, EXPECTED_PORT, 'health must report the port it is actually bound to');
   });
 
   it('TC2: Authenticated GET /health with Authorization Bearer header returns code 0 and ok: true', async () => {
@@ -28,7 +36,7 @@ describe('Tier 1 - Health & Authentication', () => {
     assert.equal(res.data.ok, true);
     assert.equal(res.data.authenticated, true);
     assert.equal(res.data.code, 0);
-    assert.equal(res.data.port, 3088);
+    assert.equal(res.data.port, EXPECTED_PORT, 'health must report the port it is actually bound to');
     assert.equal(typeof res.data.dshPort, 'number');
     assert.ok(res.data.time, 'Should contain ISO timestamp');
   });

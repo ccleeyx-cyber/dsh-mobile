@@ -19,6 +19,14 @@
 class AppVersion {
   const AppVersion._();
 
-  static const String version = '1.10.6';
-  static const String buildNumber = '28';
+  static const String version = '1.11.0';
+  static const String buildNumber = '29';
+}
+
+/// 服务层使用的别名常量（import 路径更短，且未来若改为生成式定义只动这里）。
+class AppVersionConst {
+  const AppVersionConst._();
+
+  static const String version = AppVersion.version;
+  static const String buildNumber = AppVersion.buildNumber;
 }

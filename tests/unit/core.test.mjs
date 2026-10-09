@@ -9,7 +9,7 @@
  * Runs without a live bridge — `node --test tests/unit/core.test.mjs`.
  */
 
-import { describe, it } from 'node:test';
+import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -35,6 +35,14 @@ import {
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-core-test-'));
 const WS_ROOT = path.join(TMP, 'workspace');
 fs.mkdirSync(WS_ROOT, { recursive: true });
+
+// The mkdtempSync above was never paired with a removal, so every run of this
+// file leaked one directory into the system temp dir — 18 had piled up by
+// 2026-10-08. The other two unit suites (delete-session, smoke-bridge) do clean
+// up after themselves; this was the only one that did not.
+after(() => {
+  try { fs.rmSync(TMP, { recursive: true, force: true }); } catch { /* ignore */ }
+});
 
 describe('core: path sanitization (F4.5)', () => {
   const sanitize = createPathSanitizer({

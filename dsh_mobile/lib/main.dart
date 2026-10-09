@@ -51,6 +51,20 @@ void main() async {
   // NotificationService 自己持有。
   unawaited(NotificationService.instance.init());
 
+  // 点按通知 → 直达对应会话。payload 形如 `session:<kind>:<sessionId>`。
+  // 回调先暂存到静态字段：navigatorKey 在 runApp 之后才可用（冷启动时点按
+  // 通知到达得比第一帧还早），MainShell 挂载后第一件事消费它。
+  NotificationService.instance.onSelectNotification = (payload) {
+    if (payload.startsWith('session:')) {
+      final parts = payload.split(':');
+      if (parts.length >= 3) {
+        pendingNotificationSessionId = parts.sublist(2).join(':');
+      }
+    }
+    // MainShell 处于运行态时立即触发一次消费（后台点击）。
+    pendingNotificationSink?.call();
+  };
+
   runApp(
     MultiProvider(
       providers: [
@@ -61,6 +75,15 @@ void main() async {
     ),
   );
 }
+
+/// 待跳转的会话 id（来自点按的通知）。消费后置 null。
+String? pendingNotificationSessionId;
+
+/// MainShell 注册的"有新跳转"触发器（后台点击通知时，App 已在前台运行）。
+void Function()? pendingNotificationSink;
+
+/// 全局 navigator key —— 通知跳转需要无 BuildContext 的导航出口。
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
 /// 主题模式控制器（v1.6.0 深色模式）。
 ///
@@ -148,6 +171,8 @@ class _MyAppState extends State<MyApp> {
     return MaterialApp(
       title: 'DSH Mobile',
       debugShowCheckedModeBanner: false,
+      // 通知点按跳转需要无 context 的导航出口。
+      navigatorKey: navigatorKey,
       theme: buildLightTheme(),
       // 真的深色主题（v1.6.0）。此前这里是一个亮色主题的逐字副本，永远不会被
       // 使用，只让读代码的人以为支持深色。

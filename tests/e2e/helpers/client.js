@@ -67,9 +67,20 @@ export async function apiRequest(endpoint, {
         const sid = data.sessionId ?? data.session?.sessionId;
         if (sid) await trackCreatedSession(String(sid), body?.workspaceId ?? null);
       } else if (endpoint.includes('/sessions/prompt')) {
-        // A prompt creates the session implicitly when the id was unknown.
-        const sid = body?.sessionId;
-        if (sid && typeof sid === 'string' && !sid.startsWith('session-') && sid !== 'default') {
+        // A prompt creates the session implicitly when the caller did not supply
+        // an id. Trust the RESPONSE id, not the request id: an id the caller
+        // supplied almost certainly names a session that already existed, and
+        // archiving it would hide the user's real work.
+        //
+        // This used to be `!sid.startsWith('session-')` on the REQUEST body, a
+        // heuristic that is exactly backwards: real engine ids are
+        // `session-<uuid>` — 1896 of 2321 (82%) in the live workspace.json — so
+        // the filter discarded the very ids the tracker existed to catch and the
+        // sessions piled up.
+        const newSid = data.sessionId ?? data.session?.sessionId;
+        const suppliedSid = typeof body?.sessionId === 'string' ? body.sessionId : null;
+        const sid = newSid && String(newSid) !== suppliedSid ? String(newSid) : null;
+        if (sid && sid !== 'default') {
           await trackCreatedSession(sid, body?.workspaceId ?? null);
         }
       }

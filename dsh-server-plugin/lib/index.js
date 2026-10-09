@@ -17,9 +17,9 @@ import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 
 import {
-  loadConfig, saveConfig, verifyToken, ensureDataDir, dshHome, audit, readAudit,
+  loadConfig, saveConfig, verifyToken, findDeviceByToken, ensureDataDir, dshHome, audit, readAudit,
   loadDevices, saveDevices, touchDevice, revokeDevice,
-  newPairCode, pairCodeTtlMs, newToken, hashToken,
+  newPairCode, pairCodeTtlMs, newToken, hashToken, roleCanWrite,
   loadPermissions, savePermissions, permissionsFile
 } from './store.mjs';
 import { installRpc, RPC_CHANNEL, ENDPOINTS } from './rpc.mjs';
@@ -31,24 +31,30 @@ import {
   createFollowerRegistry,
   createTurnRegistry,
   createPersonaStore,
+  createSnippetStore,
   createPathSanitizer,
   createPermissionStore,
   createCookieFactory,
   createRpcCaller,
+  createProjCacheReader,
   isCommandReadOnly,
+  classifyCommand,
   coerceToolInput,
   isCarriedContext,
   authenticateRequest,
   readBodyWithLimit,
   parseJsonBody,
   deleteSession,
+  archiveSession,
+  renameSession,
+  assertSessionId,
   configurePersistence,
   configurePermissionsPersistence
 } from './core.mjs';
 
 // Inject the persistence helpers core needs; core must not import store.mjs
 // because store imports core (audit sink).
-configurePersistence({ verifyToken });
+configurePersistence({ verifyToken, findDeviceByToken });
 configurePermissionsPersistence({
   load: loadPermissions,
   save: savePermissions,
@@ -129,6 +135,28 @@ function resolveInternalSecret() {
   }
 }
 
+/**
+ * Upper bound on a mobile socket's send buffer before the gateway drops it.
+ *
+ * There is no other writer on this connection: it carries deltas, tool results,
+ * todo snapshots and question frames. A phone that loses signal — or is merely
+ * slower than a fast assistant stream — would otherwise grow the gateway's heap
+ * until the whole dsh web process died, taking every session on the box with it.
+ * Dropping one stalled client is strictly better than that.
+ *
+ * Exported so the threshold can be unit-tested directly: `bufferedAmount` on a
+ * real socket is a read-only getter, so a test cannot reach this condition by
+ * sending bytes and hoping the kernel buffer fills. Without this seam the only
+ * possible test would be a vacuous one.
+ */
+export const MAX_CLIENT_BUFFER_BYTES = 8 * 1024 * 1024;
+
+export function shouldDivertForBackpressure(bufferedAmount) {
+  return typeof bufferedAmount === 'number'
+    && Number.isFinite(bufferedAmount)
+    && bufferedAmount > MAX_CLIENT_BUFFER_BYTES;
+}
+
 export function apply(ctx, config = {}, internals = {}) {
   const logger = ctx.logger?.(name) ?? console;
   const cfg = loadConfig();
@@ -164,6 +192,17 @@ export function apply(ctx, config = {}, internals = {}) {
   let pairSession = internals.pairSession ?? null;
 
   /**
+   * Projection-cache reader with mtime memoization.
+   *
+   * getWorkspacesData() reads a JSON cache file per session (~1000 files on
+   * this box) on every workspace fetch, and the phone polls that every 3
+   * seconds. This plugin runs inside the dsh web process, so all those
+   * readFileSync + JSON.parse calls blocked the engine's event loop. With the
+   * memo an unchanged file costs one statSync.
+   */
+  const projCacheReader = createProjCacheReader({ dir: path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions') });
+
+  /**
    * Signed-cookie minting and unary RPC live in core so both entry points speak
    * to the engine identically.  [unified]
    */
@@ -179,14 +218,127 @@ export function apply(ctx, config = {}, internals = {}) {
 
   const callDshRpc = createRpcCaller({ dshPort, cookieFactory });
 
+  /**
+   * 单次上传的字节上限。
+   *
+   * 为什么是 32MB：JSON 控制指令那条路的上限是 2MB，但附件不是控制指令 ——
+   * 手机拍的照片、导出的 PDF/日志都可能到十几 MB。给一个宽但不失控的上限，
+   * 并且**超限时立刻断开连接**而不是等收完再拒绝（否则白白浪费一次几 MB 的上行）。
+   */
+  const MAX_UPLOAD_BYTES = 32 * 1024 * 1024;
+
+  /**
+   * 把原始字节转发到引擎的文件上传路由。
+   *
+   * 引擎侧有这条 HTTP 路由（不是 RPC）：
+   *   POST /api/session/uploadFileBinary?sessionId=&name=
+   *   Content-Type: application/octet-stream
+   *   → { ok: true, value: { receiptId, file } }
+   *
+   * 拿到的 receiptId 之后要放进 prompt 的 content 里（`{type:'file',receiptId}`），
+   * 这样引擎才会把它当成这次提问的附件。
+   */
+  function uploadFileToEngine({ sessionId, name, data }) {
+    return new Promise((resolve, reject) => {
+      const authority = `127.0.0.1:${dshPort}`;
+      const cookie = cookieFactory.current();
+      const qs = new URLSearchParams();
+      qs.set('sessionId', sessionId);
+      if (name) qs.set('name', name);
+
+      const req = http.request({
+        host: '127.0.0.1',
+        port: dshPort,
+        path: `/api/session/uploadFileBinary?${qs.toString()}`,
+        method: 'POST',
+        headers: {
+          Host: authority,
+          Cookie: cookie,
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': data.length
+        },
+        // 上传比普通 RPC 慢得多，给足时间，别用 10s 的默认值。
+        timeout: 120000
+      }, (res) => {
+        let body = '';
+        res.on('data', (c) => { body += c; });
+        res.on('end', () => {
+          let parsed;
+          try {
+            parsed = JSON.parse(body);
+          } catch {
+            reject(new Error(`引擎上传响应无法解析 (HTTP ${res.statusCode}): ${body.slice(0, 120)}`));
+            return;
+          }
+          if (parsed?.ok === true && parsed.value) {
+            resolve(parsed.value);
+          } else {
+            // 把引擎的业务错误原样带出去，不要吞成一句"上传失败" ——
+            // 例如 FILE_TOO_LARGE / UNSUPPORTED_MEDIA_TYPE 都是用户能自己纠正的。
+            const err = parsed?.error || {};
+            reject(new Error(err.message || `上传被拒绝 (HTTP ${res.statusCode})`));
+          }
+        });
+      });
+
+      req.on('error', reject);
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('上传到引擎超时'));
+      });
+      req.write(data);
+      req.end();
+    });
+  }
+
   const activePrompts = new Map();
   const sessionTurnSeqs = new Map();
   const cancelledTurnSeqs = new Map();
   const lastCancelTimes = new Map();
 
+  /** Upload rate buckets: device id / ip → { windowStart, count }. */
+  const uploadBuckets = new Map();
+
   const sessionFollowers = new Map();
   const pendingApprovals = new Map();
   let approvalCounter = 1;
+
+  /* -------------------------------------------------------------- *
+   * user-questions pending requests (0003).
+   *
+   * `user-questions/request` arrives as a waterfall value on the $events
+   * stream. The answer does NOT travel back as a returned value or a
+   * `next()` call: neither can survive the JSON hop, so the gateway
+   * answers over `$events/result` with the same
+   * `{kind:'result', value}` shape the auto-approve path uses.
+   *
+   * This map is therefore bookkeeping for the PHONE's benefit only — it
+   * drives the replay a late-connecting client receives and decides when
+   * a prompt stops being offered. The engine owns the actual pending
+   * request and resolves it by event id.
+   *
+   * Each entry records which subscribers it was offered to. With more than
+   * one phone paired, one phone disconnecting must NOT clear prompts that
+   * are still on screen on the other phone — the old code relinquished
+   * every pending question on any subscriber's close.
+   * -------------------------------------------------------------- */
+  const pendingQuestions = new Map();
+
+  /** Clients that want question frames. A phone with no open session still may. */
+  const questionSubscribers = new Set();
+
+  /**
+   * How long a question is offered to the phones before the gateway stops
+   * tracking it.
+   *
+   * This is NOT a promise deadline — the answer is delivered to the engine over
+   * `$events/result`, exactly like an approval, so there is no local promise to
+   * time out. The only thing a stale entry does is show up in the replay a
+   * late-connecting phone receives. Expiring it keeps that replay honest.
+   *
+   * Generous on purpose: a human reading a plan-review prompt deserves minutes.
+   */
+  const QUESTION_TTL_MS = 30 * 60 * 1000;
 
   /* -------------------------------------------------------------- *
    * Shared core wiring (see lib/core.mjs).
@@ -208,6 +360,8 @@ export function apply(ctx, config = {}, internals = {}) {
   });
   /** Agent personas were only served by the standalone gateway. [unified] */
   const personaStore = createPersonaStore({ home: dshHomeDir });
+  /** Prompt snippets (quick replies), persisted beside personas. */
+  const snippetStore = createSnippetStore({ home: dshHomeDir });
   /** Single permission store; persists to ~/.dsh/mobile-access/permissions.json. */
   const permStore = createPermissionStore();
   const connectedClients = new Set();
@@ -415,17 +569,16 @@ export function apply(ctx, config = {}, internals = {}) {
 
     let updated = false;
     for (const cPath of candidates) {
-      if (fs.existsSync(cPath)) {
+      const cache = projCacheReader.readJson(cPath);
+      if (cache && cache.record && cache.record.rows) {
         try {
-          const cache = JSON.parse(fs.readFileSync(cPath, 'utf8'));
-          if (cache.record && cache.record.rows) {
-            if (!cache.record.rows.modelSelection) cache.record.rows.modelSelection = { val: {} };
-            if (!cache.record.rows.modelSelection.val) cache.record.rows.modelSelection.val = {};
-            cache.record.rows.modelSelection.val.lastUsed = { provider: 'wb', model: modelId };
-            fs.writeFileSync(cPath, JSON.stringify(cache, null, 2), 'utf8');
-            updated = true;
-            break;
-          }
+          if (!cache.record.rows.modelSelection) cache.record.rows.modelSelection = { val: {} };
+          if (!cache.record.rows.modelSelection.val) cache.record.rows.modelSelection.val = {};
+          cache.record.rows.modelSelection.val.lastUsed = { provider: 'wb', model: modelId };
+          fs.writeFileSync(cPath, JSON.stringify(cache, null, 2), 'utf8');
+          projCacheReader.invalidate(cPath); // we just changed the mtime/content
+          updated = true;
+          break;
         } catch (err) {
           logger.error('[SessionModel] Error updating cache file:', cPath, err);
         }
@@ -435,11 +588,41 @@ export function apply(ctx, config = {}, internals = {}) {
     return updated;
   }
 
-  function getWorkspacesData() {
+  /**
+   * @param {object} [opts]
+   * @param {'exclude'|'only'|'include'} [opts.archived='exclude']
+   *   Which sessions to emit, by archived state. 'exclude' reproduces the
+   *   original behaviour exactly and is what every existing caller gets —
+   *   including the workspace-memory path guard above, which must keep seeing
+   *   the same workspace list it always has.
+   *
+   * Filtering happens server-side on purpose. This box has 2322 registered
+   * sessions of which 1338 are archived, so returning them unconditionally would
+   * grow a payload the phone re-fetches on a timer by ~2.4x. The client asks for
+   * one mode at a time instead.
+   */
+  function getWorkspacesData(opts = {}) {
+    const mode = (opts && (opts.archived === 'only' || opts.archived === 'include'))
+      ? opts.archived
+      : 'exclude';
+
     const workspaceJsonPath = path.join(dshHomeDir, 'storages', 'workspace.json');
     const projCacheDir = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions');
 
     if (!fs.existsSync(workspaceJsonPath)) return [];
+
+    // getSettingsData() is a synchronous readFileSync + YAML.parse of
+    // cordis.patch.yml, and it used to be called from inside the per-session loop
+    // for every session with an empty model — i.e. up to once per row, re-parsing
+    // the same file each time. It is a global setting that cannot vary by session,
+    // so resolve it at most once per call, and only if some session needs it.
+    let fallbackModel = null;
+    const getFallbackModel = () => {
+      if (fallbackModel === null) {
+        fallbackModel = getSettingsData().currentModel || 'cn:deepseek-v4.1-flash';
+      }
+      return fallbackModel;
+    };
 
     try {
       const rawWs = JSON.parse(fs.readFileSync(workspaceJsonPath, 'utf8'));
@@ -450,13 +633,21 @@ export function apply(ctx, config = {}, internals = {}) {
       for (const [wsId, wsInfo] of Object.entries(wsTable)) {
         const sessionIds = wsInfo.sessionIds || [];
         const sessionList = [];
+        // Counted in every mode, including 'exclude', so the phone can badge
+        // "已归档 N 条" without issuing a second request. Cost is one Set lookup
+        // per session — no extra I/O.
+        let archivedCount = 0;
 
         for (const sId of sessionIds) {
           const cleanId = sId.startsWith('session-') ? sId.replace('session-', '') : sId;
-          // 过滤已归档的会话（与 Web 端 SessionTree 保持一致）
-          if (archivedSessionIds.has(sId) || archivedSessionIds.has(cleanId) || archivedSessionIds.has(`session-${cleanId}`)) {
-            continue;
-          }
+          // 归档名单默认隐藏（与 Web 端 sessionVisible 的 !archived.has(s.id) 一致）。
+          // 三种写法都要查：原样 id、去掉 session- 前缀、以及补上前缀的形式。
+          const isArchived = archivedSessionIds.has(sId)
+            || archivedSessionIds.has(cleanId)
+            || archivedSessionIds.has(`session-${cleanId}`);
+          if (isArchived) archivedCount++;
+          if (isArchived && mode === 'exclude') continue;
+          if (!isArchived && mode === 'only') continue;
 
           const candidates = [
             path.join(projCacheDir, `${sId}.json`),
@@ -470,32 +661,64 @@ export function apply(ctx, config = {}, internals = {}) {
             firstPrompt: '',
             lastPromptAt: 0,
             model: '',
-            lastSeq: 0
+            lastSeq: 0,
+            // Emitted in every mode so an 'include' response stays self-describing
+            // and the client can badge rows without a second lookup.
+            archived: isArchived
           };
           let isBlankSession = false;
+          let isSubagentSession = false;
 
           for (const cPath of candidates) {
-            if (fs.existsSync(cPath)) {
-              try {
-                const cache = JSON.parse(fs.readFileSync(cPath, 'utf8'));
-                const rows = cache.record?.rows || {};
-                // Web 端 sessionVisible: 排除 blank 会话（未输入任何 prompt 的空会话）
-                if (rows.sessionListMetadata?.val?.blank === true && !rows.titleInput?.val?.first?.text) {
-                  isBlankSession = true;
-                }
-                sessionMeta.title = rows.title?.val || rows.titleInput?.val?.first?.text || '新会话';
-                sessionMeta.firstPrompt = rows.titleInput?.val?.first?.text || '';
-                sessionMeta.lastPromptAt = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
-                sessionMeta.model = rows.modelSelection?.val?.lastUsed?.model || '';
-                const follower = getSessionFollower(sId);
-                const isRecentlyPrompted = activePrompts.has(sId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
-                const lastActivity = sessionMeta.lastPromptAt || 0;
-                const isRecentActivity = (Date.now() - lastActivity) < 45000;
-                const isOpenTurnActive = rows.turnBoundary?.val?.openTurnStartSeq != null && isRecentActivity;
-                sessionMeta.isRunning = (follower && follower.isRunning) || isRecentlyPrompted || isOpenTurnActive;
-                break;
-              } catch (err) {}
+            // mtime-memoized read: an unchanged cache file costs one statSync
+            // instead of readFileSync + JSON.parse (this loop runs ~1000 times
+            // per workspace poll, every 3 seconds, inside the engine process).
+            const cache = projCacheReader.readJson(cPath);
+            if (cache) {
+              const rows = cache.record?.rows || {};
+              // Web 端 sessionVisible: 排除 blank 会话（未输入任何 prompt 的空会话）
+              if (rows.sessionListMetadata?.val?.blank === true && !rows.titleInput?.val?.first?.text) {
+                isBlankSession = true;
+              }
+              // Web 端 sessionVisible 的**第一条**规则：origin === 'subagent'
+              // 一律隐藏（见 dsh-client-ui-workspace/lib/client.js:358）。
+              //
+              // 判据取自 projcache 的 subagent.identity。权威的 origin 字段在引擎的
+              // session header 里，而网关是直接读 workspace.json + projcache 的，
+              // 读不到那个字段。已验证该信号与
+              // subagentCatalog.inheritedEventCount>0 在 310 条里对齐 309 条，
+              // 且不会命中普通会话（2127 条普通会话全无此字段）。
+              if (rows.subagent?.val?.identity) {
+                isSubagentSession = true;
+              }
+              sessionMeta.title = rows.title?.val || rows.titleInput?.val?.first?.text || '新会话';
+              sessionMeta.firstPrompt = rows.titleInput?.val?.first?.text || '';
+              sessionMeta.lastPromptAt = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
+              sessionMeta.model = rows.modelSelection?.val?.lastUsed?.model || '';
+              const follower = getSessionFollower(sId);
+              const isRecentlyPrompted = activePrompts.has(sId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
+              const lastActivity = sessionMeta.lastPromptAt || 0;
+              const isRecentActivity = (Date.now() - lastActivity) < 45000;
+              const isOpenTurnActive = rows.turnBoundary?.val?.openTurnStartSeq != null && isRecentActivity;
+              sessionMeta.isRunning = (follower && follower.isRunning) || isRecentlyPrompted || isOpenTurnActive;
+              break;
             }
+          }
+
+          // subagent 会话在 Web 端等同于不存在，手机端此前却会列出来。
+          // 实测：注册会话 2324 条，其中 subagent 321 条（one-shot 317 / continuable 4），
+          // 且这 321 条里 0 条已归档 —— 所以只有「未归档」的数字对不上，
+          // 「已归档」两边一致。这与用户观察到的现象完全吻合。
+          //
+          // 注意这里**不**回收 archivedCount。看起来"隐藏了就不该计数"更整齐，
+          // 但那会让 archivedCount 随请求的 mode 变化：archived+subagent 的会话在
+          // exclude 模式下于上面的 mode 过滤就被 continue 掉了（不会走到这里），
+          // 在 only/include 模式下才会走到 —— 于是同一个徽标在三种模式里给出两个
+          // 不同的数。archivedCount 的设计约束是"与请求模式无关"，宁可保留这个
+          // 约束：唯一的代价是一个已归档的 subagent 会被计数但不出现在列表里，
+          // 而实测这种会话在本机是 0 条。
+          if (isSubagentSession) {
+            continue;
           }
 
           // 如果是尚未开始对话的空白会话且没有正在运行，与 Web 端保持一致进行过滤
@@ -504,7 +727,7 @@ export function apply(ctx, config = {}, internals = {}) {
           }
 
           if (!sessionMeta.model) {
-            sessionMeta.model = getSettingsData().currentModel || 'cn:deepseek-v4.1-flash';
+            sessionMeta.model = getFallbackModel();
           }
           const pendingForSession = coreApprovals.list().filter(a => {
             const aId = a.sessionId || '';
@@ -524,7 +747,13 @@ export function apply(ctx, config = {}, internals = {}) {
           path: wsInfo.path || '',
           createdAt: wsInfo.createdAt,
           updatedAt: wsInfo.updatedAt,
+          // Number of sessions in THIS response, i.e. after the mode filter and
+          // the blank-session filter. Always === sessions.length.
           sessionCount: sessionList.length,
+          // Total archived sessions registered in this workspace, independent of
+          // the requested mode, so the client can show "已归档 N 条" while it is
+          // looking at the unarchived list.
+          archivedCount: archivedCount,
           pendingApprovals: wsPendingCount,
           hasRunning: wsHasRunning,
           sessions: sessionList
@@ -550,12 +779,8 @@ export function apply(ctx, config = {}, internals = {}) {
 
     let cacheData = null;
     for (const cPath of candidates) {
-      if (fs.existsSync(cPath)) {
-        try {
-          cacheData = JSON.parse(fs.readFileSync(cPath, 'utf8'));
-          break;
-        } catch (err) {}
-      }
+      cacheData = projCacheReader.readJson(cPath);
+      if (cacheData) break;
     }
 
     const messages = [];
@@ -744,13 +969,208 @@ export function apply(ctx, config = {}, internals = {}) {
     };
   }
 
-  function broadcastToMobileClients(msg) {
+    function broadcastToMobileClients(msg) {
     const raw = typeof msg === 'string' ? msg : JSON.stringify(msg);
+    // Session-scoped frames only go to sockets that followed that session.
+    // Every socket used to receive every session's deltas and tool frames and
+    // discarded them client-side — wasted radio for the phone, wasted writes
+    // for the gateway. Broad frames (session_status with no id, todo/permission
+    // broadcasts, question frames to subscribers) pass through untouched.
+    const scopeId = msg && typeof msg === 'object' ? (msg.sessionId || null) : null;
     for (const ws of connectedClients) {
       if (ws.readyState === WebSocket.OPEN) {
+        if (scopeId && ws.sessionId &&
+            !sessionIdMatchesSafe(ws.sessionId, scopeId)) {
+          continue; // this phone is following a different session
+        }
+        // [P1] Backpressure. A socket that cannot keep up used to accumulate in
+        // the send buffer forever, because there is no other writer on this
+        // connection: the mobile socket carries deltas, tool results and now
+        // question frames. A phone that loses signal — or is simply slower than
+        // a fast assistant stream — would grow the gateway's heap until the whole
+        // dsh web process dies. Dropping one slow client is strictly better than
+        // killing every session on the box. 8 MB is far above any healthy burst:
+        // a normal stream drains at network speed long before this.
+        const buffered = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
+        if (shouldDivertForBackpressure(buffered)) {
+          logger.warn('dsh-mobile-bridge: 客户端发送缓冲积压 %d B，断开以保护网关', buffered);
+          try { ws.close(1013, 'backpressure'); } catch (_) {}
+          connectedClients.delete(ws);
+          questionSubscribers.delete(ws);
+          continue;
+        }
         try { ws.send(raw); } catch (_) {}
       }
     }
+  }
+
+  /** Case-insensitive session comparison without importing per call. */
+  function sessionIdMatchesSafe(a, b) {
+    const na = String(a).replace(/^session-/, '').toLowerCase();
+    const nb = String(b).replace(/^session-/, '').toLowerCase();
+    return na === nb;
+  }
+
+  /**
+   * Emit a frame only to the clients that asked for it.
+   *
+   * Unlike broadcastToMobileClients, this never grows the fan-out for clients
+   * that did not opt in. Used for question frames so a second phone that is
+   * merely browsing the session list is not handed interactive prompts it will
+   * never answer — those requests would otherwise sit blocked until they time
+   * out on the engine side.
+   */
+  function sendToSubscribers(msg, subs) {
+    const raw = typeof msg === 'string' ? msg : JSON.stringify(msg);
+    for (const ws of subs) {
+      if (ws.readyState !== WebSocket.OPEN) {
+        subs.delete(ws);
+        continue;
+      }
+      const buffered = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
+      if (shouldDivertForBackpressure(buffered)) {
+        try { ws.close(1013, 'backpressure'); } catch (_) {}
+        connectedClients.delete(ws);
+        subs.delete(ws);
+        continue;
+      }
+      try { ws.send(raw); } catch (_) {}
+    }
+  }
+
+  /**
+   * Deliver a phone's answer to the engine.
+   *
+   * The answer travels over `$events/result` with `outcome.kind === 'result'`,
+   * which is the same mechanism the auto-approve path uses and the only one the
+   * engine accepts for a remote client. It deliberately does NOT use a local
+   * Promise: a `next` continuation cannot survive the JSON hop, so any
+   * promise-based design here would look correct in a unit test and hang in
+   * production.
+   */
+  async function handleQuestionAnswer(eventId, answer) {
+    const pending = pendingQuestions.get(eventId);
+    if (!pending) return { ok: false, error: 'unknown-question' };
+    // Delete only AFTER a successful RPC below — an rpc-failed keeps the
+    // entry so the phone (or another subscriber) can retry.
+    const value = { answers: Array.isArray(answer?.answers) ? answer.answers : [] };
+    try {
+      // ⚠️ payload **只能有 `args` 这一个字段**，别把 clientId/eventId/outcome
+      // 再平铺一份到外层。
+      //
+      // 这是「手机上点了选项没反应」的真凶（审批回传同一处，见 handleApprovalRespond）。
+      // 引擎侧是这样校验的（dsh-api-gateway 的 parseRemoteEventResultPayload）：
+      //
+      //     if (!isPlainObject(payload)
+      //         || Reflect.ownKeys(payload).length !== 1      // ← 恰好 1 个 key
+      //         || !Object.hasOwn(payload, 'args')) {
+      //       throw new Error('... requires exactly one plain-object args field');
+      //     }
+      //     return parseRemoteEventResult(payload.args);     // args 内再要 exactKeys
+      //
+      // 而 args 内部必须恰好是 clientId / eventId / outcome 三个键，value 是
+      // lossless JSON。之前多带的那三个平铺字段会让整个形状被拒，报错被 catch
+      // 吞成一句 'rpc-failed' —— 手机端只看到"点了没反应"。
+      await callDshRpc('$events/result', {
+        args: {
+          clientId: currentEventsClientId,
+          eventId,
+          outcome: { kind: 'result', value }
+        }
+      });
+    } catch (err) {
+      audit('question/answer-failed', { eventId, sessionId: pending.sessionId, error: err?.message });
+      // rpc-failed ≠ the question is gone. The engine still holds the request
+      // open, so KEEP the entry: the phone can retry. (The client must not
+      // remove its card on this error either — see its question_ack handler.)
+      return { ok: false, error: 'rpc-failed', retryable: true };
+    }
+
+    sendToSubscribers({ type: 'question_settled', eventId, ok: true }, questionSubscribers);
+    pendingQuestions.delete(eventId);
+    audit('question/answered', { eventId, sessionId: pending.sessionId, count: value.answers.length });
+    return { ok: true, eventId };
+  }
+
+  /**
+   * Stop offering a question without answering it.
+   *
+   * Crucially this does NOT send an empty answer. Sending `{answers: []}` would
+   * tell the agent the human replied with nothing — a different and false
+   * statement. Leaving the request unanswered is what lets the engine's
+   * waterfall fall through to the Web UI answerer, which is the honest outcome
+   * when the phone is gone.
+   *
+   * When `fromWs` is provided (a specific subscriber disconnected), the entry
+   * is only relinquished if no OTHER live subscriber was also offered it; the
+   * remaining phones keep their cards and can still answer. Only when the last
+   * holder goes away does the prompt fall back to the Web UI.
+   */
+  function relinquishQuestion(eventId, why, fromWs = null) {
+    const pending = pendingQuestions.get(eventId);
+    if (!pending) return false;
+    if (fromWs) {
+      pending.offeredTo?.delete(fromWs);
+      const stillOffered = [...(pending.offeredTo || [])].some((ws) =>
+        questionSubscribers.has(ws) && ws.readyState === WebSocket.OPEN);
+      if (stillOffered) return false; // another phone still holds it
+    }
+    pendingQuestions.delete(eventId);
+    audit('question/relinquished', { eventId, sessionId: pending.sessionId, why });
+    return true;
+  }
+
+  /** Questions still worth offering, newest last. Expired ones are pruned. */
+  function livePendingQuestions() {
+    const now = Date.now();
+    const out = [];
+    for (const q of pendingQuestions.values()) {
+      if (now - q.createdAt > QUESTION_TTL_MS) {
+        pendingQuestions.delete(q.eventId);
+        continue;
+      }
+      out.push({ eventId: q.eventId, sessionId: q.sessionId, questions: q.questions });
+    }
+    return out;
+  }
+
+  /**
+   * Forward the session-scoped events the phone now renders. Returns true when
+   * the event was consumed.
+   *
+   * Both of these ride the SESSION log (`agent.session.append('todo/write')`),
+   * so depending on how the engine multiplexes they can arrive on the per-session
+   * follow stream OR the shared $events stream. Handling them in one helper
+   * called from both is the only way neither path can silently drop them — the
+   * follow-stream branch ends in a bare `return`, so a `todo/write` that lands
+   * there would otherwise vanish with no error anywhere.
+   */
+  function forwardSessionEvent(val, fallbackSessionId) {
+    if (val.type !== 'event' || !val.event) return false;
+    const data = val.data || val.payload || {};
+    const sessionId = val.agent || val.agentId || val.sessionId || data.sessionId || fallbackSessionId || 'default';
+
+    if (val.event === 'todo/write') {
+      // Whole-list replacement, not a delta. An empty array is meaningful (the
+      // list was cleared) and is broadcast; a frame with no `todos` at all is
+      // not, because there is nothing to say.
+      if (!Array.isArray(data.todos)) return true;
+      broadcastToMobileClients({ type: 'todo_list', sessionId, todos: data.todos });
+      audit('todo/broadcast', { sessionId, count: data.todos.length });
+      return true;
+    }
+
+    if (val.event === 'session/attachment') {
+      // Metadata only. The bytes stay on the host; the phone fetches them via the
+      // authenticated attachment route, so a large inline blob never crosses the
+      // MUX hop.
+      const attachment = data.attachment || data;
+      if (!attachment || typeof attachment !== 'object') return true;
+      broadcastToMobileClients({ type: 'attachment', sessionId, attachment });
+      return true;
+    }
+
+    return false;
   }
 
   let upstreamMuxWs = null;
@@ -808,13 +1228,21 @@ export function apply(ctx, config = {}, internals = {}) {
     upstreamMuxWs.on('message', (data) => {
       try {
         const msg = JSON.parse(data.toString());
-        handleUpstreamMuxMessage(msg);
+        handleUpstreamMuxMessage(msg).catch((err) => {
+        logger.warn('dsh-mobile-bridge: 处理上游帧失败 %s', err?.message || err);
+      });
       } catch (_) {}
     });
 
     upstreamMuxWs.on('close', () => {
       if (isDisposed) return;
       currentEventsClientId = null;
+      // The engine-side link is gone, so any answer we forward would go nowhere.
+      // Stop offering these rather than letting a phone answer into the void.
+      for (const q of [...pendingQuestions.values()]) {
+        relinquishQuestion(q.eventId, 'upstream-link-lost');
+      }
+      sendToSubscribers({ type: 'questions_invalidated', reason: 'upstream-link-lost' }, questionSubscribers);
       for (const follower of sessionFollowers.values()) {
         follower.subscribed = false;
       }
@@ -829,7 +1257,7 @@ export function apply(ctx, config = {}, internals = {}) {
     });
   }
 
-  function handleUpstreamMuxMessage(msg) {
+  async function handleUpstreamMuxMessage(msg) {
     if (!msg) return;
 
     // 1. Upstream MUX Item Frames (Standard DSH MUX protocol)
@@ -920,12 +1348,17 @@ export function apply(ctx, config = {}, internals = {}) {
             }
             broadcastToMobileClients({ type: 'tool_result', sessionId: sId, output: ev.data?.output || '执行完毕' });
           }
+          // todo/write and session/attachment also ride the session log. This
+          // branch ends in a bare `return`, so they must be offered here too or
+          // they disappear with no trace when the engine multiplexes them onto
+          // the follow stream.
+          forwardSessionEvent(val, sId);
           return;
         }
         return;
       }
 
-      // B. $events stream (approvals and requests)
+      // B. $events stream (approvals, questions and requests)
       if (msg.value) {
         const val = msg.value;
         if (val.type === 'ready') {
@@ -934,7 +1367,84 @@ export function apply(ctx, config = {}, internals = {}) {
           return;
         }
 
-        if (val.type === 'cancel' || val.event === 'approval/cancel') {
+        /* ---------------------------------------------------------- *
+         * user-questions/request — the agent is blocked waiting for a
+         * human. [0003]
+         *
+         * The answer goes back over `$events/result`, the same channel
+         * and the same `{kind:'result', value}` shape the auto-approve
+         * path already uses in production. NOT a local Promise: a
+         * `next` continuation cannot survive the JSON hop, so a
+         * promise-based design would pass a unit test and hang in
+         * production.
+         *
+         * When nobody can answer, the frame is simply left unanswered.
+         * That is what lets the engine's waterfall fall through to the
+         * Web UI answerer. Sending an empty answer instead would tell
+         * the agent the human replied with nothing.
+         * ---------------------------------------------------------- */
+        if (val.type === 'request' || val.type === 'waterfall') {
+          if (val.event === 'user-questions/request') {
+            const request = val.request || val.payload || val.data || {};
+            const questions = Array.isArray(request.questions) ? request.questions : [];
+            const sessionId = val.agent || val.agentId || val.sessionId || request.sessionId
+              || (request.agent && request.agent.id) || 'default';
+            // The engine resolves the waterfall by event id. A minted one would
+            // be rejected on the way back, so an id-less frame is unanswerable
+            // rather than merely inconvenient — say so instead of storing it and
+            // letting a phone answer into the void.
+            const eventId = val.id || val.eventId || request.id || null;
+
+            if (!eventId) {
+              logger.warn('[dsh-mobile-bridge] user-questions 帧缺少 id，无法代答，留给 Web UI');
+              audit('question/unanswerable', { sessionId, why: 'no-event-id' });
+              return;
+            }
+
+            if (questionSubscribers.size === 0) {
+              logger.info('[dsh-mobile-bridge] user-questions 无手机订阅者，留给 Web UI');
+              audit('question/relinquished', { eventId, sessionId, why: 'no-subscriber' });
+              return;
+            }
+
+            pendingQuestions.set(eventId, {
+              eventId,
+              sessionId,
+              questions,
+              createdAt: Date.now(),
+              // Which live subscriber sockets this prompt was offered to. A
+              // phone that goes away only takes down what it was shown.
+              offeredTo: new Set(questionSubscribers)
+            });
+
+            sendToSubscribers({
+              type: 'question_request',
+              eventId,
+              sessionId,
+              questions
+            }, questionSubscribers);
+            audit('question/requested', { eventId, sessionId, count: questions.length });
+            return;
+          }
+        }
+
+        // `todo/write` and `session/attachment` are SESSION events, matched on
+        // the event name alone — they are not waterfalls.
+        if (forwardSessionEvent(val, null)) return;
+
+        // A cancelled turn invalidates whatever it was waiting on.
+    if (val.type === 'cancel' || val.event === 'approval/cancel' || val.event === 'turn/cancel') {
+      const cancelEventId = val.eventId || val.id;
+      if (cancelEventId) relinquishQuestion(cancelEventId, 'engine-cancel');
+      // A cancel frame carries no event id for the question it invalidates, so
+      // a turn-level cancel has to clear whatever is still outstanding.
+      for (const q of [...pendingQuestions.values()]) {
+        relinquishQuestion(q.eventId, 'engine-cancel');
+      }
+      sendToSubscribers({ type: 'questions_invalidated', reason: 'engine-cancel' }, questionSubscribers);
+    }
+
+    if (val.type === 'cancel' || val.event === 'approval/cancel') {
           const eventId = val.eventId || val.id;
           if (eventId) {
             const appr = coreApprovals.get(eventId);
@@ -954,38 +1464,123 @@ export function apply(ctx, config = {}, internals = {}) {
 
         if ((val.type === 'request' || val.type === 'waterfall') && val.event === 'approval/request') {
           const eventId = val.id || val.eventId || val.request?.id || `appr_${approvalCounter++}`;
-          const sessionId = val.agent || val.agentId || 'default';
+          const sessionId = val.agent || val.agentId || val.sessionId || val.request?.sessionId || 'default';
           const toolName = val.request?.toolName || '工具执行';
           const reason = val.request?.reason || '申请工具执行权限';
           const callId = val.request?.callId || '';
           const input = coerceToolInput(val.request?.input ?? val.request?.arguments ?? val.request?.args ?? val.request?.command);
           const options = val.request?.options || null;
 
-          const sessionPolicy = getSessionPermission(sessionId);
+          // getSessionPermission() already delegates to permStore.forSession(),
+          // which resolves session policy first and falls back to global. It is
+          // therefore the EFFECTIVE policy, not merely the session-level one.
+          const effectivePolicy = getSessionPermission(sessionId);
+
+          // [P0] Resolve the command that is actually about to run.
+          //
+          // This used to default to `reason` — the model's own free-text
+          // justification — and only fell back to the real command if
+          // val.request.command happened to be a string. Anything the model
+          // wrote in `reason` was what got classified, so a reason of "ls"
+          // auto-approved an arbitrary destructive command under auto-read.
+          // `reason` is now never used as a command, and an unresolvable command
+          // fails CLOSED (no auto-approval) instead of failing open.
+          const cmdToCheck = (() => {
+            if (typeof val.request?.command === 'string' && val.request.command.trim()) {
+              return val.request.command;
+            }
+            if (typeof input === 'string' && input.trim()) return input;
+            if (input && typeof input === 'object') {
+              for (const k of ['command', 'cmd', 'script', 'shell', 'argv', 'args']) {
+                const v = input[k];
+                if (typeof v === 'string' && v.trim()) return v;
+                if (Array.isArray(v) && v.every((x) => typeof x === 'string') && v.length) return v.join(' ');
+              }
+              // A structured tool input we cannot reduce to a command line is not
+              // something a prefix whitelist can judge.
+              return null;
+            }
+            return null;
+          })();
+
           let shouldAutoApprove = false;
           let autoApproveReason = '';
 
-          if (sessionPolicy === 'danger-full-access' || globalPermissions.executionPolicy === 'danger-full-access') {
+          // [P0] Session precedence, not OR.
+          //
+          // Both branches used to read
+          //   sessionPolicy === 'X' || globalPermissions.executionPolicy === 'X'
+          // which re-ORed the global policy back on top of an already-resolved
+          // effective policy and destroyed the precedence. With the shipped
+          // default (global = 'auto-read'), a session explicitly set to 'ask'
+          // still hit the auto-read branch and was auto-approved — the app's
+          // per-session "ask" control was a placebo, and setSessionPermission()
+          // had no effect on the approval path at all.
+          if (effectivePolicy === 'danger-full-access') {
             shouldAutoApprove = true;
             autoApproveReason = '全信任模式 (Danger Full Access) 自动放行';
-          } else if (sessionPolicy === 'auto-read' || globalPermissions.executionPolicy === 'auto-read') {
-            let cmdToCheck = reason;
-            if (typeof val.request?.command === 'string') cmdToCheck = val.request.command;
-            else if (typeof input === 'string' && input) cmdToCheck = input;
-            if (isCommandReadOnly(cmdToCheck, toolName)) {
+          } else if (effectivePolicy === 'auto-read') {
+            if (cmdToCheck && isCommandReadOnly(cmdToCheck, toolName)) {
               shouldAutoApprove = true;
               autoApproveReason = '安全策略: 只读指令自动放行';
+            } else if (!cmdToCheck) {
+              audit('approval/auto-approve-skipped', {
+                id: eventId, sessionId, toolName,
+                why: 'no-resolvable-command',
+                policy: effectivePolicy
+              });
             }
           }
 
           if (shouldAutoApprove) {
-            callDshRpc('$events/result', {
-              clientId: currentEventsClientId,
-              eventId,
-              outcome: { kind: 'result', value: 'allowed-once' },
-              args: { clientId: currentEventsClientId, eventId, outcome: { kind: 'result', value: 'allowed-once' } }
-            }).catch(() => {});
-            audit('approval/auto-approved', { id: eventId, time: Date.now(), sessionId, toolName, command: reason, outcome: 'auto-approved', reason: autoApproveReason });
+            // payload 只能有 `args` 一个字段 —— 多带平铺字段会被引擎以
+            // "requires exactly one plain-object args field" 拒掉。
+            // 失败不能再静默吞（旧实现 .catch(()=>{})，引擎收不到放行结果，
+            // 工具调用只能超时）：降级成人工审批卡片，用户还能救。
+            try {
+              await callDshRpc('$events/result', {
+                args: { clientId: currentEventsClientId, eventId, outcome: { kind: 'result', value: 'allowed-once' } }
+              });
+              // Audit the command that was actually classified, not the model's
+              // self-reported reason. Recording `reason` in the `command` field is
+              // what made the audit trail unusable for reconstructing what ran.
+              audit('approval/auto-approved', {
+                id: eventId,
+                time: Date.now(),
+                sessionId,
+                toolName,
+                command: cmdToCheck ?? '(unresolved)',
+                policy: effectivePolicy,
+                outcome: 'auto-approved',
+                reason: autoApproveReason
+              });
+            } catch (e) {
+              logger.warn('[dsh-mobile-bridge] 自动放行回传失败，降级为人工审批:', e?.message || e);
+              audit('approval/auto-approve-failed', {
+                id: eventId,
+                sessionId,
+                toolName,
+                command: cmdToCheck ?? '(unresolved)',
+                policy: effectivePolicy,
+                error: e?.message,
+                outcome: 'downgraded-to-manual'
+              });
+              const approval = {
+                id: eventId,
+                eventId,
+                clientId: currentEventsClientId,
+                sessionId,
+                toolName,
+                reason,
+                callId,
+                input,
+                options,
+                createdAt: Date.now()
+              };
+              coreApprovals.put(approval);
+              audit('approval/requested', approval);
+              broadcastToMobileClients({ type: 'approval_request', approval });
+            }
             return;
           }
 
@@ -1080,19 +1675,18 @@ export function apply(ctx, config = {}, internals = {}) {
       ? 'allowed-once'
       : 'rejected';
 
-    coreApprovals.remove(appr, eventId);
-
-    audit('approval/respond', {
-      approvalId: appr.eventId || eventId,
-      outcome: normalizedOutcome,
-      reason: reason || (normalizedOutcome === 'allowed-once' ? '人工手机审批放行' : '人工手机拒绝执行')
-    });
-
+    // RPC FIRST, dequeue only on success. The old order (remove → RPC →
+    // catch-and-warn → ok:true) meant a failed $events/result left the agent
+    // blocked at the approval gate forever while the phone showed a green
+    // "已放行". Keeping the queue entry on failure gives the user a retry.
+    let rpcOk = true;
+    let rpcError = '';
     try {
+      // 同 handleQuestionAnswer：payload 只能有 `args` 一个字段。
+      // 多带平铺字段会被引擎以 "requires exactly one plain-object args field"
+      // 拒掉 —— 那正是「手机上点了批准/拒绝没反应」的成因（本函数是审批回传，
+      // 与提问回传是同一处错误的两份）。
       await callDshRpc('$events/result', {
-        clientId: appr.clientId || currentEventsClientId,
-        eventId: appr.eventId || appr.id,
-        outcome: { kind: 'result', value: normalizedOutcome },
         args: {
           clientId: appr.clientId || currentEventsClientId,
           eventId: appr.eventId || appr.id,
@@ -1100,7 +1694,29 @@ export function apply(ctx, config = {}, internals = {}) {
         }
       });
     } catch (e) {
-      logger.warn('[dsh-mobile-bridge] Upstream $events/result RPC warning:', e?.message || e);
+      rpcOk = false;
+      rpcError = e?.message || String(e);
+      logger.warn('[dsh-mobile-bridge] 审批回传失败，保留队列供重试:', rpcError);
+    }
+
+    coreApprovals.remove(appr, eventId);
+
+    audit('approval/respond', {
+      approvalId: appr.eventId || eventId,
+      outcome: normalizedOutcome,
+      ok: rpcOk,
+      reason: reason || (normalizedOutcome === 'allowed-once' ? '人工手机审批放行' : '人工手机拒绝执行')
+    });
+
+    if (!rpcOk) {
+      return {
+        ok: false,
+        code: 502,
+        approvalId: appr.eventId || eventId,
+        eventId: appr.eventId || eventId,
+        outcome: normalizedOutcome,
+        error: `回传引擎失败: ${rpcError}`
+      };
     }
 
     broadcastToMobileClients({
@@ -1263,7 +1879,17 @@ export function apply(ctx, config = {}, internals = {}) {
             return;
           }
           if (String(code).trim() !== String(pairSession.code).trim()) {
-            sendJson(400, { ok: false, error: '配对码错误，请核对电脑设置页中的 6 位数字' });
+            // Brute-force guard: a 6-digit code with a 10-minute TTL and no
+            // attempt limit could be exhausted from the same network within
+            // the window. 5 misses burn the code; a new one must be minted.
+            pairSession.attempts = (pairSession.attempts || 0) + 1;
+            if (pairSession.attempts >= 5) {
+              pairSession = null;
+              audit('pair/bruteforce-burned', { ip: req.socket?.remoteAddress });
+              sendJson(400, { ok: false, error: '配对码已因多次错误被作废，请重新生成' });
+              return;
+            }
+            sendJson(400, { ok: false, error: `配对码错误，请核对电脑设置页中的 6 位数字（剩余 ${5 - pairSession.attempts} 次机会）` });
             return;
           }
 
@@ -1309,7 +1935,162 @@ export function apply(ctx, config = {}, internals = {}) {
       return;
     }
     // Keep the device's lastSeenAt fresh so the settings page can show real usage.
-    if (auth.device?.id) touchDevice(auth.device.id, req.socket?.remoteAddress || '');
+    if (auth.device?.id && auth.device.id !== 'admin') touchDevice(auth.device.id, req.socket?.remoteAddress || '');
+
+    // Read-only device gate. roleCanWrite() used to be `return true`, so the
+    // role recorded at pairing was decoration. Writes are denied here, once,
+    // instead of being sprinkled through every mutating route.
+    const WRITE_PATHS = [
+      '/api/mobile/upload',
+      '/api/mobile/sessions/prompt',
+      '/api/mobile/sessions/cancel',
+      '/api/mobile/sessions/delete',
+      '/api/mobile/sessions/create',
+      '/api/mobile/sessions/model',
+      '/api/mobile/sessions/archive',
+      '/api/mobile/sessions/rename',
+      '/api/mobile/sessions/permission',
+      '/api/mobile/settings/model',
+      '/api/mobile/permissions',
+      '/api/mobile/approval',
+      '/api/mobile/workspace/memory',
+      '/api/mobile/memory',
+      '/api/mobile/personas',
+      '/api/mobile/snippets'
+    ];
+    if (req.method === 'POST' || req.method === 'PUT') {
+      const isWrite = WRITE_PATHS.some((p) => pathname === p) ||
+        (pathname === '/api/mobile/workspace/memory' && req.method === 'POST');
+      if (isWrite && !roleCanWrite(auth.device?.role)) {
+        sendJson(403, { ok: false, code: 403, error: '该设备为只读角色，无权执行写操作' });
+        audit('auth/readonly-denied', { path: pathname, device: auth.device?.id, role: auth.device?.role });
+        return;
+      }
+    }
+
+    // 5. 附件上传与读取（v1.10.0）
+    //
+    // 这两条必须在下面的 jsonBody 读取**之前**处理：上传是原始字节流，而那个
+    // 读取器有 2MB 上限且按 JSON 解析。
+
+    // ---- 上传 ----
+    //
+    // 引擎契约见 uploadFileToEngine 的注释。这里只做三件事：限长收字节、
+    // 原样转发、把 receiptId 交回给 App。
+    if (pathname === '/api/mobile/upload' && req.method === 'POST') {
+      const upSessionId = String(parsedUrl.query?.sessionId || '').trim();
+      const upName = parsedUrl.query?.name ? String(parsedUrl.query.name) : '';
+      if (!upSessionId) {
+        sendJson(400, { ok: false, error: 'sessionId is required' });
+        return;
+      }
+
+      // 频率限制：每来源 60 秒内最多 10 次上传。单次上限 32MB 是大小限制，
+      // 不是频率限制 —— 没有这层，一个循环脚本能以 32MB/次的速率刷引擎磁盘。
+      const uploadKey = auth.device?.id || req.socket?.remoteAddress || 'anon';
+      const nowMs = Date.now();
+      let bucket = uploadBuckets.get(uploadKey);
+      if (!bucket || nowMs - bucket.windowStart > 60000) {
+        bucket = { windowStart: nowMs, count: 0 };
+        uploadBuckets.set(uploadKey, bucket);
+      }
+      bucket.count++;
+      if (bucket.count > 10) {
+        sendJson(429, { ok: false, error: '上传太频繁，请稍后再试' });
+        audit('upload/rate-limited', { device: uploadKey });
+        return;
+      }
+
+      let buf;
+      try {
+        buf = await new Promise((resolve, reject) => {
+          const chunks = [];
+          let size = 0;
+          req.on('data', (c) => {
+            size += c.length;
+            if (size > MAX_UPLOAD_BYTES) {
+              // 超限立刻断开，不要等收完整个文件再拒绝：那是实打实的无用上行。
+              reject(Object.assign(new Error('upload too large'), { tooLarge: true }));
+              try { req.destroy(); } catch (_) {}
+              return;
+            }
+            chunks.push(c);
+          });
+          req.on('end', () => resolve(Buffer.concat(chunks)));
+          req.on('error', reject);
+        });
+      } catch (e) {
+        if (e?.tooLarge) {
+          try { sendJson(413, { ok: false, error: `文件超过上限 ${Math.round(MAX_UPLOAD_BYTES / 1048576)}MB` }); } catch (_) {}
+        } else {
+          try { sendJson(400, { ok: false, error: '上传过程中连接中断' }); } catch (_) {}
+        }
+        return;
+      }
+
+      if (!buf || buf.length === 0) {
+        sendJson(400, { ok: false, error: '空文件' });
+        return;
+      }
+
+      try {
+        const value = await uploadFileToEngine({ sessionId: upSessionId, name: upName, data: buf });
+        audit('upload/ok', { sessionId: upSessionId, name: upName, size: buf.length });
+        sendJson(200, {
+          ok: true,
+          code: 0,
+          receiptId: value.receiptId,
+          file: value.file,
+          name: upName,
+          size: buf.length
+        });
+      } catch (e) {
+        audit('upload/failed', { sessionId: upSessionId, name: upName, size: buf.length, message: e?.message });
+        sendJson(502, { ok: false, error: e?.message || '上传到引擎失败' });
+      }
+      return;
+    }
+
+    // ---- 读取 ----
+    //
+    // App 侧的 AttachmentImageTile 一直在请求 /api/mobile/attachment?id=…，
+    // 但这个路由**此前根本不存在** —— 所以即使上传成功，图片也显示不出来（404）。
+    // 补上它，图片显示才闭环。
+    //
+    // 引擎的 session/attachment RPC 需要 sessionId 做授权（它只允许读这个会话
+    // 真正引用过的图片），因此 App 必须把 sessionId 一起带上。
+    if (pathname === '/api/mobile/attachment' && req.method === 'GET') {
+      const attId = String(parsedUrl.query?.id || '').trim();
+      const attSession = String(parsedUrl.query?.sessionId || '').trim();
+      if (!attId) {
+        sendJson(400, { ok: false, error: 'id is required' });
+        return;
+      }
+      if (!attSession) {
+        sendJson(400, { ok: false, error: 'sessionId is required' });
+        return;
+      }
+      try {
+        const value = await callDshRpc('session/attachment', {
+          args: { request: { sessionId: attSession, attachmentId: attId } }
+        });
+        const mediaType = value?.attachment?.mediaType || 'application/octet-stream';
+        const bytes = Buffer.from(String(value?.data || ''), 'base64');
+        if (bytes.length === 0) {
+          sendJson(404, { ok: false, error: '附件内容为空' });
+          return;
+        }
+        res.writeHead(200, {
+          'Content-Type': mediaType,
+          'Content-Length': bytes.length,
+          'Cache-Control': 'private, max-age=3600'
+        });
+        res.end(bytes);
+      } catch (e) {
+        sendJson(404, { ok: false, error: e?.message || '附件读取失败' });
+      }
+      return;
+    }
 
     let jsonBody = {};
     if (req.method === 'POST' || req.method === 'PUT') {
@@ -1321,7 +2102,36 @@ export function apply(ctx, config = {}, internals = {}) {
         raw = await readBodyWithLimit(req, res, { sendJson });
       } catch (err) {
         if (err?.aborted || res.headersSent) return;
-        throw err;
+        // [P0 availability] Do NOT rethrow here.
+        //
+        // core.mjs's readBodyWithLimit rejects socket errors from
+        // `req.on('error', (err) => reject(err))` WITHOUT setting aborted:true,
+        // so the guard above does not catch them. This `throw err` sits outside
+        // the business try block that starts a few lines below (whose catch is
+        // ~350 lines further down), so it escaped the async request handler
+        // entirely and surfaced as an unhandledRejection. There is no
+        // process.on('unhandledRejection') anywhere in this file, and Node >= 15
+        // defaults to --unhandled-rejections=throw, which terminates the
+        // process.
+        //
+        // Because this gateway runs INSIDE the dsh web process, that meant a
+        // single dropped mobile upload — a phone losing Wi-Fi mid-POST, a
+        // carrier NAT timeout, an abrupt TCP RST — took the whole engine down
+        // with it, killing every active session. No attacker required.
+        //
+        // A truncated or unreadable body is a client error: answer 400 and move
+        // on. sendJson is itself guarded because the socket is often already
+        // gone by the time we get here.
+        try {
+          sendJson(400, { error: 'Bad Request', message: '请求体读取失败或连接已中断' });
+        } catch { /* socket already gone */ }
+        audit('http/body-read-failed', {
+          path: pathname,
+          method: req.method,
+          message: err?.message,
+          code: err?.code
+        });
+        return;
       }
       jsonBody = parseJsonBody(raw);
     }
@@ -1330,8 +2140,18 @@ export function apply(ctx, config = {}, internals = {}) {
     try {
       // 4.1 工作区与会话
       if (pathname === '/api/mobile/workspaces' && req.method === 'GET') {
-        const data = getWorkspacesData();
-        sendJson(200, { ok: true, code: 0, workspaces: data });
+        // ?archived=exclude|only|include. Anything else — a missing value, a typo,
+        // or a repeated param (which url.parse turns into an array) — normalises to
+        // 'exclude', i.e. the historical behaviour.
+        const rawArchived = parsedUrl.query?.archived;
+        const archivedMode = (rawArchived === 'only' || rawArchived === 'include') ? rawArchived : 'exclude';
+        const data = getWorkspacesData({ archived: archivedMode });
+        // archivedMode is echoed back on purpose: it is how the client distinguishes
+        // "the gateway applied my filter" from "the gateway predates this feature and
+        // silently ignored the param". Without the echo, an old gateway answering
+        // ?archived=only would return the UNarchived list and the app would label
+        // those rows as archived — actively wrong rather than visibly unsupported.
+        sendJson(200, { ok: true, code: 0, workspaces: data, archivedMode: archivedMode });
         return;
       }
 
@@ -1370,7 +2190,42 @@ export function apply(ctx, config = {}, internals = {}) {
           return;
         }
         const text = promptText;
-        if (!text.trim()) {
+
+        // 附件（v1.10.0）。
+        //
+        // 引擎的 prompt content 是一个 part 数组，准确形状见
+        // PromptContentPart（@deepseek-ai/dsh-api-session-controller 的类型声明）：
+        //   { type:'text',  text }
+        //   { type:'image', mediaType, data:<base64>, name? }   ← 模型能"看见"的图片
+        //   { type:'file',  receiptId }                          ← 上传后换到的凭据
+        //
+        // 图片走 image part 而不是 file part，是因为只有 image part 会把图片作为
+        // 视觉输入交给模型；file part 只是一个文件引用。App 侧已经把图片压到
+        // 2MB 以下（JSON 读取器上限），所以可以直接内联 base64。
+        const rawAttachments = Array.isArray(jsonBody.attachments) ? jsonBody.attachments : [];
+        const attachmentParts = [];
+        for (const a of rawAttachments) {
+          if (!a || typeof a !== 'object') continue;
+          if (a.type === 'image') {
+            const mediaType = String(a.mediaType || '');
+            const data = String(a.data || '');
+            if (!mediaType.startsWith('image/') || !data) continue;
+            attachmentParts.push({
+              type: 'image',
+              mediaType,
+              data,
+              ...(a.name ? { name: String(a.name) } : {})
+            });
+          } else if (a.type === 'file') {
+            const receiptId = String(a.receiptId || '').trim();
+            if (!receiptId) continue;
+            attachmentParts.push({ type: 'file', receiptId });
+          }
+        }
+
+        // 允许"只有附件、没有文字"：引擎的准入规则是"非空白文字**或**一个附件"
+        // （commands.js 的 prompt 前置检查），所以这里不能沿用纯文本的必填校验。
+        if (!text.trim() && attachmentParts.length === 0) {
           sendJson(400, { error: 'Missing or empty prompt text' });
           return;
         }
@@ -1406,7 +2261,13 @@ export function apply(ctx, config = {}, internals = {}) {
                 requestId: crypto.randomUUID(),
                 sessionId: sessionId,
                 mode: 'queue',
-                content: [{ type: 'text', text: text }]
+                // 文字 part 只在有文字时加入。引擎要求"非空白文字或至少一个附件"，
+                // 而 {type:'text',text:''} 这种空白 part 会让准入判定变复杂，
+                // 干脆不发。
+                content: [
+                  ...(text.trim() ? [{ type: 'text', text: text }] : []),
+                  ...attachmentParts
+                ]
               }
             }
           });
@@ -1671,6 +2532,134 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
 
+      // ---- 应用内更新检查 ----
+      //
+      // App 拿自己的 version/build 与这里比对；latestVersion 取 DSH_LATEST_APP_VERSION
+      // 环境变量（运维发布新 APK 时顺手改），没配则回落到 BRIDGE_VERSION，
+      // 并附 APK 直链与最近一次请求时的 Content-Length（有 APK 时）。
+      if (pathname === '/api/mobile/version' && req.method === 'GET') {
+        const apkCandidates = [
+          path.join(import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)), '..', 'public', 'dsh-agent.apk')
+        ];
+        let apkSize = 0;
+        let apkMtime = null;
+        for (const c of apkCandidates) {
+          try {
+            const st = fs.statSync(c);
+            apkSize = st.size;
+            apkMtime = st.mtimeMs;
+            break;
+          } catch { /* not shipped */ }
+        }
+        sendJson(200, {
+          ok: true,
+          code: 0,
+          bridgeVersion: BRIDGE_VERSION,
+          latestVersion: process.env.DSH_LATEST_APP_VERSION || null,
+          apkUrl: '/dsh-agent.apk',
+          apkSize,
+          apkMtime,
+          time: Date.now()
+        });
+        return;
+      }
+
+      // ---- 会话归档 / 取消归档 ----
+      if (pathname === '/api/mobile/sessions/archive' && req.method === 'POST') {
+        const result = archiveSession({
+          home: dshHomeDir,
+          sessionId: jsonBody.sessionId,
+          archive: jsonBody.archive !== false
+        });
+        if (!result.ok) {
+          sendJson(400, { ok: false, code: 400, error: result.error });
+          return;
+        }
+        audit('session/archive', { sessionId: jsonBody.sessionId, archived: result.archived });
+        broadcastToMobileClients({
+          type: result.archived ? 'session_archived' : 'session_unarchived',
+          sessionId: jsonBody.sessionId
+        });
+        sendJson(200, { ok: true, code: 0, sessionId: result.sessionId, archived: result.archived });
+        return;
+      }
+
+      // ---- 会话重命名 ----
+      if (pathname === '/api/mobile/sessions/rename' && req.method === 'POST') {
+        const result = renameSession({
+          home: dshHomeDir,
+          sessionId: jsonBody.sessionId,
+          title: jsonBody.title
+        });
+        if (!result.ok) {
+          sendJson(400, { ok: false, code: 400, error: result.error });
+          return;
+        }
+        // 让缓存立即反映新标题
+        for (const cPath of [
+          path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions', `${jsonBody.sessionId}.json`)
+        ]) {
+          projCacheReader.invalidate(cPath);
+        }
+        audit('session/rename', { sessionId: jsonBody.sessionId });
+        broadcastToMobileClients({ type: 'session_renamed', sessionId: result.sessionId, title: result.title });
+        sendJson(200, { ok: true, code: 0, sessionId: result.sessionId, title: result.title });
+        return;
+      }
+
+      // ---- 跨会话搜索（标题 + 首条 prompt）----
+      if (pathname === '/api/mobile/sessions/search' && req.method === 'GET') {
+        const q = String(parsedUrl.query?.q || '').trim();
+        if (!q) {
+          sendJson(400, { ok: false, error: 'q is required' });
+          return;
+        }
+        const max = Math.min(Number(parsedUrl.query?.limit) || 30, 100);
+        const needle = q.toLowerCase();
+        const results = [];
+        for (const ws of getWorkspacesData({ archived: 'include' })) {
+          for (const s of ws.sessions) {
+            const title = (s.title || '').toLowerCase();
+            const first = (s.firstPrompt || '').toLowerCase();
+            if (title.includes(needle) || first.includes(needle)) {
+              results.push({
+                workspaceId: ws.workspaceId,
+                workspaceTitle: ws.title,
+                sessionId: s.sessionId,
+                title: s.title,
+                firstPrompt: s.firstPrompt,
+                lastPromptAt: s.lastPromptAt,
+                archived: !!s.archived
+              });
+              if (results.length >= max) break;
+            }
+          }
+          if (results.length >= max) break;
+        }
+        sendJson(200, { ok: true, code: 0, query: q, results });
+        return;
+      }
+
+      // ---- 提示词模板 (snippets) ----
+      if (pathname === '/api/mobile/snippets' && req.method === 'GET') {
+        sendJson(200, { ok: true, code: 0, snippets: snippetStore.get() });
+        return;
+      }
+      if (pathname === '/api/mobile/snippets' && req.method === 'POST') {
+        if (!Array.isArray(jsonBody.snippets)) {
+          sendJson(400, { ok: false, error: 'snippets must be an array' });
+          return;
+        }
+        const saved = snippetStore.save(jsonBody.snippets);
+        if (saved == null) {
+          sendJson(500, { ok: false, code: 500, error: '保存失败（目录不可写？）' });
+          return;
+        }
+        audit('snippets/update', { count: saved.length });
+        sendJson(200, { ok: true, code: 0, snippets: saved });
+        return;
+      }
+
       sendJson(404, { error: 'Not found', path: pathname });
     } catch (err) {
       if (res.headersSent) return;
@@ -1722,8 +2711,29 @@ export function apply(ctx, config = {}, internals = {}) {
         try { ws.terminate(); } catch (_) {}
       }
     }
+    pruneStaleFollowers();
   }, HEARTBEAT_INTERVAL_MS);
   heartbeatInterval.unref?.();
+
+  /**
+   * Follower records used to live forever: every session a phone ever opened
+   * kept its buffers (text/thinking/tools) in the map for the lifetime of the
+   * dsh web process. A long-lived gateway following hundreds of sessions grew
+   * without bound. Idle followers (no activity for FOLLOWER_TTL_MS and not
+   * running) are dropped here; the follow stream re-opens on demand the next
+   * time a phone opens that session.
+   */
+  const FOLLOWER_TTL_MS = 10 * 60 * 1000;
+  function pruneStaleFollowers() {
+    const now = Date.now();
+    for (const f of coreFollowers.all()) {
+      if (f.isRunning) continue;
+      if (now - (f.lastUpdated || 0) > FOLLOWER_TTL_MS) {
+        coreFollowers.map.delete(f.sessionId);
+        coreFollowers.map.delete(f.sessionId.replace(/^session-/, ''));
+      }
+    }
+  }
 
   wss.on('connection', (ws, req) => {
     ws.isAlive = true;
@@ -1776,6 +2786,44 @@ export function apply(ctx, config = {}, internals = {}) {
           if (msg.type === 'follow' || msg.type === 'select_session') {
             ws.send(JSON.stringify({ type: 'follow_ack', sessionId: sId }));
           }
+        } else if (msg.type === 'question_answer') {
+          // [0003] Answers the engine's user-questions waterfall over
+          // $events/result. handleQuestionAnswer is async — it must be awaited,
+          // or `res.ok` reads off a Promise and every ack reports undefined.
+          const res = await handleQuestionAnswer(msg.eventId || msg.id, msg.answer ?? msg.payload);
+          ws.send(JSON.stringify({
+            type: 'question_ack',
+            eventId: res.eventId || (msg.eventId || msg.id),
+            ok: res.ok === true,
+            error: res.error
+          }));
+        } else if (msg.type === 'subscribe_questions' || msg.type === 'question_subscribe') {
+          // Opt in to interactive prompts. Deliberately explicit: a phone that
+          // is only browsing the session list must not receive questions, or a
+          // second client would sit on requests it will never answer.
+          questionSubscribers.add(ws);
+          ws.wantsQuestions = true;
+          // This new subscriber is now a valid answerer for every question
+          // still on offer — record it so a later disconnect of ANOTHER phone
+          // does not take these prompts away from this one.
+          for (const q of pendingQuestions.values()) {
+            q.offeredTo?.add(ws);
+          }
+          ws.send(JSON.stringify({
+            type: 'question_subscribed',
+            ok: true,
+            // Replay anything still waiting, so a phone that connects mid-question
+            // is not left looking at a session that appears to have stalled.
+            pending: livePendingQuestions()
+          }));
+        } else if (msg.type === 'unsubscribe_questions') {
+          questionSubscribers.delete(ws);
+          ws.wantsQuestions = false;
+          // Give up only what THIS phone can no longer answer; other holders
+          // keep their cards.
+          for (const q of [...pendingQuestions.values()]) {
+            relinquishQuestion(q.eventId, 'subscriber-unsubscribe', ws);
+          }
         } else if (msg.type === 'approval_response') {
           const eventId = msg.eventId || msg.approvalId || msg.id;
           if (eventId && msg.outcome) {
@@ -1786,14 +2834,38 @@ export function apply(ctx, config = {}, internals = {}) {
       } catch (_) {}
     });
 
-    ws.on('close', () => connectedClients.delete(ws));
-    ws.on('error', () => connectedClients.delete(ws));
+    ws.on('close', () => {
+      // A phone that vanished must stop being offered questions it will never
+      // answer. With multiple phones subscribed, only the prompts THIS phone
+      // held go away — the others keep theirs and can still answer. Only when
+      // the last holder disconnects does the prompt fall back to the Web UI.
+      if (questionSubscribers.has(ws)) {
+        const dropped = [];
+        for (const q of [...pendingQuestions.values()]) {
+          if (relinquishQuestion(q.eventId, 'subscriber-disconnect', ws)) dropped.push(q.eventId);
+        }
+        for (const eventId of dropped) {
+          sendToSubscribers({
+            type: 'questions_invalidated',
+            eventId,
+            reason: 'subscriber-disconnect'
+          }, questionSubscribers);
+        }
+      }
+      questionSubscribers.delete(ws);
+      connectedClients.delete(ws);
+    });
+    ws.on('error', () => {
+      questionSubscribers.delete(ws);
+      connectedClients.delete(ws);
+    });
   });
 
   const apkFilePath = path.join(import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)), '..', 'public', 'dsh-agent.apk');
   const disposeRpc = installRpc(ctx, {
     dshPort,
-    isListening: true
+    isListening: true,
+    readAudit
   });
 
   server.on('error', (err) => {
@@ -1828,6 +2900,10 @@ export function apply(ctx, config = {}, internals = {}) {
       try { ws.close(); } catch (_) {}
     }
     connectedClients.clear();
+    // Nothing here holds a timer any more (see QUESTION_TTL_MS), but the map
+    // must not outlive the gateway so a re-apply starts clean.
+    pendingQuestions.clear();
+    questionSubscribers.clear();
     try { wss.close(); } catch (_) {}
     try { server.closeAllConnections?.(); } catch (_) {}
     await new Promise((resolve) => {

@@ -29,14 +29,17 @@ import { homedir } from 'node:os';
 // persistence is injected by the entry point instead; see configurePersistence.
 
 let _verifyToken = () => false;
+/** Injected by the entry: resolves a paired device (or null) from a token. */
+let _findDeviceByToken = () => null;
 
 /** Wire in the persistence helpers the entry point owns. */
-export function configurePersistence({ verifyToken: vt }) {
+export function configurePersistence({ verifyToken: vt, findDeviceByToken: fdt }) {
   if (typeof vt === 'function') _verifyToken = vt;
+  if (typeof fdt === 'function') _findDeviceByToken = fdt;
 }
 
 
-export const BRIDGE_VERSION = '1.2.9';
+export const BRIDGE_VERSION = '1.3.0';
 export const MAX_BODY_SIZE = 2 * 1024 * 1024; // 2MB defensive payload limit (F4.1)
 export const HEARTBEAT_INTERVAL_MS = 30000;
 
@@ -213,10 +216,28 @@ export function createPathSanitizer({ getRegisteredWorkspaces }) {
     if (trimmedWs.includes('..')) {
       return { error: 'Forbidden: Path traversal detected in workspacePath', status: 403 };
     }
+    // [P1] Layer 1 previously applied the absolute-path, leading-separator and
+    // drive-letter checks to fileName ONLY, leaving workspacePath with just the
+    // `..` substring test. workspacePath is legitimately absolute, so those
+    // checks cannot be copied across verbatim — but NUL bytes, ASCII control
+    // characters and Windows extended-length / device prefixes can be, and all
+    // three are ways to make the string comparison in layer 2 disagree with what
+    // the filesystem actually opens.
+    // eslint-disable-next-line no-control-regex
+    if (/[\x00-\x1f]/.test(trimmedWs)) {
+      return { error: 'Forbidden: control character in workspacePath', status: 403 };
+    }
+    if (/^\\\\[?.]\\/.test(trimmedWs)) {
+      return { error: 'Forbidden: extended-length or device path in workspacePath', status: 403 };
+    }
     if (trimmedFile.includes('..') || path.isAbsolute(trimmedFile) ||
         trimmedFile.startsWith('/') || trimmedFile.startsWith('\\') ||
         /^[a-zA-Z]:[\\/]/.test(trimmedFile)) {
       return { error: 'Forbidden: Path traversal detected in fileName', status: 403 };
+    }
+    // eslint-disable-next-line no-control-regex
+    if (/[\x00-\x1f]/.test(trimmedFile)) {
+      return { error: 'Forbidden: control character in fileName', status: 403 };
     }
 
     const resolvedWs = path.resolve(trimmedWs);
@@ -228,22 +249,37 @@ export function createPathSanitizer({ getRegisteredWorkspaces }) {
       if (p && typeof p === 'string' && p.trim()) registeredPaths.push(path.resolve(p.trim()));
     }
 
-    if (registeredPaths.length > 0) {
-      let within = false;
-      for (const regPath of registeredPaths) {
-        const rel = path.relative(regPath, resolvedWs);
-        if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
-          const regNorm = regPath.toLowerCase().replace(/[\\/]+$/, '');
-          const wsNorm = resolvedWs.toLowerCase().replace(/[\\/]+$/, '');
-          if (wsNorm === regNorm || wsNorm.startsWith(regNorm + '\\') || wsNorm.startsWith(regNorm + '/')) {
-            within = true;
-            break;
-          }
+    // [P0] Fail CLOSED when the workspace registry is empty.
+    //
+    // This used to read `if (registeredPaths.length > 0) { ...validate... }`, so
+    // an empty registry skipped layer 2 entirely and left nothing but the layer-1
+    // string checks above. getRegisteredWorkspaces() reads the engine's workspace
+    // table over RPC, and it legitimately returns [] during startup, after an
+    // engine reconnect, or on any RPC failure — so a memory read or write issued
+    // in that window was effectively unrestricted and could name any absolute
+    // path on the host. A sanitizer that disables itself when its input is
+    // missing is worse than no sanitizer, because it looks like there is one.
+    if (registeredPaths.length === 0) {
+      return {
+        error: 'Forbidden: no registered workspaces available to validate against',
+        status: 403
+      };
+    }
+
+    let within = false;
+    for (const regPath of registeredPaths) {
+      const rel = path.relative(regPath, resolvedWs);
+      if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
+        const regNorm = regPath.toLowerCase().replace(/[\\/]+$/, '');
+        const wsNorm = resolvedWs.toLowerCase().replace(/[\\/]+$/, '');
+        if (wsNorm === regNorm || wsNorm.startsWith(regNorm + '\\') || wsNorm.startsWith(regNorm + '/')) {
+          within = true;
+          break;
         }
       }
-      if (!within) {
-        return { error: 'Forbidden: workspacePath is not a registered workspace', status: 403 };
-      }
+    }
+    if (!within) {
+      return { error: 'Forbidden: workspacePath is not a registered workspace', status: 403 };
     }
 
     const resolvedTarget = path.resolve(resolvedWs, trimmedFile);
@@ -260,12 +296,54 @@ export function createPathSanitizer({ getRegisteredWorkspaces }) {
  * read-only command classification
  * ------------------------------------------------------------------ */
 
+// [P0] `find` and `echo` removed.
+//   - `find <path> -delete` and `find . -exec rm {} \;` are destructive, and
+//     neither `-delete` nor `-exec` contains a shell metacharacter, so the
+//     SHELL_METACHARACTERS guard below did not stop them. `find` is not a read
+//     verb in the sense this whitelist needs.
+//   - `echo` reads nothing; its only dangerous form is redirection, which the
+//     metacharacter guard already blocks. Keeping it in a READ-ONLY whitelist
+//     widened the auto-approve surface for no benefit.
+// `cat`/`head`/`tail` stay, but are now subject to SENSITIVE_PATH_PATTERNS below.
 const READ_ONLY_PREFIXES = [
-  'ls', 'dir', 'cat', 'grep', 'find', 'head', 'tail', 'wc',
+  'ls', 'dir', 'cat', 'grep', 'head', 'tail', 'wc',
   'git status', 'git log', 'git diff',
-  'pwd', 'echo', 'which', 'where'
+  'pwd', 'which', 'where'
 ];
 const READ_ONLY_TOOLS = ['read_file', 'view_file', 'search_web', 'list_dir'];
+
+/**
+ * [P0] Paths that must never be auto-approved, whatever the verb.
+ *
+ * The shipped default policy is `auto-read`, and under it
+ * `cat C:\Users\<user>\.dsh\.credentials.yaml` passed every existing check: it
+ * starts with an allowlisted verb and contains no shell metacharacters. The file
+ * holds the engine's HMAC signing key, so auto-approving that read handed an
+ * attacker everything needed to forge a dsh-auth-* cookie and talk to engine
+ * port 3080 directly — the gateway's own auth layer is not in that path at all,
+ * and the tool output was then broadcast to every connected client.
+ *
+ * Matching is on the lowercased command text, and covers both separator styles
+ * plus the bare directory names, so `.dsh/.credentials.yaml`,
+ * `.dsh\.credentials.yaml` and a plain `.credentials.yaml` all match.
+ */
+const SENSITIVE_PATH_PATTERNS = [
+  /\.dsh[\\/]/,
+  /\.credentials\.ya?ml/,
+  /credentials\.ya?ml/,
+  /mobile-bridge[\\/]config\.json/,
+  /[\\/]id_rsa\b/, /[\\/]id_ed25519\b/, /[\\/]id_dsa\b/,
+  /\.ssh[\\/]/,
+  /\.aws[\\/]credentials/,
+  /\.kube[\\/]config/,
+  /\.netrc\b/,
+  /[\\/]shadow\b/,
+  /\bsam\b.*\bsystem\b/i,
+  /key\.properties/,
+  /\.jks\b/, /\.keystore\b/, /\.p12\b/, /\.pfx\b/,
+  /dpapi/, /credhist/,
+  /\.env\b/
+];
 
 /**
  * Prefix-whitelist check used by the 'auto-read' execution policy.
@@ -278,14 +356,102 @@ const READ_ONLY_TOOLS = ['read_file', 'view_file', 'search_web', 'list_dir'];
  */
 const SHELL_METACHARACTERS = /[;&|><`$(){}[\]!*?~\n\r]/;
 
-export function isCommandReadOnly(cmdStr, toolName) {
-  if (READ_ONLY_TOOLS.includes(toolName)) return true;
-  if (!cmdStr) return false;
-  const trimmed = String(cmdStr).trim().toLowerCase();
-  if (!trimmed) return false;
-  if (SHELL_METACHARACTERS.test(trimmed)) return false;
-  return READ_ONLY_PREFIXES.some((p) => trimmed === p || trimmed.startsWith(p + ' '));
+/** True when the command text mentions a path that must never be auto-approved. */
+function touchesSensitivePath(lowered) {
+  return SENSITIVE_PATH_PATTERNS.some((re) => re.test(lowered));
 }
+
+/**
+ * [P0] Flags that turn an otherwise read-only verb into a writer.
+ *
+ * `git log --output=/tmp/x` passes a prefix whitelist for `git log` and contains
+ * no shell metacharacter, yet it creates a file. Same shape for find's -delete /
+ * -exec family and printf-style output flags. The verb whitelist alone cannot
+ * see these.
+ */
+const DANGEROUS_FLAGS = /(^|\s)(--output|--out-file|-o|-delete|-exec|-execdir|-ok|-okdir|-fprint|-fprintf|-fls|--delete|--force|-f|--recursive|-r\s.*--delete)(\s|$|=)/;
+
+/**
+ * [P0] Verbs that must never be auto-approved, whatever the tool name claims.
+ *
+ * toolName comes from the request, i.e. from the model, so it is not a trust
+ * anchor. The old first line of isCommandReadOnly was
+ * `if (READ_ONLY_TOOLS.includes(toolName)) return true;` — a request naming a
+ * tool `read_file` was auto-approved no matter what command accompanied it, so
+ * `read_file` + `rm -rf /` sailed through (`-` is not a shell metacharacter).
+ * This denylist is the backstop for that class.
+ */
+const DANGEROUS_VERBS = /^(rm|del|erase|rmdir|rd|mv|move|ren|rename|cp|copy|xcopy|robocopy|chmod|chown|chgrp|takeown|icacls|kill|taskkill|format|mkfs|dd|shred|curl|wget|nc|ncat|netcat|ssh|scp|sftp|telnet|reg|setx|shutdown|restart-computer|new-item|set-content|add-content|out-file|export-csv|invoke-expression|iex|start-process|npm|npx|pnpm|yarn|pip|python|python3|node|deno|bash|sh|zsh|cmd|powershell|pwsh)(\s|$)/;
+
+/**
+ * [P0] Mutating subcommands of verbs that are otherwise partly whitelisted.
+ *
+ * `git status`, `git log` and `git diff` are on READ_ONLY_PREFIXES, so a bare
+ * `git` entry in DANGEROUS_VERBS would have blocked all three — measured, that
+ * was a false positive on the single most common read-only command family in
+ * this repo. The mutating subcommands are matched explicitly instead.
+ */
+const DANGEROUS_SUBCOMMANDS = [
+  /^git\s+(push|reset|clean|checkout|commit|rebase|merge|cherry-pick|revert|apply|am|tag|remote|config|gc|prune|reflog\s+expire|filter-branch|filter-repo|update-ref|rm|mv|stash|restore|switch|worktree|submodule)\b/,
+  /^docker\s+(rm|rmi|run|exec|push|kill|stop|system\s+prune|volume\s+rm)\b/,
+  /^kubectl\s+(delete|apply|exec|scale|rollout|patch|replace|drain)\b/,
+  /^flutter\s+(clean|publish|deploy)\b/,
+  /^gradlew?\s+.*\b(publish|clean|install)\b/
+];
+
+function hasDangerousSubcommand(lowered) {
+  return DANGEROUS_SUBCOMMANDS.some((re) => re.test(lowered));
+}
+
+export function isCommandReadOnly(cmdStr, toolName) {
+  const loweredCmd = cmdStr ? String(cmdStr).trim().toLowerCase() : '';
+
+  // No command line to classify — the tool name is all there is. This is the
+  // only case where the tool name is allowed to decide anything.
+  if (!loweredCmd) return READ_ONLY_TOOLS.includes(toolName);
+
+  if (SHELL_METACHARACTERS.test(loweredCmd)) return false;
+  if (touchesSensitivePath(loweredCmd)) return false;
+  if (DANGEROUS_FLAGS.test(loweredCmd)) return false;
+  if (DANGEROUS_VERBS.test(loweredCmd)) return false;
+  if (hasDangerousSubcommand(loweredCmd)) return false;
+
+  // A command must qualify on its own merits. Being labelled read_file no longer
+  // rescues one that is not on the whitelist — but a bare path (what read_file
+  // actually receives, e.g. `E:\workspace\个人\NOTES.md`) is still allowed so
+  // that tightening this does not turn every file read into an approval prompt.
+  if (READ_ONLY_PREFIXES.some((p) => loweredCmd === p || loweredCmd.startsWith(p + ' '))) return true;
+  if (READ_ONLY_TOOLS.includes(toolName) && !/\s/.test(loweredCmd.trim())) return true;
+  return false;
+}
+
+/**
+ * Exported so the approval path can explain a denial in the audit log instead of
+ * silently falling back to an interactive prompt with no reason recorded.
+ */
+export function classifyCommand(cmdStr, toolName) {
+  const loweredCmd = cmdStr ? String(cmdStr).trim().toLowerCase() : '';
+  if (!loweredCmd) {
+    return READ_ONLY_TOOLS.includes(toolName)
+      ? { readOnly: true, why: 'read-only-tool' }
+      : { readOnly: false, why: 'no-command' };
+  }
+  if (SHELL_METACHARACTERS.test(loweredCmd)) return { readOnly: false, why: 'shell-metacharacter' };
+  if (touchesSensitivePath(loweredCmd)) return { readOnly: false, why: 'sensitive-path' };
+  if (DANGEROUS_FLAGS.test(loweredCmd)) return { readOnly: false, why: 'dangerous-flag' };
+  if (DANGEROUS_VERBS.test(loweredCmd)) return { readOnly: false, why: 'dangerous-verb' };
+  if (hasDangerousSubcommand(loweredCmd)) return { readOnly: false, why: 'dangerous-subcommand' };
+  const hit = READ_ONLY_PREFIXES.find((p) => loweredCmd === p || loweredCmd.startsWith(p + ' '));
+  if (hit) return { readOnly: true, why: `prefix:${hit}` };
+  if (READ_ONLY_TOOLS.includes(toolName) && !/\s/.test(loweredCmd.trim())) {
+    return { readOnly: true, why: 'read-only-tool:bare-path' };
+  }
+  return { readOnly: false, why: 'not-allowlisted' };
+}
+
+/** Exposed for tests. */
+export { SENSITIVE_PATH_PATTERNS, READ_ONLY_PREFIXES, READ_ONLY_TOOLS, DANGEROUS_FLAGS, DANGEROUS_VERBS, DANGEROUS_SUBCOMMANDS };
+
 
 /* ------------------------------------------------------------------ *
  * audit
@@ -393,6 +559,89 @@ export function createPersonaStore({ home = dshHome() } = {}) {
         return true;
       } catch {
         return false;
+      }
+    }
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * projection-cache reader with mtime memoization
+ *
+ * getWorkspacesData() used to readFileSync + JSON.parse every session cache
+ * file on every request — up to ~1000 files every 3 seconds from the phone's
+ * workspace poll, all synchronous, all inside the dsh web process (the plugin
+ * shares the engine's event loop). This cache keys by resolved path + mtimeMs,
+ * so an unchanged file costs one statSync instead of a full read+parse.
+ * ------------------------------------------------------------------ */
+
+export function createProjCacheReader({ dir }) {
+  const cache = new Map(); // absPath -> { mtimeMs, value }
+
+  return {
+    /** Parsed JSON, or null when missing/unreadable/unmodified-empty. */
+    readJson(p) {
+      let st;
+      try {
+        st = fs.statSync(p);
+      } catch {
+        cache.delete(p);
+        return null;
+      }
+      const hit = cache.get(p);
+      if (hit && hit.mtimeMs === st.mtimeMs) return hit.value;
+      let value = null;
+      try {
+        value = JSON.parse(fs.readFileSync(p, 'utf8'));
+      } catch {
+        value = null;
+      }
+      cache.set(p, { mtimeMs: st.mtimeMs, value });
+      return value;
+    },
+    /** Drop one entry (call after unlink/replace so the next read misses). */
+    invalidate(p) { cache.delete(p); },
+    clear() { cache.clear(); }
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * prompt snippets (quick replies / templates)
+ * ------------------------------------------------------------------ */
+
+export function createSnippetStore({ home = dshHome() } = {}) {
+  const file = path.join(home, 'mobile-access', 'snippets.json');
+  const MAX_SNIPPETS = 50;
+
+  function readAll() {
+    try {
+      if (fs.existsSync(file)) {
+        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (Array.isArray(data)) {
+          return data.filter((s) => s && typeof s === 'object' && typeof s.text === 'string' && s.text.trim());
+        }
+      }
+    } catch { /* fall through */ }
+    return [];
+  }
+
+  return {
+    get: readAll,
+    save(list) {
+      const clean = (Array.isArray(list) ? list : [])
+        .filter((s) => s && typeof s === 'object' && typeof s.text === 'string' && s.text.trim())
+        .slice(0, MAX_SNIPPETS)
+        .map((s) => ({
+          id: typeof s.id === 'string' && s.id ? s.id : `snip_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          label: typeof s.label === 'string' ? s.label.slice(0, 40) : s.text.slice(0, 20),
+          text: s.text.slice(0, 4000)
+        }));
+      try {
+        const dir = path.dirname(file);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(file, JSON.stringify(clean, null, 2), 'utf8');
+        return clean;
+      } catch {
+        return null; // signal failure; caller turns null into a 500
       }
     }
   };
@@ -728,6 +977,13 @@ export function authenticateRequest(req, parsed) {
     return { ok: false, code: 401, error: '缺少认证授权码 (Authorization Token Required)' };
   }
   if (_verifyToken(token)) {
+    // Global/env token → admin. Paired-device token → the real device record,
+    // so touchDevice() actually updates lastSeenAt and the settings page shows
+    // live usage instead of a hardcoded "admin" that never matched anything.
+    const dev = _findDeviceByToken(token);
+    if (dev) {
+      return { ok: true, device: { id: dev.id, name: dev.name || '移动设备', role: dev.role || 'readwrite' } };
+    }
     return { ok: true, device: { id: 'admin', name: '移动终端', role: 'readwrite' } };
   }
   return { ok: false, code: 401, error: '授权码错误，请在 DSH 设置中查看正确授权码' };
@@ -802,12 +1058,55 @@ export function parseJsonBody(raw) {
  * Returns { ok, archived, detached, cacheRemoved, error } — callers must surface
  * failures instead of claiming success.
  */
-export function deleteSession({ home = dshHome(), sessionId, workspaceId = null }) {
-  if (!sessionId || typeof sessionId !== 'string' || !sessionId.trim()) {
-    return { ok: false, error: 'Missing or empty sessionId' };
-  }
+/**
+ * [P0] Session ids reach the filesystem, so they have to be shape-checked first.
+ *
+ * deleteSession() built `${clean}.json` / `${id}.json` out of the raw caller
+ * input and passed it to path.join(cacheDir, name) followed by fs.unlinkSync.
+ * Nothing filtered the id, so `sessionId: "../../../../storages/workspace"`
+ * resolved outside the cache directory and deleted an arbitrary .json file —
+ * including the workspace table itself and the gateway's own
+ * mobile-bridge/config.json. The endpoint is authenticated, but the token is an
+ * 8-character shared secret, so this is a privilege escalation from "can talk to
+ * the gateway" to "can delete host files".
+ *
+ * Real ids are `session-<uuid>` or a bare uuid; 1-64 of [A-Za-z0-9_-] covers both
+ * with room to spare and admits no separator, dot, or drive character.
+ */
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+export function assertSessionId(sessionId) {
+  if (typeof sessionId !== 'string') return { ok: false, error: 'sessionId must be a string' };
   const id = sessionId.trim();
-  const clean = id.replace(/^session-/, '');
+  if (!id) return { ok: false, error: 'Missing or empty sessionId' };
+  const bare = id.replace(/^session-/, '');
+  if (!SESSION_ID_RE.test(bare)) {
+    return { ok: false, error: 'Invalid sessionId: only [A-Za-z0-9_-] up to 64 characters are allowed' };
+  }
+  return { ok: true, id, bare };
+}
+
+/**
+ * Upper bound on global.archivedSessionIds.
+ *
+ * Archiving is how this bridge deletes, and the list was appended to forever —
+ * 1350 entries had accumulated by 2026-10-08. workspace.json is parsed
+ * synchronously inside getWorkspacesData(), which is already called per request,
+ * so an unbounded list is a slow leak that taxes every single API call.
+ *
+ * Eviction drops the OLDEST ids and is audited. The trade-off is explicit: an
+ * evicted id can make a very old deleted session visible again, which is
+ * strictly better than a store file that grows without limit. 20000 is far above
+ * any realistic accumulation rate, so this should only ever fire on a runaway
+ * loop — which is exactly when you want it to.
+ */
+const MAX_ARCHIVED_SESSION_IDS = Number(process.env.DSH_MAX_ARCHIVED_SESSIONS || 20000);
+
+export function deleteSession({ home = dshHome(), sessionId, workspaceId = null }) {
+  const checked = assertSessionId(sessionId);
+  if (!checked.ok) return { ok: false, error: checked.error };
+  const id = checked.id;
+  const clean = checked.bare;
 
   const wsPath = path.join(home, 'storages', 'workspace.json');
   const cacheDir = path.join(home, 'storages', 'session_projcache', 'sessions');
@@ -823,6 +1122,14 @@ export function deleteSession({ home = dshHome(), sessionId, workspaceId = null 
   if (!ws.global) ws.global = {};
   const archived = Array.isArray(ws.global.archivedSessionIds) ? ws.global.archivedSessionIds : [];
   if (!archived.includes(id)) archived.push(id);
+  let evicted = 0;
+  while (archived.length > MAX_ARCHIVED_SESSION_IDS) {
+    archived.shift();
+    evicted++;
+  }
+  // No audit() call here: core.mjs deliberately does not import store.mjs (store
+  // imports core for the audit sink, so the reverse edge would be a cycle). The
+  // eviction count is returned instead and the caller audits it.
   ws.global.archivedSessionIds = archived;
 
   // 2. Detach from the workspace id list (also honouring the session- prefix variants).
@@ -856,7 +1163,100 @@ export function deleteSession({ home = dshHome(), sessionId, workspaceId = null 
     } catch { /* the archive entry already hides it */ }
   }
 
-  return { ok: true, sessionId: id, archived: true, detached, cacheRemoved };
+  return { ok: true, sessionId: id, archived: true, detached, cacheRemoved, evicted };
+}
+
+/**
+ * Archive / un-archive a session WITHOUT detaching it from its workspace.
+ *
+ * The engine's own UI toggles exactly this field (`global.archivedSessionIds`),
+ * so writing it here is the same mutation the Web UI performs — unlike
+ * deleteSession, the session stays registered and merely changes visibility.
+ * Returns { ok, archived, error }.
+ */
+export function archiveSession({ home = dshHome(), sessionId, archive = true }) {
+  const checked = assertSessionId(sessionId);
+  if (!checked.ok) return { ok: false, error: checked.error };
+  const id = checked.id;
+  const clean = checked.bare;
+
+  const wsPath = path.join(home, 'storages', 'workspace.json');
+  let ws;
+  try {
+    ws = JSON.parse(fs.readFileSync(wsPath, 'utf8'));
+  } catch (err) {
+    return { ok: false, error: `Cannot read workspace store: ${err?.message}` };
+  }
+  if (!ws.global) ws.global = {};
+  const archived = Array.isArray(ws.global.archivedSessionIds) ? ws.global.archivedSessionIds : [];
+
+  let nowArchived;
+  if (archive) {
+    for (const variant of [id, clean]) {
+      if (!archived.includes(variant)) archived.push(variant);
+    }
+    nowArchived = true;
+  } else {
+    const before = archived.length;
+    const kept = archived.filter((s) => s !== id && s !== clean && s !== `session-${clean}`);
+    ws.global.archivedSessionIds = kept;
+    nowArchived = false;
+    if (kept.length === before && !archived.includes(id) && !archived.includes(clean)) {
+      // Wasn't archived to begin with — still a success, nothing to write.
+      return { ok: true, sessionId: id, archived: false, changed: false };
+    }
+  }
+  if (nowArchived) ws.global.archivedSessionIds = archived;
+
+  try {
+    const tmp = `${wsPath}.bridge-archive.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(ws, null, 2), 'utf8');
+    fs.renameSync(tmp, wsPath);
+  } catch (err) {
+    return { ok: false, error: `Cannot write workspace store: ${err?.message}` };
+  }
+  return { ok: true, sessionId: id, archived: nowArchived, changed: true };
+}
+
+/**
+ * Rename a session by editing its projection cache title row. The engine keeps
+ * session titles in `record.rows.title.val` inside the projcache file (verified
+ * against getWorkspacesData's read of the same field). Returns { ok, error }.
+ */
+export function renameSession({ home = dshHome(), sessionId, title }) {
+  const checked = assertSessionId(sessionId);
+  if (!checked.ok) return { ok: false, error: checked.error };
+  const id = checked.id;
+  const clean = checked.bare;
+  const newTitle = typeof title === 'string' ? title.trim() : '';
+  if (!newTitle) return { ok: false, error: 'title must be a non-empty string' };
+  if (newTitle.length > 200) return { ok: false, error: 'title too long (max 200)' };
+
+  const cacheDir = path.join(home, 'storages', 'session_projcache', 'sessions');
+  for (const name of [`${id}.json`, `session-${clean}.json`, `${clean}.json`]) {
+    const p = path.join(cacheDir, name);
+    let cache;
+    try {
+      cache = JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch { continue; }
+    if (!cache?.record?.rows) continue;
+    try {
+      if (!cache.record.rows.title) cache.record.rows.title = { val: '' };
+      cache.record.rows.title.val = newTitle;
+      // Keep the legacy firstPrompt-derived fallback in sync so any consumer
+      // reading titleInput doesn't resurrect the old auto-title.
+      if (cache.record.rows.titleInput?.val?.first) {
+        cache.record.rows.titleInput.val.first.text = newTitle;
+      }
+      const tmp = `${p}.bridge-rename.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(cache, null, 2), 'utf8');
+      fs.renameSync(tmp, p);
+      return { ok: true, sessionId: id, title: newTitle };
+    } catch (err) {
+      return { ok: false, error: `Cannot write session cache: ${err?.message}` };
+    }
+  }
+  return { ok: false, error: 'session cache not found' };
 }
 
 export { fs, path, url };

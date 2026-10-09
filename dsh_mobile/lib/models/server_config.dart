@@ -98,7 +98,13 @@ class ServerConfig {
 
   String get wsUrl {
     final scheme = effectiveUseHttps ? 'wss' : 'ws';
-    return '$scheme://$cleanHost:$cleanPort/mobile-ws?token=$effectiveToken';
+    // Token deliberately NOT in the query string anymore: URLs end up in proxy
+    // access logs, analytics and OS-level network diagnostics. The gateway
+    // accepts the same headers as HTTP (Authorization / x-dsh-token), and
+    // WebSocketChannel.connect passes them through. The query fallback remains
+    // only for gateways predating header auth — they ignored headers, so a
+    // 401 there triggers the client's auth-failure path cleanly.
+    return '$scheme://$cleanHost:$cleanPort/mobile-ws';
   }
 
   Map<String, dynamic> toJson() => {

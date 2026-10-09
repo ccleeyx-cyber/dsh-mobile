@@ -18,8 +18,34 @@ import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
 
+    /** 分享接收：SEND intent 带来的内容，Dart 侧启动时消费一次。 */
+    private var pendingShare: MutableMap<String, String>? = null
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        captureShareIntent(intent)
+    }
+
+    /** 把 SEND intent 的文字/图片 URI 暂存，等 Dart 侧来取。 */
+    private fun captureShareIntent(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_SEND) return
+        val map = mutableMapOf<String, String>()
+        if (intent.type == "text/plain") {
+            val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: ""
+            if (text.isNotBlank()) map["text"] = text
+        } else if (intent.type?.startsWith("image/") == true) {
+            @Suppress("DEPRECATION")
+            val uri = intent.getParcelableExtra<android.net.Uri>(Intent.EXTRA_STREAM)
+            if (uri != null) map["imagePath"] = uri.toString()
+        }
+        if (map.isNotEmpty()) pendingShare = map
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // 冷启动分享：intent 在 Activity 创建时就已就位。
+        captureShareIntent(intent)
 
         // 语音输入：App 调用 startListening，插件起原生识别器；结果与错误
         // 经 EventChannel 回传。这里只做"点击时若 App 已退到后台就把前台服务
@@ -54,10 +80,50 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+
+        // 打开外部 URL（APK 下载直链等）。Dart 侧没有内建的系统浏览器出口，
+        // 也不用 url_launcher —— 只为一个动线加一个插件不值。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_URL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "openUrl" -> {
+                        val url = call.argument<String>("url")
+                        if (url.isNullOrBlank()) {
+                            result.error("bad-args", "url is required", null)
+                            return@setMethodCallHandler
+                        }
+                        try {
+                            val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            startActivity(intent)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            // 没有浏览器可处理时如实回传，Dart 侧提示复制直链。
+                            result.success(false)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        // 分享接收：Dart 侧启动时来取一次，取走即清（避免下次启动重复注入）。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_SHARE)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "consumePending" -> {
+                        val share = pendingShare
+                        pendingShare = null
+                        result.success(share)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
     }
 
     companion object {
         private const val CHANNEL_METHODS = "dsh_mobile/foreground"
+        private const val CHANNEL_URL = "dsh_mobile/url"
+        private const val CHANNEL_SHARE = "dsh_mobile/share"
     }
 }
 

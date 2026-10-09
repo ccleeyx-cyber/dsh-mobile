@@ -104,8 +104,13 @@ async function dispatch(endpoint, payload, deps) {
       return { ok, deviceId: id };
     }
 
-    case 'audit/list':
-      return [];
+    case 'audit/list': {
+      // Real data now: readAudit is injected by the entry (lib/index.js), which
+      // owns the store. This used to be a hardcoded [] stub — the HTTP route
+      // exposed live audit records while the DSH settings page showed none.
+      const limit = Number(payload?.limit) > 0 ? Number(payload.limit) : 100;
+      return typeof deps.readAudit === 'function' ? deps.readAudit(limit) : [];
+    }
 
     default:
       throw new Error(`未知的 RPC 指令: ${endpoint}`);

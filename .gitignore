@@ -30,9 +30,15 @@ cookie.txt
 
 # Agent orchestration scratch — contains sub-agent transcripts with live
 # tokens (GitHub PATs, bridge tokens, engine secrets). Never commit.
+# NOTE: `.agents/hooks.json` was committed before this rule existed; gitignore
+# has no effect on already-tracked files. It was untracked again on 2026-10-08
+# via `git rm --cached`. Do not re-add anything under .agents/.
 .agents/
 
 # Superseded implementation kept only for reference.
+# Deleted from disk on 2026-10-08: it still contained a plaintext engine HMAC
+# secret and a live bridge token, and nothing imported it. Rule kept so it can
+# never be re-committed by accident.
 dsh-server-plugin/index.js.legacy
 
 # Local environment overrides
@@ -40,8 +46,23 @@ dsh-server-plugin/index.js.legacy
 .env.local
 *.local
 
+# Android signing material — never commit the keystore or its passwords.
+*.jks
+*.keystore
+key.properties
+
 # Test leftovers
 _diag*.log
 _run*.log
 _u.log
 _t.log
+# scripts/await-apk.mjs writes the downloaded CI artifact here and never cleans up.
+apk-artifact.zip
+# The E2E memory tests write these into whatever workspacePath they are pointed
+# at. On 2026-10-08 they were found in E:\workspace\个人\ — i.e. OUTSIDE this
+# repo, where gitignore cannot reach them. The real fix is to point those tests
+# at a temp dir (see ANALYSIS-优化与新增功能.md §1.14a); these rules only cover
+# the case where the repo itself is the workspace.
+E2E_MEMORY_TEST.MD
+LARGE_MEMORY_TEST.MD
+PROJECT_WORKLOAD_MEMORY.MD

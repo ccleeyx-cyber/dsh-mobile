@@ -1,0 +1,482 @@
+diff --git a/dsh-server-plugin/lib/core.mjs b/dsh-server-plugin/lib/core.mjs
+index fb80667..aad2c1b 100644
+--- a/dsh-server-plugin/lib/core.mjs
++++ b/dsh-server-plugin/lib/core.mjs
+@@ -213,11 +213,29 @@ export function createPathSanitizer({ getRegisteredWorkspaces }) {
+     if (trimmedWs.includes('..')) {
+       return { error: 'Forbidden: Path traversal detected in workspacePath', status: 403 };
+     }
++    // [P1] Layer 1 previously applied the absolute-path, leading-separator and
++    // drive-letter checks to fileName ONLY, leaving workspacePath with just the
++    // `..` substring test. workspacePath is legitimately absolute, so those
++    // checks cannot be copied across verbatim — but NUL bytes, ASCII control
++    // characters and Windows extended-length / device prefixes can be, and all
++    // three are ways to make the string comparison in layer 2 disagree with what
++    // the filesystem actually opens.
++    // eslint-disable-next-line no-control-regex
++    if (/[\x00-\x1f]/.test(trimmedWs)) {
++      return { error: 'Forbidden: control character in workspacePath', status: 403 };
++    }
++    if (/^\\\\[?.]\\/.test(trimmedWs)) {
++      return { error: 'Forbidden: extended-length or device path in workspacePath', status: 403 };
++    }
+     if (trimmedFile.includes('..') || path.isAbsolute(trimmedFile) ||
+         trimmedFile.startsWith('/') || trimmedFile.startsWith('\\') ||
+         /^[a-zA-Z]:[\\/]/.test(trimmedFile)) {
+       return { error: 'Forbidden: Path traversal detected in fileName', status: 403 };
+     }
++    // eslint-disable-next-line no-control-regex
++    if (/[\x00-\x1f]/.test(trimmedFile)) {
++      return { error: 'Forbidden: control character in fileName', status: 403 };
++    }
+ 
+     const resolvedWs = path.resolve(trimmedWs);
+ 
+@@ -228,22 +246,37 @@ export function createPathSanitizer({ getRegisteredWorkspaces }) {
+       if (p && typeof p === 'string' && p.trim()) registeredPaths.push(path.resolve(p.trim()));
+     }
+ 
+-    if (registeredPaths.length > 0) {
+-      let within = false;
+-      for (const regPath of registeredPaths) {
+-        const rel = path.relative(regPath, resolvedWs);
+-        if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
+-          const regNorm = regPath.toLowerCase().replace(/[\\/]+$/, '');
+-          const wsNorm = resolvedWs.toLowerCase().replace(/[\\/]+$/, '');
+-          if (wsNorm === regNorm || wsNorm.startsWith(regNorm + '\\') || wsNorm.startsWith(regNorm + '/')) {
+-            within = true;
+-            break;
+-          }
++    // [P0] Fail CLOSED when the workspace registry is empty.
++    //
++    // This used to read `if (registeredPaths.length > 0) { ...validate... }`, so
++    // an empty registry skipped layer 2 entirely and left nothing but the layer-1
++    // string checks above. getRegisteredWorkspaces() reads the engine's workspace
++    // table over RPC, and it legitimately returns [] during startup, after an
++    // engine reconnect, or on any RPC failure — so a memory read or write issued
++    // in that window was effectively unrestricted and could name any absolute
++    // path on the host. A sanitizer that disables itself when its input is
++    // missing is worse than no sanitizer, because it looks like there is one.
++    if (registeredPaths.length === 0) {
++      return {
++        error: 'Forbidden: no registered workspaces available to validate against',
++        status: 403
++      };
++    }
++
++    let within = false;
++    for (const regPath of registeredPaths) {
++      const rel = path.relative(regPath, resolvedWs);
++      if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
++        const regNorm = regPath.toLowerCase().replace(/[\\/]+$/, '');
++        const wsNorm = resolvedWs.toLowerCase().replace(/[\\/]+$/, '');
++        if (wsNorm === regNorm || wsNorm.startsWith(regNorm + '\\') || wsNorm.startsWith(regNorm + '/')) {
++          within = true;
++          break;
+         }
+       }
+-      if (!within) {
+-        return { error: 'Forbidden: workspacePath is not a registered workspace', status: 403 };
+-      }
++    }
++    if (!within) {
++      return { error: 'Forbidden: workspacePath is not a registered workspace', status: 403 };
+     }
+ 
+     const resolvedTarget = path.resolve(resolvedWs, trimmedFile);
+@@ -260,13 +293,55 @@ export function createPathSanitizer({ getRegisteredWorkspaces }) {
+  * read-only command classification
+  * ------------------------------------------------------------------ */
+ 
++// [P0] `find` and `echo` removed.
++//   - `find <path> -delete` and `find . -exec rm {} \;` are destructive, and
++//     neither `-delete` nor `-exec` contains a shell metacharacter, so the
++//     SHELL_METACHARACTERS guard below did not stop them. `find` is not a read
++//     verb in the sense this whitelist needs.
++//   - `echo` reads nothing; its only dangerous form is redirection, which the
++//     metacharacter guard already blocks. Keeping it in a READ-ONLY whitelist
++//     widened the auto-approve surface for no benefit.
++// `cat`/`head`/`tail` stay, but are now subject to SENSITIVE_PATH_PATTERNS below.
+ const READ_ONLY_PREFIXES = [
+-  'ls', 'dir', 'cat', 'grep', 'find', 'head', 'tail', 'wc',
++  'ls', 'dir', 'cat', 'grep', 'head', 'tail', 'wc',
+   'git status', 'git log', 'git diff',
+-  'pwd', 'echo', 'which', 'where'
++  'pwd', 'which', 'where'
+ ];
+ const READ_ONLY_TOOLS = ['read_file', 'view_file', 'search_web', 'list_dir'];
+ 
++/**
++ * [P0] Paths that must never be auto-approved, whatever the verb.
++ *
++ * The shipped default policy is `auto-read`, and under it
++ * `cat C:\Users\<user>\.dsh\.credentials.yaml` passed every existing check: it
++ * starts with an allowlisted verb and contains no shell metacharacters. The file
++ * holds the engine's HMAC signing key, so auto-approving that read handed an
++ * attacker everything needed to forge a dsh-auth-* cookie and talk to engine
++ * port 3080 directly — the gateway's own auth layer is not in that path at all,
++ * and the tool output was then broadcast to every connected client.
++ *
++ * Matching is on the lowercased command text, and covers both separator styles
++ * plus the bare directory names, so `.dsh/.credentials.yaml`,
++ * `.dsh\.credentials.yaml` and a plain `.credentials.yaml` all match.
++ */
++const SENSITIVE_PATH_PATTERNS = [
++  /\.dsh[\\/]/,
++  /\.credentials\.ya?ml/,
++  /credentials\.ya?ml/,
++  /mobile-bridge[\\/]config\.json/,
++  /[\\/]id_rsa\b/, /[\\/]id_ed25519\b/, /[\\/]id_dsa\b/,
++  /\.ssh[\\/]/,
++  /\.aws[\\/]credentials/,
++  /\.kube[\\/]config/,
++  /\.netrc\b/,
++  /[\\/]shadow\b/,
++  /\bsam\b.*\bsystem\b/i,
++  /key\.properties/,
++  /\.jks\b/, /\.keystore\b/, /\.p12\b/, /\.pfx\b/,
++  /dpapi/, /credhist/,
++  /\.env\b/
++];
++
+ /**
+  * Prefix-whitelist check used by the 'auto-read' execution policy.
+  *
+@@ -278,15 +353,103 @@ const READ_ONLY_TOOLS = ['read_file', 'view_file', 'search_web', 'list_dir'];
+  */
+ const SHELL_METACHARACTERS = /[;&|><`$(){}[\]!*?~\n\r]/;
+ 
++/** True when the command text mentions a path that must never be auto-approved. */
++function touchesSensitivePath(lowered) {
++  return SENSITIVE_PATH_PATTERNS.some((re) => re.test(lowered));
++}
++
++/**
++ * [P0] Flags that turn an otherwise read-only verb into a writer.
++ *
++ * `git log --output=/tmp/x` passes a prefix whitelist for `git log` and contains
++ * no shell metacharacter, yet it creates a file. Same shape for find's -delete /
++ * -exec family and printf-style output flags. The verb whitelist alone cannot
++ * see these.
++ */
++const DANGEROUS_FLAGS = /(^|\s)(--output|--out-file|-o|-delete|-exec|-execdir|-ok|-okdir|-fprint|-fprintf|-fls|--delete|--force|-f|--recursive|-r\s.*--delete)(\s|$|=)/;
++
++/**
++ * [P0] Verbs that must never be auto-approved, whatever the tool name claims.
++ *
++ * toolName comes from the request, i.e. from the model, so it is not a trust
++ * anchor. The old first line of isCommandReadOnly was
++ * `if (READ_ONLY_TOOLS.includes(toolName)) return true;` — a request naming a
++ * tool `read_file` was auto-approved no matter what command accompanied it, so
++ * `read_file` + `rm -rf /` sailed through (`-` is not a shell metacharacter).
++ * This denylist is the backstop for that class.
++ */
++const DANGEROUS_VERBS = /^(rm|del|erase|rmdir|rd|mv|move|ren|rename|cp|copy|xcopy|robocopy|chmod|chown|chgrp|takeown|icacls|kill|taskkill|format|mkfs|dd|shred|curl|wget|nc|ncat|netcat|ssh|scp|sftp|telnet|reg|setx|shutdown|restart-computer|new-item|set-content|add-content|out-file|export-csv|invoke-expression|iex|start-process|npm|npx|pnpm|yarn|pip|python|python3|node|deno|bash|sh|zsh|cmd|powershell|pwsh)(\s|$)/;
++
++/**
++ * [P0] Mutating subcommands of verbs that are otherwise partly whitelisted.
++ *
++ * `git status`, `git log` and `git diff` are on READ_ONLY_PREFIXES, so a bare
++ * `git` entry in DANGEROUS_VERBS would have blocked all three — measured, that
++ * was a false positive on the single most common read-only command family in
++ * this repo. The mutating subcommands are matched explicitly instead.
++ */
++const DANGEROUS_SUBCOMMANDS = [
++  /^git\s+(push|reset|clean|checkout|commit|rebase|merge|cherry-pick|revert|apply|am|tag|remote|config|gc|prune|reflog\s+expire|filter-branch|filter-repo|update-ref|rm|mv|stash|restore|switch|worktree|submodule)\b/,
++  /^docker\s+(rm|rmi|run|exec|push|kill|stop|system\s+prune|volume\s+rm)\b/,
++  /^kubectl\s+(delete|apply|exec|scale|rollout|patch|replace|drain)\b/,
++  /^flutter\s+(clean|publish|deploy)\b/,
++  /^gradlew?\s+.*\b(publish|clean|install)\b/
++];
++
++function hasDangerousSubcommand(lowered) {
++  return DANGEROUS_SUBCOMMANDS.some((re) => re.test(lowered));
++}
++
+ export function isCommandReadOnly(cmdStr, toolName) {
+-  if (READ_ONLY_TOOLS.includes(toolName)) return true;
+-  if (!cmdStr) return false;
+-  const trimmed = String(cmdStr).trim().toLowerCase();
+-  if (!trimmed) return false;
+-  if (SHELL_METACHARACTERS.test(trimmed)) return false;
+-  return READ_ONLY_PREFIXES.some((p) => trimmed === p || trimmed.startsWith(p + ' '));
++  const loweredCmd = cmdStr ? String(cmdStr).trim().toLowerCase() : '';
++
++  // No command line to classify — the tool name is all there is. This is the
++  // only case where the tool name is allowed to decide anything.
++  if (!loweredCmd) return READ_ONLY_TOOLS.includes(toolName);
++
++  if (SHELL_METACHARACTERS.test(loweredCmd)) return false;
++  if (touchesSensitivePath(loweredCmd)) return false;
++  if (DANGEROUS_FLAGS.test(loweredCmd)) return false;
++  if (DANGEROUS_VERBS.test(loweredCmd)) return false;
++  if (hasDangerousSubcommand(loweredCmd)) return false;
++
++  // A command must qualify on its own merits. Being labelled read_file no longer
++  // rescues one that is not on the whitelist — but a bare path (what read_file
++  // actually receives, e.g. `E:\workspace\个人\NOTES.md`) is still allowed so
++  // that tightening this does not turn every file read into an approval prompt.
++  if (READ_ONLY_PREFIXES.some((p) => loweredCmd === p || loweredCmd.startsWith(p + ' '))) return true;
++  if (READ_ONLY_TOOLS.includes(toolName) && !/\s/.test(loweredCmd.trim())) return true;
++  return false;
+ }
+ 
++/**
++ * Exported so the approval path can explain a denial in the audit log instead of
++ * silently falling back to an interactive prompt with no reason recorded.
++ */
++export function classifyCommand(cmdStr, toolName) {
++  const loweredCmd = cmdStr ? String(cmdStr).trim().toLowerCase() : '';
++  if (!loweredCmd) {
++    return READ_ONLY_TOOLS.includes(toolName)
++      ? { readOnly: true, why: 'read-only-tool' }
++      : { readOnly: false, why: 'no-command' };
++  }
++  if (SHELL_METACHARACTERS.test(loweredCmd)) return { readOnly: false, why: 'shell-metacharacter' };
++  if (touchesSensitivePath(loweredCmd)) return { readOnly: false, why: 'sensitive-path' };
++  if (DANGEROUS_FLAGS.test(loweredCmd)) return { readOnly: false, why: 'dangerous-flag' };
++  if (DANGEROUS_VERBS.test(loweredCmd)) return { readOnly: false, why: 'dangerous-verb' };
++  if (hasDangerousSubcommand(loweredCmd)) return { readOnly: false, why: 'dangerous-subcommand' };
++  const hit = READ_ONLY_PREFIXES.find((p) => loweredCmd === p || loweredCmd.startsWith(p + ' '));
++  if (hit) return { readOnly: true, why: `prefix:${hit}` };
++  if (READ_ONLY_TOOLS.includes(toolName) && !/\s/.test(loweredCmd.trim())) {
++    return { readOnly: true, why: 'read-only-tool:bare-path' };
++  }
++  return { readOnly: false, why: 'not-allowlisted' };
++}
++
++/** Exposed for tests. */
++export { SENSITIVE_PATH_PATTERNS, READ_ONLY_PREFIXES, READ_ONLY_TOOLS, DANGEROUS_FLAGS, DANGEROUS_VERBS, DANGEROUS_SUBCOMMANDS };
++
++
+ /* ------------------------------------------------------------------ *
+  * audit
+  * ------------------------------------------------------------------ */
+@@ -802,12 +965,55 @@ export function parseJsonBody(raw) {
+  * Returns { ok, archived, detached, cacheRemoved, error } — callers must surface
+  * failures instead of claiming success.
+  */
+-export function deleteSession({ home = dshHome(), sessionId, workspaceId = null }) {
+-  if (!sessionId || typeof sessionId !== 'string' || !sessionId.trim()) {
+-    return { ok: false, error: 'Missing or empty sessionId' };
+-  }
++/**
++ * [P0] Session ids reach the filesystem, so they have to be shape-checked first.
++ *
++ * deleteSession() built `${clean}.json` / `${id}.json` out of the raw caller
++ * input and passed it to path.join(cacheDir, name) followed by fs.unlinkSync.
++ * Nothing filtered the id, so `sessionId: "../../../../storages/workspace"`
++ * resolved outside the cache directory and deleted an arbitrary .json file —
++ * including the workspace table itself and the gateway's own
++ * mobile-bridge/config.json. The endpoint is authenticated, but the token is an
++ * 8-character shared secret, so this is a privilege escalation from "can talk to
++ * the gateway" to "can delete host files".
++ *
++ * Real ids are `session-<uuid>` or a bare uuid; 1-64 of [A-Za-z0-9_-] covers both
++ * with room to spare and admits no separator, dot, or drive character.
++ */
++const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
++
++export function assertSessionId(sessionId) {
++  if (typeof sessionId !== 'string') return { ok: false, error: 'sessionId must be a string' };
+   const id = sessionId.trim();
+-  const clean = id.replace(/^session-/, '');
++  if (!id) return { ok: false, error: 'Missing or empty sessionId' };
++  const bare = id.replace(/^session-/, '');
++  if (!SESSION_ID_RE.test(bare)) {
++    return { ok: false, error: 'Invalid sessionId: only [A-Za-z0-9_-] up to 64 characters are allowed' };
++  }
++  return { ok: true, id, bare };
++}
++
++/**
++ * Upper bound on global.archivedSessionIds.
++ *
++ * Archiving is how this bridge deletes, and the list was appended to forever —
++ * 1350 entries had accumulated by 2026-10-08. workspace.json is parsed
++ * synchronously inside getWorkspacesData(), which is already called per request,
++ * so an unbounded list is a slow leak that taxes every single API call.
++ *
++ * Eviction drops the OLDEST ids and is audited. The trade-off is explicit: an
++ * evicted id can make a very old deleted session visible again, which is
++ * strictly better than a store file that grows without limit. 20000 is far above
++ * any realistic accumulation rate, so this should only ever fire on a runaway
++ * loop — which is exactly when you want it to.
++ */
++const MAX_ARCHIVED_SESSION_IDS = Number(process.env.DSH_MAX_ARCHIVED_SESSIONS || 20000);
++
++export function deleteSession({ home = dshHome(), sessionId, workspaceId = null }) {
++  const checked = assertSessionId(sessionId);
++  if (!checked.ok) return { ok: false, error: checked.error };
++  const id = checked.id;
++  const clean = checked.bare;
+ 
+   const wsPath = path.join(home, 'storages', 'workspace.json');
+   const cacheDir = path.join(home, 'storages', 'session_projcache', 'sessions');
+@@ -823,6 +1029,14 @@ export function deleteSession({ home = dshHome(), sessionId, workspaceId = null
+   if (!ws.global) ws.global = {};
+   const archived = Array.isArray(ws.global.archivedSessionIds) ? ws.global.archivedSessionIds : [];
+   if (!archived.includes(id)) archived.push(id);
++  let evicted = 0;
++  while (archived.length > MAX_ARCHIVED_SESSION_IDS) {
++    archived.shift();
++    evicted++;
++  }
++  // No audit() call here: core.mjs deliberately does not import store.mjs (store
++  // imports core for the audit sink, so the reverse edge would be a cycle). The
++  // eviction count is returned instead and the caller audits it.
+   ws.global.archivedSessionIds = archived;
+ 
+   // 2. Detach from the workspace id list (also honouring the session- prefix variants).
+@@ -856,7 +1070,7 @@ export function deleteSession({ home = dshHome(), sessionId, workspaceId = null
+     } catch { /* the archive entry already hides it */ }
+   }
+ 
+-  return { ok: true, sessionId: id, archived: true, detached, cacheRemoved };
++  return { ok: true, sessionId: id, archived: true, detached, cacheRemoved, evicted };
+ }
+ 
+ export { fs, path, url };
+diff --git a/dsh-server-plugin/lib/index.js b/dsh-server-plugin/lib/index.js
+index b3872fd..277f51c 100644
+--- a/dsh-server-plugin/lib/index.js
++++ b/dsh-server-plugin/lib/index.js
+@@ -954,27 +954,71 @@ export function apply(ctx, config = {}, internals = {}) {
+ 
+         if ((val.type === 'request' || val.type === 'waterfall') && val.event === 'approval/request') {
+           const eventId = val.id || val.eventId || val.request?.id || `appr_${approvalCounter++}`;
+-          const sessionId = val.agent || val.agentId || 'default';
++          const sessionId = val.agent || val.agentId || val.sessionId || val.request?.sessionId || 'default';
+           const toolName = val.request?.toolName || '工具执行';
+           const reason = val.request?.reason || '申请工具执行权限';
+           const callId = val.request?.callId || '';
+           const input = coerceToolInput(val.request?.input ?? val.request?.arguments ?? val.request?.args ?? val.request?.command);
+           const options = val.request?.options || null;
+ 
+-          const sessionPolicy = getSessionPermission(sessionId);
++          // getSessionPermission() already delegates to permStore.forSession(),
++          // which resolves session policy first and falls back to global. It is
++          // therefore the EFFECTIVE policy, not merely the session-level one.
++          const effectivePolicy = getSessionPermission(sessionId);
++
++          // [P0] Resolve the command that is actually about to run.
++          //
++          // This used to default to `reason` — the model's own free-text
++          // justification — and only fell back to the real command if
++          // val.request.command happened to be a string. Anything the model
++          // wrote in `reason` was what got classified, so a reason of "ls"
++          // auto-approved an arbitrary destructive command under auto-read.
++          // `reason` is now never used as a command, and an unresolvable command
++          // fails CLOSED (no auto-approval) instead of failing open.
++          const cmdToCheck = (() => {
++            if (typeof val.request?.command === 'string' && val.request.command.trim()) {
++              return val.request.command;
++            }
++            if (typeof input === 'string' && input.trim()) return input;
++            if (input && typeof input === 'object') {
++              for (const k of ['command', 'cmd', 'script', 'shell', 'argv', 'args']) {
++                const v = input[k];
++                if (typeof v === 'string' && v.trim()) return v;
++                if (Array.isArray(v) && v.every((x) => typeof x === 'string') && v.length) return v.join(' ');
++              }
++              // A structured tool input we cannot reduce to a command line is not
++              // something a prefix whitelist can judge.
++              return null;
++            }
++            return null;
++          })();
++
+           let shouldAutoApprove = false;
+           let autoApproveReason = '';
+ 
+-          if (sessionPolicy === 'danger-full-access' || globalPermissions.executionPolicy === 'danger-full-access') {
++          // [P0] Session precedence, not OR.
++          //
++          // Both branches used to read
++          //   sessionPolicy === 'X' || globalPermissions.executionPolicy === 'X'
++          // which re-ORed the global policy back on top of an already-resolved
++          // effective policy and destroyed the precedence. With the shipped
++          // default (global = 'auto-read'), a session explicitly set to 'ask'
++          // still hit the auto-read branch and was auto-approved — the app's
++          // per-session "ask" control was a placebo, and setSessionPermission()
++          // had no effect on the approval path at all.
++          if (effectivePolicy === 'danger-full-access') {
+             shouldAutoApprove = true;
+             autoApproveReason = '全信任模式 (Danger Full Access) 自动放行';
+-          } else if (sessionPolicy === 'auto-read' || globalPermissions.executionPolicy === 'auto-read') {
+-            let cmdToCheck = reason;
+-            if (typeof val.request?.command === 'string') cmdToCheck = val.request.command;
+-            else if (typeof input === 'string' && input) cmdToCheck = input;
+-            if (isCommandReadOnly(cmdToCheck, toolName)) {
++          } else if (effectivePolicy === 'auto-read') {
++            if (cmdToCheck && isCommandReadOnly(cmdToCheck, toolName)) {
+               shouldAutoApprove = true;
+               autoApproveReason = '安全策略: 只读指令自动放行';
++            } else if (!cmdToCheck) {
++              audit('approval/auto-approve-skipped', {
++                id: eventId, sessionId, toolName,
++                why: 'no-resolvable-command',
++                policy: effectivePolicy
++              });
+             }
+           }
+ 
+@@ -985,7 +1029,19 @@ export function apply(ctx, config = {}, internals = {}) {
+               outcome: { kind: 'result', value: 'allowed-once' },
+               args: { clientId: currentEventsClientId, eventId, outcome: { kind: 'result', value: 'allowed-once' } }
+             }).catch(() => {});
+-            audit('approval/auto-approved', { id: eventId, time: Date.now(), sessionId, toolName, command: reason, outcome: 'auto-approved', reason: autoApproveReason });
++            // Audit the command that was actually classified, not the model's
++            // self-reported reason. Recording `reason` in the `command` field is
++            // what made the audit trail unusable for reconstructing what ran.
++            audit('approval/auto-approved', {
++              id: eventId,
++              time: Date.now(),
++              sessionId,
++              toolName,
++              command: cmdToCheck ?? '(unresolved)',
++              policy: effectivePolicy,
++              outcome: 'auto-approved',
++              reason: autoApproveReason
++            });
+             return;
+           }
+ 
+@@ -1321,7 +1377,36 @@ export function apply(ctx, config = {}, internals = {}) {
+         raw = await readBodyWithLimit(req, res, { sendJson });
+       } catch (err) {
+         if (err?.aborted || res.headersSent) return;
+-        throw err;
++        // [P0 availability] Do NOT rethrow here.
++        //
++        // core.mjs's readBodyWithLimit rejects socket errors from
++        // `req.on('error', (err) => reject(err))` WITHOUT setting aborted:true,
++        // so the guard above does not catch them. This `throw err` sits outside
++        // the business try block that starts a few lines below (whose catch is
++        // ~350 lines further down), so it escaped the async request handler
++        // entirely and surfaced as an unhandledRejection. There is no
++        // process.on('unhandledRejection') anywhere in this file, and Node >= 15
++        // defaults to --unhandled-rejections=throw, which terminates the
++        // process.
++        //
++        // Because this gateway runs INSIDE the dsh web process, that meant a
++        // single dropped mobile upload — a phone losing Wi-Fi mid-POST, a
++        // carrier NAT timeout, an abrupt TCP RST — took the whole engine down
++        // with it, killing every active session. No attacker required.
++        //
++        // A truncated or unreadable body is a client error: answer 400 and move
++        // on. sendJson is itself guarded because the socket is often already
++        // gone by the time we get here.
++        try {
++          sendJson(400, { error: 'Bad Request', message: '请求体读取失败或连接已中断' });
++        } catch { /* socket already gone */ }
++        audit('http/body-read-failed', {
++          path: pathname,
++          method: req.method,
++          message: err?.message,
++          code: err?.code
++        });
++        return;
+       }
+       jsonBody = parseJsonBody(raw);
+     }

@@ -20,6 +20,7 @@ import 'config_page.dart';
 import '../theme/app_colors.dart';
 import '../main.dart';
 import '../services/voice_input_service.dart';
+import '../services/platform_services.dart';
 import '../models/pending_attachment.dart';
 import '../services/attachment_picker.dart';
 
@@ -152,6 +153,22 @@ class _ChatViewState extends State<ChatView> {
     VoiceInputService.instance.init().then((ok) {
       if (mounted) setState(() => _voiceSupported = ok);
     });
+
+    // 分享接收：从系统分享（SEND intent）进来的文字填进输入框。
+    // 只在首次挂载消费一次；图片分享走附件管线，此处暂只接文字
+    //（图片 URI 需要读 content:// 流，接附件管线改动大，先不做）。
+    _consumePendingShare();
+  }
+
+  Future<void> _consumePendingShare() async {
+    final shared = await ShareReceiver.consumePending();
+    if (shared == null || !mounted) return;
+    if (shared.text.isNotEmpty) {
+      final cur = _inputController.text;
+      _inputController.text = cur.isEmpty ? shared.text : '$cur\n${shared.text}';
+      setState(() {});
+      _jumpToBottom();
+    }
   }
 
   @override
@@ -2299,6 +2316,9 @@ class _ChatViewState extends State<ChatView> {
               // 待发附件也放进卡片内 —— 它与"这条消息要发什么"是同一件事，
               // 摆在卡片外会显得是两个不相干的东西。
               if (_pendingAttachments.isNotEmpty) _buildPendingAttachments(),
+              // 提示词模板（v1.11.0）：点一下把模板文字接进输入框。
+              // 没有模板时不占任何空间。
+              if (dsh.snippets.isNotEmpty) _buildSnippetChips(dsh),
               TextField(
                 controller: _inputController,
                 focusNode: _inputFocusNode,
@@ -2334,6 +2354,38 @@ class _ChatViewState extends State<ChatView> {
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// 提示词模板 chips：横向滚动，点按把模板文字**追加**到输入框（不覆盖
+  /// 已有内容 —— 用户可能已经打了半句）。
+  Widget _buildSnippetChips(DshService dsh) {
+    return SizedBox(
+      height: 30,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: dsh.snippets.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 6),
+        itemBuilder: (ctx, i) {
+          final snip = dsh.snippets[i];
+          return ActionChip(
+            label: Text(snip.label, style: TextStyle(fontSize: 11.5, color: context.c.textSecondary)),
+            backgroundColor: context.c.surface,
+            side: BorderSide(color: context.c.border),
+            visualDensity: VisualDensity.compact,
+            onPressed: () {
+              final cur = _inputController.text;
+              _inputController.text = cur.isEmpty
+                  ? snip.text
+                  : '$cur\n${snip.text}';
+              _inputController.selection = TextSelection.fromPosition(
+                TextPosition(offset: _inputController.text.length),
+              );
+              dsh.updateDraft(_inputController.text);
+            },
+          );
+        },
       ),
     );
   }

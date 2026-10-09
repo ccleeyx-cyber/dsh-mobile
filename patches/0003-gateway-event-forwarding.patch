@@ -1,0 +1,443 @@
+diff --git a/dsh-server-plugin/lib/index.js b/dsh-server-plugin/lib/index.js
+index 9018742..2bdc1c7 100644
+--- a/dsh-server-plugin/lib/index.js
++++ b/dsh-server-plugin/lib/index.js
+@@ -129,6 +129,28 @@ function resolveInternalSecret() {
+   }
+ }
+ 
++/**
++ * Upper bound on a mobile socket's send buffer before the gateway drops it.
++ *
++ * There is no other writer on this connection: it carries deltas, tool results,
++ * todo snapshots and question frames. A phone that loses signal — or is merely
++ * slower than a fast assistant stream — would otherwise grow the gateway's heap
++ * until the whole dsh web process died, taking every session on the box with it.
++ * Dropping one stalled client is strictly better than that.
++ *
++ * Exported so the threshold can be unit-tested directly: `bufferedAmount` on a
++ * real socket is a read-only getter, so a test cannot reach this condition by
++ * sending bytes and hoping the kernel buffer fills. Without this seam the only
++ * possible test would be a vacuous one.
++ */
++export const MAX_CLIENT_BUFFER_BYTES = 8 * 1024 * 1024;
++
++export function shouldDivertForBackpressure(bufferedAmount) {
++  return typeof bufferedAmount === 'number'
++    && Number.isFinite(bufferedAmount)
++    && bufferedAmount > MAX_CLIENT_BUFFER_BYTES;
++}
++
+ export function apply(ctx, config = {}, internals = {}) {
+   const logger = ctx.logger?.(name) ?? console;
+   const cfg = loadConfig();
+@@ -188,6 +210,38 @@ export function apply(ctx, config = {}, internals = {}) {
+   const pendingApprovals = new Map();
+   let approvalCounter = 1;
+ 
++  /* -------------------------------------------------------------- *
++   * user-questions pending requests (0003).
++   *
++   * `user-questions/request` arrives as a waterfall value on the $events
++   * stream. The answer does NOT travel back as a returned value or a
++   * `next()` call: neither can survive the JSON hop, so the gateway
++   * answers over `$events/result` with the same
++   * `{kind:'result', value}` shape the auto-approve path uses.
++   *
++   * This map is therefore bookkeeping for the PHONE's benefit only — it
++   * drives the replay a late-connecting client receives and decides when
++   * a prompt stops being offered. The engine owns the actual pending
++   * request and resolves it by event id.
++   * -------------------------------------------------------------- */
++  const pendingQuestions = new Map();
++
++  /** Clients that want question frames. A phone with no open session still may. */
++  const questionSubscribers = new Set();
++
++  /**
++   * How long a question is offered to the phones before the gateway stops
++   * tracking it.
++   *
++   * This is NOT a promise deadline — the answer is delivered to the engine over
++   * `$events/result`, exactly like an approval, so there is no local promise to
++   * time out. The only thing a stale entry does is show up in the replay a
++   * late-connecting phone receives. Expiring it keeps that replay honest.
++   *
++   * Generous on purpose: a human reading a plan-review prompt deserves minutes.
++   */
++  const QUESTION_TTL_MS = 30 * 60 * 1000;
++
+   /* -------------------------------------------------------------- *
+    * Shared core wiring (see lib/core.mjs).
+    *
+@@ -791,15 +845,161 @@ export function apply(ctx, config = {}, internals = {}) {
+     };
+   }
+ 
+-  function broadcastToMobileClients(msg) {
++    function broadcastToMobileClients(msg) {
+     const raw = typeof msg === 'string' ? msg : JSON.stringify(msg);
+     for (const ws of connectedClients) {
+       if (ws.readyState === WebSocket.OPEN) {
++        // [P1] Backpressure. A socket that cannot keep up used to accumulate in
++        // the send buffer forever, because there is no other writer on this
++        // connection: the mobile socket carries deltas, tool results and now
++        // question frames. A phone that loses signal — or is simply slower than
++        // a fast assistant stream — would grow the gateway's heap until the whole
++        // dsh web process dies. Dropping one slow client is strictly better than
++        // killing every session on the box. 8 MB is far above any healthy burst:
++        // a normal stream drains at network speed long before this.
++        const buffered = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
++        if (shouldDivertForBackpressure(buffered)) {
++          logger.warn('dsh-mobile-bridge: 客户端发送缓冲积压 %d B，断开以保护网关', buffered);
++          try { ws.close(1013, 'backpressure'); } catch (_) {}
++          connectedClients.delete(ws);
++          questionSubscribers.delete(ws);
++          continue;
++        }
+         try { ws.send(raw); } catch (_) {}
+       }
+     }
+   }
+ 
++  /**
++   * Emit a frame only to the clients that asked for it.
++   *
++   * Unlike broadcastToMobileClients, this never grows the fan-out for clients
++   * that did not opt in. Used for question frames so a second phone that is
++   * merely browsing the session list is not handed interactive prompts it will
++   * never answer — those requests would otherwise sit blocked until they time
++   * out on the engine side.
++   */
++  function sendToSubscribers(msg, subs) {
++    const raw = typeof msg === 'string' ? msg : JSON.stringify(msg);
++    for (const ws of subs) {
++      if (ws.readyState !== WebSocket.OPEN) {
++        subs.delete(ws);
++        continue;
++      }
++      const buffered = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
++      if (shouldDivertForBackpressure(buffered)) {
++        try { ws.close(1013, 'backpressure'); } catch (_) {}
++        connectedClients.delete(ws);
++        subs.delete(ws);
++        continue;
++      }
++      try { ws.send(raw); } catch (_) {}
++    }
++  }
++
++  /**
++   * Deliver a phone's answer to the engine.
++   *
++   * The answer travels over `$events/result` with `outcome.kind === 'result'`,
++   * which is the same mechanism the auto-approve path uses and the only one the
++   * engine accepts for a remote client. It deliberately does NOT use a local
++   * Promise: a `next` continuation cannot survive the JSON hop, so any
++   * promise-based design here would look correct in a unit test and hang in
++   * production.
++   */
++  async function handleQuestionAnswer(eventId, answer) {
++    const pending = pendingQuestions.get(eventId);
++    if (!pending) return { ok: false, error: 'unknown-question' };
++    pendingQuestions.delete(eventId);
++
++    const value = { answers: Array.isArray(answer?.answers) ? answer.answers : [] };
++    try {
++      await callDshRpc('$events/result', {
++        clientId: currentEventsClientId,
++        eventId,
++        outcome: { kind: 'result', value },
++        args: { clientId: currentEventsClientId, eventId, outcome: { kind: 'result', value } }
++      });
++    } catch (err) {
++      audit('question/answer-failed', { eventId, sessionId: pending.sessionId, error: err?.message });
++      return { ok: false, error: 'rpc-failed' };
++    }
++
++    sendToSubscribers({ type: 'question_settled', eventId, ok: true }, questionSubscribers);
++    audit('question/answered', { eventId, sessionId: pending.sessionId, count: value.answers.length });
++    return { ok: true, eventId };
++  }
++
++  /**
++   * Stop offering a question without answering it.
++   *
++   * Crucially this does NOT send an empty answer. Sending `{answers: []}` would
++   * tell the agent the human replied with nothing — a different and false
++   * statement. Leaving the request unanswered is what lets the engine's
++   * waterfall fall through to the Web UI answerer, which is the honest outcome
++   * when the phone is gone.
++   */
++  function relinquishQuestion(eventId, why) {
++    const pending = pendingQuestions.get(eventId);
++    if (!pending) return false;
++    pendingQuestions.delete(eventId);
++    audit('question/relinquished', { eventId, sessionId: pending.sessionId, why });
++    return true;
++  }
++
++  /** Questions still worth offering, newest last. Expired ones are pruned. */
++  function livePendingQuestions() {
++    const now = Date.now();
++    const out = [];
++    for (const q of pendingQuestions.values()) {
++      if (now - q.createdAt > QUESTION_TTL_MS) {
++        pendingQuestions.delete(q.eventId);
++        continue;
++      }
++      out.push({ eventId: q.eventId, sessionId: q.sessionId, questions: q.questions });
++    }
++    return out;
++  }
++
++  /**
++   * Forward the session-scoped events the phone now renders. Returns true when
++   * the event was consumed.
++   *
++   * Both of these ride the SESSION log (`agent.session.append('todo/write')`),
++   * so depending on how the engine multiplexes they can arrive on the per-session
++   * follow stream OR the shared $events stream. Handling them in one helper
++   * called from both is the only way neither path can silently drop them — the
++   * follow-stream branch ends in a bare `return`, so a `todo/write` that lands
++   * there would otherwise vanish with no error anywhere.
++   */
++  function forwardSessionEvent(val, fallbackSessionId) {
++    if (val.type !== 'event' || !val.event) return false;
++    const data = val.data || val.payload || {};
++    const sessionId = val.agent || val.agentId || val.sessionId || data.sessionId || fallbackSessionId || 'default';
++
++    if (val.event === 'todo/write') {
++      // Whole-list replacement, not a delta. An empty array is meaningful (the
++      // list was cleared) and is broadcast; a frame with no `todos` at all is
++      // not, because there is nothing to say.
++      if (!Array.isArray(data.todos)) return true;
++      broadcastToMobileClients({ type: 'todo_list', sessionId, todos: data.todos });
++      audit('todo/broadcast', { sessionId, count: data.todos.length });
++      return true;
++    }
++
++    if (val.event === 'session/attachment') {
++      // Metadata only. The bytes stay on the host; the phone fetches them via the
++      // authenticated attachment route, so a large inline blob never crosses the
++      // MUX hop.
++      const attachment = data.attachment || data;
++      if (!attachment || typeof attachment !== 'object') return true;
++      broadcastToMobileClients({ type: 'attachment', sessionId, attachment });
++      return true;
++    }
++
++    return false;
++  }
++
+   let upstreamMuxWs = null;
+   let muxReconnectTimer = null;
+ 
+@@ -855,13 +1055,21 @@ export function apply(ctx, config = {}, internals = {}) {
+     upstreamMuxWs.on('message', (data) => {
+       try {
+         const msg = JSON.parse(data.toString());
+-        handleUpstreamMuxMessage(msg);
++        handleUpstreamMuxMessage(msg).catch((err) => {
++        logger.warn('dsh-mobile-bridge: 处理上游帧失败 %s', err?.message || err);
++      });
+       } catch (_) {}
+     });
+ 
+     upstreamMuxWs.on('close', () => {
+       if (isDisposed) return;
+       currentEventsClientId = null;
++      // The engine-side link is gone, so any answer we forward would go nowhere.
++      // Stop offering these rather than letting a phone answer into the void.
++      for (const q of [...pendingQuestions.values()]) {
++        relinquishQuestion(q.eventId, 'upstream-link-lost');
++      }
++      sendToSubscribers({ type: 'questions_invalidated', reason: 'upstream-link-lost' }, questionSubscribers);
+       for (const follower of sessionFollowers.values()) {
+         follower.subscribed = false;
+       }
+@@ -876,7 +1084,7 @@ export function apply(ctx, config = {}, internals = {}) {
+     });
+   }
+ 
+-  function handleUpstreamMuxMessage(msg) {
++  async function handleUpstreamMuxMessage(msg) {
+     if (!msg) return;
+ 
+     // 1. Upstream MUX Item Frames (Standard DSH MUX protocol)
+@@ -967,12 +1175,17 @@ export function apply(ctx, config = {}, internals = {}) {
+             }
+             broadcastToMobileClients({ type: 'tool_result', sessionId: sId, output: ev.data?.output || '执行完毕' });
+           }
++          // todo/write and session/attachment also ride the session log. This
++          // branch ends in a bare `return`, so they must be offered here too or
++          // they disappear with no trace when the engine multiplexes them onto
++          // the follow stream.
++          forwardSessionEvent(val, sId);
+           return;
+         }
+         return;
+       }
+ 
+-      // B. $events stream (approvals and requests)
++      // B. $events stream (approvals, questions and requests)
+       if (msg.value) {
+         const val = msg.value;
+         if (val.type === 'ready') {
+@@ -981,7 +1194,81 @@ export function apply(ctx, config = {}, internals = {}) {
+           return;
+         }
+ 
+-        if (val.type === 'cancel' || val.event === 'approval/cancel') {
++        /* ---------------------------------------------------------- *
++         * user-questions/request — the agent is blocked waiting for a
++         * human. [0003]
++         *
++         * The answer goes back over `$events/result`, the same channel
++         * and the same `{kind:'result', value}` shape the auto-approve
++         * path already uses in production. NOT a local Promise: a
++         * `next` continuation cannot survive the JSON hop, so a
++         * promise-based design would pass a unit test and hang in
++         * production.
++         *
++         * When nobody can answer, the frame is simply left unanswered.
++         * That is what lets the engine's waterfall fall through to the
++         * Web UI answerer. Sending an empty answer instead would tell
++         * the agent the human replied with nothing.
++         * ---------------------------------------------------------- */
++        if (val.type === 'request' || val.type === 'waterfall') {
++          if (val.event === 'user-questions/request') {
++            const request = val.request || val.payload || val.data || {};
++            const questions = Array.isArray(request.questions) ? request.questions : [];
++            const sessionId = val.agent || val.agentId || val.sessionId || request.sessionId
++              || (request.agent && request.agent.id) || 'default';
++            // The engine resolves the waterfall by event id. A minted one would
++            // be rejected on the way back, so an id-less frame is unanswerable
++            // rather than merely inconvenient — say so instead of storing it and
++            // letting a phone answer into the void.
++            const eventId = val.id || val.eventId || request.id || null;
++
++            if (!eventId) {
++              logger.warn('[dsh-mobile-bridge] user-questions 帧缺少 id，无法代答，留给 Web UI');
++              audit('question/unanswerable', { sessionId, why: 'no-event-id' });
++              return;
++            }
++
++            if (questionSubscribers.size === 0) {
++              logger.info('[dsh-mobile-bridge] user-questions 无手机订阅者，留给 Web UI');
++              audit('question/relinquished', { eventId, sessionId, why: 'no-subscriber' });
++              return;
++            }
++
++            pendingQuestions.set(eventId, {
++              eventId,
++              sessionId,
++              questions,
++              createdAt: Date.now()
++            });
++
++            sendToSubscribers({
++              type: 'question_request',
++              eventId,
++              sessionId,
++              questions
++            }, questionSubscribers);
++            audit('question/requested', { eventId, sessionId, count: questions.length });
++            return;
++          }
++        }
++
++        // `todo/write` and `session/attachment` are SESSION events, matched on
++        // the event name alone — they are not waterfalls.
++        if (forwardSessionEvent(val, null)) return;
++
++        // A cancelled turn invalidates whatever it was waiting on.
++    if (val.type === 'cancel' || val.event === 'approval/cancel' || val.event === 'turn/cancel') {
++      const cancelEventId = val.eventId || val.id;
++      if (cancelEventId) relinquishQuestion(cancelEventId, 'engine-cancel');
++      // A cancel frame carries no event id for the question it invalidates, so
++      // a turn-level cancel has to clear whatever is still outstanding.
++      for (const q of [...pendingQuestions.values()]) {
++        relinquishQuestion(q.eventId, 'engine-cancel');
++      }
++      sendToSubscribers({ type: 'questions_invalidated', reason: 'engine-cancel' }, questionSubscribers);
++    }
++
++    if (val.type === 'cancel' || val.event === 'approval/cancel') {
+           const eventId = val.eventId || val.id;
+           if (eventId) {
+             const appr = coreApprovals.get(eventId);
+@@ -1918,6 +2205,33 @@ export function apply(ctx, config = {}, internals = {}) {
+           if (msg.type === 'follow' || msg.type === 'select_session') {
+             ws.send(JSON.stringify({ type: 'follow_ack', sessionId: sId }));
+           }
++        } else if (msg.type === 'question_answer') {
++          // [0003] Answers the engine's user-questions waterfall over
++          // $events/result. handleQuestionAnswer is async — it must be awaited,
++          // or `res.ok` reads off a Promise and every ack reports undefined.
++          const res = await handleQuestionAnswer(msg.eventId || msg.id, msg.answer ?? msg.payload);
++          ws.send(JSON.stringify({
++            type: 'question_ack',
++            eventId: res.eventId || (msg.eventId || msg.id),
++            ok: res.ok === true,
++            error: res.error
++          }));
++        } else if (msg.type === 'subscribe_questions' || msg.type === 'question_subscribe') {
++          // Opt in to interactive prompts. Deliberately explicit: a phone that
++          // is only browsing the session list must not receive questions, or a
++          // second client would sit on requests it will never answer.
++          questionSubscribers.add(ws);
++          ws.wantsQuestions = true;
++          ws.send(JSON.stringify({
++            type: 'question_subscribed',
++            ok: true,
++            // Replay anything still waiting, so a phone that connects mid-question
++            // is not left looking at a session that appears to have stalled.
++            pending: livePendingQuestions()
++          }));
++        } else if (msg.type === 'unsubscribe_questions') {
++          questionSubscribers.delete(ws);
++          ws.wantsQuestions = false;
+         } else if (msg.type === 'approval_response') {
+           const eventId = msg.eventId || msg.approvalId || msg.id;
+           if (eventId && msg.outcome) {
+@@ -1928,8 +2242,26 @@ export function apply(ctx, config = {}, internals = {}) {
+       } catch (_) {}
+     });
+ 
+-    ws.on('close', () => connectedClients.delete(ws));
+-    ws.on('error', () => connectedClients.delete(ws));
++    ws.on('close', () => {
++      // A phone that vanished must stop being offered questions it will never
++      // answer, and the remaining subscribers (and the Web UI) must be told the
++      // prompt is no longer live.
++      if (questionSubscribers.has(ws)) {
++        for (const q of [...pendingQuestions.values()]) {
++          relinquishQuestion(q.eventId, 'subscriber-disconnect');
++        }
++        sendToSubscribers({
++          type: 'questions_invalidated',
++          reason: 'subscriber-disconnect'
++        }, questionSubscribers);
++      }
++      questionSubscribers.delete(ws);
++      connectedClients.delete(ws);
++    });
++    ws.on('error', () => {
++      questionSubscribers.delete(ws);
++      connectedClients.delete(ws);
++    });
+   });
+ 
+   const apkFilePath = path.join(import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)), '..', 'public', 'dsh-agent.apk');
+@@ -1970,6 +2302,10 @@ export function apply(ctx, config = {}, internals = {}) {
+       try { ws.close(); } catch (_) {}
+     }
+     connectedClients.clear();
++    // Nothing here holds a timer any more (see QUESTION_TTL_MS), but the map
++    // must not outlive the gateway so a re-apply starts clean.
++    pendingQuestions.clear();
++    questionSubscribers.clear();
+     try { wss.close(); } catch (_) {}
+     try { server.closeAllConnections?.(); } catch (_) {}
+     await new Promise((resolve) => {

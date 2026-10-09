@@ -1,11 +1,19 @@
 /**
  * Tier 1: Workspace Memory & Audit Trail Verification
  * Features: Query MEMORY.md, update MEMORY.md, validate audit logs, reject missing params
+ *
+ * ⚠️ TC4 writes a scratch file into a REAL registered workspace (the memory
+ * endpoint rejects unregistered paths with 403, so there is no temp-dir
+ * alternative). It now deletes that file in a finally block and asserts the
+ * deletion; previously it left E2E_MEMORY_TEST.MD in the developer's workspace
+ * root on every run.
  */
 
+import fs from 'node:fs';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { apiRequest } from '../helpers/client.js';
+import { trackWorkspaceFile, cleanupWorkspaceFiles, autoCleanup } from '../helpers/guard.js';
 
 describe('Tier 1 - Workspace Memory & Audit Trail', () => {
 
@@ -50,28 +58,42 @@ describe('Tier 1 - Workspace Memory & Audit Trail', () => {
     // headroom when the tier runs back-to-back with the rest of the suite.
     const IO_TIMEOUT_MS = 30000;
 
-    const writeRes = await apiRequest('/api/mobile/workspace/memory', {
-      method: 'POST',
-      body: {
-        workspacePath: targetWs.path,
-        fileName: testFileName,
-        content: testContent
-      },
-      timeout: IO_TIMEOUT_MS
-    });
+    // The memory endpoint validates workspacePath against the registered
+    // workspace whitelist, so this has to write into a REAL workspace — a temp
+    // dir would just get a 403. Register the path up front so the finally block
+    // (and the process-exit safety net) always removes it again. This test used
+    // to leave E2E_MEMORY_TEST.MD behind in the developer's own workspace root
+    // on every run.
+    const abs = trackWorkspaceFile(targetWs.path, testFileName);
+    autoCleanup();
 
-    assert.equal(writeRes.status, 200);
-    assert.equal(writeRes.data.ok, true);
+    try {
+      const writeRes = await apiRequest('/api/mobile/workspace/memory', {
+        method: 'POST',
+        body: {
+          workspacePath: targetWs.path,
+          fileName: testFileName,
+          content: testContent
+        },
+        timeout: IO_TIMEOUT_MS
+      });
 
-    // Read back
-    const readRes = await apiRequest(
-      `/api/mobile/workspace/memory?workspacePath=${encodeURIComponent(targetWs.path)}&fileName=${testFileName}`,
-      { timeout: IO_TIMEOUT_MS }
-    );
+      assert.equal(writeRes.status, 200);
+      assert.equal(writeRes.data.ok, true);
 
-    assert.equal(readRes.status, 200);
-    assert.equal(readRes.data.content, testContent);
-    assert.equal(readRes.data.exists, true);
+      // Read back
+      const readRes = await apiRequest(
+        `/api/mobile/workspace/memory?workspacePath=${encodeURIComponent(targetWs.path)}&fileName=${testFileName}`,
+        { timeout: IO_TIMEOUT_MS }
+      );
+
+      assert.equal(readRes.status, 200);
+      assert.equal(readRes.data.content, testContent);
+      assert.equal(readRes.data.exists, true);
+    } finally {
+      cleanupWorkspaceFiles();
+      assert.ok(!fs.existsSync(abs), `TC4 must not leave ${testFileName} in the real workspace`);
+    }
   });
 
   it('TC5: GET /api/mobile/audit-logs returns audit log entries', async () => {

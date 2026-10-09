@@ -4,25 +4,43 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "npm run test:unit && npm run test:e2e && npm run test:challenger",
-    "test:unit": "node --test --test-concurrency=1 tests/unit/core.test.mjs tests/unit/delete-session.test.mjs tests/unit/smoke-bridge.test.mjs",
-    "test:e2e": "node --test --test-concurrency=1 \"tests/e2e/**/*.test.js\"",
-    "test:tier1": "node --test --test-concurrency=1 \"tests/e2e/tier1-features/**/*.test.js\"",
-    "test:tier2": "node --test --test-concurrency=1 \"tests/e2e/tier2-boundary/**/*.test.js\"",
-    "test:tier3": "node --test --test-concurrency=1 \"tests/e2e/tier3-cross-feature/**/*.test.js\"",
-    "test:tier4": "node --test --test-concurrency=1 \"tests/e2e/tier4-workloads/**/*.test.js\"",
+    "//": "分层说明见 ANALYSIS-优化与新增功能.md §1.14 / §6.10。",
+    "//safe": "test = 只跑 hermetic 单测。八个 unit 文件都用 mkdtempSync 隔离 DSH_HOME，0 次真实网关(3088)调用，不建会话、不打 LLM、不改任何真实配置。这是唯一可以随手跑的命令。",
+    "//safe-detail": "其中 archived-filter.test.mjs 会用 mock Cordis ctx 真的把插件加载起来；event-forwarding.test.mjs 还会额外起一个假引擎（空闲端口上的 HTTP + WS），把网关的上游 MUX 和 $events/result RPC 都接管掉，好断言事件转发。两者打的都是自己起的实例，绝不碰你正在运行的 dsh web（3080/3081/3088 始终由真实进程持有）。",
+    "//danger": "下面所有 live/destructive 脚本都会打真实网关(3088)、在真实工作区建会话、消耗真实 LLM token，其中 destructive 那批还会改你的真实策略且恢复不可靠。2026-10-08 之前 `npm test` 把它们全串在一起，一次跑约 750~850 次真实调用 + 55~65 个真实会话 + 25~30 次真实 prompt。现在必须显式指名才跑。",
+
+    "test": "npm run test:unit",
+    "test:unit": "node --test --test-concurrency=1 --test-timeout=120000 tests/unit/core.test.mjs tests/unit/delete-session.test.mjs tests/unit/security-hardening.test.mjs tests/unit/smoke-bridge.test.mjs tests/unit/archived-filter.test.mjs tests/unit/event-forwarding.test.mjs tests/unit/session-visibility.test.mjs tests/unit/attachment-routes.test.mjs",
+
+    "//hook": "所有 live 脚本都挂 --import ./tests/cleanup-hook.mjs，让每个测试文件进程结束时把自己建的空会话归档掉。test:unit 故意不挂：它用 mkdtempSync 隔离 DSH_HOME、一个会话都不建，挂上反而会让一次\"安全\"的单测去扫并归档真实工作区的遗留会话。",
+    "test:live": "npm run test:e2e && npm run test:challenger",
+    "test:e2e": "node --test --test-concurrency=1 --import ./tests/cleanup-hook.mjs \"tests/e2e/**/*.test.js\"",
+    "test:tier1": "node --test --test-concurrency=1 --import ./tests/cleanup-hook.mjs \"tests/e2e/tier1-features/**/*.test.js\"",
+    "test:tier2": "node --test --test-concurrency=1 --import ./tests/cleanup-hook.mjs \"tests/e2e/tier2-boundary/**/*.test.js\"",
+    "test:tier3": "node --test --test-concurrency=1 --import ./tests/cleanup-hook.mjs \"tests/e2e/tier3-cross-feature/**/*.test.js\"",
+    "//tier4": "glob 是 **/*.test.js，会静默跳过同目录下两个 .mjs 基准 —— 这目前反而是好事，那两个基准会反复刷你的真实全局策略且无 before/after 备份。",
+    "test:tier4": "node --test --test-concurrency=1 --import ./tests/cleanup-hook.mjs \"tests/e2e/tier4-workloads/**/*.test.js\"",
 
     "test:challenger": "npm run test:challenger:unit && npm run test:challenger:e2e && npm run test:challenger:race",
-    "test:challenger:unit": "node --test --test-concurrency=1 tests/m1_adversarial_stress.test.js tests/m1_stress_challenge.test.js tests/m4_stress_challenge.test.js",
-    "test:challenger:e2e": "node --test --test-concurrency=1 tests/m2_stress_challenge.test.js tests/m3_stress_challenge.test.js tests/m3_1_reconnect_churn_challenge.test.js tests/m4_adversarial_boundary_challenge.test.js tests/m4_empirical_boundary_stress.test.js",
-    "test:challenger:race": "node tests/stress_cancel.mjs && node tests/r3_adversarial_verify.mjs",
+    "test:challenger:unit": "node --test --test-concurrency=1 --import ./tests/cleanup-hook.mjs tests/m1_adversarial_stress.test.js tests/m1_stress_challenge.test.js tests/m4_stress_challenge.test.js",
+    "test:challenger:e2e": "node --test --test-concurrency=1 --import ./tests/cleanup-hook.mjs tests/m2_stress_challenge.test.js tests/m3_stress_challenge.test.js tests/m3_1_reconnect_churn_challenge.test.js tests/m4_adversarial_boundary_challenge.test.js tests/m4_empirical_boundary_stress.test.js",
+    "test:challenger:race": "node --import ./tests/cleanup-hook.mjs tests/stress_cancel.mjs && node --import ./tests/cleanup-hook.mjs tests/r3_adversarial_verify.mjs",
 
+    "//destructive": "会写真实 ~/.dsh 配置或真实工作区文件。已全部接入 tests/e2e/helpers/guard.js 的快照-恢复（2026-10-08），但跑之前仍建议备份 ~/.dsh/mobile-access/permissions.json。历史罪行：permissions.test.js TC5 把你工作区里第一个真实会话设成 danger-full-access 且完全不恢复；permission-prompt.test.js 的\"恢复\"是硬编码 auto-read；mobile-security-guard.test.js 用 orig.maxSteps||30 / protectGit!==false 把原值改坏；oversized-payloads.test.js TC5 把全局默认模型设成 5000 字符垃圾串；三个 memory 测试往真实工作区写文件且从不删除。",
+    "test:destructive": "node --test --test-concurrency=1 --import ./tests/cleanup-hook.mjs tests/e2e/tier1-features/permissions.test.js tests/e2e/tier1-features/models-and-settings.test.js tests/e2e/tier1-features/workspace-memory.test.js tests/e2e/tier2-boundary/oversized-payloads.test.js tests/e2e/tier3-cross-feature/permission-prompt.test.js tests/e2e/tier4-workloads/policy-sync-persistence-stress.test.js tests/e2e/tier4-workloads/mobile-security-guard.test.js tests/e2e/tier4-workloads/mobile-developer-memory.test.js",
+
+    "//bench": "两个基准都会 30~50 轮反复翻你的真实全局策略，全程无 before/after 备份；且 benchmark-policy-sync.mjs 全文 0 条 assert，SLA 违规只 console.warn → 永远 exit 0，其 waiters 还没有超时保护，收不到帧就永久挂死。",
     "bench": "npm run bench:policy && npm run bench:burst",
-    "bench:policy": "node tests/e2e/tier4-workloads/benchmark-policy-sync.mjs",
-    "bench:burst": "node tests/e2e/tier4-workloads/burst-concurrency-stress.mjs",
+    "bench:policy": "node --import ./tests/cleanup-hook.mjs tests/e2e/tier4-workloads/benchmark-policy-sync.mjs",
+    "bench:burst": "node --import ./tests/cleanup-hook.mjs tests/e2e/tier4-workloads/burst-concurrency-stress.mjs",
+
+    "//probe": "0 断言的诊断脚本。它绕过网关直连引擎 3080 建会话，并用 session/delete 清理 —— 而这个 RPC 项目自己在 tests/e2e/helpers/session-cleanup.js:10 认定不存在 → 每跑一次必泄漏一个真实会话。",
     "probe:dsh": "node tests/probe_dsh.cjs",
 
-    "verify": "npm test && npm run bench"
+    "//sweep": "手动清理：归档 state 文件里记录过的空会话，不动任何有真实内容的会话。加 DSH_E2E_FORCE=1 可连有内容的也归档（危险）。",
+    "test:sweep": "node -e \"import('./tests/e2e/helpers/session-cleanup.js').then(async m => { const r = await m.cleanupTestSessions({ force: process.env.DSH_E2E_FORCE === '1' }); console.log(r); })\"",
+
+    "verify": "npm run test:unit"
   },
   "engines": {
     "node": ">=20"

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/dsh_service.dart';
+import '../main.dart';
 import 'chat_view.dart';
 import 'workspaces_view.dart';
 import 'security_permissions_view.dart';
@@ -22,11 +23,26 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // 点按通知（后台运行态）→ 切到对话 tab 并打开对应会话。
+    pendingNotificationSink = _consumePendingNotification;
+    // 冷启动 / 已停后台时点按通知，MainShell 一挂载就消费。
+    WidgetsBinding.instance.addPostFrameCallback((_) => _consumePendingNotification());
+  }
+
+  void _consumePendingNotification() {
+    final sid = pendingNotificationSessionId;
+    if (sid == null || sid.isEmpty || !mounted) return;
+    pendingNotificationSessionId = null;
+    setState(() => _currentIndex = 0);
+    Provider.of<DshService>(context, listen: false).openSessionById(sid);
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    if (identical(pendingNotificationSink, _consumePendingNotification)) {
+      pendingNotificationSink = null;
+    }
     super.dispose();
   }
 
@@ -36,6 +52,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final dsh = Provider.of<DshService>(context, listen: false);
     if (state == AppLifecycleState.resumed) {
       dsh.handleAppResumed();
+      _consumePendingNotification(); // 点通知回前台时消费跳转
       // 回到前台：停止后台保活（前台不需要它），并且此后不再发通知 ——
       // 界面就在眼前，再弹通知是噪音。
       dsh.setAppForeground(true);

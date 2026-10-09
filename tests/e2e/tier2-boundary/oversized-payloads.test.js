@@ -1,12 +1,26 @@
 /**
  * Tier 2 Boundary: Oversized Payloads & Resource Stress Verification
  * Features: 1MB/5MB payloads, large memory file, wide JSON objects, extreme string lengths
+ *
+ * ⚠️ DESTRUCTIVE SUITE — despite living in the "boundary" tier, TC3 writes a
+ * 96 KB scratch file into a real workspace, TC4 rewrites the live global
+ * execution policy, and TC5 posts a 5 KB garbage model name at the live default
+ * model. All three now snapshot-and-restore via helpers/guard.js. Run it with
+ * `npm run test:destructive`, not `npm test`.
  */
 
+import fs from 'node:fs';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { apiRequest } from '../helpers/client.js';
 import { MOCK_PAYLOADS } from '../helpers/fixtures.js';
+import {
+  trackWorkspaceFile,
+  cleanupWorkspaceFiles,
+  autoCleanup,
+  withRestoredPermissions,
+  withRestoredModel
+} from '../helpers/guard.js';
 
 describe('Tier 2 - Oversized Payloads & Stress', () => {
 
@@ -76,54 +90,90 @@ describe('Tier 2 - Oversized Payloads & Stress', () => {
     // back-to-back. Give it explicit headroom instead of letting it flake.
     const IO_TIMEOUT_MS = 30000;
 
-    const writeRes = await apiRequest('/api/mobile/workspace/memory', {
-      method: 'POST',
-      body: {
-        workspacePath: targetWs.path,
-        fileName: testFileName,
-        content: largeContent
-      },
-      timeout: IO_TIMEOUT_MS
-    });
+    // Writes into a REAL workspace (the endpoint 403s unregistered paths), so it
+    // must be removed again. This is the test that left a 96 KB
+    // LARGE_MEMORY_TEST.MD in the developer's workspace root.
+    const abs = trackWorkspaceFile(targetWs.path, testFileName);
+    autoCleanup();
 
-    assert.equal(writeRes.status, 200);
-    assert.equal(writeRes.data.ok, true);
+    try {
+      const writeRes = await apiRequest('/api/mobile/workspace/memory', {
+        method: 'POST',
+        body: {
+          workspacePath: targetWs.path,
+          fileName: testFileName,
+          content: largeContent
+        },
+        timeout: IO_TIMEOUT_MS
+      });
 
-    const readRes = await apiRequest(
-      `/api/mobile/workspace/memory?workspacePath=${encodeURIComponent(targetWs.path)}&fileName=${testFileName}`,
-      { timeout: IO_TIMEOUT_MS }
-    );
+      assert.equal(writeRes.status, 200);
+      assert.equal(writeRes.data.ok, true);
 
-    assert.equal(readRes.status, 200);
-    assert.equal(readRes.data.content.length, largeContent.length);
+      const readRes = await apiRequest(
+        `/api/mobile/workspace/memory?workspacePath=${encodeURIComponent(targetWs.path)}&fileName=${testFileName}`,
+        { timeout: IO_TIMEOUT_MS }
+      );
+
+      assert.equal(readRes.status, 200);
+      assert.equal(readRes.data.content.length, largeContent.length);
+    } finally {
+      cleanupWorkspaceFiles();
+      assert.ok(!fs.existsSync(abs), `TC3 must not leave a 96 KB ${testFileName} in the real workspace`);
+    }
   });
 
   it('TC4: Permissions POST with 200 unrecognized properties filters safely', async () => {
-    const widePayload = {
-      defaultPolicy: 'auto-read'
-    };
-    for (let i = 0; i < 200; i++) {
-      widePayload[`extra_param_${i}`] = `value_${i}`;
-    }
+    // This is a real mutation of the live global policy, not just a payload
+    // shape test: it wrote defaultPolicy 'auto-read' and never restored, so a
+    // user on `ask` was downgraded by running the boundary suite.
+    await withRestoredPermissions(async (orig) => {
+      const widePayload = {
+        defaultPolicy: 'auto-read'
+      };
+      for (let i = 0; i < 200; i++) {
+        widePayload[`extra_param_${i}`] = `value_${i}`;
+      }
 
-    const res = await apiRequest('/api/mobile/permissions', {
-      method: 'POST',
-      body: widePayload
+      const res = await apiRequest('/api/mobile/permissions', {
+        method: 'POST',
+        body: widePayload
+      });
+
+      assert.equal(res.status, 200);
+      assert.equal(res.data.ok, true);
+      assert.equal(res.data.permissions.executionPolicy, 'auto-read');
+      // The point of the test is that the 200 unknown keys are ignored, so prove
+      // none of them leaked into the persisted config.
+      const echoed = Object.keys(res.data.permissions);
+      const leaked = echoed.filter((k) => k.startsWith('extra_param_'));
+      assert.deepEqual(leaked, [], 'unrecognized properties must not be persisted');
+      assert.ok(orig, 'guard must have snapshotted the original permissions');
     });
-
-    assert.equal(res.status, 200);
-    assert.equal(res.data.ok, true);
-    assert.equal(res.data.permissions.executionPolicy, 'auto-read');
   });
 
   it('TC5: POST /api/mobile/settings/model with 5,000 character model name handles safely', async () => {
-    const hugeModelName = 'model_' + 'x'.repeat(5000);
-    const res = await apiRequest('/api/mobile/settings/model', {
-      method: 'POST',
-      body: { model: hugeModelName }
-    });
+    // If the bridge accepts this (200), the developer's global default model
+    // becomes a 5 KB garbage string and every later session fails to resolve a
+    // model. The old version restored nothing.
+    await withRestoredModel(async (origModel) => {
+      const hugeModelName = 'model_' + 'x'.repeat(5000);
+      const res = await apiRequest('/api/mobile/settings/model', {
+        method: 'POST',
+        body: { model: hugeModelName }
+      });
 
-    // Should handle without crash
-    assert.ok(res.status === 200 || res.status === 400);
+      // Should handle without crash
+      assert.ok(res.status === 200 || res.status === 400);
+
+      // Whatever it answered, the effective model must still be usable.
+      const after = await apiRequest('/api/mobile/settings');
+      const now = after.data?.settings?.currentModel;
+      if (res.status === 200) {
+        assert.equal(now, hugeModelName, 'a 200 means the name was accepted verbatim');
+      } else {
+        assert.equal(now, origModel, 'a 400 must leave the model untouched');
+      }
+    });
   });
 });

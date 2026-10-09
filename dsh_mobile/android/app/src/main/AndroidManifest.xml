@@ -29,11 +29,14 @@
     <!-- 息屏后仍要收到推送，需要绕过 Doze 的省电限制 -->
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
-    <!-- 允许非加密明文流量(ws:// 和 http://)，方便公网 IP 直接连接 -->
+    <!-- 允许非加密明文流量(ws:// 和 http://)，方便公网 IP 直接连接。
+         allowBackup=false：网关令牌存在 SharedPreferences 里，云备份会把它
+         带走（Android 12+ 云备份默认开启）。-->
     <application
         android:label="DSH Mobile"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
         android:usesCleartextTraffic="true">
 
         <activity
@@ -51,6 +54,18 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <!-- 分享接收：从任意 App 分享文字/图片直接进 DSH 发送框。
+                 文字进输入框；图片走既有的附件管线（压缩→内联 base64）。 -->
+            <intent-filter android:label="发送到 DSH">
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="text/plain"/>
+            </intent-filter>
+            <intent-filter android:label="发送到 DSH">
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="image/*"/>
             </intent-filter>
         </activity>
 

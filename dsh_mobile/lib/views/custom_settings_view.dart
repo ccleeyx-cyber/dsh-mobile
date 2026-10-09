@@ -3,7 +3,9 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../models/dsh_settings.dart';
 import '../models/app_version.dart';
+import '../models/gateway_features.dart';
 import '../services/dsh_service.dart';
+import '../services/platform_services.dart';
 import 'config_page.dart';
 import 'gateway_health_view.dart';
 import '../theme/app_colors.dart';
@@ -524,6 +526,62 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
 
           const SizedBox(height: 16),
 
+          // 2.5 Prompt Snippets（提示词模板）
+          _buildSectionHeader('提示词模板 (Quick Snippets)', Icons.bolt_rounded, context.c.warning),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: _cardDecoration(),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '在聊天输入框上方显示的快捷模板条。点击模板即把内容追加到输入框。',
+                  style: TextStyle(color: context.c.textSecondary, fontSize: 12),
+                ),
+                const SizedBox(height: 10),
+                if (dsh.snippets.isEmpty)
+                  Text('还没有模板，点下面按钮添加。', style: TextStyle(color: context.c.textTertiary, fontSize: 12))
+                else
+                  ...dsh.snippets.map(
+                    (s) => Padding(
+                      padding: const EdgeInsets.only(bottom: 6),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '${s.label} — ${s.text.length > 40 ? '${s.text.substring(0, 40)}…' : s.text}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(color: context.c.textPrimary, fontSize: 12.5),
+                            ),
+                          ),
+                          IconButton(
+                            icon: Icon(Icons.delete_outline_rounded, size: 16, color: context.c.danger),
+                            tooltip: '删除该模板',
+                            onPressed: () async {
+                              final next = [...dsh.snippets]..removeWhere((x) => x.id == s.id);
+                              await dsh.saveSnippets(next);
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    icon: Icon(Icons.add_rounded, size: 16, color: context.c.accent),
+                    label: Text('添加模板', style: TextStyle(color: context.c.accent, fontSize: 12, fontWeight: FontWeight.w600)),
+                    onPressed: () => _showAddSnippetDialog(context, dsh),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 16),
+
           // 3. Connectivity & Network Diagnostics
           _buildSectionHeader('网络与网关诊断 (Connectivity & Diagnostics)', Icons.network_check_rounded, context.c.success),
           const SizedBox(height: 8),
@@ -672,6 +730,13 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                   children: [
                     Expanded(
                       child: TextButton.icon(
+                        icon: Icon(Icons.system_update_rounded, size: 16, color: context.c.accent),
+                        label: Text('检查更新', style: TextStyle(color: context.c.accent, fontSize: 12, fontWeight: FontWeight.w600)),
+                        onPressed: () => _checkForUpdate(context, dsh),
+                      ),
+                    ),
+                    Expanded(
+                      child: TextButton.icon(
                         icon: Icon(Icons.download_rounded, size: 16, color: context.c.accent),
                         label: Text('复制 APK 下载直链', style: TextStyle(color: context.c.accent, fontSize: 12, fontWeight: FontWeight.w600)),
                         onPressed: () {
@@ -700,6 +765,96 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
         ],
       ),
     );
+  }
+
+  /// 添加一条提示词模板：标签 + 内容，保存到网关。
+  Future<void> _showAddSnippetDialog(BuildContext context, DshService dsh) async {
+    final labelController = TextEditingController();
+    final textController = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: context.c.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: BorderSide(color: context.c.border)),
+        title: Text('添加模板', style: TextStyle(color: context.c.textPrimary, fontSize: 16, fontWeight: FontWeight.bold)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: labelController,
+              autofocus: true,
+              maxLength: 20,
+              decoration: InputDecoration(hintText: '显示名称（如：继续）', counterText: '', border: OutlineInputBorder(borderRadius: BorderRadius.circular(8))),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: textController,
+              maxLines: 4,
+              maxLength: 400,
+              decoration: InputDecoration(hintText: '模板内容（将追加到输入框）', counterText: '', border: OutlineInputBorder(borderRadius: BorderRadius.circular(8))),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text('取消', style: TextStyle(color: context.c.textSecondary))),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: context.c.accent,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              elevation: 0,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('保存', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+    final label = labelController.text.trim();
+    final text = textController.text.trim();
+    labelController.dispose();
+    textController.dispose();
+    if (ok != true || text.isEmpty) return;
+    final next = [
+      ...dsh.snippets,
+      Snippet(id: 'snip_${DateTime.now().millisecondsSinceEpoch}', label: label.isEmpty ? text.substring(0, text.length.clamp(0, 20)) : label, text: text),
+    ];
+    await dsh.saveSnippets(next);
+  }
+
+  /// 检查更新：调网关 /api/mobile/version，比较 App 版本与 latestVersion。
+  Future<void> _checkForUpdate(BuildContext context, DshService dsh) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final hasUpdate = await dsh.checkForUpdate();
+    if (!mounted) return;
+    final info = dsh.gatewayVersion;
+    final cfg = dsh.currentConfig;
+    if (hasUpdate && info?.latestVersion != null) {
+      // 有新版：直接给"去下载"动线（浏览器打开网关的 APK 直链）。
+      final apkUrl = '${cfg?.httpBaseUrl ?? 'http://127.0.0.1:3088'}/dsh-agent.apk';
+      final ok = await UrlOpener.open(apkUrl);
+      if (!mounted) return;
+      if (!ok) {
+        Clipboard.setData(ClipboardData(text: apkUrl));
+        messenger.showSnackBar(SnackBar(
+          content: Text('发现新版本 v${info!.latestVersion}，但打不开浏览器。直链已复制：$apkUrl'),
+          backgroundColor: context.c.warning,
+          behavior: SnackBarBehavior.floating,
+        ));
+      }
+    } else if (info?.latestVersion == null) {
+      messenger.showSnackBar(SnackBar(
+        content: const Text('网关未配置最新版本号（DSH_LATEST_APP_VERSION）。当前已是客户端最新版。'),
+        backgroundColor: context.c.success,
+        behavior: SnackBarBehavior.floating,
+      ));
+    } else {
+      messenger.showSnackBar(SnackBar(
+        content: Text('当前已是最新版本 (v${AppVersion.version})'),
+        backgroundColor: context.c.success,
+        behavior: SnackBarBehavior.floating,
+      ));
+    }
   }
 
   Widget _buildSectionHeader(String title, IconData icon, Color color) {

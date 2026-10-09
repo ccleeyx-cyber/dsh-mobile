@@ -23,8 +23,30 @@ const { apply } = await import('../../dsh-server-plugin/lib/index.js');
 // instead of assuming a published default (there is no default any more).
 const { loadConfig } = await import('../../dsh-server-plugin/lib/store.mjs');
 const DEFAULT_TEST_TOKEN = loadConfig().token;
+// Single source of truth for the version the bridge reports. This used to be a
+// hardcoded /^1\.2\.\d+$/ regex, which silently turned into a time bomb: the
+// moment core.mjs was bumped to match pubspec.yaml (1.3.0) the ONLY hermetic CI
+// gate went red. Now the assertion checks consistency, not a literal.
+const { BRIDGE_VERSION } = await import('../../dsh-server-plugin/lib/core.mjs');
 
-const PORT = 3199;
+/**
+ * Grab an OS-assigned free port instead of hardcoding one.
+ *
+ * PORT used to be the constant 3199. Because `node --test` parallelises by file,
+ * a constant port is exactly what forced `--test-concurrency=1` across all six
+ * test scripts in package.json. There is a small TOCTOU window between closing
+ * the probe socket and the bridge binding, but it is orders of magnitude better
+ * than two suites racing for the same fixed port.
+ */
+async function pickFreePort() {
+  const srv = http.createServer();
+  await new Promise((res, rej) => { srv.once('error', rej); srv.listen(0, '127.0.0.1', res); });
+  const { port } = srv.address();
+  await new Promise((res) => srv.close(res));
+  return port;
+}
+
+const PORT = await pickFreePort();
 const BASE = `http://127.0.0.1:${PORT}`;
 
 let teardown = null;
@@ -99,7 +121,10 @@ describe('smoke: refactored Cordis entry', () => {
     assert.equal(r.status, 200);
     assert.equal(r.data.ok, true);
     assert.equal(r.data.authenticated, true);
-    assert.match(r.data.version, /^1\.2\.\d+$/);
+    // Consistency, not a literal: whatever core.mjs exports must be what the
+    // route reports. Survives a version bump without going red.
+    assert.equal(r.data.version, BRIDGE_VERSION);
+    assert.match(r.data.version, /^\d+\.\d+\.\d+/, 'version must be semver-shaped');
   });
 
   it('rejects a missing token with 401', async () => {

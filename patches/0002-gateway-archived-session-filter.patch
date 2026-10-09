@@ -1,0 +1,130 @@
+diff --git a/dsh-server-plugin/lib/index.js b/dsh-server-plugin/lib/index.js
+index 277f51c..9018742 100644
+--- a/dsh-server-plugin/lib/index.js
++++ b/dsh-server-plugin/lib/index.js
+@@ -435,12 +435,42 @@ export function apply(ctx, config = {}, internals = {}) {
+     return updated;
+   }
+ 
+-  function getWorkspacesData() {
++  /**
++   * @param {object} [opts]
++   * @param {'exclude'|'only'|'include'} [opts.archived='exclude']
++   *   Which sessions to emit, by archived state. 'exclude' reproduces the
++   *   original behaviour exactly and is what every existing caller gets —
++   *   including the workspace-memory path guard above, which must keep seeing
++   *   the same workspace list it always has.
++   *
++   * Filtering happens server-side on purpose. This box has 2322 registered
++   * sessions of which 1338 are archived, so returning them unconditionally would
++   * grow a payload the phone re-fetches on a timer by ~2.4x. The client asks for
++   * one mode at a time instead.
++   */
++  function getWorkspacesData(opts = {}) {
++    const mode = (opts && (opts.archived === 'only' || opts.archived === 'include'))
++      ? opts.archived
++      : 'exclude';
++
+     const workspaceJsonPath = path.join(dshHomeDir, 'storages', 'workspace.json');
+     const projCacheDir = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions');
+ 
+     if (!fs.existsSync(workspaceJsonPath)) return [];
+ 
++    // getSettingsData() is a synchronous readFileSync + YAML.parse of
++    // cordis.patch.yml, and it used to be called from inside the per-session loop
++    // for every session with an empty model — i.e. up to once per row, re-parsing
++    // the same file each time. It is a global setting that cannot vary by session,
++    // so resolve it at most once per call, and only if some session needs it.
++    let fallbackModel = null;
++    const getFallbackModel = () => {
++      if (fallbackModel === null) {
++        fallbackModel = getSettingsData().currentModel || 'cn:deepseek-v4.1-flash';
++      }
++      return fallbackModel;
++    };
++
+     try {
+       const rawWs = JSON.parse(fs.readFileSync(workspaceJsonPath, 'utf8'));
+       const wsTable = rawWs.tables && rawWs.tables.workspaces ? rawWs.tables.workspaces : {};
+@@ -450,13 +480,21 @@ export function apply(ctx, config = {}, internals = {}) {
+       for (const [wsId, wsInfo] of Object.entries(wsTable)) {
+         const sessionIds = wsInfo.sessionIds || [];
+         const sessionList = [];
++        // Counted in every mode, including 'exclude', so the phone can badge
++        // "已归档 N 条" without issuing a second request. Cost is one Set lookup
++        // per session — no extra I/O.
++        let archivedCount = 0;
+ 
+         for (const sId of sessionIds) {
+           const cleanId = sId.startsWith('session-') ? sId.replace('session-', '') : sId;
+-          // 过滤已归档的会话（与 Web 端 SessionTree 保持一致）
+-          if (archivedSessionIds.has(sId) || archivedSessionIds.has(cleanId) || archivedSessionIds.has(`session-${cleanId}`)) {
+-            continue;
+-          }
++          // 归档名单默认隐藏（与 Web 端 sessionVisible 的 !archived.has(s.id) 一致）。
++          // 三种写法都要查：原样 id、去掉 session- 前缀、以及补上前缀的形式。
++          const isArchived = archivedSessionIds.has(sId)
++            || archivedSessionIds.has(cleanId)
++            || archivedSessionIds.has(`session-${cleanId}`);
++          if (isArchived) archivedCount++;
++          if (isArchived && mode === 'exclude') continue;
++          if (!isArchived && mode === 'only') continue;
+ 
+           const candidates = [
+             path.join(projCacheDir, `${sId}.json`),
+@@ -470,7 +508,10 @@ export function apply(ctx, config = {}, internals = {}) {
+             firstPrompt: '',
+             lastPromptAt: 0,
+             model: '',
+-            lastSeq: 0
++            lastSeq: 0,
++            // Emitted in every mode so an 'include' response stays self-describing
++            // and the client can badge rows without a second lookup.
++            archived: isArchived
+           };
+           let isBlankSession = false;
+ 
+@@ -504,7 +545,7 @@ export function apply(ctx, config = {}, internals = {}) {
+           }
+ 
+           if (!sessionMeta.model) {
+-            sessionMeta.model = getSettingsData().currentModel || 'cn:deepseek-v4.1-flash';
++            sessionMeta.model = getFallbackModel();
+           }
+           const pendingForSession = coreApprovals.list().filter(a => {
+             const aId = a.sessionId || '';
+@@ -524,7 +565,13 @@ export function apply(ctx, config = {}, internals = {}) {
+           path: wsInfo.path || '',
+           createdAt: wsInfo.createdAt,
+           updatedAt: wsInfo.updatedAt,
++          // Number of sessions in THIS response, i.e. after the mode filter and
++          // the blank-session filter. Always === sessions.length.
+           sessionCount: sessionList.length,
++          // Total archived sessions registered in this workspace, independent of
++          // the requested mode, so the client can show "已归档 N 条" while it is
++          // looking at the unarchived list.
++          archivedCount: archivedCount,
+           pendingApprovals: wsPendingCount,
+           hasRunning: wsHasRunning,
+           sessions: sessionList
+@@ -1415,8 +1462,18 @@ export function apply(ctx, config = {}, internals = {}) {
+     try {
+       // 4.1 工作区与会话
+       if (pathname === '/api/mobile/workspaces' && req.method === 'GET') {
+-        const data = getWorkspacesData();
+-        sendJson(200, { ok: true, code: 0, workspaces: data });
++        // ?archived=exclude|only|include. Anything else — a missing value, a typo,
++        // or a repeated param (which url.parse turns into an array) — normalises to
++        // 'exclude', i.e. the historical behaviour.
++        const rawArchived = parsedUrl.query?.archived;
++        const archivedMode = (rawArchived === 'only' || rawArchived === 'include') ? rawArchived : 'exclude';
++        const data = getWorkspacesData({ archived: archivedMode });
++        // archivedMode is echoed back on purpose: it is how the client distinguishes
++        // "the gateway applied my filter" from "the gateway predates this feature and
++        // silently ignored the param". Without the echo, an old gateway answering
++        // ?archived=only would return the UNarchived list and the app would label
++        // those rows as archived — actively wrong rather than visibly unsupported.
++        sendJson(200, { ok: true, code: 0, workspaces: data, archivedMode: archivedMode });
+         return;
+       }
+ 

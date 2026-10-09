@@ -109,11 +109,38 @@ export function verifyToken(inputToken) {
   const cfg = loadConfig();
   if (trimmed === cfg.token) return true;
   if (process.env.DSH_AUTH_TOKEN && trimmed === process.env.DSH_AUTH_TOKEN) return true;
+  // Paired-device tokens. Previously the token minted at pairing was never
+  // checked here, so a freshly paired phone got 401 on its next request and
+  // revokeDevice() had no effect on auth at all. Hash (never the plaintext)
+  // is compared, and revoked devices are refused.
+  const dev = findDeviceByToken(trimmed);
+  if (dev && dev.revoked !== true) return true;
   return false;
 }
 
-export function roleCanWrite() {
-  return true;
+/**
+ * Resolve a paired device by its token, or null. Constant-time-ish comparison:
+ * we hash the candidate once and compare hex digests, so a token never sits in
+ * a string-comparison timing oracle and the plaintext is never stored.
+ */
+export function findDeviceByToken(inputToken) {
+  if (!inputToken || typeof inputToken !== 'string') return null;
+  const hash = hashToken(inputToken.trim());
+  const state = loadDevices();
+  for (const dev of state.devices) {
+    if (dev?.tokenHash === hash) return dev;
+  }
+  return null;
+}
+
+/**
+ * Real role check. Roles: 'readwrite' (default at pairing) and 'readonly'.
+ * A readonly device can view sessions/approvals/permissions but cannot prompt,
+ * cancel, upload, delete or mutate settings. Previously this returned true
+ * unconditionally, so the role field on devices.json was decoration.
+ */
+export function roleCanWrite(role) {
+  return !role || role === 'readwrite';
 }
 
 const DEFAULT_PERMISSIONS = {

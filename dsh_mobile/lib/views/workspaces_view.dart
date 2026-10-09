@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../models/workspace.dart';
+import '../models/gateway_features.dart';
 import '../services/dsh_service.dart';
 import '../theme/app_colors.dart';
 
@@ -129,6 +130,167 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
       return DateFormat('HH:mm').format(dt);
     }
     return DateFormat('MM-dd HH:mm').format(dt);
+  }
+
+  /// 全库搜索浮层：网关 /api/mobile/sessions/search，命中即跳转会话。
+  Future<void> _showGlobalSearchSheet(BuildContext context, DshService dsh) async {
+    final queryController = TextEditingController();
+    List<SessionSearchHit> results = const [];
+    bool searching = false;
+
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: context.c.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (sheetCtx) => StatefulBuilder(
+        builder: (sheetCtx, setSheetState) => Padding(
+          padding: EdgeInsets.only(bottom: MediaQuery.of(sheetCtx).viewInsets.bottom),
+          child: SizedBox(
+            height: MediaQuery.of(sheetCtx).size.height * 0.75,
+            child: Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+                  child: Row(
+                    children: [
+                      Icon(Icons.travel_explore_rounded, size: 20, color: context.c.accent),
+                      const SizedBox(width: 8),
+                      Text('全库搜索会话', style: TextStyle(color: context.c.textPrimary, fontSize: 15, fontWeight: FontWeight.bold)),
+                      const Spacer(),
+                      IconButton(
+                        icon: Icon(Icons.close, size: 18, color: context.c.textTertiary),
+                        onPressed: () => Navigator.pop(sheetCtx),
+                      ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: TextField(
+                    controller: queryController,
+                    autofocus: true,
+                    style: TextStyle(color: context.c.textPrimary, fontSize: 14),
+                    decoration: InputDecoration(
+                      hintText: '按标题或首条消息搜索（含已归档）',
+                      hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 12.5),
+                      prefixIcon: Icon(Icons.search, size: 18, color: context.c.textTertiary),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                    ),
+                    onSubmitted: (q) async {
+                      if (q.trim().isEmpty) return;
+                      setSheetState(() => searching = true);
+                      results = await dsh.searchSessions(q);
+                      setSheetState(() => searching = false);
+                    },
+                  ),
+                ),
+                Expanded(
+                  child: searching
+                      ? const Center(child: CircularProgressIndicator())
+                      : results.isEmpty
+                          ? Center(
+                              child: Text(
+                                queryController.text.trim().isEmpty ? '输入关键词后回车搜索' : '没有命中会话',
+                                style: TextStyle(color: context.c.textTertiary, fontSize: 12.5),
+                              ),
+                            )
+                          : ListView.builder(
+                              itemCount: results.length,
+                              itemBuilder: (itemCtx, i) {
+                                final hit = results[i];
+                                return ListTile(
+                                  dense: true,
+                                  leading: Icon(
+                                    hit.archived ? Icons.archive_outlined : Icons.chat_bubble_outline_rounded,
+                                    size: 20,
+                                    color: hit.archived ? context.c.textTertiary : context.c.accent,
+                                  ),
+                                  title: Text(
+                                    hit.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(color: context.c.textPrimary, fontSize: 13.5),
+                                  ),
+                                  subtitle: Text(
+                                    '${hit.workspaceTitle} · ${hit.firstPrompt.isEmpty ? '无预览' : hit.firstPrompt}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(color: context.c.textSecondary, fontSize: 11.5),
+                                  ),
+                                  onTap: () {
+                                    Navigator.pop(sheetCtx);
+                                    dsh.openSessionById(hit.sessionId, title: hit.title);
+                                    widget.onSwitchToChat?.call();
+                                  },
+                                );
+                              },
+                            ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    queryController.dispose();
+  }
+
+  /// 重命名会话：调网关 /api/mobile/sessions/rename。
+  ///
+  /// 失败要如实说（改的是 projcache 标题行，网关读不到缓存文件时会失败），
+  /// 不能像删除那样静默乐观。
+  Future<void> _showRenameDialog(BuildContext context, DshService dsh, SessionMeta s) async {
+    final controller = TextEditingController(text: s.title);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: context.c.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: context.c.border),
+        ),
+        title: Text('重命名会话', style: TextStyle(color: context.c.textPrimary, fontSize: 17, fontWeight: FontWeight.bold)),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 60,
+          decoration: InputDecoration(
+            hintText: '输入新名称',
+            counterText: '',
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('取消', style: TextStyle(color: context.c.textSecondary)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: context.c.accent,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              elevation: 0,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('保存', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+    final newText = controller.text.trim();
+    controller.dispose();
+    if (ok != true || newText.isEmpty || newText == s.title) return;
+    final success = await dsh.renameSession(s.sessionId, newText);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(success ? '已重命名为「$newText」' : '重命名失败: ${dsh.lastError}'),
+      backgroundColor: success ? context.c.success : context.c.danger,
+      behavior: SnackBarBehavior.floating,
+    ));
   }
 
   // Delete Session Confirmation Dialog
@@ -482,34 +644,57 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           // Search Bar
           Padding(
             padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
-            child: Container(
-              height: 38,
-              decoration: BoxDecoration(
-                color: context.c.surface,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: context.c.border),
-              ),
-              child: TextField(
-                controller: _searchController,
-                style: TextStyle(color: context.c.textPrimary, fontSize: 13),
-                decoration: InputDecoration(
-                  hintText: '搜索工作区、路径或历史对话...',
-                  hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 12.5),
-                  prefixIcon: Icon(Icons.search, size: 17, color: context.c.textTertiary),
-                  suffixIcon: _searchFilter.isNotEmpty
-                      ? IconButton(
-                          icon: Icon(Icons.clear, size: 15, color: context.c.textTertiary),
-                          onPressed: () {
-                            _searchController.clear();
-                            setState(() => _searchFilter = '');
-                          },
-                        )
-                      : null,
-                  border: InputBorder.none,
-                  contentPadding: const EdgeInsets.symmetric(vertical: 9),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Container(
+                    height: 38,
+                    decoration: BoxDecoration(
+                      color: context.c.surface,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: context.c.border),
+                    ),
+                    child: TextField(
+                      controller: _searchController,
+                      style: TextStyle(color: context.c.textPrimary, fontSize: 13),
+                      decoration: InputDecoration(
+                        hintText: '搜索工作区、路径或历史对话...',
+                        hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 12.5),
+                        prefixIcon: Icon(Icons.search, size: 17, color: context.c.textTertiary),
+                        suffixIcon: _searchFilter.isNotEmpty
+                            ? IconButton(
+                                icon: Icon(Icons.clear, size: 15, color: context.c.textTertiary),
+                                onPressed: () {
+                                  _searchController.clear();
+                                  setState(() => _searchFilter = '');
+                                },
+                              )
+                            : null,
+                        border: InputBorder.none,
+                        contentPadding: const EdgeInsets.symmetric(vertical: 9),
+                      ),
+                      onChanged: (val) => setState(() => _searchFilter = val.trim()),
+                    ),
+                  ),
                 ),
-                onChanged: (val) => setState(() => _searchFilter = val.trim()),
-              ),
+                const SizedBox(width: 8),
+                // 全局搜索：本地过滤只看得到当前筛选模式下已加载的列表；
+                // 这个按钮打网关的 /api/mobile/sessions/search，全库（含归档）按
+                // 标题+首条 prompt 搜。
+                SizedBox(
+                  height: 38,
+                  child: OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      side: BorderSide(color: context.c.border),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    onPressed: () => _showGlobalSearchSheet(context, dsh),
+                    icon: Icon(Icons.travel_explore_rounded, size: 16, color: context.c.accent),
+                    label: Text('全库', style: TextStyle(color: context.c.accent, fontSize: 12, fontWeight: FontWeight.w600)),
+                  ),
+                ),
+              ],
             ),
           ),
 
@@ -983,6 +1168,31 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
+            IconButton(
+              icon: Icon(
+                s.archived ? Icons.unarchive_outlined : Icons.archive_outlined,
+                size: 18,
+                color: context.c.textTertiary,
+              ),
+              tooltip: s.archived ? '取消归档' : '归档',
+              onPressed: () async {
+                HapticFeedback.selectionClick();
+                final ok = await dsh.setSessionArchived(s.sessionId, !s.archived);
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                  content: Text(ok
+                      ? (s.archived ? '已取消归档' : '已归档「${s.title}」')
+                      : '${s.archived ? '取消归档' : '归档'}失败: ${dsh.lastError}'),
+                  backgroundColor: ok ? context.c.success : context.c.danger,
+                  behavior: SnackBarBehavior.floating,
+                ));
+              },
+            ),
+            IconButton(
+              icon: Icon(Icons.edit_outlined, size: 18, color: context.c.textTertiary),
+              tooltip: '重命名',
+              onPressed: () => _showRenameDialog(context, dsh, s),
+            ),
             IconButton(
               icon: Icon(Icons.delete_outline_rounded, size: 18, color: context.c.textTertiary),
               tooltip: '删除会话',
