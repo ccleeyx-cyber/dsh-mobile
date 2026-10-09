@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -235,6 +236,118 @@ void main() {
       // 超时的时长，体感上就是"麦克风反应很慢"。
       expect(localeCalls, 1,
           reason: '第二次点击不应再查 locales；实际查了 $localeCalls 次');
+    });
+  });
+
+  group('识别结果必须真的到达 Dart（"能录音但转化不出文字"）', () {
+    // 用户报的原话：「点击了语音那个图标，也显示了收音的动画，但是就是录不到，
+    // 没有发送语音过去，也没有转化成文字」——动画能出来说明麦克风开了、
+    // listen 成功了；但一个字都没有，说明**识别结果没有去处**。
+    //
+    // 成因：listen() 的 onResult 参数从来没传过，所以插件把结果交付给一个 null
+    // 回调。本方法的 onPartial / onFinal 曾经只出现在签名里，函数体一次都没引用，
+    // 而 analyze 不把"形参未使用"当警告 —— 于是这个漏法不报任何错，一路到用户手上。
+    //
+    // 这一组直接模拟平台把识别结果推进来，断言它真的变成了文字。
+
+    /// 模拟平台 → App 的回调帧（插件用 textRecognition 方法名回传 JSON 字符串）。
+    Future<void> pushRecognition(String words, {bool finalResult = false}) async {
+      final payload = jsonEncode({
+        'alternates': [
+          {'recognizedWords': words, 'confidence': 0.92}
+        ],
+        'finalResult': finalResult,
+      });
+      await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .handlePlatformMessage(
+        channel.name,
+        const StandardMethodCodec()
+            .encodeMethodCall(MethodCall('textRecognition', payload)),
+        (ByteData? _) {},
+      );
+    }
+
+    void stubHappy() {
+      stub((MethodCall call) {
+        switch (call.method) {
+          case 'initialize':
+            return Future<Object?>.value(true);
+          case 'has_permission':
+            return Future<Object?>.value(true);
+          case 'locales':
+            return Future<Object?>.value(['zh_CN:中文']);
+          case 'listen':
+            return Future<Object?>.value(true);
+          default:
+            return Future<Object?>.value(null);
+        }
+      });
+    }
+
+    test('平台推来中间结果 → onPartial 收到文字', () async {
+      stubHappy();
+      final svc = VoiceInputService.instance;
+      svc.debugReset();
+
+      final partials = <String>[];
+      await svc.start(
+        onPartial: (text, _) => partials.add(text),
+        onFinal: (_) {},
+        onError: (_) {},
+      );
+
+      await pushRecognition('你好');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(
+        partials,
+        contains('你好'),
+        reason: '中间结果必须到达 onPartial。若为空，最可能的原因是 listen() '
+            '没有传 onResult —— 那样麦克风会正常打开、动画也会动，但识别结果'
+            '被交付给一个 null 回调，一个字都出不来。实际收到: $partials',
+      );
+    });
+
+    test('平台推来最终结果 → onFinal 收到完整文字', () async {
+      stubHappy();
+      final svc = VoiceInputService.instance;
+      svc.debugReset();
+
+      final finals = <String>[];
+      await svc.start(
+        onPartial: (_, __) {},
+        onFinal: finals.add,
+        onError: (_) {},
+      );
+
+      await pushRecognition('今天天气不错', finalResult: true);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(
+        finals,
+        contains('今天天气不错'),
+        reason: '最终结果必须到达 onFinal，否则输入框永远拿不到文字。'
+            '实际收到: $finals',
+      );
+    });
+
+    test('空文本不回调（避免把输入框清空）', () async {
+      stubHappy();
+      final svc = VoiceInputService.instance;
+      svc.debugReset();
+
+      final partials = <String>[];
+      await svc.start(
+        onPartial: (text, _) => partials.add(text),
+        onFinal: (_) {},
+        onError: (_) {},
+      );
+
+      await pushRecognition('');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      // 空字符串直接丢弃：把它交给上层会把用户已经输入的内容清掉。
+      expect(partials, isEmpty, reason: '空结果不应回调；实际: $partials');
     });
   });
 

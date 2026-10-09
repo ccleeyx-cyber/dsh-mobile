@@ -244,6 +244,26 @@ class VoiceInputService {
       // 拿到 started 之后也是这么记的）。
       await _speech
           .listen(
+            // ⚠️ onResult **必须传**，漏了它就没有任何识别结果会到达 Dart。
+            //
+            // 这是「能看到录音动画、但一个字都转化不出来、也发不出去」的成因：
+            // 插件照常打开麦克风、照常推进平台状态（所以动画会动、isListening
+            // 也为真），但识别结果要交付的那个回调是 null —— 文字没有去处，
+            // 于是 onPartial / onFinal 一次都不会被调用。
+            //
+            // 更糟的是这个漏法**不会报任何错**：本方法的 onPartial / onFinal
+            // 参数曾经只出现在签名和文档注释里，函数体里一次都没引用过；而
+            // analyze 不把"形参未使用"当成警告，所以它能一路活到用户手上，
+            // 表现成"功能看着在跑、就是没结果"。
+            onResult: (result) {
+              final text = result.recognizedWords;
+              if (text.isEmpty) return;
+              if (result.finalResult) {
+                onFinal(text);
+              } else {
+                onPartial(text, result.confidence);
+              }
+            },
             listenOptions: SpeechListenOptions(
               // 语言放这里而不是 listen() 的顶层参数：后者已标记 deprecated。
               localeId: await _resolveLocale(localeId),
