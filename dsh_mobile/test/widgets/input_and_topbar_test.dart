@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 
 import 'package:dsh_mobile/main.dart';
+import 'package:dsh_mobile/models/pending_attachment.dart';
 import 'package:dsh_mobile/services/dsh_service.dart';
 import 'package:dsh_mobile/services/voice_input_service.dart';
 import 'package:dsh_mobile/theme/app_colors.dart';
@@ -16,13 +17,17 @@ import 'package:dsh_mobile/views/main_shell.dart';
 void main() {
   /// 把 ChatView 挂起来。ChatView 只依赖 DshService 和 ThemeScope；
   /// ThemeController 是菜单回调里才用到的（context.read），build 期不碰。
-  Future<void> pumpChat(WidgetTester tester, {Size size = const Size(400, 900)}) async {
+  ///
+  /// 返回 service 实例，因为有些路径只在"已连接"时才可达（附件入口就是），
+  /// 调用方需要自己设定连接状态。
+  Future<DshService> pumpChat(WidgetTester tester, {Size size = const Size(400, 900)}) async {
     tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
+    final dsh = DshService();
     await tester.pumpWidget(
       ChangeNotifierProvider<DshService>.value(
-        value: DshService(),
+        value: dsh,
         child: MaterialApp(
           builder: (ctx, child) => ThemeScope(isDark: false, child: child ?? const SizedBox()),
           home: const ChatView(),
@@ -30,6 +35,7 @@ void main() {
       ),
     );
     await tester.pump();
+    return dsh;
   }
 
   Future<void> teardown(WidgetTester tester) async {
@@ -107,6 +113,79 @@ void main() {
 
     test('默认识别语言是 zh_CN', () {
       expect(VoiceInputService.defaultLocaleId, 'zh_CN');
+    });
+  });
+
+  group('附件入口（用户报「没有上传图片或者文件功能」）', () {
+    testWidgets('输入栏有附件按钮，且可点', (tester) async {
+      await pumpChat(tester);
+
+      final icon = find.byIcon(Icons.attach_file_rounded);
+      expect(icon, findsOneWidget, reason: '输入栏必须有附件入口');
+
+      final ink = tester.widget<InkWell>(
+        find.ancestor(of: icon, matching: find.byType(InkWell)).first,
+      );
+      expect(ink.onTap, isNotNull);
+
+      await teardown(tester);
+    });
+
+    testWidgets('点击后弹出「图片 / 文件」两个入口', (tester) async {
+      // 附件入口是"已连接"才可达的路径（离线点它会提示先重连，而不是打开一个
+      // 必然失败的选择器），所以这里先把状态设成已连接。
+      final dsh = await pumpChat(tester);
+      dsh.debugSetConnection(true);
+      await tester.pump();
+
+      await tester.tap(find.byIcon(Icons.attach_file_rounded));
+      await tester.pumpAndSettle();
+
+      expect(find.text('图片'), findsOneWidget);
+      expect(find.text('文件'), findsOneWidget);
+
+      await teardown(tester);
+    });
+
+    testWidgets('离线时点附件不打开选择器，而是提示先重连', (tester) async {
+      await pumpChat(tester);
+
+      await tester.tap(find.byIcon(Icons.attach_file_rounded));
+      await tester.pumpAndSettle();
+
+      // 离线时打开选择器只会让用户白选一次、上传必然失败，所以必须先拦住。
+      expect(find.text('图片'), findsNothing);
+      expect(find.textContaining('网络已断开'), findsOneWidget);
+
+      await teardown(tester);
+    });
+
+    testWidgets('待发附件显示名字与体积，且能单独删除', (tester) async {
+      await pumpChat(tester);
+      final state = tester.state(find.byType(ChatView));
+
+      // 用测试缝隙直接挂载，绕开原生选择器（单测里调不起来）。
+      (state as dynamic).debugAddPendingAttachment(
+        const PendingFile(
+          localId: 'f1',
+          name: 'report.pdf',
+          byteLength: 2048,
+          receiptId: 'r-1',
+        ),
+      );
+      await tester.pump();
+
+      // 名字与体积都要显示 —— 用户必须能确认"挂上的到底是哪个文件"。
+      expect(find.text('report.pdf'), findsOneWidget);
+      expect(find.text('2 KB'), findsOneWidget);
+
+      await tester.tap(find.byIcon(Icons.close_rounded).first);
+      await tester.pump();
+
+      expect(find.text('report.pdf'), findsNothing);
+      expect(find.text('2 KB'), findsNothing);
+
+      await teardown(tester);
     });
   });
 

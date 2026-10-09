@@ -20,6 +20,8 @@ import 'config_page.dart';
 import '../theme/app_colors.dart';
 import '../main.dart';
 import '../services/voice_input_service.dart';
+import '../models/pending_attachment.dart';
+import '../services/attachment_picker.dart';
 
 class ChatView extends StatefulWidget {
   final VoidCallback? onOpenWorkspaces;
@@ -60,6 +62,21 @@ class _ChatViewState extends State<ChatView> {
   // null = 尚未探测；探测结果决定按钮是可用还是禁用。
   bool? _voiceSupported;
   bool _voiceListening = false;
+
+  // ---- 附件 (v1.10.0) ----
+  /// 已挂载、等待随下一条消息发出去的附件。
+  final List<PendingAttachment> _pendingAttachments = [];
+  int _attachSeq = 0;
+
+  /// 本地标识，只用于列表 key 与删除定位，不发给服务端 —— 所以不需要 UUID，
+  /// 一个递增计数在单个页面生命周期内就足够唯一。
+  String _nextAttachmentId() => 'att-${++_attachSeq}';
+
+  /// 测试用：直接挂一个附件，绕开原生选择器（单测里调不起来）。
+  @visibleForTesting
+  void debugAddPendingAttachment(PendingAttachment attachment) {
+    setState(() => _pendingAttachments.add(attachment));
+  }
 
   void _toggleSearch() {
     setState(() {
@@ -255,7 +272,8 @@ class _ChatViewState extends State<ChatView> {
 
   void _sendMessage(DshService dsh) {
     final text = _inputController.text.trim();
-    if (text.isEmpty) return;
+    // 允许"只有附件、没有文字"（引擎的准入规则是"文字或附件"）。
+    if (text.isEmpty && _pendingAttachments.isEmpty) return;
 
     // Graceful offline degradation guard (F3.4)
     if (!dsh.isConnected) {
@@ -277,9 +295,97 @@ class _ChatViewState extends State<ChatView> {
     }
 
     HapticFeedback.lightImpact();
+    // 先把附件交给发送、再清空 —— 顺序反过来会让 sendChatMessage 收到空列表。
+    final outgoing = List<PendingAttachment>.from(_pendingAttachments);
     _inputController.clear();
-    dsh.sendChatMessage(text);
+    setState(() => _pendingAttachments.clear());
+    dsh.sendChatMessage(text, attachments: outgoing);
     _scrollToBottom();
+  }
+
+  /// 选取并挂载附件（§4.2）。
+  ///
+  /// 图片在挂载时就压好、编码好、验过大小；文件在挂载时就已经上传完、拿到凭据。
+  /// 之所以都前移到"挂载"这一步而不是等发送：失败必须当场说清。用户挂上一张 8MB
+  /// 的图、写了一大段话、点发送，才发现图没传上去 —— 那是最差的失败方式。
+  Future<void> _attach(DshService dsh, {required bool asFile}) async {
+    try {
+      final media = asFile
+          ? await AttachmentPicker.instance.pickFile()
+          : await AttachmentPicker.instance.pickImage();
+      if (media == null) return; // 用户取消
+
+      if (media.bytes.length > AttachmentPicker.maxUploadBytes && asFile) {
+        final mb = (media.bytes.length / (1024 * 1024)).toStringAsFixed(1);
+        _toast('文件 ${mb}MB 超过上限 32MB');
+        return;
+      }
+
+      PendingAttachment? attachment;
+      if (asFile || !media.isImage) {
+        // 文件：先上传换凭据。这一步可能耗时，给个进度提示。
+        _toast('正在上传 ${media.name}…');
+        final receiptId = await dsh.uploadAttachment(name: media.name, bytes: media.bytes);
+        attachment = PendingFile(
+          localId: _nextAttachmentId(),
+          name: media.name,
+          byteLength: media.bytes.length,
+          receiptId: receiptId,
+        );
+      } else {
+        // 图片：直接在本地编码成 image part，不发网络请求。
+        attachment = PendingImage.fromPicked(media, localId: _nextAttachmentId());
+      }
+
+      if (!mounted) return;
+      setState(() => _pendingAttachments.add(attachment!));
+      ScaffoldMessenger.of(context).clearSnackBars();
+    } on AttachmentError catch (e) {
+      // 面向用户的原因（太大 / 空文件 / 上传被拒），直接展示。
+      _toast(e.message);
+    } catch (e) {
+      debugPrint('[ChatView] 附件处理失败: $e');
+      _toast('附件处理失败，请重试');
+    }
+  }
+
+  /// 选择入口：图片 / 文件。做成底部弹窗而不是两个按钮，是因为输入栏的横向
+  /// 空间已经很紧（输入框 + 麦克风 + 发送），再加两个图标会挤。
+  Future<void> _showAttachSheet(DshService dsh) async {
+    if (!dsh.isConnected) {
+      _toast('网络已断开，请先重试连接');
+      return;
+    }
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: context.c.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: Icon(Icons.image_outlined, color: context.c.accent),
+              title: Text('图片', style: TextStyle(color: context.c.textPrimary, fontSize: 14)),
+              subtitle: Text('自动压缩到 1600px，agent 能直接看到',
+                  style: TextStyle(color: context.c.textTertiary, fontSize: 11.5)),
+              onTap: () => Navigator.pop(ctx, 'image'),
+            ),
+            ListTile(
+              leading: Icon(Icons.attach_file_rounded, color: context.c.accent),
+              title: Text('文件', style: TextStyle(color: context.c.textPrimary, fontSize: 14)),
+              subtitle: Text('任意文件，上限 32MB',
+                  style: TextStyle(color: context.c.textTertiary, fontSize: 11.5)),
+              onTap: () => Navigator.pop(ctx, 'file'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    await _attach(dsh, asFile: choice == 'file');
   }
 
 
@@ -2071,6 +2177,78 @@ class _ChatViewState extends State<ChatView> {
   /// 根因是把「申请权限」和「探测能力」合并成了一次性的初始化，且失败后永久
   /// 记为不可用。现在无论什么状态都保持可点：点下去会重新探测并触发权限申请；
   /// 确实不行时用 SnackBar 说清是哪种原因，给出可执行的下一步。
+  /// 附件入口按钮。
+  Widget _buildAttachButton(DshService dsh) {
+    // 已有待发附件时按钮点亮，给出"已经挂了东西"的持续提示。
+    final hasPending = _pendingAttachments.isNotEmpty;
+    final color = hasPending ? context.c.accent : context.c.textSecondary;
+    return Tooltip(
+      message: '添加图片或文件',
+      child: InkWell(
+        onTap: () => _showAttachSheet(dsh),
+        borderRadius: BorderRadius.circular(22),
+        child: Container(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+            color: hasPending ? context.c.accentSurface : Colors.transparent,
+            shape: BoxShape.circle,
+            border: Border.all(color: context.c.border, width: 1),
+          ),
+          child: Icon(Icons.attach_file_rounded, size: 20, color: color),
+        ),
+      ),
+    );
+  }
+
+  /// 待发附件条。每个附件显示名字与体积，可单项删除。
+  Widget _buildPendingAttachments() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (final a in _pendingAttachments)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 4),
+              child: Row(
+                children: [
+                  Icon(
+                    a is PendingImage ? Icons.image_outlined : Icons.insert_drive_file_outlined,
+                    size: 15,
+                    color: a is PendingImage ? context.c.accent : context.c.purple,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      a.name,
+                      style: TextStyle(fontSize: 12, color: context.c.textPrimary),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    a.sizeLabel,
+                    style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                  ),
+                  const SizedBox(width: 2),
+                  InkWell(
+                    onTap: () => setState(() => _pendingAttachments.remove(a)),
+                    borderRadius: BorderRadius.circular(11),
+                    child: Padding(
+                      padding: const EdgeInsets.all(3),
+                      child: Icon(Icons.close_rounded, size: 15, color: context.c.textTertiary),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildMicButton(DshService dsh) {
     final listening = _voiceListening;
     // 只有"已探测且确定不可用"才显示划掉的麦克风。未探测完成时显示正常图标 ——
@@ -2162,9 +2340,15 @@ class _ChatViewState extends State<ChatView> {
         border: Border(top: BorderSide(color: context.c.border)),
       ),
       child: SafeArea(
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
+            // 待发附件条：钉在输入栏正上方，让"附件到底挂上了没有"始终可见，
+            // 每一项都能单独摘掉。
+            if (_pendingAttachments.isNotEmpty) _buildPendingAttachments(),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
             // Text Input Pill
             Expanded(
               child: Container(
@@ -2197,6 +2381,10 @@ class _ChatViewState extends State<ChatView> {
             ),
             // 语音输入（§4.2）。放在输入框与发送键之间：它是"另一种输入方式"，
             // 不是"发送"，所以不能和发送键合并成一个按钮。
+            // 附件入口（§4.2）。放在麦克风之前：它比语音更高频，而且形状上
+            // 属于"往输入框里加东西"，与"用另一种方式输入"分开更符合直觉。
+            _buildAttachButton(dsh),
+            const SizedBox(width: 6),
             _buildMicButton(dsh),
             const SizedBox(width: 10),
             // Send / Cancel Action Button
@@ -2256,6 +2444,8 @@ class _ChatViewState extends State<ChatView> {
                   onPressed: () => _sendMessage(dsh),
                 ),
               ),
+          ],
+        ),
           ],
         ),
       ),

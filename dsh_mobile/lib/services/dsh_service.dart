@@ -13,6 +13,7 @@ import '../models/approval_request.dart';
 import '../models/dsh_settings.dart';
 import '../models/permission_config.dart';
 import '../models/user_question.dart';
+import '../models/pending_attachment.dart';
 import 'draft_store.dart';
 import 'notification_service.dart';
 import '../models/audit_log.dart';
@@ -535,6 +536,17 @@ class DshService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 测试用：直接设定连接状态。
+  ///
+  /// 存在的原因：一批 UI 路径只在"已连接"时才可达（附件入口、发送、语音上传等），
+  /// 而真正建连要开 WebSocket 打真实网关 —— 单测里既做不到也不该做。没有这个缝，
+  /// 那些路径就只能靠人眼看，等于没测。
+  @visibleForTesting
+  void debugSetConnection(bool connected) {
+    _status = connected ? ConnectionStatus.connected : ConnectionStatus.disconnected;
+    notifyListeners();
+  }
+
   void selectWorkspace(Workspace ws, {bool autoSelectSession = true}) {
     _currentWorkspace = ws;
     _sessionPollTimer?.cancel();
@@ -599,13 +611,78 @@ class DshService extends ChangeNotifier {
   /// 走网关的已鉴权附件路由，因此必须把 Authorization 头一起带上 ——
   /// 裸 `Image.network(url)` 会 401。这里返回的是 URL + 头，由 UI 侧用
   /// `Image.network(..., headers: ...)` 渲染。
-  ({String url, Map<String, String> headers})? attachmentUrl(AttachmentRef ref) {
+  ///
+  /// **必须带 sessionId**（v1.10.0 修正）：引擎的 session/attachment RPC 是按
+  /// 会话授权的 —— 它只允许读取"该会话真正引用过的图片"。此前只传 id，网关
+  /// 那条路由又根本不存在，所以图片始终显示不出来。现在两边都补齐了。
+  ({String url, Map<String, String> headers})? attachmentUrl(
+    AttachmentRef ref, {
+    String? sessionId,
+  }) {
     final cfg = _currentConfig;
     if (cfg == null) return null;
+    final sid = sessionId ?? _currentSession?.sessionId;
+    if (sid == null || sid.isEmpty) return null;
     final uri = Uri.parse('${cfg.httpBaseUrl}/api/mobile/attachment').replace(
-      queryParameters: {'id': ref.id},
+      queryParameters: {'id': ref.id, 'sessionId': sid},
     );
     return (url: uri.toString(), headers: _authHeaders);
+  }
+
+  /// 把文件原始字节上传到网关，换取引擎签发的 receiptId（§4.2）。
+  ///
+  /// 先上传再发送，而不是把字节塞进 prompt：prompt 的 JSON 请求体有 2MB 上限，
+  /// 而文件动辄十几 MB。上传走独立的原始字节路由（32MB 上限）。
+  ///
+  /// 失败时抛 [AttachmentError]，消息面向用户 —— 上传失败必须当场说清，
+  /// 不能让用户以为挂上了、发出去后才发现 agent 没收到。
+  Future<String> uploadAttachment({
+    required String name,
+    required Uint8List bytes,
+    String? sessionId,
+  }) async {
+    final cfg = _currentConfig;
+    if (cfg == null) throw const AttachmentError('尚未配置网关地址');
+    final sid = sessionId ?? _currentSession?.sessionId;
+    if (sid == null || sid.isEmpty) throw const AttachmentError('请先选择一个会话再上传文件');
+    if (bytes.isEmpty) throw const AttachmentError('文件是空的');
+
+    final uri = Uri.parse('${cfg.httpBaseUrl}/api/mobile/upload').replace(
+      queryParameters: {'sessionId': sid, 'name': name},
+    );
+
+    http.Response res;
+    try {
+      res = await http.post(
+        uri,
+        headers: {
+          ..._authHeaders,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: bytes,
+      ).timeout(const Duration(seconds: 120));
+    } catch (e) {
+      throw AttachmentError('上传失败：${e is Exception ? e.toString().split(':').first : e}');
+    }
+
+    Map<String, dynamic> body = const {};
+    try {
+      body = jsonDecode(res.body) as Map<String, dynamic>;
+    } catch (_) {
+      // 交给下面的状态码分支统一报错。
+    }
+
+    if (res.statusCode == 413) {
+      throw AttachmentError(body['error']?.toString() ?? '文件超过大小上限');
+    }
+    if (res.statusCode != 200 || body['ok'] != true) {
+      throw AttachmentError(body['error']?.toString() ?? '上传失败 (HTTP ${res.statusCode})');
+    }
+    final receiptId = body['receiptId']?.toString() ?? '';
+    if (receiptId.isEmpty) {
+      throw const AttachmentError('上传成功但服务端没有返回凭据，请重试');
+    }
+    return receiptId;
   }
 
   /// 返回是否真的发出去了。
@@ -796,17 +873,30 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  // Send Prompt
-  Future<void> sendChatMessage(String text) async {
-    if (text.trim().isEmpty) return;
+  /// 发送一条消息。[attachments] 见 §4.2 上传图片/文件。
+  ///
+  /// 允许"只有附件、没有文字"：引擎的准入规则是"非空白文字**或**至少一个附件"，
+  /// 所以这里不能沿用纯文本的必填判断 —— 否则用户传了一张截图却发不出去。
+  Future<void> sendChatMessage(String text, {List<PendingAttachment> attachments = const []}) async {
+    if (text.trim().isEmpty && attachments.isEmpty) return;
 
     final sessionId = _currentSession?.sessionId ?? 'default';
 
     // 1. Add user message to UI immediately
+    //
+    // 附件名只拼进**本地显示**用的这一段文本，不进 wire body。真正的附件由引擎
+    // 在回合开始后通过 session/attachment 事件回传，届时消息才拿到服务端签发的
+    // AttachmentRef（v1.4.1 的机制）并渲染出缩略图。若把文件名塞进再发出去，
+    // 服务端回包后会变成"文件名 + 缩略图"两份，反而重复。
+    final displayText = attachments.isEmpty
+        ? text
+        : (text.trim().isEmpty
+            ? '📎 ${attachments.map((a) => a.name).join('、')}'
+            : '$text\n\n📎 ${attachments.map((a) => a.name).join('、')}');
     final userMsg = ChatMessage(
       id: _uuid.v4(),
       role: 'user',
-      content: text,
+      content: displayText,
       timestamp: DateTime.now(),
     );
     _messages.add(userMsg);
@@ -843,6 +933,10 @@ class DshService extends ChangeNotifier {
               'sessionId': sessionId,
               'text': text,
               'model': currentModel,
+              // 附件（v1.10.0）。图片是内联 base64 的 image part，文件是上传后换到的
+              // receiptId。网关负责把它们并进引擎要求的 content 数组。
+              if (attachments.isNotEmpty)
+                'attachments': attachments.map((a) => a.toWirePart()).toList(),
             }),
           ).timeout(const Duration(seconds: 20));
           break;

@@ -1,7 +1,7 @@
 name: dsh_mobile
 description: "A modern Android client for DeepSeek Harness (DSH)"
 publish_to: "none"
-version: 1.9.0+21
+version: 1.10.0+22
 
 environment:
   sdk: ">=3.0.0 <4.0.0"
@@ -43,6 +43,17 @@ dependencies:
   # 只用本地通知 + 保持 WS 长连接，不接 FCM —— 这样不依赖任何外部推送服务，
   # 也不需要 Google 服务（国内网络下不可靠）。
   flutter_local_notifications: ^17.2.3
+
+  # 上传图片/文件（§4.2）。两个依赖各司其职：
+  #
+  # * image_picker：选图片。关键优势是**内置压缩**（maxWidth/maxHeight/imageQuality）。
+  #   这不是可选优化 —— 网关的 JSON 请求体有 2MB 上限，而图片要以 base64 内联进
+  #   prompt（只有 image part 能让模型真正"看见"图片）。手机直出 12MP 照片约 4MB，
+  #   base64 后 5.3MB，必然超限；压到 1600px/80% 通常 200~500KB，安全落在上限内。
+  # * file_picker：选任意文件。走独立的原始字节上传路由（32MB 上限），不受 JSON
+  #   上限约束，所以不需要压缩。
+  image_picker: ^1.1.2
+  file_picker: ^8.1.2
 
   # Utilities
   intl: ^0.19.0
