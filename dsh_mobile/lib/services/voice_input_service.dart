@@ -50,6 +50,16 @@ class VoiceInputService {
   @visibleForTesting
   Duration listenTimeout = const Duration(seconds: 6);
 
+  /// 查询设备可用语言列表的超时。
+  ///
+  /// 给得比另外两个短：语言只是"提示"，查不到可以用默认值继续，没必要让用户
+  /// 多等。走完这个超时仍然会正常往下走 listen()，不会变成失败。
+  @visibleForTesting
+  Duration localeProbeTimeout = const Duration(seconds: 2);
+
+  /// 本机是否已确认查不到语言列表（查过一次超时就不再查）。
+  bool _localeProbeUnavailable = false;
+
   /// 设备是否有可用的语音识别服务。
   bool get isAvailable => _available;
 
@@ -186,6 +196,13 @@ class VoiceInputService {
       if (locales.isEmpty) {
         lines.add('  → 语言列表为空，通常意味着识别服务不可用');
       }
+    } on TimeoutException {
+      // 这条本身**不是失败**：语言只是提示，查不到会用默认语言继续。
+      // 但如果它发生在 start() 里且没有超时保护，就会表现成"点了没反应"——
+      // 用户手机上实测到的正是这一条，所以这里必须写清它意味着什么。
+      lines.add('可用语言: 查询超时（这台设备的语言列表接口不响应）');
+      lines.add('  → 不影响使用，App 会用默认语言继续；'
+          '若语音仍无法启动，问题在 listen 这一步');
     } catch (e) {
       lines.add('可用语言: 查询失败 ($e)');
     }
@@ -301,9 +318,30 @@ class VoiceInputService {
   ///
   /// 一个能工作的近似请求，好过一个必然失败的精确请求。
   Future<String?> _resolveLocale(String preferred) async {
+    // 这台设备的 locales() 查不出来就别再查了。
+    //
+    // 一旦踩过一次超时，后续每次点击都会白等一个超时 —— 而语言只是一个"提示"，
+    // 查不到照样能用默认值继续走 listen()。所以把结论记住。
+    if (_localeProbeUnavailable) return preferred;
     try {
       // 6.6.2 里 locales 是**方法**（返回 Future），不是 getter。
-      final available = await _speech.locales();
+      //
+      // ⚠️ 这里的超时是必须的，它就是「语音点了完全没反应」的真凶所在。
+      //
+      // 现场证据（用户手机上的诊断报告）：
+      //     服务可用: 是 / 麦克风权限: 已授予 / 可用语言: 查询失败(5s 超时)
+      // 也就是说设备有识别引擎、权限也给了，但 locales() **永不返回**。
+      //
+      // 而调用点是这样写的：
+      //     await _speech.listen(listenOptions: SpeechListenOptions(
+      //         localeId: await _resolveLocale(localeId), ...))
+      // `_resolveLocale` 是 listen() 的**实参**，排在 listen() 之前求值 ——
+      // 加在 listen() 上的超时根本保护不到它。它一挂死，listen() 永远轮不到
+      // 执行，界面就毫无反应，连报错都没有。
+      //
+      // 语言本来就只是提示：查不到就用默认值继续，让 listen() 去报真实原因，
+      // 比卡在这里强得多。
+      final available = await _speech.locales().timeout(localeProbeTimeout);
       if (available.isEmpty) return preferred;
       String norm(String s) => s.replaceAll('-', '_').toLowerCase();
       final want = norm(preferred);
@@ -315,6 +353,11 @@ class VoiceInputService {
         if (norm(l.localeId).split('_').first == lang) return l.localeId;
       }
       return null;
+    } on TimeoutException {
+      // 记住这台设备查不出来，别再让每次点击都白等。
+      _localeProbeUnavailable = true;
+      debugPrint('[VoiceInput] 语言列表查询超时，改用默认语言继续');
+      return preferred;
     } catch (e) {
       debugPrint('[VoiceInput] 语言列表查询失败: $e');
       return preferred;
@@ -365,6 +408,13 @@ class VoiceInputService {
     _initialized = false;
     _available = false;
     _listening = false;
+    _initTimedOut = false;
+    // 这个也要清：单例会跨用例存活，漏了它会让"查过一次就不再查"那条断言在
+    // 后面的用例里拿到 0 次调用，表现成一个与产品无关的莫名失败。
+    _localeProbeUnavailable = false;
+    initTimeout = const Duration(seconds: 12);
+    listenTimeout = const Duration(seconds: 6);
+    localeProbeTimeout = const Duration(seconds: 2);
   }
 
   @visibleForTesting

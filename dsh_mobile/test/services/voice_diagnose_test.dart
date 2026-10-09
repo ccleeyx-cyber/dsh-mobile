@@ -151,6 +151,93 @@ void main() {
     });
   });
 
+  group('locales() 挂死时仍必须走到 listen（手机实测到的真凶）', () {
+    // 用户手机上的诊断报告是：
+    //     服务可用: 是 / 麦克风权限: 已授予 / 可用语言: 查询失败(5s 超时)
+    //
+    // 即设备有识别引擎、权限也给了，但 locales() 永不返回。而 start() 里
+    // `localeId: await _resolveLocale(localeId)` 是 listen() 的**实参**，排在
+    // listen() 之前求值 —— 加在 listen() 上的超时保护不到它。它一挂死，listen()
+    // 永远轮不到执行，用户看到的就是"点了完全没反应"。
+    //
+    // 这一组守的就是：语言列表查不出来**不能**挡住 listen。
+    test('locales 永不返回时，start() 仍会调用 listen 并返回', () async {
+      stub((MethodCall call) {
+        switch (call.method) {
+          case 'initialize':
+            return Future<Object?>.value(true);
+          case 'has_permission':
+            return Future<Object?>.value(true);
+          case 'locales':
+            // 永不完成 —— 等价于那台设备上的实际行为
+            return Completer<Object?>().future;
+          case 'listen':
+            return Future<Object?>.value(true);
+          default:
+            return Future<Object?>.value(null);
+        }
+      });
+
+      final svc = VoiceInputService.instance;
+      svc.debugReset();
+      svc.localeProbeTimeout = const Duration(milliseconds: 250);
+      svc.listenTimeout = const Duration(seconds: 2);
+
+      final sw = Stopwatch()..start();
+      await svc.start(
+        onPartial: (_, __) {},
+        onFinal: (_) {},
+        onError: (_) {},
+      );
+      sw.stop();
+
+      expect(
+        calls.any((c) => c.method == 'listen'),
+        isTrue,
+        reason: '必须走到 listen。若为否，说明卡在了 _resolveLocale 里的 '
+            'locales() 上 —— 这正是"点了没反应"的成因（连报错都没有，因为根本'
+            '没走到报错那一步）。实际调用: ${calls.map((c) => c.method).toList()}',
+      );
+      expect(
+        sw.elapsedMilliseconds < 6000,
+        isTrue,
+        reason: '必须在有限时间内返回；实际 ${sw.elapsedMilliseconds}ms',
+      );
+    });
+
+    test('查过一次超时后不再重复查（不让每次点击都白等）', () async {
+      var localeCalls = 0;
+      stub((MethodCall call) {
+        switch (call.method) {
+          case 'initialize':
+            return Future<Object?>.value(true);
+          case 'has_permission':
+            return Future<Object?>.value(true);
+          case 'locales':
+            localeCalls++;
+            return Completer<Object?>().future;
+          case 'listen':
+            return Future<Object?>.value(true);
+          default:
+            return Future<Object?>.value(null);
+        }
+      });
+
+      final svc = VoiceInputService.instance;
+      svc.debugReset();
+      svc.localeProbeTimeout = const Duration(milliseconds: 200);
+      svc.listenTimeout = const Duration(seconds: 1);
+
+      await svc.start(onPartial: (_, __) {}, onFinal: (_) {}, onError: (_) {});
+      await svc.start(onPartial: (_, __) {}, onFinal: (_) {}, onError: (_) {});
+
+      // 语言只是提示，查过一次超时就把结论记住；否则用户每次点击都要多等一个
+      // 超时的时长，体感上就是"麦克风反应很慢"。
+      expect(localeCalls, 1,
+          reason: '第二次点击不应再查 locales；实际查了 $localeCalls 次');
+    });
+  });
+
   group('诊断报告能区分各种原因', () {
     test('正常情况下报告包含每一项探测结果', () async {
       stub((MethodCall call) {
