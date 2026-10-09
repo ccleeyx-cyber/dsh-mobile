@@ -19,13 +19,17 @@ void main() async {
       child: Container(
         padding: const EdgeInsets.all(8),
         decoration: BoxDecoration(
-          color: const Color(0xFFF8FAFC),
+          // 错误边界的颜色刻意固定取浅色值：ErrorWidget.builder 是一个全局回调，
+          // 签名里没有 BuildContext，拿不到 ThemeScope。这里的深色下会是一块浅色
+          // 面板，但它只在渲染崩溃时出现一次 —— 为此引入一个全局主题单例
+          // （以及它带来的初始化顺序问题）不值得。正常路径永远走不到这里。
+          color: AppColors.background,
           borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: const Color(0xFFE2E8F0)),
+          border: Border.all(color: AppColors.border),
         ),
         child: SelectableText(
           details.exceptionAsString(),
-          style: const TextStyle(fontSize: 12, color: Color(0xFF64748B), fontFamily: 'monospace'),
+          style: const TextStyle(fontSize: 12, color: AppColors.textSecondary, fontFamily: 'monospace'),
         ),
       ),
     );

@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../models/workspace.dart';
 import '../services/dsh_service.dart';
+import '../theme/app_colors.dart';
 
 class WorkspacesView extends StatefulWidget {
   final VoidCallback? onSwitchToChat;
@@ -135,30 +136,30 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: Colors.white,
+        backgroundColor: context.c.surface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: Color(0xFFE5E7EB)),
+          side: BorderSide(color: context.c.border),
         ),
-        title: const Row(
+        title: Row(
           children: [
-            Icon(Icons.warning_amber_rounded, color: Color(0xFFDC2626), size: 22),
+            Icon(Icons.warning_amber_rounded, color: context.c.danger, size: 22),
             SizedBox(width: 8),
-            Text('删除会话', style: TextStyle(color: Color(0xFF111827), fontSize: 17, fontWeight: FontWeight.bold)),
+            Text('删除会话', style: TextStyle(color: context.c.textPrimary, fontSize: 17, fontWeight: FontWeight.bold)),
           ],
         ),
         content: Text(
           '确定要删除会话「${s.title}」吗？\n此操作将清除该会话的本地记录，无法撤销。',
-          style: const TextStyle(color: Color(0xFF4B5563), fontSize: 13, height: 1.5),
+          style: TextStyle(color: context.c.textPrimary, fontSize: 13, height: 1.5),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消', style: TextStyle(color: Color(0xFF6B7280))),
+            child: Text('取消', style: TextStyle(color: context.c.textSecondary)),
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFFDC2626),
+              backgroundColor: context.c.danger,
               foregroundColor: Colors.white,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
               elevation: 0,
@@ -198,7 +199,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: Colors.white,
+      backgroundColor: context.c.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
@@ -220,7 +221,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                     width: 40,
                     height: 4,
                     decoration: BoxDecoration(
-                      color: const Color(0xFFD1D5DB),
+                      color: context.c.border,
                       borderRadius: BorderRadius.circular(2),
                     ),
                   ),
@@ -228,12 +229,12 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 const SizedBox(height: 16),
                 Row(
                   children: [
-                    const Icon(Icons.description_outlined, color: Color(0xFF0078D4)),
+                    Icon(Icons.description_outlined, color: context.c.accent),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
                         '项目记忆与指令 (MEMORY.md)',
-                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF111827)),
+                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: context.c.textPrimary),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
@@ -243,7 +244,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 const SizedBox(height: 4),
                 Text(
                   ws.path,
-                  style: const TextStyle(fontSize: 11, color: Color(0xFF6B7280)),
+                  style: TextStyle(fontSize: 11, color: context.c.textSecondary),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
@@ -251,18 +252,18 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 Container(
                   height: 220,
                   decoration: BoxDecoration(
-                    color: const Color(0xFFF9FAFB),
+                    color: context.c.surfaceMuted,
                     borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: const Color(0xFFE5E7EB)),
+                    border: Border.all(color: context.c.border),
                   ),
                   child: TextField(
                     controller: textController,
                     maxLines: null,
                     expands: true,
-                    style: const TextStyle(color: Color(0xFF1F2937), fontSize: 13, fontFamily: 'monospace'),
-                    decoration: const InputDecoration(
+                    style: TextStyle(color: context.c.textPrimary, fontSize: 13, fontFamily: 'monospace'),
+                    decoration: InputDecoration(
                       hintText: '# 项目背景与上下文约定\n在这里编写项目的架构背景、禁止修改的文件或个性化智能体指示...',
-                      hintStyle: TextStyle(color: Color(0xFF9CA3AF)),
+                      hintStyle: TextStyle(color: context.c.textTertiary),
                       contentPadding: EdgeInsets.all(12),
                       border: InputBorder.none,
                     ),
@@ -274,7 +275,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   height: 46,
                   child: ElevatedButton(
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF0078D4),
+                      backgroundColor: context.c.accent,
                       foregroundColor: Colors.white,
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                       elevation: 0,
@@ -314,7 +315,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
 
     return Row(
       children: [
-        const Icon(Icons.inventory_2_outlined, size: 15, color: Color(0xFF9CA3AF)),
+        Icon(Icons.inventory_2_outlined, size: 15, color: context.c.textTertiary),
         const SizedBox(width: 8),
         for (final entry in modes.entries) ...[
           ChoiceChip(
@@ -328,8 +329,8 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
             showCheckmark: false,
             visualDensity: VisualDensity.compact,
             labelStyle: const TextStyle(fontSize: 11.5),
-            backgroundColor: Colors.white,
-            side: const BorderSide(color: Color(0xFFE5E7EB)),
+            backgroundColor: context.c.surface,
+            side: BorderSide(color: context.c.border),
           ),
           const SizedBox(width: 6),
         ],
@@ -348,21 +349,21 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
       margin: const EdgeInsets.fromLTRB(14, 0, 14, 6),
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: const Color(0xFFFFFBEB),
+        color: context.c.warningSurface,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFFFDE68A)),
+        border: Border.all(color: context.c.warningBorder),
       ),
-      child: const Row(
+      child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(Icons.warning_amber_rounded, size: 16, color: Color(0xFFB45309)),
+          Icon(Icons.warning_amber_rounded, size: 16, color: context.c.warning),
           SizedBox(width: 8),
           Expanded(
             child: Text(
               '网关没有回显归档筛选模式，说明它仍是旧版本：它忽略了这个参数，'
               '返回的还是未归档会话。下面列出的并不是已归档内容。\n'
               '需要在宿主机上重启 dsh web，让新版网关生效后此筛选才可用。',
-              style: TextStyle(fontSize: 11.5, height: 1.5, color: Color(0xFF92400E)),
+              style: TextStyle(fontSize: 11.5, height: 1.5, color: context.c.warning),
             ),
           ),
         ],
@@ -398,31 +399,31 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     }
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF9FAFB),
+      backgroundColor: context.c.surfaceMuted,
       appBar: AppBar(
-        backgroundColor: Colors.white,
+        backgroundColor: context.c.surface,
         elevation: 0,
         scrolledUnderElevation: 0,
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(1),
-          child: Container(color: const Color(0xFFE5E7EB), height: 1),
+          child: Container(color: context.c.border, height: 1),
         ),
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
+            Text(
               '工作区与项目管理',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Color(0xFF111827)),
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: context.c.textPrimary),
             ),
             Text(
               '管理各工程项目与历史会话流',
-              style: TextStyle(fontSize: 11, color: Color(0xFF6B7280)),
+              style: TextStyle(fontSize: 11, color: context.c.textSecondary),
             ),
           ],
         ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.refresh_rounded, color: Color(0xFF4B5563), size: 20),
+            icon: Icon(Icons.refresh_rounded, color: context.c.textPrimary, size: 20),
             tooltip: '刷新工作区',
             onPressed: () {
               dsh.fetchWorkspaces();
@@ -436,9 +437,9 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           // Fluent CommandBar Stats Row
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-            decoration: const BoxDecoration(
-              color: Colors.white,
-              border: Border(bottom: BorderSide(color: Color(0xFFE5E7EB))),
+            decoration: BoxDecoration(
+              color: context.c.surface,
+              border: Border(bottom: BorderSide(color: context.c.border)),
             ),
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
@@ -447,20 +448,20 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   _buildHeaderPill(
                     icon: Icons.folder_rounded,
                     label: '${workspaces.length} 个挂载项目',
-                    color: const Color(0xFF0078D4),
+                    color: context.c.accent,
                   ),
                   const SizedBox(width: 8),
                   _buildHeaderPill(
                     icon: Icons.chat_bubble_outline_rounded,
                     label: '$totalSessions 个历史会话',
-                    color: const Color(0xFF0284C7),
+                    color: context.c.accent,
                   ),
                   if (totalRunning > 0) ...[
                     const SizedBox(width: 8),
                     _buildHeaderPill(
                       icon: Icons.bolt_rounded,
                       label: '$totalRunning 个任务执行中',
-                      color: const Color(0xFF0078D4),
+                      color: context.c.accent,
                       animate: true,
                     ),
                   ],
@@ -469,7 +470,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                     _buildHeaderPill(
                       icon: Icons.shield_outlined,
                       label: '${dsh.pendingApprovals.length} 项待审批',
-                      color: const Color(0xFFD97706),
+                      color: context.c.warning,
                       animate: true,
                     ),
                   ],
@@ -484,20 +485,20 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
             child: Container(
               height: 38,
               decoration: BoxDecoration(
-                color: Colors.white,
+                color: context.c.surface,
                 borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: const Color(0xFFE5E7EB)),
+                border: Border.all(color: context.c.border),
               ),
               child: TextField(
                 controller: _searchController,
-                style: const TextStyle(color: Color(0xFF1F2937), fontSize: 13),
+                style: TextStyle(color: context.c.textPrimary, fontSize: 13),
                 decoration: InputDecoration(
                   hintText: '搜索工作区、路径或历史对话...',
-                  hintStyle: const TextStyle(color: Color(0xFF9CA3AF), fontSize: 12.5),
-                  prefixIcon: const Icon(Icons.search, size: 17, color: Color(0xFF9CA3AF)),
+                  hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 12.5),
+                  prefixIcon: Icon(Icons.search, size: 17, color: context.c.textTertiary),
                   suffixIcon: _searchFilter.isNotEmpty
                       ? IconButton(
-                          icon: const Icon(Icons.clear, size: 15, color: Color(0xFF9CA3AF)),
+                          icon: Icon(Icons.clear, size: 15, color: context.c.textTertiary),
                           onPressed: () {
                             _searchController.clear();
                             setState(() => _searchFilter = '');
@@ -526,8 +527,8 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           // Workspace List
           Expanded(
             child: filteredWorkspaces.isEmpty
-                ? const Center(
-                    child: Text('没有找到匹配的工作区', style: TextStyle(color: Color(0xFF9CA3AF))),
+                ? Center(
+                    child: Text('没有找到匹配的工作区', style: TextStyle(color: context.c.textTertiary)),
                   )
                 : ListView.builder(
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
@@ -583,16 +584,16 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: context.c.surface,
         borderRadius: BorderRadius.circular(10),
         border: Border.all(
           color: isCurrent
-              ? const Color(0xFF0078D4)
+              ? context.c.accent
               : (hasRunning
-                  ? const Color(0xFF0078D4).withOpacity(0.5)
+                  ? context.c.accent.withOpacity(0.5)
                   : (pendingCount > 0
-                      ? const Color(0xFFF59E0B)
-                      : const Color(0xFFE5E7EB))),
+                      ? context.c.warning
+                      : context.c.border)),
           width: isCurrent ? 1.5 : 1.0,
         ),
         boxShadow: [
@@ -611,12 +612,12 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
             width: 34,
             height: 34,
             decoration: BoxDecoration(
-              color: isCurrent ? const Color(0xFF0078D4).withOpacity(0.12) : const Color(0xFFF3F4F6),
+              color: isCurrent ? context.c.accent.withOpacity(0.12) : context.c.surfaceMuted,
               borderRadius: BorderRadius.circular(8),
             ),
             child: Icon(
               Icons.folder_rounded,
-              color: isCurrent ? const Color(0xFF0078D4) : const Color(0xFF6B7280),
+              color: isCurrent ? context.c.accent : context.c.textSecondary,
               size: 18,
             ),
           ),
@@ -628,7 +629,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   style: TextStyle(
                     fontSize: 14.5,
                     fontWeight: FontWeight.w600,
-                    color: isCurrent ? const Color(0xFF0078D4) : const Color(0xFF111827),
+                    color: isCurrent ? context.c.accent : context.c.textPrimary,
                   ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
@@ -639,20 +640,20 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF0078D4).withOpacity(0.1),
+                    color: context.c.accent.withOpacity(0.1),
                     borderRadius: BorderRadius.circular(4),
-                    border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.3)),
+                    border: Border.all(color: context.c.accent.withOpacity(0.3)),
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      const SizedBox(
+                      SizedBox(
                         width: 8,
                         height: 8,
-                        child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF0078D4)),
+                        child: CircularProgressIndicator(strokeWidth: 1.5, color: context.c.accent),
                       ),
                       const SizedBox(width: 4),
-                      Text('$runningSessionsCount 执行中', style: const TextStyle(color: Color(0xFF0078D4), fontSize: 9.5, fontWeight: FontWeight.bold)),
+                      Text('$runningSessionsCount 执行中', style: TextStyle(color: context.c.accent, fontSize: 9.5, fontWeight: FontWeight.bold)),
                     ],
                   ),
                 ),
@@ -662,16 +663,16 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
-                    color: const Color(0xFFFEF3C7),
+                    color: context.c.warningBadgeSurface,
                     borderRadius: BorderRadius.circular(4),
-                    border: Border.all(color: const Color(0xFFFDE68A)),
+                    border: Border.all(color: context.c.warningBorder),
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      const Icon(Icons.shield_outlined, size: 10, color: Color(0xFFD97706)),
+                      Icon(Icons.shield_outlined, size: 10, color: context.c.warning),
                       const SizedBox(width: 3),
-                      Text('$pendingCount 待审批', style: const TextStyle(color: Color(0xFFD97706), fontSize: 9.5, fontWeight: FontWeight.bold)),
+                      Text('$pendingCount 待审批', style: TextStyle(color: context.c.warning, fontSize: 9.5, fontWeight: FontWeight.bold)),
                     ],
                   ),
                 ),
@@ -681,11 +682,11 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF0078D4).withOpacity(0.1),
+                    color: context.c.accent.withOpacity(0.1),
                     borderRadius: BorderRadius.circular(4),
-                    border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.3)),
+                    border: Border.all(color: context.c.accent.withOpacity(0.3)),
                   ),
-                  child: const Text('当前活跃', style: TextStyle(color: Color(0xFF0078D4), fontSize: 9.5, fontWeight: FontWeight.bold)),
+                  child: Text('当前活跃', style: TextStyle(color: context.c.accent, fontSize: 9.5, fontWeight: FontWeight.bold)),
                 ),
               ],
             ],
@@ -699,7 +700,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   Expanded(
                     child: Text(
                       ws.path,
-                      style: const TextStyle(fontSize: 11, color: Color(0xFF6B7280), fontFamily: 'monospace'),
+                      style: TextStyle(fontSize: 11, color: context.c.textSecondary, fontFamily: 'monospace'),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -711,7 +712,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                         const SnackBar(content: Text('路径已复制到剪贴板'), duration: Duration(seconds: 1)),
                       );
                     },
-                    child: const Icon(Icons.copy, size: 13, color: Color(0xFF9CA3AF)),
+                    child: Icon(Icons.copy, size: 13, color: context.c.textTertiary),
                   ),
                 ],
               ),
@@ -726,7 +727,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                     : dsh.archivedFilter == 'include'
                         ? '共 ${ws.sessions.length} 个对话（含已归档）'
                         : '共 ${ws.sessions.length} 个历史对话',
-                style: const TextStyle(fontSize: 10.5, color: Color(0xFF9CA3AF)),
+                style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
               ),
             ],
           ),
@@ -740,8 +741,8 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                     Expanded(
                       child: OutlinedButton.icon(
                         style: OutlinedButton.styleFrom(
-                          foregroundColor: const Color(0xFF0078D4),
-                          side: const BorderSide(color: Color(0xFF0078D4)),
+                          foregroundColor: context.c.accent,
+                          side: BorderSide(color: context.c.accent),
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                           padding: const EdgeInsets.symmetric(vertical: 6),
                         ),
@@ -756,7 +757,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   Expanded(
                     child: ElevatedButton.icon(
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF0078D4),
+                        backgroundColor: context.c.accent,
                         foregroundColor: Colors.white,
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                         padding: const EdgeInsets.symmetric(vertical: 6),
@@ -774,14 +775,14 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   const SizedBox(width: 8),
                   IconButton(
                     tooltip: '查看/编辑项目说明 (MEMORY.md)',
-                    icon: const Icon(Icons.menu_book_rounded, color: Color(0xFF6B7280), size: 19),
+                    icon: Icon(Icons.menu_book_rounded, color: context.c.textSecondary, size: 19),
                     onPressed: () => _openMemoryEditor(context, dsh, ws),
                   ),
                 ],
               ),
             ),
 
-            const Divider(color: Color(0xFFE5E7EB), height: 1),
+            Divider(color: context.c.border, height: 1),
 
             // Sessions List inside workspace
             if (ws.sessions.isEmpty)
@@ -791,7 +792,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   // 「已归档」视图下必须换说法：本机 GZ 工作区一条归档都没有，
                   // 若仍显示「暂无会话」会让人以为会话丢了。
                   dsh.archivedFilter == 'only' ? '此工作区没有已归档的会话' : '此工作区暂无会话',
-                  style: const TextStyle(color: Color(0xFF9CA3AF), fontSize: 12),
+                  style: TextStyle(color: context.c.textTertiary, fontSize: 12),
                 ),
               )
             else
@@ -824,14 +825,14 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 2.5),
       decoration: BoxDecoration(
-        color: isCurrentSession ? const Color(0xFFEFF6FC) : Colors.transparent,
+        color: isCurrentSession ? context.c.selectedSurface : Colors.transparent,
         borderRadius: BorderRadius.circular(6),
         border: Border.all(
           color: isRunning
-              ? const Color(0xFF0078D4).withOpacity(0.4)
+              ? context.c.accent.withOpacity(0.4)
               : (pendingCount > 0
-                  ? const Color(0xFFF59E0B).withOpacity(0.35)
-                  : (isCurrentSession ? const Color(0xFF0078D4).withOpacity(0.3) : Colors.transparent)),
+                  ? context.c.warning.withOpacity(0.35)
+                  : (isCurrentSession ? context.c.accent.withOpacity(0.3) : Colors.transparent)),
           width: 1.0,
         ),
       ),
@@ -843,15 +844,15 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 width: 30,
                 height: 30,
                 decoration: BoxDecoration(
-                  color: const Color(0xFF0078D4).withOpacity(0.12),
+                  color: context.c.accent.withOpacity(0.12),
                   shape: BoxShape.circle,
-                  border: Border.all(color: const Color(0xFF0078D4), width: 1.2),
+                  border: Border.all(color: context.c.accent, width: 1.2),
                 ),
-                child: const Center(
+                child: Center(
                   child: SizedBox(
                     width: 13,
                     height: 13,
-                    child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF0078D4)),
+                    child: CircularProgressIndicator(strokeWidth: 1.5, color: context.c.accent),
                   ),
                 ),
               )
@@ -860,16 +861,16 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                     width: 30,
                     height: 30,
                     decoration: BoxDecoration(
-                      color: const Color(0xFFFEF3C7),
+                      color: context.c.warningBadgeSurface,
                       shape: BoxShape.circle,
-                      border: Border.all(color: const Color(0xFFD97706), width: 1.2),
+                      border: Border.all(color: context.c.warning, width: 1.2),
                     ),
-                    child: const Icon(Icons.shield_outlined, size: 15, color: Color(0xFFD97706)),
+                    child: Icon(Icons.shield_outlined, size: 15, color: context.c.warning),
                   )
                 : Icon(
                     Icons.chat_bubble_outline_rounded,
                     size: 16,
-                    color: isCurrentSession ? const Color(0xFF0078D4) : const Color(0xFF9CA3AF),
+                    color: isCurrentSession ? context.c.accent : context.c.textTertiary,
                   )),
         title: Row(
           children: [
@@ -879,7 +880,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 style: TextStyle(
                   fontSize: 13,
                   fontWeight: isCurrentSession ? FontWeight.w600 : FontWeight.normal,
-                  color: isCurrentSession ? const Color(0xFF0078D4) : const Color(0xFF1F2937),
+                  color: isCurrentSession ? context.c.accent : context.c.textPrimary,
                 ),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
@@ -892,13 +893,13 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
                 decoration: BoxDecoration(
-                  color: const Color(0xFFF3F4F6),
+                  color: context.c.surfaceMuted,
                   borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: const Color(0xFFD1D5DB)),
+                  border: Border.all(color: context.c.border),
                 ),
-                child: const Text(
+                child: Text(
                   '已归档',
-                  style: TextStyle(fontSize: 10, color: Color(0xFF6B7280)),
+                  style: TextStyle(fontSize: 10, color: context.c.textSecondary),
                 ),
               ),
             ],
@@ -907,20 +908,20 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF0078D4).withOpacity(0.1),
+                  color: context.c.accent.withOpacity(0.1),
                   borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.3)),
+                  border: Border.all(color: context.c.accent.withOpacity(0.3)),
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
-                  children: const [
+                  children: [
                     SizedBox(
                       width: 8,
                       height: 8,
-                      child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF0078D4)),
+                      child: CircularProgressIndicator(strokeWidth: 1.5, color: context.c.accent),
                     ),
                     SizedBox(width: 4),
-                    Text('执行中', style: TextStyle(color: Color(0xFF0078D4), fontSize: 9.5, fontWeight: FontWeight.bold)),
+                    Text('执行中', style: TextStyle(color: context.c.accent, fontSize: 9.5, fontWeight: FontWeight.bold)),
                   ],
                 ),
               ),
@@ -930,16 +931,16 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
                 decoration: BoxDecoration(
-                  color: const Color(0xFFFEF3C7),
+                  color: context.c.warningBadgeSurface,
                   borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: const Color(0xFFFDE68A)),
+                  border: Border.all(color: context.c.warningBorder),
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.priority_high_rounded, size: 10, color: Color(0xFFD97706)),
+                    Icon(Icons.priority_high_rounded, size: 10, color: context.c.warning),
                     const SizedBox(width: 2),
-                    Text('待审批 ($pendingCount)', style: const TextStyle(color: Color(0xFFD97706), fontSize: 9.5, fontWeight: FontWeight.bold)),
+                    Text('待审批 ($pendingCount)', style: TextStyle(color: context.c.warning, fontSize: 9.5, fontWeight: FontWeight.bold)),
                   ],
                 ),
               ),
@@ -952,7 +953,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
             const SizedBox(height: 3),
             Text(
               s.firstPrompt.isNotEmpty ? s.firstPrompt : '无首条消息预览',
-              style: const TextStyle(fontSize: 11.5, color: Color(0xFF6B7280)),
+              style: TextStyle(fontSize: 11.5, color: context.c.textSecondary),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
@@ -963,18 +964,18 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
                     decoration: BoxDecoration(
-                      color: const Color(0xFFF3F4F6),
+                      color: context.c.surfaceMuted,
                       borderRadius: BorderRadius.circular(4),
-                      border: Border.all(color: const Color(0xFFE5E7EB)),
+                      border: Border.all(color: context.c.border),
                     ),
                     child: Text(
                       s.model.replaceAll('cn:', ''),
-                      style: const TextStyle(fontSize: 9.5, color: Color(0xFF4B5563), fontFamily: 'monospace'),
+                      style: TextStyle(fontSize: 9.5, color: context.c.textPrimary, fontFamily: 'monospace'),
                     ),
                   ),
                   const SizedBox(width: 6),
                 ],
-                Text(_formatTime(s.lastPromptAt), style: const TextStyle(fontSize: 10, color: Color(0xFF9CA3AF))),
+                Text(_formatTime(s.lastPromptAt), style: TextStyle(fontSize: 10, color: context.c.textTertiary)),
               ],
             ),
           ],
@@ -983,11 +984,11 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           mainAxisSize: MainAxisSize.min,
           children: [
             IconButton(
-              icon: const Icon(Icons.delete_outline_rounded, size: 18, color: Color(0xFF9CA3AF)),
+              icon: Icon(Icons.delete_outline_rounded, size: 18, color: context.c.textTertiary),
               tooltip: '删除会话',
               onPressed: () => _showDeleteSessionDialog(context, dsh, ws, s),
             ),
-            const Icon(Icons.chevron_right_rounded, size: 16, color: Color(0xFFD1D5DB)),
+            Icon(Icons.chevron_right_rounded, size: 16, color: context.c.border),
           ],
         ),
         onTap: () async {

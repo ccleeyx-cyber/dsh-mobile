@@ -6,6 +6,7 @@ import '../models/approval_preset.dart';
 import '../models/permission_config.dart';
 import '../services/dsh_service.dart';
 import '../widgets/approval_card.dart';
+import '../theme/app_colors.dart';
 
 class SecurityPermissionsView extends StatefulWidget {
   const SecurityPermissionsView({super.key});
@@ -43,28 +44,28 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
     final auditLogs = dsh.auditLogs;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF9FAFB),
+      backgroundColor: context.c.surfaceMuted,
       appBar: AppBar(
-        backgroundColor: Colors.white,
+        backgroundColor: context.c.surface,
         elevation: 0,
         scrolledUnderElevation: 0,
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(1),
-          child: Container(color: const Color(0xFFE5E7EB), height: 1),
+          child: Container(color: context.c.border, height: 1),
         ),
-        title: const Row(
+        title: Row(
           children: [
-            Icon(Icons.security_rounded, color: Color(0xFF0078D4)),
+            Icon(Icons.security_rounded, color: context.c.accent),
             SizedBox(width: 8),
             Text(
               '权限与安全中心',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF111827)),
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: context.c.textPrimary),
             ),
           ],
         ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.refresh_rounded, color: Color(0xFF4B5563)),
+            icon: Icon(Icons.refresh_rounded, color: context.c.textPrimary),
             tooltip: '刷新安全状态',
             onPressed: () {
               dsh.fetchApprovals();
@@ -78,15 +79,15 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         children: [
           // 1. Pending Approvals Section
-          _buildSectionHeader('待处理权限审批 (Pending Approvals)', Icons.pending_actions_rounded, const Color(0xFFD97706)),
+          _buildSectionHeader('待处理权限审批 (Pending Approvals)', Icons.pending_actions_rounded, context.c.warning),
           const SizedBox(height: 8),
           if (pendingApprovals.isEmpty)
             Container(
               padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
               decoration: BoxDecoration(
-                color: Colors.white,
+                color: context.c.surface,
                 borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: const Color(0xFF10B981).withOpacity(0.3)),
+                border: Border.all(color: context.c.success.withOpacity(0.3)),
                 boxShadow: [
                   BoxShadow(
                     color: Colors.black.withOpacity(0.02),
@@ -95,9 +96,9 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                   ),
                 ],
               ),
-              child: const Row(
+              child: Row(
                 children: [
-                  Icon(Icons.verified_user_rounded, color: Color(0xFF10B981), size: 28),
+                  Icon(Icons.verified_user_rounded, color: context.c.success, size: 28),
                   SizedBox(width: 14),
                   Expanded(
                     child: Column(
@@ -105,12 +106,12 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                       children: [
                         Text(
                           '安全状态良好',
-                          style: TextStyle(color: Color(0xFF111827), fontSize: 15, fontWeight: FontWeight.bold),
+                          style: TextStyle(color: context.c.textPrimary, fontSize: 15, fontWeight: FontWeight.bold),
                         ),
                         SizedBox(height: 2),
                         Text(
                           '所有后台操作已就绪，当前无阻塞性工具审批请求。',
-                          style: TextStyle(color: Color(0xFF6B7280), fontSize: 12),
+                          style: TextStyle(color: context.c.textSecondary, fontSize: 12),
                         ),
                       ],
                     ),
@@ -140,14 +141,14 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
           const SizedBox(height: 24),
 
           // 2. Global Execution & Security Policy Matrix
-          _buildSectionHeader('全局默认执行策略 (Execution Policies)', Icons.tune_rounded, const Color(0xFF0078D4)),
+          _buildSectionHeader('全局默认执行策略 (Execution Policies)', Icons.tune_rounded, context.c.accent),
           const SizedBox(height: 8),
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: Colors.white,
+              color: context.c.surface,
               borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: const Color(0xFFE5E7EB)),
+              border: Border.all(color: context.c.border),
               boxShadow: [
                 BoxShadow(
                   color: Colors.black.withOpacity(0.02),
@@ -159,9 +160,9 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
+                Text(
                   '终端命令默认放行规则 (Default Shell Policy)',
-                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Color(0xFF374151)),
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: context.c.textPrimary),
                 ),
                 const SizedBox(height: 10),
 
@@ -235,15 +236,15 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                 ),
 
                 const SizedBox(height: 14),
-                const Divider(color: Color(0xFFE5E7EB)),
+                Divider(color: context.c.border),
                 const SizedBox(height: 10),
 
                 // Sandbox Escalation Toggle
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
-                  activeColor: const Color(0xFF0078D4),
-                  title: const Text('允许沙箱提权执行 (Privilege Escalation)', style: TextStyle(fontSize: 14, color: Color(0xFF1F2937))),
-                  subtitle: const Text('允许 DSH 智能体执行需要管理员权限的命令', style: TextStyle(fontSize: 12, color: Color(0xFF6B7280))),
+                  activeColor: context.c.accent,
+                  title: Text('允许沙箱提权执行 (Privilege Escalation)', style: TextStyle(fontSize: 14, color: context.c.textPrimary)),
+                  subtitle: Text('允许 DSH 智能体执行需要管理员权限的命令', style: TextStyle(fontSize: 12, color: context.c.textSecondary)),
                   value: permissions.sandboxMode == 'danger-full-access',
                   onChanged: (val) async {
                     final updated = permissions.copyWith(
@@ -266,9 +267,9 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                 // Git & Protected Directory Protection Toggle
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
-                  activeColor: const Color(0xFF0078D4),
-                  title: const Text('敏感目录防护 (Protected Path Guard)', style: TextStyle(fontSize: 14, color: Color(0xFF1F2937))),
-                  subtitle: const Text('拦截对 .git, .dsh, 系统根目录等敏感路径的覆盖写操作', style: TextStyle(fontSize: 12, color: Color(0xFF6B7280))),
+                  activeColor: context.c.accent,
+                  title: Text('敏感目录防护 (Protected Path Guard)', style: TextStyle(fontSize: 14, color: context.c.textPrimary)),
+                  subtitle: Text('拦截对 .git, .dsh, 系统根目录等敏感路径的覆盖写操作', style: TextStyle(fontSize: 12, color: context.c.textSecondary)),
                   value: permissions.protectGit,
                   onChanged: (val) async {
                     final updated = permissions.copyWith(protectGit: val);
@@ -292,14 +293,14 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
           const SizedBox(height: 24),
 
           // 3. Security Audit Log History
-          _buildSectionHeader('操作审计日志 (Audit Trail)', Icons.history_rounded, const Color(0xFF7C3AED)),
+          _buildSectionHeader('操作审计日志 (Audit Trail)', Icons.history_rounded, context.c.purple),
           const SizedBox(height: 8),
           Container(
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
-              color: Colors.white,
+              color: context.c.surface,
               borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: const Color(0xFFE5E7EB)),
+              border: Border.all(color: context.c.border),
               boxShadow: [
                 BoxShadow(
                   color: Colors.black.withOpacity(0.02),
@@ -309,17 +310,17 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
               ],
             ),
             child: auditLogs.isEmpty
-                ? const Padding(
+                ? Padding(
                     padding: EdgeInsets.symmetric(vertical: 24),
                     child: Center(
-                       child: Text('暂无历史审计记录', style: TextStyle(color: Color(0xFF9CA3AF), fontSize: 13)),
+                       child: Text('暂无历史审计记录', style: TextStyle(color: context.c.textTertiary, fontSize: 13)),
                     ),
                   )
                 : ListView.separated(
                     shrinkWrap: true,
                     physics: const NeverScrollableScrollPhysics(),
                     itemCount: auditLogs.length,
-                    separatorBuilder: (context, index) => const Divider(color: Color(0xFFE5E7EB), height: 12),
+                    separatorBuilder: (context, index) => Divider(color: context.c.border, height: 12),
                     itemBuilder: (context, index) {
                       final item = auditLogs[index];
                       return _buildAuditLogTile(item);
@@ -347,12 +348,12 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _buildSectionHeader('审批预设 (Approval Presets)', Icons.auto_awesome_rounded, const Color(0xFF7C3AED)),
+        _buildSectionHeader('审批预设 (Approval Presets)', Icons.auto_awesome_rounded, context.c.purple),
         const SizedBox(height: 4),
-        const Text(
+        Text(
           '一键套用一组经过审阅的策略组合。下面每个预设都列出了它实际会做什么，'
           '套用后仍可在下方逐项微调。',
-          style: TextStyle(fontSize: 11.5, color: Color(0xFF6B7280), height: 1.45),
+          style: TextStyle(fontSize: 11.5, color: context.c.textSecondary, height: 1.45),
         ),
         const SizedBox(height: 10),
         ...ApprovalPreset.values.map((p) => _buildPresetTile(context, dsh, permissions, p, current)),
@@ -369,14 +370,14 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
   ) {
     final isActive = current?.id == preset.id;
     final borderColor = isActive
-        ? const Color(0xFF7C3AED)
-        : (preset.isDangerous ? const Color(0xFFFCA5A5) : const Color(0xFFE5E7EB));
+        ? context.c.purple
+        : (preset.isDangerous ? const Color(0xFFFCA5A5) : context.c.border);
     final diff = PermissionConfigSnapshot.describeDiff(permissions, preset.config);
 
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: context.c.surface,
         borderRadius: BorderRadius.circular(10),
         border: Border.all(color: borderColor, width: isActive ? 1.6 : 1),
         boxShadow: [
@@ -398,7 +399,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                 style: TextStyle(
                   fontSize: 14.5,
                   fontWeight: FontWeight.w600,
-                  color: preset.isDangerous ? const Color(0xFFB91C1C) : const Color(0xFF111827),
+                  color: preset.isDangerous ? context.c.danger : context.c.textPrimary,
                 ),
               ),
               const SizedBox(width: 8),
@@ -406,12 +407,12 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF7C3AED).withOpacity(0.1),
+                    color: context.c.purple.withOpacity(0.1),
                     borderRadius: BorderRadius.circular(4),
                   ),
-                  child: const Text(
+                  child: Text(
                     '当前',
-                    style: TextStyle(fontSize: 10, color: Color(0xFF7C3AED), fontWeight: FontWeight.bold),
+                    style: TextStyle(fontSize: 10, color: context.c.purple, fontWeight: FontWeight.bold),
                   ),
                 ),
               if (preset.isDangerous) ...[
@@ -419,13 +420,13 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
-                    color: const Color(0xFFFEE2E2),
+                    color: context.c.dangerSurface,
                     borderRadius: BorderRadius.circular(4),
                     border: Border.all(color: const Color(0xFFFCA5A5)),
                   ),
-                  child: const Text(
+                  child: Text(
                     '高风险',
-                    style: TextStyle(fontSize: 10, color: Color(0xFFB91C1C), fontWeight: FontWeight.bold),
+                    style: TextStyle(fontSize: 10, color: context.c.danger, fontWeight: FontWeight.bold),
                   ),
                 ),
               ],
@@ -433,7 +434,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
           ),
           subtitle: Text(
             preset.summary,
-            style: const TextStyle(fontSize: 11.5, color: Color(0xFF6B7280)),
+            style: TextStyle(fontSize: 11.5, color: context.c.textSecondary),
           ),
           children: [
             Align(
@@ -443,7 +444,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                 style: TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.w600,
-                  color: preset.isDangerous ? const Color(0xFFB91C1C) : const Color(0xFF374151),
+                  color: preset.isDangerous ? context.c.danger : context.c.textPrimary,
                 ),
               ),
             ),
@@ -460,7 +461,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                         width: 3,
                         height: 3,
                         decoration: BoxDecoration(
-                          color: preset.isDangerous ? const Color(0xFFB91C1C) : const Color(0xFF9CA3AF),
+                          color: preset.isDangerous ? context.c.danger : context.c.textTertiary,
                           shape: BoxShape.circle,
                         ),
                       ),
@@ -471,7 +472,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                         style: TextStyle(
                           fontSize: 11.5,
                           height: 1.45,
-                          color: preset.isDangerous ? const Color(0xFFB91C1C) : const Color(0xFF4B5563),
+                          color: preset.isDangerous ? context.c.danger : context.c.textPrimary,
                         ),
                       ),
                     ),
@@ -486,29 +487,29 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                 width: double.infinity,
                 padding: const EdgeInsets.all(9),
                 decoration: BoxDecoration(
-                  color: const Color(0xFFF9FAFB),
+                  color: context.c.surfaceMuted,
                   borderRadius: BorderRadius.circular(7),
-                  border: Border.all(color: const Color(0xFFE5E7EB)),
+                  border: Border.all(color: context.c.border),
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
+                    Text(
                       '套用后会改变：',
-                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: Color(0xFF6B7280)),
+                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: context.c.textSecondary),
                     ),
                     const SizedBox(height: 4),
                     ...diff.map(
-                      (d) => Text('· $d', style: const TextStyle(fontSize: 11, color: Color(0xFF6B7280), height: 1.5)),
+                      (d) => Text('· $d', style: TextStyle(fontSize: 11, color: context.c.textSecondary, height: 1.5)),
                     ),
                   ],
                 ),
               ),
               const SizedBox(height: 10),
             ] else ...[
-              const Text(
+              Text(
                 '与当前设置完全相同，套用不会改变任何配置项。',
-                style: TextStyle(fontSize: 11, color: Color(0xFF9CA3AF)),
+                style: TextStyle(fontSize: 11, color: context.c.textTertiary),
               ),
               const SizedBox(height: 10),
             ],
@@ -519,9 +520,9 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                     ? null
                     : () => _applyPreset(context, dsh, permissions, preset, diff),
                 style: FilledButton.styleFrom(
-                  backgroundColor: preset.isDangerous ? const Color(0xFFDC2626) : const Color(0xFF7C3AED),
-                  disabledBackgroundColor: const Color(0xFFE5E7EB),
-                  disabledForegroundColor: const Color(0xFF9CA3AF),
+                  backgroundColor: preset.isDangerous ? context.c.danger : context.c.purple,
+                  disabledBackgroundColor: context.c.border,
+                  disabledForegroundColor: context.c.textTertiary,
                   padding: const EdgeInsets.symmetric(vertical: 10),
                 ),
                 child: Text(
@@ -548,9 +549,9 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
       final confirmed = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Row(
+          title: Row(
             children: [
-              Icon(Icons.warning_amber_rounded, color: Color(0xFFDC2626), size: 22),
+              Icon(Icons.warning_amber_rounded, color: context.c.danger, size: 22),
               SizedBox(width: 8),
               Text('套用「完全信任」？'),
             ],
@@ -565,7 +566,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
             FilledButton(
-              style: FilledButton.styleFrom(backgroundColor: const Color(0xFFDC2626)),
+              style: FilledButton.styleFrom(backgroundColor: context.c.danger),
               onPressed: () => Navigator.pop(ctx, true),
               child: const Text('我明白风险，套用'),
             ),
@@ -600,7 +601,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
         const SizedBox(width: 8),
         Text(
           title,
-          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF111827)),
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: context.c.textPrimary),
         ),
       ],
     );
@@ -620,9 +621,9 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.all(10),
         decoration: BoxDecoration(
-          color: isSelected ? const Color(0xFF0078D4).withOpacity(0.08) : Colors.white,
+          color: isSelected ? context.c.accent.withOpacity(0.08) : context.c.surface,
           border: Border.all(
-            color: isSelected ? const Color(0xFF0078D4) : const Color(0xFFE5E7EB),
+            color: isSelected ? context.c.accent : context.c.border,
             width: isSelected ? 1.5 : 1.0,
           ),
           borderRadius: BorderRadius.circular(8),
@@ -633,7 +634,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
               value: value,
               groupValue: groupValue,
               onChanged: onChanged,
-              activeColor: const Color(0xFF0078D4),
+              activeColor: context.c.accent,
             ),
             const SizedBox(width: 6),
             Expanded(
@@ -645,13 +646,13 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                     style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.bold,
-                      color: isSelected ? const Color(0xFF0078D4) : const Color(0xFF1F2937),
+                      color: isSelected ? context.c.accent : context.c.textPrimary,
                     ),
                   ),
                   const SizedBox(height: 2),
                   Text(
                     subtitle,
-                    style: const TextStyle(fontSize: 11, color: Color(0xFF6B7280)),
+                    style: TextStyle(fontSize: 11, color: context.c.textSecondary),
                   ),
                 ],
               ),
@@ -667,20 +668,20 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
     String outcomeText;
     switch (item.outcome) {
       case 'allowed-once':
-        outcomeColor = const Color(0xFF16A34A);
+        outcomeColor = context.c.success;
         outcomeText = '已授权放行';
         break;
       case 'auto-approved':
-        outcomeColor = const Color(0xFF0284C7);
+        outcomeColor = context.c.accent;
         outcomeText = '只读自动放行';
         break;
       case 'rejected':
-        outcomeColor = const Color(0xFFDC2626);
+        outcomeColor = context.c.danger;
         outcomeText = '已拦截拒绝';
         break;
       case 'pending':
       default:
-        outcomeColor = const Color(0xFFD97706);
+        outcomeColor = context.c.warning;
         outcomeText = '等待审批中';
         break;
     }
@@ -710,19 +711,19 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                 children: [
                   Text(
                     item.toolName,
-                    style: const TextStyle(color: Color(0xFF1F2937), fontSize: 12, fontWeight: FontWeight.bold),
+                    style: TextStyle(color: context.c.textPrimary, fontSize: 12, fontWeight: FontWeight.bold),
                   ),
                   const Spacer(),
                   Text(
                     _formatTime(item.time),
-                    style: const TextStyle(color: Color(0xFF9CA3AF), fontSize: 10),
+                    style: TextStyle(color: context.c.textTertiary, fontSize: 10),
                   ),
                 ],
               ),
               const SizedBox(height: 2),
               Text(
                 item.command,
-                style: const TextStyle(color: Color(0xFF4B5563), fontSize: 11, fontFamily: 'monospace'),
+                style: TextStyle(color: context.c.textPrimary, fontSize: 11, fontFamily: 'monospace'),
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
               ),
@@ -731,7 +732,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                   padding: const EdgeInsets.only(top: 2),
                   child: Text(
                     item.reason!,
-                    style: const TextStyle(color: Color(0xFF9CA3AF), fontSize: 10),
+                    style: TextStyle(color: context.c.textTertiary, fontSize: 10),
                   ),
                 ),
             ],

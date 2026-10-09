@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import '../theme/app_colors.dart';
 
 String sanitizeMarkdown(String? raw) {
   if (raw == null || raw.isEmpty) return '';
@@ -48,9 +49,9 @@ class SafeMarkdown extends StatelessWidget {
       return SelectableText(
         data,
         style: fallbackTextStyle ??
-            const TextStyle(
+            TextStyle(
               fontSize: 14,
-              color: Color(0xFF1F2937),
+              color: context.c.textPrimary,
               height: 1.45,
             ),
       );

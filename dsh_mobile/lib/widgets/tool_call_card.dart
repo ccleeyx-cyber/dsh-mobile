@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../models/chat_message.dart';
+import '../theme/app_colors.dart';
 
 class ToolCallCard extends StatefulWidget {
   final ToolExecution tool;
@@ -77,10 +78,10 @@ class _ToolCallCardState extends State<ToolCallCard> {
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
       decoration: BoxDecoration(
-        color: const Color(0xFFF8FAFC),
+        color: context.c.background,
         borderRadius: BorderRadius.circular(8),
         border: Border.all(
-          color: isRunning ? const Color(0xFF0078D4).withOpacity(0.4) : const Color(0xFFE2E8F0),
+          color: isRunning ? context.c.accent.withOpacity(0.4) : context.c.border,
         ),
       ),
       child: Column(
@@ -96,16 +97,16 @@ class _ToolCallCardState extends State<ToolCallCard> {
                   Icon(
                     _getToolIcon(widget.tool.name),
                     size: 15,
-                    color: isRunning ? const Color(0xFF0078D4) : const Color(0xFF475569),
+                    color: isRunning ? context.c.accent : context.c.textSecondary,
                   ),
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
                       '工具调用: ${widget.tool.name}',
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 12,
                         fontWeight: FontWeight.w600,
-                        color: Color(0xFF1E293B),
+                        color: context.c.textPrimary,
                       ),
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -115,18 +116,18 @@ class _ToolCallCardState extends State<ToolCallCard> {
                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                     decoration: BoxDecoration(
                       color: isRunning
-                          ? const Color(0xFF0078D4).withOpacity(0.1)
-                          : const Color(0xFF10B981).withOpacity(0.1),
+                          ? context.c.accent.withOpacity(0.1)
+                          : context.c.success.withOpacity(0.1),
                       borderRadius: BorderRadius.circular(4),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         if (isRunning) ...[
-                          const SizedBox(
+                          SizedBox(
                             width: 8,
                             height: 8,
-                            child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF0078D4)),
+                            child: CircularProgressIndicator(strokeWidth: 1.5, color: context.c.accent),
                           ),
                           const SizedBox(width: 4),
                         ],
@@ -135,7 +136,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                           style: TextStyle(
                             fontSize: 10,
                             fontWeight: FontWeight.w600,
-                            color: isRunning ? const Color(0xFF0078D4) : const Color(0xFF059669),
+                            color: isRunning ? context.c.accent : context.c.success,
                           ),
                         ),
                       ],
@@ -145,7 +146,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                   Icon(
                     _expanded ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded,
                     size: 16,
-                    color: const Color(0xFF94A3B8),
+                    color: context.c.textSecondary,
                   ),
                 ],
               ),
@@ -160,9 +161,9 @@ class _ToolCallCardState extends State<ToolCallCard> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const Text(
+                      Text(
                         '输入参数:',
-                        style: TextStyle(fontSize: 10.5, color: Color(0xFF64748B), fontWeight: FontWeight.w500),
+                        style: TextStyle(fontSize: 10.5, color: context.c.textSecondary, fontWeight: FontWeight.w500),
                       ),
                       if (widget.tool.input.isNotEmpty)
                         InkWell(
@@ -180,10 +181,10 @@ class _ToolCallCardState extends State<ToolCallCard> {
                           child: Padding(
                             padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                             child: Row(
-                              children: const [
-                                Icon(Icons.copy_rounded, size: 11, color: Color(0xFF64748B)),
+                              children: [
+                                Icon(Icons.copy_rounded, size: 11, color: context.c.textSecondary),
                                 SizedBox(width: 3),
-                                Text('复制', style: TextStyle(fontSize: 10.5, color: Color(0xFF64748B))),
+                                Text('复制', style: TextStyle(fontSize: 10.5, color: context.c.textSecondary)),
                               ],
                             ),
                           ),
@@ -196,9 +197,9 @@ class _ToolCallCardState extends State<ToolCallCard> {
                     padding: const EdgeInsets.all(7),
                     margin: const EdgeInsets.only(top: 3, bottom: 8),
                     decoration: BoxDecoration(
-                      color: Colors.white,
+                      color: context.c.surface,
                       borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: const Color(0xFFE2E8F0)),
+                      border: Border.all(color: context.c.border),
                     ),
                     child: Scrollbar(
                       controller: _inputScrollController,
@@ -207,7 +208,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                         controller: _inputScrollController,
                         child: SelectableText(
                           widget.tool.input,
-                          style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Color(0xFF334155)),
+                          style: TextStyle(fontSize: 11, fontFamily: 'monospace', color: context.c.textPrimary),
                         ),
                       ),
                     ),
@@ -218,7 +219,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                       children: [
                         Text(
                           '执行输出 (${widget.tool.output.split('\n').length} 行):',
-                          style: const TextStyle(fontSize: 10.5, color: Color(0xFF64748B), fontWeight: FontWeight.w500),
+                          style: TextStyle(fontSize: 10.5, color: context.c.textSecondary, fontWeight: FontWeight.w500),
                         ),
                         if (widget.tool.output.isNotEmpty)
                           InkWell(
@@ -236,10 +237,10 @@ class _ToolCallCardState extends State<ToolCallCard> {
                             child: Padding(
                               padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                               child: Row(
-                                children: const [
-                                  Icon(Icons.copy_rounded, size: 11, color: Color(0xFF64748B)),
+                                children: [
+                                  Icon(Icons.copy_rounded, size: 11, color: context.c.textSecondary),
                                   SizedBox(width: 3),
-                                  Text('复制', style: TextStyle(fontSize: 10.5, color: Color(0xFF64748B))),
+                                  Text('复制', style: TextStyle(fontSize: 10.5, color: context.c.textSecondary)),
                                 ],
                               ),
                             ),
@@ -252,9 +253,9 @@ class _ToolCallCardState extends State<ToolCallCard> {
                       padding: const EdgeInsets.all(7),
                       margin: const EdgeInsets.only(top: 3, bottom: 8),
                       decoration: BoxDecoration(
-                        color: Colors.white,
+                        color: context.c.surface,
                         borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: const Color(0xFFE2E8F0)),
+                        border: Border.all(color: context.c.border),
                       ),
                       child: Scrollbar(
                         controller: _outputScrollController,
@@ -263,7 +264,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                           controller: _outputScrollController,
                           child: SelectableText(
                             widget.tool.output.isEmpty ? '等待执行结果输出...' : widget.tool.output,
-                            style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Color(0xFF334155)),
+                            style: TextStyle(fontSize: 11, fontFamily: 'monospace', color: context.c.textPrimary),
                           ),
                         ),
                       ),
@@ -280,19 +281,19 @@ class _ToolCallCardState extends State<ToolCallCard> {
                       padding: const EdgeInsets.symmetric(vertical: 4),
                       alignment: Alignment.center,
                       decoration: BoxDecoration(
-                        color: const Color(0xFFF1F5F9),
+                        color: context.c.background,
                         borderRadius: BorderRadius.circular(4),
                       ),
                       child: Row(
                         mainAxisAlignment: MainAxisAlignment.center,
-                        children: const [
-                          Icon(Icons.keyboard_arrow_up_rounded, size: 14, color: Color(0xFF64748B)),
+                        children: [
+                          Icon(Icons.keyboard_arrow_up_rounded, size: 14, color: context.c.textSecondary),
                           SizedBox(width: 4),
                           Text(
                             '收起工具调用',
                             style: TextStyle(
                               fontSize: 11,
-                              color: Color(0xFF64748B),
+                              color: context.c.textSecondary,
                               fontWeight: FontWeight.w600,
                             ),
                           ),

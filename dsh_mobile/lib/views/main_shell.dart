@@ -6,6 +6,7 @@ import 'workspaces_view.dart';
 import 'security_permissions_view.dart';
 import 'custom_settings_view.dart';
 import 'config_page.dart';
+import '../theme/app_colors.dart';
 
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
@@ -67,9 +68,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
             decoration: BoxDecoration(
-              color: const Color(0xFFD97706),
+              color: context.c.warning,
               borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: Colors.white, width: 1.5),
+              border: Border.all(color: context.c.surface, width: 1.5),
             ),
             constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
             child: Text(
@@ -103,22 +104,22 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
     return Scaffold(
       resizeToAvoidBottomInset: false,
-      backgroundColor: const Color(0xFFF9FAFB),
+      backgroundColor: context.c.surfaceMuted,
       body: Column(
         children: [
           if (isTokenInvalid)
             Container(
               width: double.infinity,
-              color: const Color(0xFFFEF2F2),
+              color: context.c.dangerSurface,
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
               child: Row(
                 children: [
-                  const Icon(Icons.key_off_rounded, color: Color(0xFFDC2626), size: 16),
+                  Icon(Icons.key_off_rounded, color: context.c.danger, size: 16),
                   const SizedBox(width: 8),
-                  const Expanded(
+                  Expanded(
                     child: Text(
                       '访问令牌已失效 (401 Unauthorized)。请更新服务器访问令牌。',
-                      style: TextStyle(color: Color(0xFF991B1B), fontSize: 12, fontWeight: FontWeight.w500),
+                      style: TextStyle(color: context.c.danger, fontSize: 12, fontWeight: FontWeight.w500),
                     ),
                   ),
                   TextButton(
@@ -132,7 +133,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                       minimumSize: Size.zero,
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     ),
-                    child: const Text('更新令牌', style: TextStyle(color: Color(0xFFDC2626), fontWeight: FontWeight.bold, fontSize: 12)),
+                    child: Text('更新令牌', style: TextStyle(color: context.c.danger, fontWeight: FontWeight.bold, fontSize: 12)),
                   ),
                 ],
               ),
@@ -159,30 +160,30 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         ],
       ),
       bottomNavigationBar: Container(
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          border: Border(top: BorderSide(color: Color(0xFFE5E7EB), width: 1.0)),
+        decoration: BoxDecoration(
+          color: context.c.surface,
+          border: Border(top: BorderSide(color: context.c.border, width: 1.0)),
         ),
         child: SafeArea(
           child: NavigationBarTheme(
             data: NavigationBarThemeData(
-              backgroundColor: Colors.white,
-              indicatorColor: const Color(0xFF0078D4).withOpacity(0.12),
+              backgroundColor: context.c.surface,
+              indicatorColor: context.c.accent.withOpacity(0.12),
               labelTextStyle: WidgetStateProperty.resolveWith<TextStyle>((states) {
                 if (states.contains(WidgetState.selected)) {
-                  return const TextStyle(
+                  return TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
-                    color: Color(0xFF0078D4),
+                    color: context.c.accent,
                   );
                 }
-                return const TextStyle(fontSize: 12, color: Color(0xFF6B7280));
+                return TextStyle(fontSize: 12, color: context.c.textSecondary);
               }),
               iconTheme: WidgetStateProperty.resolveWith<IconThemeData>((states) {
                 if (states.contains(WidgetState.selected)) {
-                  return const IconThemeData(color: Color(0xFF0078D4), size: 24);
+                  return IconThemeData(color: context.c.accent, size: 24);
                 }
-                return const IconThemeData(color: Color(0xFF6B7280), size: 24);
+                return IconThemeData(color: context.c.textSecondary, size: 24);
               }),
             ),
             child: NavigationBar(

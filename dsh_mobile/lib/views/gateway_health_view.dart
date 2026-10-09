@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../models/gateway_health.dart';
 import '../services/dsh_service.dart';
+import '../theme/app_colors.dart';
 
 /// 网关健康仪表盘（v1.6.0）。
 ///
@@ -91,19 +92,19 @@ class _OverallBanner extends StatelessWidget {
   Widget build(BuildContext context) {
     final (Color bg, Color border, Color fg, IconData icon) = switch (health.overall) {
       HealthBad() => (
-          const Color(0xFFFEF2F2),
-          const Color(0xFFFECACA),
-          const Color(0xFFB91C1C),
+          context.c.dangerSurface,
+          context.c.dangerBorder,
+          context.c.danger,
           Icons.error_outline_rounded,
         ),
       HealthWarn() => (
-          const Color(0xFFFFFBEB),
-          const Color(0xFFFDE68A),
-          const Color(0xFFB45309),
+          context.c.warningSurface,
+          context.c.warningBorder,
+          context.c.warning,
           Icons.warning_amber_rounded,
         ),
       _ => (
-          const Color(0xFFDCFCE7),
+          context.c.successSurface,
           const Color(0xFF86EFAC),
           const Color(0xFF15803D),
           Icons.check_circle_outline_rounded,
@@ -153,17 +154,17 @@ class _MetricTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final Color dot = switch (metric.level) {
-      HealthBad() => const Color(0xFFDC2626),
-      HealthWarn() => const Color(0xFFF59E0B),
-      _ => const Color(0xFF10B981),
+      HealthBad() => context.c.danger,
+      HealthWarn() => context.c.warning,
+      _ => context.c.success,
     };
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: context.c.surface,
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: const Color(0xFFE5E7EB)),
+        border: Border.all(color: context.c.border),
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -181,22 +182,22 @@ class _MetricTile extends StatelessWidget {
               children: [
                 Text(
                   metric.label,
-                  style: const TextStyle(fontSize: 12, color: Color(0xFF6B7280)),
+                  style: TextStyle(fontSize: 12, color: context.c.textSecondary),
                 ),
                 const SizedBox(height: 2),
                 Text(
                   metric.value,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 15,
                     fontWeight: FontWeight.w600,
-                    color: Color(0xFF111827),
+                    color: context.c.textPrimary,
                   ),
                 ),
                 if (metric.detail != null) ...[
                   const SizedBox(height: 3),
                   Text(
                     metric.detail!,
-                    style: const TextStyle(fontSize: 11, color: Color(0xFF9CA3AF), height: 1.4),
+                    style: TextStyle(fontSize: 11, color: context.c.textTertiary, height: 1.4),
                   ),
                 ],
               ],
@@ -211,17 +212,18 @@ class _MetricTile extends StatelessWidget {
 class _Legend extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    const items = [
-      (Color(0xFF10B981), '正常'),
-      (Color(0xFFF59E0B), '需要注意'),
-      (Color(0xFFDC2626), '需要处理'),
+    // 不能是 const：颜色取自 ThemeScope（依赖 BuildContext），编译期未知。
+    final items = [
+      (context.c.success, '正常'),
+      (context.c.warning, '需要注意'),
+      (context.c.danger, '需要处理'),
     ];
     return Row(
       children: [
         for (final (c, label) in items) ...[
           Container(width: 8, height: 8, decoration: BoxDecoration(color: c, shape: BoxShape.circle)),
           const SizedBox(width: 4),
-          Text(label, style: const TextStyle(fontSize: 10.5, color: Color(0xFF9CA3AF))),
+          Text(label, style: TextStyle(fontSize: 10.5, color: context.c.textTertiary)),
           const SizedBox(width: 14),
         ],
       ],

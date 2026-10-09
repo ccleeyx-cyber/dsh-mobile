@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import '../theme/app_colors.dart';
 
 class ThinkingCard extends StatefulWidget {
   final String content;
@@ -79,10 +80,10 @@ class _ThinkingCardState extends State<ThinkingCard> {
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
       decoration: BoxDecoration(
-        color: isThinking ? const Color(0xFFF0F7FF) : const Color(0xFFF3F4F6),
+        color: isThinking ? context.c.accentSurface : context.c.surfaceMuted,
         borderRadius: BorderRadius.circular(8),
         border: Border.all(
-          color: isThinking ? const Color(0xFF0078D4).withOpacity(0.3) : const Color(0xFFE5E7EB),
+          color: isThinking ? context.c.accent.withOpacity(0.3) : context.c.border,
           width: 1.0,
         ),
       ),
@@ -99,7 +100,7 @@ class _ThinkingCardState extends State<ThinkingCard> {
                   Icon(
                     isThinking ? Icons.psychology_rounded : Icons.lightbulb_outline_rounded,
                     size: 16,
-                    color: isThinking ? const Color(0xFF0078D4) : const Color(0xFF4B5563),
+                    color: isThinking ? context.c.accent : context.c.textPrimary,
                   ),
                   const SizedBox(width: 6),
                   Text(
@@ -107,17 +108,17 @@ class _ThinkingCardState extends State<ThinkingCard> {
                     style: TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
-                      color: isThinking ? const Color(0xFF0078D4) : const Color(0xFF374151),
+                      color: isThinking ? context.c.accent : context.c.textPrimary,
                     ),
                   ),
                   if (isThinking) ...[
                     const SizedBox(width: 8),
-                    const SizedBox(
+                    SizedBox(
                       width: 10,
                       height: 10,
                       child: CircularProgressIndicator(
                         strokeWidth: 1.5,
-                        color: Color(0xFF0078D4),
+                        color: context.c.accent,
                       ),
                     ),
                   ],
@@ -125,7 +126,7 @@ class _ThinkingCardState extends State<ThinkingCard> {
                   Icon(
                     _expanded ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded,
                     size: 18,
-                    color: const Color(0xFF9CA3AF),
+                    color: context.c.textTertiary,
                   ),
                 ],
               ),
@@ -139,9 +140,9 @@ class _ThinkingCardState extends State<ThinkingCard> {
                 constraints: const BoxConstraints(maxHeight: 280),
                 padding: const EdgeInsets.all(8),
                 decoration: BoxDecoration(
-                  color: Colors.white,
+                  color: context.c.surface,
                   borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: const Color(0xFFE5E7EB)),
+                  border: Border.all(color: context.c.border),
                 ),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
@@ -155,10 +156,10 @@ class _ThinkingCardState extends State<ThinkingCard> {
                           controller: _scrollController,
                           child: SelectableText(
                             widget.content.isEmpty ? '正在分析上下文并规划步骤...' : widget.content,
-                            style: const TextStyle(
+                            style: TextStyle(
                               fontSize: 11.5,
                               height: 1.5,
-                              color: Color(0xFF374151),
+                              color: context.c.textPrimary,
                               fontFamily: 'monospace',
                             ),
                           ),
@@ -186,10 +187,10 @@ class _ThinkingCardState extends State<ThinkingCard> {
                               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
                               child: Row(
                                 mainAxisSize: MainAxisSize.min,
-                                children: const [
-                                  Icon(Icons.copy_rounded, size: 12, color: Color(0xFF6B7280)),
+                                children: [
+                                  Icon(Icons.copy_rounded, size: 12, color: context.c.textSecondary),
                                   SizedBox(width: 4),
-                                  Text('复制', style: TextStyle(fontSize: 11, color: Color(0xFF6B7280))),
+                                  Text('复制', style: TextStyle(fontSize: 11, color: context.c.textSecondary)),
                                 ],
                               ),
                             ),
@@ -207,10 +208,10 @@ class _ThinkingCardState extends State<ThinkingCard> {
                               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
                               child: Row(
                                 mainAxisSize: MainAxisSize.min,
-                                children: const [
-                                  Icon(Icons.keyboard_arrow_up_rounded, size: 13, color: Color(0xFF6B7280)),
+                                children: [
+                                  Icon(Icons.keyboard_arrow_up_rounded, size: 13, color: context.c.textSecondary),
                                   SizedBox(width: 2),
-                                  Text('收起', style: TextStyle(fontSize: 11, color: Color(0xFF6B7280))),
+                                  Text('收起', style: TextStyle(fontSize: 11, color: context.c.textSecondary)),
                                 ],
                               ),
                             ),

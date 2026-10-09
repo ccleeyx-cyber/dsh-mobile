@@ -4,6 +4,7 @@ import '../models/server_config.dart';
 import '../services/dsh_service.dart';
 import '../services/storage_service.dart';
 import 'main_shell.dart';
+import '../theme/app_colors.dart';
 
 class ConfigPage extends StatefulWidget {
   const ConfigPage({super.key});
@@ -265,30 +266,30 @@ class _ConfigPageState extends State<ConfigPage> {
       margin: const EdgeInsets.only(bottom: 16),
       padding: const EdgeInsets.fromLTRB(14, 10, 6, 6),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: context.c.surface,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFFE5E7EB)),
+        border: Border.all(color: context.c.border),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              const Icon(Icons.dns_outlined, size: 18, color: Color(0xFF6B7280)),
+              Icon(Icons.dns_outlined, size: 18, color: context.c.textSecondary),
               const SizedBox(width: 8),
               Expanded(
                 child: !_profilesLoaded
                     ? const SizedBox(height: 22)
                     : _profiles.isEmpty
-                        ? const Text('尚无已保存的网关',
-                            style: TextStyle(fontSize: 13, color: Color(0xFF9CA3AF)))
+                        ? Text('尚无已保存的网关',
+                            style: TextStyle(fontSize: 13, color: context.c.textTertiary))
                         : DropdownButton<String>(
                             isExpanded: true,
                             isDense: true,
                             value: selected,
                             hint: const Text('选择已保存的网关', style: TextStyle(fontSize: 13)),
                             underline: const SizedBox.shrink(),
-                            style: const TextStyle(fontSize: 13.5, color: Color(0xFF1F2937)),
+                            style: TextStyle(fontSize: 13.5, color: context.c.textPrimary),
                             items: _profiles
                                 .map((p) => DropdownMenuItem<String>(
                                       value: p.id,
@@ -325,11 +326,11 @@ class _ConfigPageState extends State<ConfigPage> {
             ),
           ),
           if (selected != null)
-            const Padding(
+            Padding(
               padding: EdgeInsets.only(left: 10, bottom: 6),
               child: Text(
                 '切换只填入下方表单；点「保存并进入聊天」才会连接并记住。',
-                style: TextStyle(fontSize: 11, color: Color(0xFF9CA3AF)),
+                style: TextStyle(fontSize: 11, color: context.c.textTertiary),
               ),
             ),
         ],

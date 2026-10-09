@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../models/approval_request.dart';
+import '../theme/app_colors.dart';
 
 typedef ApprovalResponseCallback = void Function(
   ApprovalRequest req,
@@ -64,7 +65,7 @@ class _ApprovalCardState extends State<ApprovalCard> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: Colors.white,
+      backgroundColor: context.c.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
@@ -89,7 +90,7 @@ class _ApprovalCardState extends State<ApprovalCard> {
                         width: 36,
                         height: 4,
                         decoration: BoxDecoration(
-                          color: const Color(0xFFD1D5DB),
+                          color: context.c.border,
                           borderRadius: BorderRadius.circular(2),
                         ),
                       ),
@@ -99,14 +100,14 @@ class _ApprovalCardState extends State<ApprovalCard> {
                     // Sheet Header
                     Row(
                       children: [
-                        const Icon(Icons.gpp_bad_rounded, color: Color(0xFFDC2626), size: 22),
+                        Icon(Icons.gpp_bad_rounded, color: context.c.danger, size: 22),
                         const SizedBox(width: 8),
-                        const Text(
+                        Text(
                           '拒绝工具执行 (Reject Tool Call)',
                           style: TextStyle(
                             fontSize: 16.5,
                             fontWeight: FontWeight.bold,
-                            color: Color(0xFF111827),
+                            color: context.c.textPrimary,
                           ),
                         ),
                       ],
@@ -114,14 +115,14 @@ class _ApprovalCardState extends State<ApprovalCard> {
                     const SizedBox(height: 6),
                     Text(
                       '工具: ${widget.request.toolName} • 会话: ${widget.request.sessionId}',
-                      style: const TextStyle(fontSize: 12, color: Color(0xFF6B7280)),
+                      style: TextStyle(fontSize: 12, color: context.c.textSecondary),
                     ),
                     const SizedBox(height: 14),
 
                     // Quick Chips
-                    const Text(
+                    Text(
                       '快速选择拒绝原因 (可直接点击):',
-                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Color(0xFF374151)),
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: context.c.textPrimary),
                     ),
                     const SizedBox(height: 8),
                     Wrap(
@@ -130,10 +131,10 @@ class _ApprovalCardState extends State<ApprovalCard> {
                       children: quickReasons.map((chip) {
                         return ActionChip(
                           label: Text(chip, style: const TextStyle(fontSize: 11.5)),
-                          backgroundColor: const Color(0xFFF3F4F6),
+                          backgroundColor: context.c.surfaceMuted,
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(8),
-                            side: const BorderSide(color: Color(0xFFE5E7EB)),
+                            side: BorderSide(color: context.c.border),
                           ),
                           onPressed: () {
                             HapticFeedback.selectionClick();
@@ -153,17 +154,17 @@ class _ApprovalCardState extends State<ApprovalCard> {
                       style: const TextStyle(fontSize: 13),
                       decoration: InputDecoration(
                         hintText: '输入具体拒绝理由（可选），智能体会根据说明调整后续方案...',
-                        hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF9CA3AF)),
+                        hintStyle: TextStyle(fontSize: 12, color: context.c.textTertiary),
                         filled: true,
-                        fillColor: const Color(0xFFF9FAFB),
+                        fillColor: context.c.surfaceMuted,
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(8),
-                          borderSide: const BorderSide(color: Color(0xFFD1D5DB)),
+                          borderSide: BorderSide(color: context.c.border),
                         ),
                         focusedBorder: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(8),
-                          borderSide: const BorderSide(color: Color(0xFFDC2626)),
+                          borderSide: BorderSide(color: context.c.danger),
                         ),
                       ),
                     ),
@@ -175,7 +176,7 @@ class _ApprovalCardState extends State<ApprovalCard> {
                         Expanded(
                           child: OutlinedButton(
                             style: OutlinedButton.styleFrom(
-                              side: const BorderSide(color: Color(0xFFE5E7EB)),
+                              side: BorderSide(color: context.c.border),
                               padding: const EdgeInsets.symmetric(vertical: 11),
                               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                             ),
@@ -184,14 +185,14 @@ class _ApprovalCardState extends State<ApprovalCard> {
                               Navigator.pop(ctx);
                               widget.onRespond(widget.request, 'rejected', null);
                             },
-                            child: const Text('直接拒绝 (无理由)', style: TextStyle(color: Color(0xFF4B5563), fontSize: 13)),
+                            child: Text('直接拒绝 (无理由)', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
                           ),
                         ),
                         const SizedBox(width: 12),
                         Expanded(
                           child: ElevatedButton(
                             style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFFDC2626),
+                              backgroundColor: context.c.danger,
                               foregroundColor: Colors.white,
                               elevation: 0,
                               padding: const EdgeInsets.symmetric(vertical: 11),
@@ -231,10 +232,10 @@ class _ApprovalCardState extends State<ApprovalCard> {
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 14.0, vertical: 8.0),
       decoration: BoxDecoration(
-        color: const Color(0xFFFFFBEB),
+        color: context.c.warningSurface,
         borderRadius: BorderRadius.circular(12),
         border: Border.all(
-          color: const Color(0xFFFDE68A),
+          color: context.c.warningBorder,
           width: 1.2,
         ),
         boxShadow: [
@@ -251,23 +252,23 @@ class _ApprovalCardState extends State<ApprovalCard> {
           // Header strip
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            decoration: const BoxDecoration(
-              color: Color(0xFFFEF3C7),
+            decoration: BoxDecoration(
+              color: context.c.warningBadgeSurface,
               borderRadius: BorderRadius.vertical(top: Radius.circular(11)),
             ),
             child: Row(
               children: [
-                const Icon(
+                Icon(
                   Icons.security_rounded,
-                  color: Color(0xFFD97706),
+                  color: context.c.warning,
                   size: 20,
                 ),
                 const SizedBox(width: 8),
-                const Expanded(
+                Expanded(
                   child: Text(
                     '执行权限申请 (Tool Approval)',
                     style: TextStyle(
-                      color: Color(0xFFB45309),
+                      color: context.c.warning,
                       fontWeight: FontWeight.bold,
                       fontSize: 13.5,
                     ),
@@ -278,7 +279,7 @@ class _ApprovalCardState extends State<ApprovalCard> {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                   decoration: BoxDecoration(
-                    color: const Color(0xFFD97706),
+                    color: context.c.warning,
                     borderRadius: BorderRadius.circular(6),
                   ),
                   child: Row(
@@ -310,8 +311,8 @@ class _ApprovalCardState extends State<ApprovalCard> {
                 // Description/Reason
                 Text(
                   req.reason.isNotEmpty ? req.reason : '智能体申请调用 ${req.toolName} 执行任务',
-                  style: const TextStyle(
-                    color: Color(0xFF1F2937),
+                  style: TextStyle(
+                    color: context.c.textPrimary,
                     fontWeight: FontWeight.w600,
                     fontSize: 13.5,
                     height: 1.4,
@@ -323,9 +324,9 @@ class _ApprovalCardState extends State<ApprovalCard> {
                   const SizedBox(height: 10),
                   Container(
                     decoration: BoxDecoration(
-                      color: const Color(0xFF0F172A),
+                      color: context.c.textPrimary,
                       borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: const Color(0xFF334155)),
+                      border: Border.all(color: context.c.textPrimary),
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -337,10 +338,10 @@ class _ApprovalCardState extends State<ApprovalCard> {
                             children: [
                               const Icon(Icons.code_rounded, size: 14, color: Color(0xFF38BDF8)),
                               const SizedBox(width: 6),
-                              const Text(
+                              Text(
                                 '执行指令',
                                 style: TextStyle(
-                                  color: Color(0xFF94A3B8),
+                                  color: context.c.textSecondary,
                                   fontSize: 11,
                                   fontWeight: FontWeight.bold,
                                 ),
@@ -349,13 +350,13 @@ class _ApprovalCardState extends State<ApprovalCard> {
                               InkWell(
                                 onTap: () => _copyToClipboard(context, req.command!, '执行指令'),
                                 borderRadius: BorderRadius.circular(4),
-                                child: const Padding(
+                                child: Padding(
                                   padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                                   child: Row(
                                     children: [
-                                      Icon(Icons.copy_rounded, size: 12, color: Color(0xFF94A3B8)),
+                                      Icon(Icons.copy_rounded, size: 12, color: context.c.textSecondary),
                                       SizedBox(width: 3),
-                                      Text('复制', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11)),
+                                      Text('复制', style: TextStyle(color: context.c.textSecondary, fontSize: 11)),
                                     ],
                                   ),
                                 ),
@@ -363,7 +364,7 @@ class _ApprovalCardState extends State<ApprovalCard> {
                             ],
                           ),
                         ),
-                        const Divider(height: 1, color: Color(0xFF1E293B)),
+                        Divider(height: 1, color: context.c.textPrimary),
                         // Command snippet with scroll
                         ConstrainedBox(
                           constraints: const BoxConstraints(maxHeight: 140),
@@ -383,8 +384,8 @@ class _ApprovalCardState extends State<ApprovalCard> {
                                   ),
                                   TextSpan(
                                     text: req.command!,
-                                    style: const TextStyle(
-                                      color: Color(0xFFF1F5F9),
+                                    style: TextStyle(
+                                      color: context.c.background,
                                       fontFamily: 'monospace',
                                       fontSize: 12,
                                       height: 1.4,
@@ -405,9 +406,9 @@ class _ApprovalCardState extends State<ApprovalCard> {
                   const SizedBox(height: 10),
                   Container(
                     decoration: BoxDecoration(
-                      color: Colors.white,
+                      color: context.c.surface,
                       borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: const Color(0xFFE2E8F0)),
+                      border: Border.all(color: context.c.border),
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -422,34 +423,34 @@ class _ApprovalCardState extends State<ApprovalCard> {
                             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
                             child: Row(
                               children: [
-                                const Icon(Icons.data_object_rounded, size: 14, color: Color(0xFF64748B)),
+                                Icon(Icons.data_object_rounded, size: 14, color: context.c.textSecondary),
                                 const SizedBox(width: 6),
-                                const Text(
+                                Text(
                                   '参数载荷 (Arguments)',
-                                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF475569)),
+                                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: context.c.textSecondary),
                                 ),
                                 const Spacer(),
                                 Icon(
                                   _isInputExpanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
                                   size: 16,
-                                  color: const Color(0xFF64748B),
+                                  color: context.c.textSecondary,
                                 ),
                               ],
                             ),
                           ),
                         ),
                         if (_isInputExpanded) ...[
-                          const Divider(height: 1, color: Color(0xFFE2E8F0)),
+                          Divider(height: 1, color: context.c.border),
                           ConstrainedBox(
                             constraints: const BoxConstraints(maxHeight: 160),
                             child: SingleChildScrollView(
                               padding: const EdgeInsets.all(10),
                               child: SelectableText(
                                 _formatInput(req.input),
-                                style: const TextStyle(
+                                style: TextStyle(
                                   fontSize: 11,
                                   fontFamily: 'monospace',
-                                  color: Color(0xFF1E293B),
+                                  color: context.c.textPrimary,
                                 ),
                               ),
                             ),
@@ -465,13 +466,13 @@ class _ApprovalCardState extends State<ApprovalCard> {
                   const SizedBox(height: 8),
                   Row(
                     children: [
-                      const Icon(Icons.tag_rounded, size: 12, color: Color(0xFF9CA3AF)),
+                      Icon(Icons.tag_rounded, size: 12, color: context.c.textTertiary),
                       const SizedBox(width: 4),
                       Text(
                         '调用编号: ${req.callId}',
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 11,
-                          color: Color(0xFF6B7280),
+                          color: context.c.textSecondary,
                           fontFamily: 'monospace',
                         ),
                       ),
@@ -504,11 +505,11 @@ class _ApprovalCardState extends State<ApprovalCard> {
                         ),
                       );
                     },
-                    icon: const Icon(Icons.close_rounded, size: 16, color: Color(0xFFDC2626)),
-                    label: const Text('拒绝 (Reject)', style: TextStyle(color: Color(0xFFDC2626))),
+                    icon: Icon(Icons.close_rounded, size: 16, color: context.c.danger),
+                    label: Text('拒绝 (Reject)', style: TextStyle(color: context.c.danger)),
                     style: OutlinedButton.styleFrom(
                       side: const BorderSide(color: Color(0xFFFCA5A5)),
-                      backgroundColor: Colors.white,
+                      backgroundColor: context.c.surface,
                       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(8),
@@ -526,7 +527,7 @@ class _ApprovalCardState extends State<ApprovalCard> {
                   icon: const Icon(Icons.check_rounded, size: 16, color: Colors.white),
                   label: const Text('允许一次 (Allow)', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF16A34A),
+                    backgroundColor: context.c.success,
                     elevation: 0,
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     shape: RoundedRectangleBorder(

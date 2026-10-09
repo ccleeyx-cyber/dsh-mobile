@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'message_search.dart';
+import '../../theme/app_colors.dart';
 
 /// The in-session search bar and result list (v1.4.2 会话内查找).
 ///
@@ -62,9 +63,9 @@ class _MessageSearchPanelState extends State<MessageSearchPanel> {
   Widget build(BuildContext context) {
     final hasQuery = widget.query.isNotEmpty;
     return Container(
-      decoration: const BoxDecoration(
-        color: Colors.white,
-        border: Border(bottom: BorderSide(color: Color(0xFFE5E7EB))),
+      decoration: BoxDecoration(
+        color: context.c.surface,
+        border: Border(bottom: BorderSide(color: context.c.border)),
       ),
       child: SafeArea(
         bottom: false,
@@ -75,7 +76,7 @@ class _MessageSearchPanelState extends State<MessageSearchPanel> {
               padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
               child: Row(
                 children: [
-                  const Icon(Icons.search_rounded, size: 18, color: Color(0xFF6B7280)),
+                  Icon(Icons.search_rounded, size: 18, color: context.c.textSecondary),
                   const SizedBox(width: 8),
                   Expanded(
                     child: TextField(
@@ -84,9 +85,9 @@ class _MessageSearchPanelState extends State<MessageSearchPanel> {
                       style: const TextStyle(fontSize: 13.5),
                       textInputAction: TextInputAction.search,
                       onChanged: widget.onQueryChanged,
-                      decoration: const InputDecoration(
+                      decoration: InputDecoration(
                         hintText: '在当前会话中查找…',
-                        hintStyle: TextStyle(fontSize: 13, color: Color(0xFF9CA3AF)),
+                        hintStyle: TextStyle(fontSize: 13, color: context.c.textTertiary),
                         border: InputBorder.none,
                         isDense: true,
                         contentPadding: EdgeInsets.symmetric(vertical: 6),
@@ -97,9 +98,9 @@ class _MessageSearchPanelState extends State<MessageSearchPanel> {
                   InkWell(
                     onTap: widget.onClose,
                     borderRadius: BorderRadius.circular(6),
-                    child: const Padding(
+                    child: Padding(
                       padding: EdgeInsets.all(6),
-                      child: Icon(Icons.close_rounded, size: 18, color: Color(0xFF6B7280)),
+                      child: Icon(Icons.close_rounded, size: 18, color: context.c.textSecondary),
                     ),
                   ),
                 ],
@@ -119,7 +120,7 @@ class _MessageSearchPanelState extends State<MessageSearchPanel> {
         padding: const EdgeInsets.fromLTRB(16, 6, 16, 12),
         child: Text(
           '当前会话里没有包含「${widget.query}」的内容',
-          style: const TextStyle(fontSize: 11.5, color: Color(0xFF9CA3AF)),
+          style: TextStyle(fontSize: 11.5, color: context.c.textTertiary),
         ),
       );
     }
@@ -127,8 +128,8 @@ class _MessageSearchPanelState extends State<MessageSearchPanel> {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(0, 0, 0, 8),
-      decoration: const BoxDecoration(
-        border: Border(top: BorderSide(color: Color(0xFFF3F4F6))),
+      decoration: BoxDecoration(
+        border: Border(top: BorderSide(color: context.c.surfaceMuted)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -139,7 +140,7 @@ class _MessageSearchPanelState extends State<MessageSearchPanel> {
               // One number, and it is the number of rows below.
               '${widget.results.length} 条结果'
               '${widget.totalHits > widget.results.length ? '（${widget.totalHits} 处匹配）' : ''}',
-              style: const TextStyle(fontSize: 11, color: Color(0xFF9CA3AF)),
+              style: TextStyle(fontSize: 11, color: context.c.textTertiary),
             ),
           ),
           ConstrainedBox(
@@ -190,25 +191,25 @@ class _ResultRow extends StatelessWidget {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
                   decoration: BoxDecoration(
-                    color: const Color(0xFFF3F4F6),
+                    color: context.c.surfaceMuted,
                     borderRadius: BorderRadius.circular(4),
                   ),
                   child: Text(
                     MessageSearch.fieldLabel(hit.field),
-                    style: const TextStyle(fontSize: 9.5, color: Color(0xFF6B7280)),
+                    style: TextStyle(fontSize: 9.5, color: context.c.textSecondary),
                   ),
                 ),
                 const SizedBox(width: 6),
                 if (count > 1)
                   Text(
                     '$count 处',
-                    style: const TextStyle(fontSize: 10, color: Color(0xFF9CA3AF)),
+                    style: TextStyle(fontSize: 10, color: context.c.textTertiary),
                   ),
                 const Spacer(),
                 if (hit.timestamp != null)
                   Text(
                     _fmt(hit.timestamp!),
-                    style: const TextStyle(fontSize: 10, color: Color(0xFF9CA3AF)),
+                    style: TextStyle(fontSize: 10, color: context.c.textTertiary),
                   ),
               ],
             ),
@@ -216,10 +217,10 @@ class _ResultRow extends StatelessWidget {
             _Highlighted(
               text: hit.context(),
               query: query,
-              style: const TextStyle(fontSize: 12, color: Color(0xFF374151), height: 1.4),
-              highlightStyle: const TextStyle(
+              style: TextStyle(fontSize: 12, color: context.c.textPrimary, height: 1.4),
+              highlightStyle: TextStyle(
                 fontSize: 12,
-                color: Color(0xFFB45309),
+                color: context.c.warning,
                 fontWeight: FontWeight.w700,
                 height: 1.4,
               ),

@@ -6,6 +6,8 @@ import '../models/app_version.dart';
 import '../services/dsh_service.dart';
 import 'config_page.dart';
 import 'gateway_health_view.dart';
+import '../theme/app_colors.dart';
+import '../main.dart';
 
 class CustomSettingsView extends StatefulWidget {
   const CustomSettingsView({super.key});
@@ -33,7 +35,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: Colors.white,
+      backgroundColor: context.c.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
@@ -50,7 +52,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                     width: 40,
                     height: 4,
                     decoration: BoxDecoration(
-                      color: const Color(0xFFD1D5DB),
+                      color: context.c.border,
                       borderRadius: BorderRadius.circular(2),
                     ),
                   ),
@@ -61,15 +63,15 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                     Container(
                       padding: const EdgeInsets.all(8),
                       decoration: BoxDecoration(
-                        color: const Color(0xFF0078D4).withOpacity(0.1),
+                        color: context.c.accent.withOpacity(0.1),
                         borderRadius: BorderRadius.circular(8),
                       ),
-                      child: const Icon(Icons.smart_toy_outlined, color: Color(0xFF0078D4), size: 20),
+                      child: Icon(Icons.smart_toy_outlined, color: context.c.accent, size: 20),
                     ),
                     const SizedBox(width: 10),
-                    const Text(
+                    Text(
                       '选择大语言模型 (Select LLM)',
-                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Color(0xFF111827)),
+                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: context.c.textPrimary),
                     ),
                   ],
                 ),
@@ -82,10 +84,10 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                         TextField(
                           decoration: InputDecoration(
                             hintText: '搜索模型 (如 deepseek, glm, gpt, qwen...)',
-                            hintStyle: const TextStyle(fontSize: 13, color: Color(0xFF9CA3AF)),
-                            prefixIcon: const Icon(Icons.search, size: 20, color: Color(0xFF6B7280)),
+                            hintStyle: TextStyle(fontSize: 13, color: context.c.textTertiary),
+                            prefixIcon: Icon(Icons.search, size: 20, color: context.c.textSecondary),
                             filled: true,
-                            fillColor: const Color(0xFFF3F4F6),
+                            fillColor: context.c.surfaceMuted,
                             contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                             border: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(8),
@@ -109,10 +111,10 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                               }).toList();
 
                               if (filtered.isEmpty) {
-                                return const Padding(
+                                return Padding(
                                   padding: EdgeInsets.symmetric(vertical: 24),
                                   child: Center(
-                                    child: Text('未找到匹配的模型', style: TextStyle(color: Color(0xFF9CA3AF))),
+                                    child: Text('未找到匹配的模型', style: TextStyle(color: context.c.textTertiary)),
                                   ),
                                 );
                               }
@@ -126,19 +128,19 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                                   final isSelected = m.id == currentModel || (m.id.replaceFirst('cn:', '') == currentModel.replaceFirst('cn:', ''));
                                   return ListTile(
                                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                                    tileColor: isSelected ? const Color(0xFF0078D4).withOpacity(0.08) : null,
+                                    tileColor: isSelected ? context.c.accent.withOpacity(0.08) : null,
                                     title: Text(
                                       m.name,
                                       style: TextStyle(
-                                        color: isSelected ? const Color(0xFF0078D4) : const Color(0xFF1F2937),
+                                        color: isSelected ? context.c.accent : context.c.textPrimary,
                                         fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
                                       ),
                                     ),
                                     subtitle: Text(
                                       'ID: ${m.id} | 上下文: ${(m.contextWindow ?? 0) ~/ 1000}k',
-                                      style: const TextStyle(fontSize: 12, color: Color(0xFF6B7280)),
+                                      style: TextStyle(fontSize: 12, color: context.c.textSecondary),
                                     ),
-                                    trailing: isSelected ? const Icon(Icons.check_circle, color: Color(0xFF0078D4)) : null,
+                                    trailing: isSelected ? Icon(Icons.check_circle, color: context.c.accent) : null,
                                     onTap: () async {
                                       Navigator.pop(ctx);
                                       final ok = await dsh.switchModel(m.id);
@@ -147,7 +149,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                                         ScaffoldMessenger.of(context).showSnackBar(
                                           SnackBar(
                                             content: Text('已切换默认模型至: ${m.name}'),
-                                            backgroundColor: const Color(0xFF10B981),
+                                            backgroundColor: context.c.success,
                                             behavior: SnackBarBehavior.floating,
                                             duration: const Duration(seconds: 2),
                                           ),
@@ -174,9 +176,9 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
 
   BoxDecoration _cardDecoration() {
     return BoxDecoration(
-      color: Colors.white,
+      color: context.c.surface,
       borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: const Color(0xFFE5E7EB)),
+      border: Border.all(color: context.c.border),
       boxShadow: [
         BoxShadow(
           color: Colors.black.withOpacity(0.02),
@@ -187,11 +189,61 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     );
   }
 
+  /// 外观 / 主题选择（v1.6.0）。
+  ///
+  /// 用三选一分段控件而不是一个循环切换按钮：这里是要"选一个状态"，分段控件能
+  /// 一眼看到当前值和全部可选值；顶栏那个循环按钮适合低频快速切换。两处按场景
+  /// 各选一种，不是重复功能。
+  Widget _buildAppearanceCard(BuildContext context) {
+    final theme = context.watch<ThemeController>();
+    const options = [
+      ('system', '跟随系统', Icons.brightness_auto_rounded),
+      ('light', '浅色', Icons.light_mode_rounded),
+      ('dark', '深色', Icons.dark_mode_rounded),
+    ];
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: _cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.palette_outlined, size: 16, color: context.c.purple),
+              const SizedBox(width: 7),
+              const Text(
+                '主题模式',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFF374151)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              for (final (mode, label, icon) in options) ...[
+                Expanded(
+                  child: _ThemeOption(
+                    label: label,
+                    icon: icon,
+                    selected: theme.mode == mode,
+                    onTap: () => theme.setMode(mode),
+                  ),
+                ),
+                if (mode != 'dark') const SizedBox(width: 8),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildHealthEntry(BuildContext context) {
     final dsh = Provider.of<DshService>(context);
     final color = dsh.isConnected
-        ? const Color(0xFF10B981)
-        : (dsh.isTokenInvalid ? const Color(0xFFDC2626) : const Color(0xFF9CA3AF));
+        ? context.c.success
+        : (dsh.isTokenInvalid ? context.c.danger : context.c.textTertiary);
     final label = dsh.isConnected ? '已连接' : (dsh.isTokenInvalid ? '令牌失效' : '未连接');
 
     return InkWell(
@@ -217,9 +269,9 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
+                  Text(
                     '网关健康',
-                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Color(0xFF111827)),
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: context.c.textPrimary),
                   ),
                   const SizedBox(height: 2),
                   Row(
@@ -234,7 +286,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                         const SizedBox(width: 10),
                         Text(
                           '· ${dsh.pendingApprovals.length} 个待授权',
-                          style: const TextStyle(fontSize: 11.5, color: Color(0xFFD97706)),
+                          style: TextStyle(fontSize: 11.5, color: context.c.warning),
                         ),
                       ],
                     ],
@@ -242,7 +294,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                 ],
               ),
             ),
-            const Icon(Icons.chevron_right_rounded, color: Color(0xFF9CA3AF), size: 20),
+            Icon(Icons.chevron_right_rounded, color: context.c.textTertiary, size: 20),
           ],
         ),
       ),
@@ -256,23 +308,23 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     final currentModel = settings?.currentModel ?? 'cn:deepseek-v4.1-flash';
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF9FAFB),
+      backgroundColor: context.c.surfaceMuted,
       appBar: AppBar(
-        backgroundColor: Colors.white,
-        foregroundColor: const Color(0xFF111827),
+        backgroundColor: context.c.surface,
+        foregroundColor: context.c.textPrimary,
         elevation: 0,
         surfaceTintColor: Colors.transparent,
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(1),
-          child: Container(color: const Color(0xFFE5E7EB), height: 1),
+          child: Container(color: context.c.border, height: 1),
         ),
-        title: const Row(
+        title: Row(
           children: [
-            Icon(Icons.tune_rounded, color: Color(0xFF0078D4)),
+            Icon(Icons.tune_rounded, color: context.c.accent),
             SizedBox(width: 8),
             Text(
               '设置与深度自定义',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF111827)),
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: context.c.textPrimary),
             ),
           ],
         ),
@@ -283,10 +335,12 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           // 0. 网关健康（v1.6.0）。放在最上面：出问题时用户最想立刻看到它，
           // 而不是先滚过一屏模型参数。
           _buildHealthEntry(context),
+          const SizedBox(height: 16),
+          _buildAppearanceCard(context),
           const SizedBox(height: 24),
 
           // 1. Model & Reasoning Engine Section
-          _buildSectionHeader('大语言模型与思考引擎 (LLM & Reasoning)', Icons.smart_toy_outlined, const Color(0xFF0078D4)),
+          _buildSectionHeader('大语言模型与思考引擎 (LLM & Reasoning)', Icons.smart_toy_outlined, context.c.accent),
           const SizedBox(height: 8),
           Container(
             padding: const EdgeInsets.all(16),
@@ -300,21 +354,21 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                     Container(
                       padding: const EdgeInsets.all(10),
                       decoration: BoxDecoration(
-                        color: const Color(0xFF0078D4).withOpacity(0.1),
+                        color: context.c.accent.withOpacity(0.1),
                         borderRadius: BorderRadius.circular(10),
                       ),
-                      child: const Icon(Icons.psychology_outlined, color: Color(0xFF0078D4), size: 22),
+                      child: Icon(Icons.psychology_outlined, color: context.c.accent, size: 22),
                     ),
                     const SizedBox(width: 12),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Text('当前默认模型', style: TextStyle(color: Color(0xFF6B7280), fontSize: 11)),
+                          Text('当前默认模型', style: TextStyle(color: context.c.textSecondary, fontSize: 11)),
                           const SizedBox(height: 2),
                           Text(
                             currentModel,
-                            style: const TextStyle(color: Color(0xFF111827), fontSize: 14, fontWeight: FontWeight.bold),
+                            style: TextStyle(color: context.c.textPrimary, fontSize: 14, fontWeight: FontWeight.bold),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                           ),
@@ -323,8 +377,8 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                     ),
                     ElevatedButton(
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF0078D4).withOpacity(0.1),
-                        foregroundColor: const Color(0xFF0078D4),
+                        backgroundColor: context.c.accent.withOpacity(0.1),
+                        foregroundColor: context.c.accent,
                         elevation: 0,
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
@@ -336,17 +390,17 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                 ),
 
                 const SizedBox(height: 16),
-                const Divider(color: Color(0xFFF3F4F6)),
+                Divider(color: context.c.surfaceMuted),
                 const SizedBox(height: 12),
 
                 // Reasoning Effort Slider
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text('深度思考预算 (Reasoning Budget)', style: TextStyle(color: Color(0xFF374151), fontSize: 13, fontWeight: FontWeight.w500)),
+                    Text('深度思考预算 (Reasoning Budget)', style: TextStyle(color: context.c.textPrimary, fontSize: 13, fontWeight: FontWeight.w500)),
                     Text(
                       dsh.reasoningBudget == 0 ? '关闭思考' : '${dsh.reasoningBudget ~/ 1000}k Tokens',
-                      style: const TextStyle(color: Color(0xFF0078D4), fontSize: 13, fontWeight: FontWeight.bold),
+                      style: TextStyle(color: context.c.accent, fontSize: 13, fontWeight: FontWeight.bold),
                     ),
                   ],
                 ),
@@ -355,8 +409,8 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                   min: 0,
                   max: 32000,
                   divisions: 8,
-                  activeColor: const Color(0xFF0078D4),
-                  inactiveColor: const Color(0xFFE5E7EB),
+                  activeColor: context.c.accent,
+                  inactiveColor: context.c.border,
                   onChanged: (v) {
                     dsh.setReasoningBudget(v.round());
                   },
@@ -366,10 +420,10 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text('采样创造力 (Temperature)', style: TextStyle(color: Color(0xFF374151), fontSize: 13, fontWeight: FontWeight.w500)),
+                    Text('采样创造力 (Temperature)', style: TextStyle(color: context.c.textPrimary, fontSize: 13, fontWeight: FontWeight.w500)),
                     Text(
                       dsh.temperature.toStringAsFixed(2),
-                      style: const TextStyle(color: Color(0xFF0078D4), fontSize: 13, fontWeight: FontWeight.bold),
+                      style: TextStyle(color: context.c.accent, fontSize: 13, fontWeight: FontWeight.bold),
                     ),
                   ],
                 ),
@@ -378,8 +432,8 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                   min: 0.0,
                   max: 1.0,
                   divisions: 10,
-                  activeColor: const Color(0xFF0078D4),
-                  inactiveColor: const Color(0xFFE5E7EB),
+                  activeColor: context.c.accent,
+                  inactiveColor: context.c.border,
                   onChanged: (v) {
                     dsh.setTemperature(v);
                   },
@@ -391,7 +445,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           const SizedBox(height: 16),
 
           // 3. Connectivity & Network Diagnostics
-          _buildSectionHeader('网络与网关诊断 (Connectivity & Diagnostics)', Icons.network_check_rounded, const Color(0xFF059669)),
+          _buildSectionHeader('网络与网关诊断 (Connectivity & Diagnostics)', Icons.network_check_rounded, context.c.success),
           const SizedBox(height: 8),
           Container(
             padding: const EdgeInsets.all(16),
@@ -406,17 +460,17 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text('实时往返延迟 (Ping)', style: TextStyle(color: Color(0xFF6B7280), fontSize: 13)),
+                    Text('实时往返延迟 (Ping)', style: TextStyle(color: context.c.textSecondary, fontSize: 13)),
                     Row(
                       children: [
                         Text(
                           dsh.pingMs >= 0 ? '${dsh.pingMs} ms' : '未测速',
                           style: TextStyle(
                             color: dsh.pingMs >= 0 && dsh.pingMs < 100
-                                ? const Color(0xFF059669)
+                                ? context.c.success
                                 : dsh.pingMs >= 100
-                                    ? const Color(0xFFD97706)
-                                    : const Color(0xFF9CA3AF),
+                                    ? context.c.warning
+                                    : context.c.textTertiary,
                             fontWeight: FontWeight.bold,
                             fontSize: 13,
                           ),
@@ -433,12 +487,12 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                           child: Container(
                             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                             decoration: BoxDecoration(
-                              color: const Color(0xFF10B981).withOpacity(0.12),
+                              color: context.c.success.withOpacity(0.12),
                               borderRadius: BorderRadius.circular(6),
                             ),
                             child: _isTestingPing
-                                ? const SizedBox(width: 10, height: 10, child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF059669)))
-                                : const Text('测速', style: TextStyle(color: Color(0xFF059669), fontSize: 11, fontWeight: FontWeight.w600)),
+                                ? SizedBox(width: 10, height: 10, child: CircularProgressIndicator(strokeWidth: 1.5, color: context.c.success))
+                                : Text('测速', style: TextStyle(color: context.c.success, fontSize: 11, fontWeight: FontWeight.w600)),
                           ),
                         ),
                       ],
@@ -446,7 +500,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                   ],
                 ),
                 const SizedBox(height: 14),
-                const Divider(color: Color(0xFFF3F4F6)),
+                Divider(color: context.c.surfaceMuted),
                 const SizedBox(height: 10),
 
                 // Reconnect & Change Server
@@ -455,8 +509,8 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                     Expanded(
                       child: OutlinedButton.icon(
                         style: OutlinedButton.styleFrom(
-                          foregroundColor: const Color(0xFF374151),
-                          side: const BorderSide(color: Color(0xFFD1D5DB)),
+                          foregroundColor: context.c.textPrimary,
+                          side: BorderSide(color: context.c.border),
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                           padding: const EdgeInsets.symmetric(vertical: 10),
                         ),
@@ -474,7 +528,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                     Expanded(
                       child: ElevatedButton.icon(
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF0078D4),
+                          backgroundColor: context.c.accent,
                           foregroundColor: Colors.white,
                           elevation: 0,
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
@@ -498,7 +552,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           const SizedBox(height: 24),
 
           // 4. About & APK Updates Section
-          _buildSectionHeader('关于客户端与更新', Icons.info_outline_rounded, const Color(0xFF6B7280)),
+          _buildSectionHeader('关于客户端与更新', Icons.info_outline_rounded, context.c.textSecondary),
           const SizedBox(height: 8),
           Container(
             padding: const EdgeInsets.all(16),
@@ -512,7 +566,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                       width: 40,
                       height: 40,
                       decoration: BoxDecoration(
-                        gradient: const LinearGradient(colors: [Color(0xFF0078D4), Color(0xFF2563EB)]),
+                        gradient: LinearGradient(colors: [context.c.accent, Color(0xFF2563EB)]),
                         borderRadius: BorderRadius.circular(10),
                       ),
                       child: const Icon(Icons.layers_rounded, color: Colors.white, size: 22),
@@ -521,13 +575,13 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                     Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text('DSH Mobile Pro', style: TextStyle(color: Color(0xFF111827), fontWeight: FontWeight.bold, fontSize: 14)),
+                        Text('DSH Mobile Pro', style: TextStyle(color: context.c.textPrimary, fontWeight: FontWeight.bold, fontSize: 14)),
                         const SizedBox(height: 2),
                         // Single source of truth is lib/models/app_version.dart,
                         // which mirrors pubspec.yaml — no stale literal here.
                         Text(
                           '版本: v${AppVersion.version} (Build ${AppVersion.buildNumber})',
-                          style: TextStyle(color: Color(0xFF6B7280), fontSize: 12),
+                          style: TextStyle(color: context.c.textSecondary, fontSize: 12),
                         ),
                       ],
                     ),
@@ -538,8 +592,8 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                   children: [
                     Expanded(
                       child: TextButton.icon(
-                        icon: const Icon(Icons.download_rounded, size: 16, color: Color(0xFF0078D4)),
-                        label: const Text('复制 APK 下载直链', style: TextStyle(color: Color(0xFF0078D4), fontSize: 12, fontWeight: FontWeight.w600)),
+                        icon: Icon(Icons.download_rounded, size: 16, color: context.c.accent),
+                        label: Text('复制 APK 下载直链', style: TextStyle(color: context.c.accent, fontSize: 12, fontWeight: FontWeight.w600)),
                         onPressed: () {
                           // Build the download URL from the gateway the user is
                           // actually connected to, instead of a baked-in host
@@ -550,7 +604,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                           ScaffoldMessenger.of(context).showSnackBar(
                             SnackBar(
                               content: Text('已复制直链: $apkUrl'),
-                              backgroundColor: Color(0xFF0078D4),
+                              backgroundColor: context.c.accent,
                               behavior: SnackBarBehavior.floating,
                             ),
                           );
@@ -575,7 +629,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
         const SizedBox(width: 8),
         Text(
           title,
-          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Color(0xFF1F2937)),
+          style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: context.c.textPrimary),
         ),
       ],
     );
@@ -585,9 +639,65 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Text(label, style: const TextStyle(color: Color(0xFF6B7280), fontSize: 13)),
-        Text(value, style: const TextStyle(color: Color(0xFF111827), fontSize: 13, fontWeight: FontWeight.w600)),
+        Text(label, style: TextStyle(color: context.c.textSecondary, fontSize: 13)),
+        Text(value, style: TextStyle(color: context.c.textPrimary, fontSize: 13, fontWeight: FontWeight.w600)),
       ],
+    );
+  }
+}
+
+/// 主题模式的一个分段选项。
+///
+/// 用 [InkWell] + 边框而不是 [ChoiceChip]：Chip 自带圆角胶囊底色，三枚并排时
+/// 视觉上像三个独立按钮，用户不容易看出"这是单选"。
+class _ThemeOption extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _ThemeOption({
+    required this.label,
+    required this.icon,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final active = context.c.purple;
+    final idleBorder = context.c.border;
+    final idleFill = context.c.surfaceMuted;
+    final idleFg = context.c.textSecondary;
+
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(9),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 11),
+        decoration: BoxDecoration(
+          color: selected ? active.withOpacity(0.10) : idleFill,
+          borderRadius: BorderRadius.circular(9),
+          border: Border.all(
+            color: selected ? active : idleBorder,
+            width: selected ? 1.6 : 1,
+          ),
+        ),
+        child: Column(
+          children: [
+            Icon(icon, size: 19, color: selected ? active : idleFg),
+            const SizedBox(height: 5),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+                color: selected ? active : idleFg,
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'safe_markdown.dart';
+import '../theme/app_colors.dart';
 
 class _ContextMeta {
   final String title;
@@ -91,11 +92,11 @@ class _MemoryCardState extends State<MemoryCard> {
       );
     }
 
-    return const _ContextMeta(
+    return _ContextMeta(
       title: '携带上下文与参考信息',
       tag: 'Context',
       icon: Icons.layers_outlined,
-      themeColor: Color(0xFF94A3B8),
+      themeColor: context.c.textSecondary,
     );
   }
 
@@ -118,7 +119,7 @@ class _MemoryCardState extends State<MemoryCard> {
       width: double.infinity,
       margin: const EdgeInsets.symmetric(vertical: 4),
       decoration: BoxDecoration(
-        color: const Color(0xFFF8FAFC),
+        color: context.c.background,
         borderRadius: BorderRadius.circular(8),
         border: Border.all(
           color: meta.themeColor.withOpacity(0.35),
@@ -147,10 +148,10 @@ class _MemoryCardState extends State<MemoryCard> {
                   Expanded(
                     child: Text(
                       '${meta.title} · 点击${_expanded ? "折叠" : "展开"} (${_formatSize(widget.content.length)})',
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 12,
                         fontWeight: FontWeight.w500,
-                        color: Color(0xFF334155),
+                        color: context.c.textPrimary,
                       ),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
@@ -176,7 +177,7 @@ class _MemoryCardState extends State<MemoryCard> {
                   Icon(
                     _expanded ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded,
                     size: 16,
-                    color: const Color(0xFF94A3B8),
+                    color: context.c.textSecondary,
                   ),
                 ],
               ),
@@ -188,9 +189,9 @@ class _MemoryCardState extends State<MemoryCard> {
               margin: const EdgeInsets.fromLTRB(10, 0, 10, 10),
               padding: const EdgeInsets.all(10),
               decoration: BoxDecoration(
-                color: Colors.white,
+                color: context.c.surface,
                 borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: const Color(0xFFE2E8F0)),
+                border: Border.all(color: context.c.border),
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -205,17 +206,17 @@ class _MemoryCardState extends State<MemoryCard> {
                           data: widget.content,
                           selectable: true,
                           styleSheet: MarkdownStyleSheet(
-                            p: const TextStyle(fontSize: 12.5, color: Color(0xFF334155), height: 1.45),
-                            code: const TextStyle(
+                            p: TextStyle(fontSize: 12.5, color: context.c.textPrimary, height: 1.45),
+                            code: TextStyle(
                               color: Color(0xFF0369A1),
-                              backgroundColor: Color(0xFFF1F5F9),
+                              backgroundColor: context.c.background,
                               fontSize: 11.5,
                               fontFamily: 'monospace',
                             ),
                             codeblockDecoration: BoxDecoration(
-                              color: const Color(0xFFF8FAFC),
+                              color: context.c.background,
                               borderRadius: BorderRadius.circular(6),
-                              border: Border.all(color: const Color(0xFFE2E8F0)),
+                              border: Border.all(color: context.c.border),
                             ),
                           ),
                         ),
@@ -234,7 +235,7 @@ class _MemoryCardState extends State<MemoryCard> {
                       padding: const EdgeInsets.symmetric(vertical: 5),
                       alignment: Alignment.center,
                       decoration: BoxDecoration(
-                        color: const Color(0xFFF1F5F9),
+                        color: context.c.background,
                         borderRadius: BorderRadius.circular(6),
                       ),
                       child: Row(

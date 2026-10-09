@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../models/user_question.dart';
+import '../../theme/app_colors.dart';
 
 /// 一张等待本机回答的提问卡片（§4.1-1「回答 Agent 提问」）。
 ///
@@ -78,9 +79,9 @@ class _QuestionCardState extends State<QuestionCard> {
     return Container(
       margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
       decoration: BoxDecoration(
-        color: const Color(0xFFFFF7ED),
+        color: context.c.questionSurface,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFFFED7AA), width: 1.2),
+        border: Border.all(color: context.c.questionBorder, width: 1.2),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withOpacity(0.04),
@@ -97,15 +98,15 @@ class _QuestionCardState extends State<QuestionCard> {
             padding: const EdgeInsets.fromLTRB(14, 10, 8, 8),
             child: Row(
               children: [
-                const Icon(Icons.help_outline_rounded, size: 17, color: Color(0xFFEA580C)),
+                Icon(Icons.help_outline_rounded, size: 17, color: context.c.orange),
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
                     _isPlanReview ? 'Agent 请你审阅一份计划' : 'Agent 有问题要问你',
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w600,
-                      color: Color(0xFF9A3412),
+                      color: context.c.orange,
                     ),
                   ),
                 ),
@@ -117,15 +118,15 @@ class _QuestionCardState extends State<QuestionCard> {
                     if (confirmed == true) widget.onDismiss();
                   },
                   borderRadius: BorderRadius.circular(6),
-                  child: const Padding(
+                  child: Padding(
                     padding: EdgeInsets.all(4),
-                    child: Icon(Icons.close_rounded, size: 16, color: Color(0xFFB45309)),
+                    child: Icon(Icons.close_rounded, size: 16, color: context.c.warning),
                   ),
                 ),
               ],
             ),
           ),
-          const Divider(color: Color(0xFFFED7AA), height: 1),
+          Divider(color: context.c.questionBorder, height: 1),
 
           // questions
           ...q.questions.map(_buildQuestion),
@@ -142,16 +143,16 @@ class _QuestionCardState extends State<QuestionCard> {
                     _allAnswered
                         ? '将把回答发送给 Agent'
                         : '请回答上面每一道题${q.questions.length > 1 ? '（共 ${q.questions.length} 道）' : ''}',
-                    style: const TextStyle(fontSize: 11, color: Color(0xFF9A3412)),
+                    style: TextStyle(fontSize: 11, color: context.c.orange),
                   ),
                 ),
                 const SizedBox(width: 8),
                 FilledButton(
                   onPressed: (_allAnswered && widget.canAnswer && !_submitting) ? _submit : null,
                   style: FilledButton.styleFrom(
-                    backgroundColor: const Color(0xFFEA580C),
-                    disabledBackgroundColor: const Color(0xFFE5E7EB),
-                    disabledForegroundColor: const Color(0xFF9CA3AF),
+                    backgroundColor: context.c.orange,
+                    disabledBackgroundColor: context.c.border,
+                    disabledForegroundColor: context.c.textTertiary,
                     padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
                     minimumSize: Size.zero,
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
@@ -195,13 +196,13 @@ class _QuestionCardState extends State<QuestionCard> {
       margin: const EdgeInsets.fromLTRB(14, 0, 14, 8),
       padding: const EdgeInsets.all(9),
       decoration: BoxDecoration(
-        color: const Color(0xFFFEF2F2),
+        color: context.c.dangerSurface,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFFFECACA)),
+        border: Border.all(color: context.c.dangerBorder),
       ),
-      child: const Text(
+      child: Text(
         '当前未连接到网关，无法提交回答。Agent 仍在等待。',
-        style: TextStyle(fontSize: 11, color: Color(0xFFB91C1C)),
+        style: TextStyle(fontSize: 11, color: context.c.danger),
       ),
     );
   }
@@ -215,9 +216,9 @@ class _QuestionCardState extends State<QuestionCard> {
       margin: const EdgeInsets.fromLTRB(14, 10, 14, 0),
       padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: context.c.surface,
         borderRadius: BorderRadius.circular(9),
-        border: Border.all(color: const Color(0xFFFED7AA)),
+        border: Border.all(color: context.c.questionBorder),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -225,13 +226,13 @@ class _QuestionCardState extends State<QuestionCard> {
           if (item.header != null && item.header!.isNotEmpty) ...[
             Text(
               item.header!,
-              style: const TextStyle(fontSize: 10.5, color: Color(0xFFB45309), fontWeight: FontWeight.w600),
+              style: TextStyle(fontSize: 10.5, color: context.c.warning, fontWeight: FontWeight.w600),
             ),
             const SizedBox(height: 3),
           ],
           Text(
             item.question,
-            style: const TextStyle(fontSize: 13.5, color: Color(0xFF1F2937), height: 1.35),
+            style: TextStyle(fontSize: 13.5, color: context.c.textPrimary, height: 1.35),
           ),
           if (item.detail != null && item.detail!.isNotEmpty) ...[
             const SizedBox(height: 6),
@@ -240,14 +241,14 @@ class _QuestionCardState extends State<QuestionCard> {
               constraints: const BoxConstraints(maxHeight: 132),
               padding: const EdgeInsets.all(9),
               decoration: BoxDecoration(
-                color: const Color(0xFFF9FAFB),
+                color: context.c.surfaceMuted,
                 borderRadius: BorderRadius.circular(7),
-                border: Border.all(color: const Color(0xFFE5E7EB)),
+                border: Border.all(color: context.c.border),
               ),
               child: SingleChildScrollView(
                 child: Text(
                   item.detail!,
-                  style: const TextStyle(fontSize: 11.5, height: 1.45, color: Color(0xFF4B5563)),
+                  style: TextStyle(fontSize: 11.5, height: 1.45, color: context.c.textPrimary),
                 ),
               ),
             ),
@@ -285,21 +286,21 @@ class _QuestionCardState extends State<QuestionCard> {
               hintText: item.options.isEmpty
                   ? '输入你的回答…'
                   : '补充说明（可选；也可以只填这里代替选项）',
-              hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF9CA3AF)),
+              hintStyle: TextStyle(fontSize: 12, color: context.c.textTertiary),
               contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(7),
-                borderSide: const BorderSide(color: Color(0xFFE5E7EB)),
+                borderSide: BorderSide(color: context.c.border),
               ),
               enabledBorder: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(7),
                 borderSide: BorderSide(
-                  color: custom.trim().isNotEmpty ? const Color(0xFFEA580C) : const Color(0xFFE5E7EB),
+                  color: custom.trim().isNotEmpty ? context.c.orange : context.c.border,
                 ),
               ),
               focusedBorder: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(7),
-                borderSide: const BorderSide(color: Color(0xFFEA580C), width: 1.4),
+                borderSide: BorderSide(color: context.c.orange, width: 1.4),
               ),
             ),
           ),
@@ -331,10 +332,10 @@ class _OptionChip extends StatelessWidget {
         constraints: const BoxConstraints(maxWidth: 260),
         padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
         decoration: BoxDecoration(
-          color: selected ? const Color(0xFFFFEDD5) : Colors.white,
+          color: selected ? context.c.warningBadgeSurface : context.c.surface,
           borderRadius: BorderRadius.circular(7),
           border: Border.all(
-            color: selected ? const Color(0xFFEA580C) : const Color(0xFFE5E7EB),
+            color: selected ? context.c.orange : context.c.border,
             width: selected ? 1.5 : 1,
           ),
         ),
@@ -344,7 +345,7 @@ class _OptionChip extends StatelessWidget {
             Icon(
               selected ? Icons.check_circle_rounded : Icons.circle_outlined,
               size: 14,
-              color: selected ? const Color(0xFFEA580C) : const Color(0xFF9CA3AF),
+              color: selected ? context.c.orange : context.c.textTertiary,
             ),
             const SizedBox(width: 5),
             Flexible(
@@ -357,13 +358,13 @@ class _OptionChip extends StatelessWidget {
                     style: TextStyle(
                       fontSize: 12.5,
                       fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
-                      color: selected ? const Color(0xFF9A3412) : const Color(0xFF374151),
+                      color: selected ? context.c.orange : context.c.textPrimary,
                     ),
                   ),
                   if (option.description != null && option.description!.isNotEmpty)
                     Text(
                       option.description!,
-                      style: const TextStyle(fontSize: 10.5, color: Color(0xFF6B7280)),
+                      style: TextStyle(fontSize: 10.5, color: context.c.textSecondary),
                     ),
                 ],
               ),
@@ -376,7 +377,7 @@ class _OptionChip extends StatelessWidget {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
                 decoration: BoxDecoration(
-                  color: const Color(0xFFDCFCE7),
+                  color: context.c.successSurface,
                   borderRadius: BorderRadius.circular(4),
                   border: Border.all(color: const Color(0xFF86EFAC)),
                 ),
@@ -413,9 +414,9 @@ class TodoPanel extends StatelessWidget {
       margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
       padding: const EdgeInsets.fromLTRB(13, 11, 13, 12),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: context.c.surface,
         borderRadius: BorderRadius.circular(11),
-        border: Border.all(color: const Color(0xFFE5E7EB)),
+        border: Border.all(color: context.c.border),
         boxShadow: [
           BoxShadow(color: Colors.black.withOpacity(0.02), blurRadius: 4, offset: const Offset(0, 1)),
         ],
@@ -425,16 +426,16 @@ class TodoPanel extends StatelessWidget {
         children: [
           Row(
             children: [
-              const Icon(Icons.checklist_rounded, size: 15, color: Color(0xFF6B7280)),
+              Icon(Icons.checklist_rounded, size: 15, color: context.c.textSecondary),
               const SizedBox(width: 6),
-              const Text(
+              Text(
                 '任务进度',
-                style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: Color(0xFF374151)),
+                style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: context.c.textPrimary),
               ),
               const Spacer(),
               Text(
                 '$_done/${todos.length}',
-                style: const TextStyle(fontSize: 11.5, color: Color(0xFF9CA3AF)),
+                style: TextStyle(fontSize: 11.5, color: context.c.textTertiary),
               ),
             ],
           ),
@@ -444,23 +445,23 @@ class TodoPanel extends StatelessWidget {
             child: LinearProgressIndicator(
               value: todos.isEmpty ? 0 : _done / todos.length,
               minHeight: 4,
-              backgroundColor: const Color(0xFFF3F4F6),
-              valueColor: const AlwaysStoppedAnimation(Color(0xFF10B981)),
+              backgroundColor: context.c.surfaceMuted,
+              valueColor: AlwaysStoppedAnimation(context.c.success),
             ),
           ),
           const SizedBox(height: 10),
-          ...todos.map(_buildRow),
+          ...todos.map((t) => _buildRow(context, t)),
         ],
       ),
     );
   }
 
-  Widget _buildRow(TodoItem t) {
+  Widget _buildRow(BuildContext context, TodoItem t) {
     final done = t.isDone;
     final active = t.isActive;
     final color = done
-        ? const Color(0xFF9CA3AF)
-        : (active ? const Color(0xFF0078D4) : const Color(0xFF6B7280));
+        ? context.c.textTertiary
+        : (active ? context.c.accent : context.c.textSecondary);
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
@@ -483,7 +484,7 @@ class TodoPanel extends StatelessWidget {
                 height: 1.35,
                 color: color,
                 decoration: done ? TextDecoration.lineThrough : null,
-                decorationColor: const Color(0xFF9CA3AF),
+                decorationColor: context.c.textTertiary,
                 fontWeight: active ? FontWeight.w600 : FontWeight.normal,
               ),
             ),
