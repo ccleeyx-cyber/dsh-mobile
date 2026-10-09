@@ -94,6 +94,13 @@ class DshService extends ChangeNotifier {
 
   /// 网关版本信息（/api/mobile/version），供设置页做更新检查。
   GatewayVersionInfo? _gatewayVersion;
+
+  /// 当前会话最近一次回合的失败说明（网关 lastTurn / 实时 error 帧）。
+  ///
+  /// 非空时聊天页显示一条"上一轮以错误结束"横幅。存在的理由：错误只存在于
+  /// 引擎的 turn/end.reason 里，若只弹一瞬、或只发一条后台通知，用户回到会话
+  /// 时只会看到一条没有解释、停在半途的回答。
+  TurnEndInfo? _lastTurnFailure;
   int _reasoningBudget = 8000;
   double _temperature = 0.7;
   bool _isLoadingHistory = false;
@@ -281,6 +288,16 @@ class DshService extends ChangeNotifier {
   DshSettings? get settings => _settings;
   PermissionConfig get permissions => _permissions;
   List<AuditLogItem> get auditLogs => _auditLogs;
+  /// 当前会话最近一次回合的失败说明；无失败时为 null。
+  TurnEndInfo? get lastTurnFailure => _lastTurnFailure;
+
+  /// 用户已知悉该失败（横幅上的关闭按钮）。
+  void dismissTurnFailure() {
+    if (_lastTurnFailure == null) return;
+    _lastTurnFailure = null;
+    notifyListeners();
+  }
+
   List<AgentPersona> get personas => _personas;
   List<Snippet> get snippets => _snippets;
   GatewayVersionInfo? get gatewayVersion => _gatewayVersion;
@@ -857,6 +874,8 @@ class DshService extends ChangeNotifier {
     // TODO 与附件表相反：它们按会话分别存着，切过去直接就能显示。
     _pendingQuestions.clear();
     _lastQuestionError = null;
+    // 失败横幅同样是会话级的：切走就清，等新会话自己的数据回来再决定。
+    _lastTurnFailure = null;
     _isSending = false; // Reset sending state immediately
     _isLoadingHistory = true;
     _lastError = '';
@@ -879,6 +898,9 @@ class DshService extends ChangeNotifier {
         final rawMessages = sessionData?['messages'] as List<dynamic>? ?? [];
         final isRunning = sessionData?['isRunning'] == true;
         final sModel = sessionData?['model'] as String?;
+        // 最近一次回合是否以失败结束 —— 手机后连上来也能看到原因。
+        final turnInfo = TurnEndInfo.fromJson(sessionData?['lastTurn']);
+        _lastTurnFailure = (turnInfo != null && turnInfo.failed) ? turnInfo : null;
         if (sModel != null && sModel.isNotEmpty) {
           _currentSessionModel = sModel;
         } else if (session.model.isNotEmpty) {
@@ -1062,6 +1084,8 @@ class DshService extends ChangeNotifier {
     final int turnId = ++_activeTurnSeq;
     _isSending = true;
     _streamRevision++;
+    // 新的一轮开始：上一次的失败横幅（若有）让位，别再挂着旧错误。
+    _lastTurnFailure = null;
     notifyListeners();
 
     // Send follow event via WS
@@ -2096,13 +2120,36 @@ class DshService extends ChangeNotifier {
       if (type == 'error') {
         final sId = json['sessionId']?.toString();
         final errStr = json['error']?.toString() ?? '系统发生错误';
+        final code = json['errorCode']?.toString() ?? '';
+        // 回合级失败（turn/end.reason.kind=error）：网关会带 turnEnded=true。
+        final turnEnded = json['turnEnded'] == true;
         _lastError = errStr;
         if (sId != null && _currentSession != null && _currentSession!.matchesSessionId(sId)) {
           if (_messages.isNotEmpty && _messages.last.isAssistant && _messages.last.isStreaming) {
-            _messages.last.content = '❌ 发生错误: $errStr';
+            // ⚠️ 不能把已流出的正文覆盖掉 —— 模型出错前吐出的内容对用户仍然有用
+            // （旧写法直接 content = '❌ …'，把半截回答整段抹掉了）。
+            final partial = _messages.last.content;
+            _messages.last.content = partial.trim().isEmpty
+                ? '❌ $errStr'
+                : '$partial\n\n❌ 本轮以错误结束：$errStr';
             _messages.last.isStreaming = false;
           }
+          if (turnEnded) {
+            _lastTurnFailure = TurnEndInfo(
+              kind: 'error',
+              text: errStr,
+              code: code,
+              failed: true,
+              time: DateTime.now().millisecondsSinceEpoch,
+            );
+          }
+          // 失败即终结：把"运行中"相关的所有状态一并收干净，否则转圈会一直转下去
+          // （这是用户报的"报错了还一直显示运行中"）。
+          _sessionPollTimer?.cancel();
+          _sessionPollTimer = null;
           _isSending = false;
+          _isCanceling = false;
+          _streamRevision++;
         }
         notifyListeners();
         return;
@@ -2377,6 +2424,17 @@ class DshService extends ChangeNotifier {
           for (var t in current.tools) {
             t.isRunning = false;
           }
+        }
+        // done 现在带结束原因。若 error 帧丢了（弱网/刚好断线），这里仍能补上
+        // 失败说明 —— 结束原因只有网关读得到，手机不能靠猜。
+        final endReason = json['reason']?.toString();
+        if (endReason == 'error' || endReason == 'interrupted' || endReason == 'blocked') {
+          _lastTurnFailure = TurnEndInfo(
+            kind: endReason!,
+            text: json['message']?.toString() ?? '',
+            failed: true,
+            time: DateTime.now().millisecondsSinceEpoch,
+          );
         }
         _sessionPollTimer?.cancel();
         _sessionPollTimer = null;

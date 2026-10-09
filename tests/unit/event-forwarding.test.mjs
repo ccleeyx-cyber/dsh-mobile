@@ -535,3 +535,147 @@ describe('未知事件被忽略而不是打断处理', () => {
     await c.close();
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * 回合结束（含报错）
+ *
+ * 引擎**没有** turn/error 事件：失败只记在 turn/end 的
+ * `data.reason = {kind:'error', error:{message, code}}` 里，而那是错误文本的
+ * 唯一载体（Web UI 读它渲染错误横幅）。旧网关整个丢掉 reason，于是手机上
+ * 只有一个永不停止的转圈、一句解释都没有。
+ *
+ * 另一半是状态裁决：assistant-stream 的 chunk 帧与会话事件走 mux 的两条独立
+ * 通道，顺序无保证；旧代码每个 chunk 都 `isRunning = true`，一条迟到的尾包
+ * 就能把已结束的会话永久顶成"运行中"。
+ * ------------------------------------------------------------------ */
+describe('回合结束时手机必须能停下来并看到原因', () => {
+  const followFrame = (sessionId, value) => itemFrame(`follow-${sessionId}`, value);
+
+  it('turn/end reason=error 时转发错误文本，并把会话置为 idle', async () => {
+    const c = await connectClient();
+    const sid = 'session-turnerr';
+    c.send({ type: 'follow', sessionId: sid });
+    await c.waitFor((m) => m.type === 'follow_ack' || (m.type === 'session_status' && m.sessionId === sid));
+
+    pushToEngine(followFrame(sid, {
+      type: 'event',
+      event: { type: 'turn/start', seq: 10, data: { turn: 1 } }
+    }));
+    await c.waitFor((m) => m.type === 'session_status' && m.sessionId === sid && m.isRunning === true);
+
+    pushToEngine(followFrame(sid, {
+      type: 'event',
+      event: {
+        type: 'turn/end',
+        seq: 11,
+        data: {
+          turn: 1,
+          reason: { kind: 'error', error: { message: 'context length exceeded', code: 'CONTEXT_LENGTH' } }
+        }
+      }
+    }));
+
+    // 1) 错误文本必须到达手机 —— 这是旧版完全丢失的部分。
+    const errFrame = await c.waitFor((m) => m.type === 'error' && m.sessionId === sid);
+    assert.match(String(errFrame.error), /context length exceeded/);
+    assert.equal(errFrame.errorCode, 'CONTEXT_LENGTH');
+
+    // 2) 必须能停下来：idle 状态。
+    const idle = await c.waitFor((m) => m.type === 'session_status' && m.sessionId === sid && m.isRunning === false);
+    assert.ok(idle);
+
+    // 3) done 帧要带上结束原因，手机可区分正常结束/报错/中断。
+    const done = await c.waitFor((m) => m.type === 'done' && m.sessionId === sid);
+    assert.equal(done.reason, 'error');
+
+    await c.close();
+  });
+
+  it('迟到的 chunk 帧不得把已结束的回合顶回"运行中"', async () => {
+    const c = await connectClient();
+    const sid = 'session-latechunk';
+    c.send({ type: 'follow', sessionId: sid });
+    await c.waitFor((m) => m.type === 'follow_ack' || (m.type === 'session_status' && m.sessionId === sid));
+
+    pushToEngine(followFrame(sid, {
+      type: 'event', event: { type: 'turn/start', seq: 20, data: { turn: 2 } }
+    }));
+    await c.waitFor((m) => m.type === 'session_status' && m.sessionId === sid && m.isRunning === true);
+
+    pushToEngine(followFrame(sid, {
+      type: 'event',
+      event: { type: 'turn/end', seq: 21, data: { turn: 2, reason: { kind: 'completed' } } }
+    }));
+    await c.waitFor((m) => m.type === 'session_status' && m.sessionId === sid && m.isRunning === false);
+
+    // 尾包：mux 上 assistant-stream 通道比会话日志慢，完全可能晚到。
+    pushToEngine(followFrame(sid, {
+      type: 'assistant-stream',
+      frame: { type: 'chunk', chunk: { type: 'text-delta', text: '迟到的尾包' } }
+    }));
+    await sleep(300);
+
+    const statusFrames = c.frames.filter((m) => m.type === 'session_status' && m.sessionId === sid);
+    assert.equal(statusFrames[statusFrames.length - 1].isRunning, false,
+      '迟到的 chunk 不得把已结束的会话顶回运行中');
+    await c.close();
+  });
+
+  it('aborted / interrupted 也要置 idle，且 interrupted 有可读文案', async () => {
+    const c = await connectClient();
+    const sid = 'session-aborted';
+    c.send({ type: 'follow', sessionId: sid });
+    await c.waitFor((m) => m.type === 'follow_ack' || (m.type === 'session_status' && m.sessionId === sid));
+
+    pushToEngine(followFrame(sid, {
+      type: 'event', event: { type: 'turn/start', seq: 30, data: { turn: 3 } }
+    }));
+    await c.waitFor((m) => m.type === 'session_status' && m.sessionId === sid && m.isRunning === true);
+
+    pushToEngine(followFrame(sid, {
+      type: 'event',
+      event: { type: 'turn/end', seq: 31, data: { turn: 3, reason: { kind: 'interrupted' } } }
+    }));
+
+    const done = await c.waitFor((m) => m.type === 'done' && m.sessionId === sid);
+    assert.equal(done.reason, 'interrupted');
+    assert.match(String(done.message), /中断/, 'interrupted 必须给用户可读的解释');
+    await c.waitFor((m) => m.type === 'session_status' && m.sessionId === sid && m.isRunning === false);
+    await c.close();
+  });
+
+  it('迟到的 chunk 不得让会话在历史接口里仍显示为运行中（用户实际看到的症状）', async () => {
+    const c = await connectClient();
+    const sid = 'session-latechunk-api';
+    c.send({ type: 'follow', sessionId: sid });
+    await c.waitFor((m) => m.type === 'follow_ack' || (m.type === 'session_status' && m.sessionId === sid));
+
+    pushToEngine(followFrame(sid, {
+      type: 'event', event: { type: 'turn/start', seq: 40, data: { turn: 4 } }
+    }));
+    await c.waitFor((m) => m.type === 'session_status' && m.sessionId === sid && m.isRunning === true);
+
+    pushToEngine(followFrame(sid, {
+      type: 'event',
+      event: { type: 'turn/end', seq: 41, data: { turn: 4, reason: { kind: 'completed' } } }
+    }));
+    await c.waitFor((m) => m.type === 'session_status' && m.sessionId === sid && m.isRunning === false);
+
+    // 尾包晚到 —— 它落在一个已经结束的回合之后。
+    pushToEngine(followFrame(sid, {
+      type: 'assistant-stream',
+      frame: { type: 'chunk', chunk: { type: 'text-delta', text: '迟到的尾包' } }
+    }));
+    await sleep(250);
+
+    // 网关**自己**对"这个会话在不在跑"的答复，就是手机列表/历史读的那一份。
+    const res = await fetch(`${BASE}/api/mobile/sessions/${sid}`, {
+      headers: { Authorization: `Bearer ${TOKEN}` }
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.data.isRunning, false,
+      '回合已结束，迟到的 chunk 不得让网关继续报"运行中"（否则手机永远转圈）');
+    await c.close();
+  });
+});

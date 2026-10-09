@@ -648,6 +648,55 @@ export function createSnippetStore({ home = dshHome() } = {}) {
 }
 
 /* ------------------------------------------------------------------ *
+ * turn/end reason translation
+ * ------------------------------------------------------------------ */
+
+/**
+ * Human-readable text for a `turn/end` reason.
+ *
+ * ⚠️ The engine has NO `turn/error` event. A failed turn is recorded as
+ * `turn/end` with `data.reason = { kind: 'error', error: { message, code } }`
+ * (see dsh-session's TurnEndReasonMap), and that field is the ONLY carrier of
+ * the failure message — the engine's own Web UI renders its error banner
+ * straight from it (dsh-client-ui-chat matches `reason.kind === 'error'`).
+ * Anything that drops `reason` therefore loses the error entirely: the phone
+ * shows a spinner that never stops and never says why.
+ *
+ * `interrupted` is the engine's marker for a crash-orphaned turn that was
+ * closed after the fact, i.e. exactly the "dsh web died mid-turn" case.
+ */
+export function describeTurnEnd(reason) {
+  const r = (reason && typeof reason === 'object') ? reason : {};
+  const kind = typeof r.kind === 'string' ? r.kind : 'unknown';
+  switch (kind) {
+    case 'error': {
+      const message = r.error?.message || r.error?.reason || '执行出错';
+      const code = r.error?.code ? String(r.error.code) : '';
+      return { kind, text: code ? `${message} (${code})` : String(message), code };
+    }
+    case 'aborted':
+      return { kind, text: '本轮已被中断', code: '' };
+    case 'max-tokens':
+      return { kind, text: '已达到最大输出长度', code: '' };
+    case 'blocked':
+      return { kind, text: '本轮被阻止（权限或策略）', code: '' };
+    case 'interrupted':
+      return { kind, text: '本轮因引擎中断而结束（可能是 dsh web 重启）', code: '' };
+    case 'completed':
+    case 'forked':
+      return { kind, text: '', code: '' };
+    default:
+      return { kind, text: '', code: '' };
+  }
+}
+
+/** True when a turn-end reason means the turn did NOT finish normally. */
+export function isFailedTurnEnd(reason) {
+  const kind = reason?.kind;
+  return kind === 'error' || kind === 'interrupted' || kind === 'blocked';
+}
+
+/* ------------------------------------------------------------------ *
  * session id helpers
  * ------------------------------------------------------------------ */
 

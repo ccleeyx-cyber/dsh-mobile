@@ -110,6 +110,43 @@ class SessionSearchHit {
       );
 }
 
+/// 最近一次回合的结束原因（网关 session 历史里的 `lastTurn`）。
+///
+/// 引擎没有独立的"回合出错"事件：失败信息只存在于 `turn/end.reason` 里，
+/// 网关把它翻译成这个结构。手机据此在会话里显示"上一轮以错误结束：…"，
+/// 而不是让上次的失败悄悄消失、或永远停在"运行中"。
+class TurnEndInfo {
+  /// completed / error / aborted / blocked / max-tokens / interrupted / forked
+  final String kind;
+
+  /// 可直接展示的中文说明（正常结束时为空串）。
+  final String text;
+  final String code;
+  final bool failed;
+  final int time;
+
+  const TurnEndInfo({
+    required this.kind,
+    this.text = '',
+    this.code = '',
+    this.failed = false,
+    this.time = 0,
+  });
+
+  static TurnEndInfo? fromJson(dynamic raw) {
+    if (raw is! Map) return null;
+    final kind = raw['kind']?.toString();
+    if (kind == null || kind.isEmpty) return null;
+    return TurnEndInfo(
+      kind: kind,
+      text: raw['text']?.toString() ?? '',
+      code: raw['code']?.toString() ?? '',
+      failed: raw['failed'] == true || raw['failed'] == 'true',
+      time: raw['time'] is int ? raw['time'] as int : 0,
+    );
+  }
+}
+
 /// 简单的 JSON 解析助手（与项目其它 model 的容错风格一致）。
 Map<String, dynamic>? parseJsonObject(String body) {
   try {

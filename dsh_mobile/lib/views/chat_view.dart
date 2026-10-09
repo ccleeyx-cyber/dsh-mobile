@@ -1825,8 +1825,64 @@ class _ChatViewState extends State<ChatView> {
           // 它是"这轮对话里出现的图"，不是一条独立消息。
           ..._buildInteractiveBlocks(dsh),
 
+          // 上一轮失败说明（回合级）。放在输入框正上方：它解释的是"为什么刚才
+          // 那一轮断了"，紧挨着用户接下来要输入的地方，且不遮挡历史消息。
+          if (dsh.lastTurnFailure != null) _buildTurnFailureBanner(dsh),
+
           // Modern Clean Input Bar
           _buildInputBar(dsh),
+        ],
+      ),
+    );
+  }
+
+  /// 上一轮失败横幅：把"这轮为什么断了"直接说清楚，并给一键"重试"的入口。
+  Widget _buildTurnFailureBanner(DshService dsh) {
+    final info = dsh.lastTurnFailure!;
+    final label = switch (info.kind) {
+      'error' => '本轮执行出错',
+      'interrupted' => '本轮被中断',
+      'blocked' => '本轮被阻止',
+      _ => '本轮未正常结束',
+    };
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+      padding: const EdgeInsets.fromLTRB(12, 10, 6, 10),
+      decoration: BoxDecoration(
+        color: context.c.dangerSurface,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: context.c.danger.withOpacity(0.35)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.error_outline_rounded, size: 18, color: context.c.danger),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(color: context.c.danger, fontSize: 12.5, fontWeight: FontWeight.bold),
+                ),
+                if (info.text.isNotEmpty) ...[
+                  const SizedBox(height: 2),
+                  SelectableText(
+                    info.text,
+                    style: TextStyle(color: context.c.textSecondary, fontSize: 12, height: 1.35),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          IconButton(
+            icon: Icon(Icons.close_rounded, size: 16, color: context.c.textTertiary),
+            tooltip: '知道了',
+            visualDensity: VisualDensity.compact,
+            onPressed: dsh.dismissTurnFailure,
+          ),
         ],
       ),
     );

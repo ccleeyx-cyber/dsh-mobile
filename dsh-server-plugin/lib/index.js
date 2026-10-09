@@ -41,6 +41,8 @@ import {
   classifyCommand,
   coerceToolInput,
   isCarriedContext,
+  describeTurnEnd,
+  isFailedTurnEnd,
   authenticateRequest,
   readBodyWithLimit,
   parseJsonBody,
@@ -696,6 +698,9 @@ export function apply(ctx, config = {}, internals = {}) {
               sessionMeta.lastPromptAt = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
               sessionMeta.model = rows.modelSelection?.val?.lastUsed?.model || '';
               const follower = getSessionFollower(sId);
+              // 先跟引擎的投影对账，再算 isRunning：卡死的 running 会在这里被
+              // 纠正（见 reconcileFollowerWithProjection 的注释）。
+              reconcileFollowerWithProjection(follower, rows);
               const isRecentlyPrompted = activePrompts.has(sId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
               const lastActivity = sessionMeta.lastPromptAt || 0;
               const isRecentActivity = (Date.now() - lastActivity) < 45000;
@@ -798,11 +803,19 @@ export function apply(ctx, config = {}, internals = {}) {
       const lastActivity = rows.sessionListMetadata?.val?.lastPromptAt || cacheData.record?.identity?.createdAt || 0;
       const isRecentActivity = (Date.now() - lastActivity) < 45000;
       const isOpenTurnActive = rows.turnBoundary?.val?.openTurnStartSeq != null && isRecentActivity;
+      // 先跟引擎投影对账，再算 isRunning —— 否则一个丢帧的 running 会跟着
+      // 会话历史一起送到手机上，表现为"打开会话永远在转圈"。
+      reconcileFollowerWithProjection(follower, rows);
       isRunning = (follower && follower.isRunning) || isRecentlyPrompted || isOpenTurnActive;
       lastSeq = rows.turnBoundary?.val?.lastStepBoundary?.seq ?? 
                 rows.sessionListMetadata?.val?.lastSeq ?? 
                 rows.titleInput?.val?.lastSeq ?? 50000;
     }
+
+    // 最近一次回合是怎么结束的。错误只存在于 turn/end.reason 里，手机后连上来
+    // （或错误发生在手机不在场时）必须也能看到它，否则"报错了但手机没显示"
+    // 就永远修不掉。
+    let lastTurn = null;
 
     // 1. 调用 DSH 原生 RPC session/page 获取真实历史事件流
     try {
@@ -896,6 +909,16 @@ export function apply(ctx, config = {}, internals = {}) {
                 id: callData.callId
               });
             }
+          } else if (ev.type === 'turn/end') {
+            // 记录最近一次回合的结束原因（后面以 lastTurn 交给手机）。
+            const end = describeTurnEnd(ev.data?.reason);
+            lastTurn = {
+              kind: end.kind,
+              text: end.text,
+              code: end.code || '',
+              failed: isFailedTurnEnd(ev.data?.reason),
+              time: ev.time || Date.now()
+            };
           }
         }
       }
@@ -965,6 +988,8 @@ export function apply(ctx, config = {}, internals = {}) {
       sessionId,
       isRunning,
       model,
+      // 最近一次回合的结束原因（含失败文本）。手机据此显示"上一轮以错误结束"。
+      lastTurn,
       messages
     };
   }
@@ -1176,6 +1201,53 @@ export function apply(ctx, config = {}, internals = {}) {
   let upstreamMuxWs = null;
   let muxReconnectTimer = null;
 
+  /**
+   * Reconcile our stream state against the engine's own projection.
+   *
+   * `follower.isRunning` is our belief, derived from frames we happened to see.
+   * Frames can be lost (the mux drops, dsh web restarts mid-turn, the phone's
+   * socket dies and a tail frame never arrives), and a wrong `true` makes the
+   * session spin forever on the phone with no way to recover short of a
+   * restart. The projcache is the engine's authoritative view, and each row
+   * carries the `seq` it was folded up to — so the rule below is not a timeout
+   * guess: it only fires when the projection has provably advanced to (or past)
+   * the newest event we saw AND still reports no open turn and no open step.
+   *
+   * Returns true when it just healed a stale running state.
+   */
+  function reconcileFollowerWithProjection(follower, rows) {
+    if (!follower || !follower.isRunning) return false;
+    const tb = rows?.turnBoundary?.val;
+    const stats = rows?.sessionStats?.val;
+    // No projection data (file missing / not yet flushed) — cannot judge.
+    if (!tb || typeof tb !== 'object') return false;
+    const projSeq = Math.max(
+      Number(rows?.turnBoundary?.seq) || 0,
+      Number(rows?.sessionStats?.seq) || 0
+    );
+    // Cannot prove the projection saw our last event → keep believing the stream.
+    if (projSeq <= 0 || projSeq < (follower.lastSeq || 0)) return false;
+    const engineOpenTurn = tb.openTurnStartSeq != null;
+    const engineOpenStep = stats ? stats.openStep != null : false;
+    if (engineOpenTurn || engineOpenStep) return false; // engine agrees it is running
+    // Engine says nothing is open, and it has folded our last event → we are stale.
+    follower.isRunning = false;
+    follower.turnOpen = false;
+    follower.activePromptText = null;
+    if (follower.sessionId) {
+      const clean = follower.sessionId.replace(/^session-/, '');
+      activePrompts.delete(follower.sessionId);
+      activePrompts.delete(clean);
+      activePrompts.delete(`session-${clean}`);
+    }
+    audit('session/stale-running-healed', {
+      sessionId: follower.sessionId,
+      projectionSeq: projSeq,
+      ourLastSeq: follower.lastSeq || 0
+    });
+    return true;
+  }
+
   function connectUpstreamMux() {
     if (isDisposed) return;
     if (upstreamMuxWs) {
@@ -1274,6 +1346,12 @@ export function apply(ctx, config = {}, internals = {}) {
             sessionId: sId,
             streamId,
             isRunning: false,
+            // 引擎是否有一个未闭合的回合。**只有 turn/start 与会话日志能把它置 true**
+            // —— chunk 不再参与（见下方 chunk 分支），否则一条迟到的增量帧就能
+            // 把已经结束的会话永久顶成"运行中"。
+            turnOpen: false,
+            // 我们见过的最新事件序号；用来和 projcache 的 seq 做无猜测对账。
+            lastSeq: 0,
             thinkingBuffer: '',
             textBuffer: '',
             tools: [],
@@ -1292,13 +1370,20 @@ export function apply(ctx, config = {}, internals = {}) {
           const aFrame = val.frame;
           if (aFrame.type === 'start') {
             follower.isRunning = true;
+            follower.turnOpen = true;
             follower.thinkingBuffer = '';
             follower.textBuffer = '';
             follower.tools = [];
             broadcastToMobileClients({ type: 'session_status', sessionId: sId, isRunning: true });
           } else if (aFrame.type === 'chunk' && aFrame.chunk) {
             const c = aFrame.chunk;
-            follower.isRunning = true;
+            // ⚠️ 这里**刻意不**把 isRunning/turnOpen 置 true。
+            //
+            // assistant-stream 帧与会话事件在 mux 上是两条独立通道，顺序无保证：
+            // 实测存在 turn/end 之后仍有尾包 chunk 抵达（流式收尾/工具增量），
+            // 旧代码每个 chunk 都 `follower.isRunning = true`，于是会话被永久
+            // 顶成"运行中"——手机上表现为永远转圈、永远不回到空闲。
+            // 增量照旧转发（内容不能丢），状态由 turn 边界独占裁决。
             if (c.type === 'reasoning-delta' && c.text) {
               follower.thinkingBuffer += c.text;
               broadcastToMobileClients({ type: 'thinking', sessionId: sId, delta: c.text, text: c.text });
@@ -1309,27 +1394,50 @@ export function apply(ctx, config = {}, internals = {}) {
               broadcastToMobileClients({ type: 'tool_call', sessionId: sId, tool: c.name || 'tool', delta: c.argumentsDelta || '' });
             }
           }
+          // 'end' 帧不裁决状态：回合结束的权威信号是会话日志里的 turn/end。
           return;
         }
 
         if (val.type === 'event' && val.event) {
           const ev = val.event;
+          if (typeof ev.seq === 'number' && ev.seq > (follower.lastSeq || 0)) {
+            follower.lastSeq = ev.seq;
+          }
           if (ev.type === 'turn/start') {
             follower.isRunning = true;
+            follower.turnOpen = true;
             follower.thinkingBuffer = '';
             follower.textBuffer = '';
             follower.tools = [];
             broadcastToMobileClients({ type: 'session_status', sessionId: sId, isRunning: true });
           } else if (ev.type === 'turn/end') {
             follower.isRunning = false;
+            follower.turnOpen = false;
             follower.activePromptText = null;
             activePrompts.delete(sId);
             activePrompts.delete(cleanId);
-            broadcastToMobileClients({ type: 'done', sessionId: sId });
+            activePrompts.delete(`session-${cleanId}`);
+            for (const t of follower.tools) t.isRunning = false;
+            const end = describeTurnEnd(ev.data?.reason);
+            follower.lastTurn = { kind: end.kind, text: end.text, time: Date.now(), seq: ev.seq };
+            if (isFailedTurnEnd(ev.data?.reason)) {
+              // 引擎没有 turn/error 事件：失败只记在 turn/end.reason 里，而那是
+              // 错误文本的**唯一**载体（Web UI 就是读它渲染错误横幅的）。
+              // 旧代码整个丢掉 reason，手机于是只有一个永不停止的转圈。
+              broadcastToMobileClients({
+                type: 'error',
+                sessionId: sId,
+                error: end.text || '本轮执行失败',
+                errorCode: end.code || 'UNKNOWN',
+                turnEnded: true
+              });
+            }
+            broadcastToMobileClients({ type: 'done', sessionId: sId, reason: end.kind, message: end.text });
             follower.thinkingBuffer = '';
             follower.textBuffer = '';
             follower.tools = [];
             broadcastToMobileClients({ type: 'session_status', sessionId: sId, isRunning: false });
+            audit('session/turn-end', { sessionId: sId, kind: end.kind });
           } else if (ev.type === 'tool/call') {
             const toolObj = {
               id: ev.data?.id || `tool_${Date.now()}`,
