@@ -20,6 +20,25 @@ class StorageService {
   static const String _keyProfiles = 'dsh_server_profiles';
   static const String _keyActiveId = 'dsh_active_profile_id';
 
+  /// Theme preference: 'system' | 'light' | 'dark' (v1.6.0).
+  ///
+  /// Stored as a plain string rather than an index so reordering the enum later
+  /// cannot silently reinterpret an existing user's choice.
+  static const String _keyThemeMode = 'dsh_theme_mode';
+
+  static Future<String> loadThemeMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = prefs.getString(_keyThemeMode);
+    // Anything unrecognised falls back to 'system' rather than throwing: a bad
+    // value must never block startup.
+    return (v == 'light' || v == 'dark') ? v! : 'system';
+  }
+
+  static Future<void> saveThemeMode(String mode) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_keyThemeMode, mode);
+  }
+
   static final Random _rng = Random.secure();
 
   /// Guarantees uniqueness **by construction**, not by luck.

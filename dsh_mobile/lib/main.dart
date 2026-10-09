@@ -5,6 +5,7 @@ import 'models/server_config.dart';
 import 'services/dsh_service.dart';
 import 'services/draft_store.dart';
 import 'services/storage_service.dart';
+import 'theme/app_colors.dart';
 import 'views/config_page.dart';
 import 'views/main_shell.dart';
 
@@ -30,6 +31,7 @@ void main() async {
     );
   };
   final savedConfig = await StorageService.loadConfig();
+  final savedThemeMode = await StorageService.loadThemeMode();
 
   // 草稿存储要在 runApp 之前接好 SharedPreferences（v1.4.2）。DshService 构造时
   // 就 new 出了 DraftStore，所以这里只挂实例、不改 provider 结构 —— 让
@@ -41,10 +43,58 @@ void main() async {
     MultiProvider(
       providers: [
         ChangeNotifierProvider(create: (_) => DshService()),
+        ChangeNotifierProvider(create: (_) => ThemeController(initialMode: savedThemeMode)),
       ],
       child: MyApp(initialConfig: savedConfig),
     ),
   );
+}
+
+/// 主题模式控制器（v1.6.0 深色模式）。
+///
+/// 存在 service 层而不是 widget 本地 state，是为了让主题切换在**整个应用**生效
+/// —— 很多页面各自维护 rebuild 会漏掉一些，导致只切换了一半。
+class ThemeController extends ChangeNotifier {
+  /// 'system' | 'light' | 'dark'
+  String _mode;
+
+  ThemeController({String initialMode = 'system'}) : _mode = initialMode;
+
+  String get mode => _mode;
+
+  ThemeMode get themeMode => switch (_mode) {
+        'light' => ThemeMode.light,
+        'dark' => ThemeMode.dark,
+        _ => ThemeMode.system,
+      };
+
+  bool get isExplicit => _mode != 'system';
+
+  Future<void> setMode(String mode) async {
+    if (mode == _mode) return;
+    _mode = mode;
+    notifyListeners();
+    await StorageService.saveThemeMode(mode);
+  }
+
+  /// 循环切换：跟随系统 → 浅色 → 深色 → 跟随系统。
+  ///
+  /// 单按钮循环而不是三选一的下拉：主题切换是一个低频、高频重复的操作，一个
+  /// 按钮点三下比打开下拉更快。
+  Future<void> cycle() async {
+    final next = switch (_mode) {
+      'system' => 'light',
+      'light' => 'dark',
+      _ => 'system',
+    };
+    await setMode(next);
+  }
+
+  String get label => switch (_mode) {
+        'light' => '浅色',
+        'dark' => '深色',
+        _ => '跟随系统',
+      };
 }
 
 class MyApp extends StatefulWidget {
@@ -78,66 +128,107 @@ class _MyAppState extends State<MyApp> {
 
   @override
   Widget build(BuildContext context) {
+    final themeMode = context.watch<ThemeController>().themeMode;
+    final isDark = themeMode == ThemeMode.dark ||
+        (themeMode == ThemeMode.system &&
+            MediaQuery.platformBrightnessOf(context) == Brightness.dark);
+
     return MaterialApp(
       title: 'DSH Mobile',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        brightness: Brightness.light,
-        scaffoldBackgroundColor: const Color(0xFFF9FAFB),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF0078D4),
-          brightness: Brightness.light,
-          surface: Colors.white,
-          primary: const Color(0xFF0078D4),
-          // `background:` 自 v3.18 起废弃，职责已由 `surface:` 承担；而脚手架
-          // 底色上面已用 scaffoldBackgroundColor 显式指定，故直接删除该参数，
-          // 不再重复赋一个同色值。
-        ),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Colors.white,
-          foregroundColor: Color(0xFF1F2937),
-          elevation: 0,
-          scrolledUnderElevation: 0,
-          iconTheme: IconThemeData(color: Color(0xFF374151)),
-          titleTextStyle: TextStyle(
-            color: Color(0xFF111827),
-            fontSize: 18,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-        cardTheme: CardTheme(
-          color: Colors.white,
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-            side: const BorderSide(color: Color(0xFFE5E7EB), width: 1),
-          ),
-        ),
-        dividerColor: const Color(0xFFE5E7EB),
-      ),
-      // darkTheme 已移除（原为安慰剂）。
+      theme: buildLightTheme(),
+      // 真的深色主题（v1.6.0）。此前这里是一个亮色主题的逐字副本，永远不会被
+      // 使用，只让读代码的人以为支持深色。
       //
-      // 原来这里的 darkTheme 是亮色主题的逐字副本：brightness: Brightness.light、
-      // surface: Colors.white、scaffoldBackgroundColor: 0xFFF9FAFB，再配合硬编码的
-      // themeMode: ThemeMode.light —— 它永远不可能被使用，只是让读代码的人以为
-      // 「支持深色模式」。
-      //
-      // 之所以不直接换成真的深色主题：lib/ 下有约 481 处硬编码色值（Colors.white、
-      // Color(0xFFF9FAFB) 等，详见 ANALYSIS-优化与新增功能.md §6.9），它们不经过
-      // Theme 取值。只改 darkTheme 会得到「深色脚手架 + 白色卡片 + 深色文字」的
-      // 花屏结果，比现在诚实地恒为亮色更糟，而且无法在不跑真机的情况下验证。
-      //
-      // 正确顺序是先做色值 token 化，再引入深色主题。themeMode 保持 light，
-      // 渲染行为与移除前逐像素一致。
-      themeMode: ThemeMode.light,
+      // 之所以那时不能直接换成真的：lib/ 下有 592 处硬编码 Color(0x...)，它们
+      // 不经过 Theme 取值，只改 darkTheme 会得到「深色脚手架 + 白色卡片 +
+      // 深色文字」的花屏，比诚实地恒为亮色更糟。正确顺序是先 token 化
+      // （lib/theme/app_colors.dart），再引入深色主题，最后放开 themeMode。
+      darkTheme: buildDarkTheme(),
+      themeMode: themeMode,
+      // 让 ThemeScope 覆盖整棵树：widget 测试可以直接包一层 ThemeScope 来
+      // 断言深色取值，不需要 singleton 或 mockito。
+      builder: (context, child) => ThemeScope(isDark: isDark, child: child ?? const SizedBox()),
       home: _buildHome(),
     );
   }
 
+  /// 浅色主题。作为顶层函数而非 State 方法，是为了让 widget 测试能直接调用并逐项
+/// 比对两个主题的结构 —— 挂在 State 上就只能通过 pump 一个 widget 绕着测，
   Widget _buildHome() {
     final cfg = widget.initialConfig;
     if (cfg != null && cfg.host.isNotEmpty) return const MainShell();
     return const ConfigPage();
   }
 }
+
+/// 浅色主题。作为顶层函数而非 State 方法，是为了让 widget 测试能直接调用并逐项
+/// 比对两个主题的结构 —— 挂在 State 上就只能通过 pump 一个 widget 绕着测，
+/// 而那种测法无法保证对比的是真实实现。
+ThemeData buildLightTheme() => ThemeData(
+      useMaterial3: true,
+      brightness: Brightness.light,
+      scaffoldBackgroundColor: AppColors.background,
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: AppColors.accent,
+        brightness: Brightness.light,
+        surface: AppColors.surface,
+        primary: AppColors.accent,
+      ),
+      appBarTheme: const AppBarTheme(
+        backgroundColor: AppColors.surface,
+        foregroundColor: AppColors.textPrimary,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        iconTheme: IconThemeData(color: AppColors.textSecondary),
+        titleTextStyle: TextStyle(
+          color: AppColors.textPrimary,
+          fontSize: 18,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      cardTheme: CardTheme(
+        color: AppColors.surface,
+        elevation: 0,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: const BorderSide(color: AppColors.border, width: 1),
+        ),
+      ),
+      dividerColor: AppColors.border,
+    );
+
+/// 深色主题。与浅色主题**结构相同、只换取值**，不做删减 —— 一个只有一半 widget
+/// 适配了深色的版本，比恒为亮色更糟。
+ThemeData buildDarkTheme() => ThemeData(
+      useMaterial3: true,
+      brightness: Brightness.dark,
+      scaffoldBackgroundColor: AppColors.backgroundDark,
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: AppColors.accentDark,
+        brightness: Brightness.dark,
+        surface: AppColors.surfaceDark,
+        primary: AppColors.accentDark,
+      ),
+      appBarTheme: const AppBarTheme(
+        backgroundColor: AppColors.surfaceDark,
+        foregroundColor: AppColors.textPrimaryDark,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        iconTheme: IconThemeData(color: AppColors.textSecondaryDark),
+        titleTextStyle: TextStyle(
+          color: AppColors.textPrimaryDark,
+          fontSize: 18,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      cardTheme: CardTheme(
+        color: AppColors.surfaceDark,
+        elevation: 0,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: const BorderSide(color: AppColors.borderDark, width: 1),
+        ),
+      ),
+      dividerColor: AppColors.borderDark,
+    );

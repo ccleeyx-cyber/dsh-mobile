@@ -5,6 +5,7 @@ import '../models/dsh_settings.dart';
 import '../models/app_version.dart';
 import '../services/dsh_service.dart';
 import 'config_page.dart';
+import 'gateway_health_view.dart';
 
 class CustomSettingsView extends StatefulWidget {
   const CustomSettingsView({super.key});
@@ -186,6 +187,68 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     );
   }
 
+  Widget _buildHealthEntry(BuildContext context) {
+    final dsh = Provider.of<DshService>(context);
+    final color = dsh.isConnected
+        ? const Color(0xFF10B981)
+        : (dsh.isTokenInvalid ? const Color(0xFFDC2626) : const Color(0xFF9CA3AF));
+    final label = dsh.isConnected ? '已连接' : (dsh.isTokenInvalid ? '令牌失效' : '未连接');
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: () => Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const GatewayHealthView()),
+      ),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: _cardDecoration(),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(9),
+              decoration: BoxDecoration(
+                color: color.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(Icons.monitor_heart_outlined, color: color, size: 21),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '网关健康',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Color(0xFF111827)),
+                  ),
+                  const SizedBox(height: 2),
+                  Row(
+                    children: [
+                      Container(width: 7, height: 7, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+                      const SizedBox(width: 5),
+                      Text(
+                        label,
+                        style: TextStyle(fontSize: 11.5, color: color, fontWeight: FontWeight.w500),
+                      ),
+                      if (dsh.pendingApprovals.isNotEmpty) ...[
+                        const SizedBox(width: 10),
+                        Text(
+                          '· ${dsh.pendingApprovals.length} 个待授权',
+                          style: const TextStyle(fontSize: 11.5, color: Color(0xFFD97706)),
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const Icon(Icons.chevron_right_rounded, color: Color(0xFF9CA3AF), size: 20),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final dsh = Provider.of<DshService>(context);
@@ -217,6 +280,11 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
       body: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         children: [
+          // 0. 网关健康（v1.6.0）。放在最上面：出问题时用户最想立刻看到它，
+          // 而不是先滚过一屏模型参数。
+          _buildHealthEntry(context),
+          const SizedBox(height: 24),
+
           // 1. Model & Reasoning Engine Section
           _buildSectionHeader('大语言模型与思考引擎 (LLM & Reasoning)', Icons.smart_toy_outlined, const Color(0xFF0078D4)),
           const SizedBox(height: 8),
