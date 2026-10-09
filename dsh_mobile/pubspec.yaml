@@ -29,7 +29,15 @@ dependencies:
   # 语音输入（§4.2）：调用系统语音识别服务，转成文字填入输入框。
   # 选它而不是自建录音+上传，是因为它零权限成本（RECORD_AUDIO 已在 manifest 声明）、
   # 不需要服务端配合、且能复用手机上已有的识别模型。
-  speech_to_text: ^7.0.0
+  #
+  # ⚠️ 版本是**钉死**的，不是随手写的：
+  # 7.x 的 android/build.gradle 用 `compileSdk = flutter.compileSdkVersion`，
+  # 它依赖 Flutter 把 `flutter` 扩展注入到插件子工程。Flutter 3.24.5 带的
+  # plugin-loader v1.0.0 不做这件事，于是构建直接失败：
+  #   Could not get unknown property 'flutter' for extension 'android'
+  # 6.6.2 用的是朴素的 compileSdkVersion 33 / minSdkVersion 21，没有这个问题。
+  # 升级 Flutter 版本、或改用能兼容 7.x 的 plugin-loader 之后，才可以放开这个钉。
+  speech_to_text: 6.6.2
 
   # 本地通知（§4.2 推送通知）：事件发生时弹系统通知。
   # 只用本地通知 + 保持 WS 长连接，不接 FCM —— 这样不依赖任何外部推送服务，
