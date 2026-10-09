@@ -41,12 +41,20 @@ void main() {
   Future<void> teardown(WidgetTester tester) async {
     // 先把待定的计时器跑完再拆树。
     //
-    // 必要性：输入框的 onChanged 会调用 dsh.updateDraft()，而草稿存储有 600ms
-    // 防抖计时器。测试若在它到期前结束，Flutter 会以
-    // "A Timer is still pending even after the widget tree was disposed" 失败、
-    // 而那个失败与产品行为无关，纯粹是测试没把时间轴走完。
+    // 有两类计时器要收：
+    //   1. 草稿存储的 600ms 防抖（onChanged → dsh.updateDraft）。
+    //   2. 语音服务内部的平台调用超时（unavailableReason / diagnose 各 5s）。
+    //      它们是为"平台不回调"准备的 —— 测试环境里平台确实不回调，于是这些
+    //      timer 会一直挂着，直到被断言成
+    //      "A Timer is still pending even after the widget tree was disposed"。
+    //
+    //   3. 语音诊断对话框最外层那个 20s 超时（chat_view 里 _VoiceDiagnoseBody
+    //      给 diagnose() 套的兜底）。它比内部两个 5s 之和还长，所以是这个文件里
+    //      最长的一个待收计时器。
+    //
+    // 推 21s 覆盖上面最长的那个。假时钟推进是瞬时的，不花真实时间。
     await tester.pumpWidget(const SizedBox.shrink());
-    await tester.pump(const Duration(milliseconds: 800));
+    await tester.pump(const Duration(seconds: 21));
   }
 
   group('语音按钮必须永远可点（用户报「有按钮但没法点击、也没弹权限」）', () {
@@ -380,6 +388,29 @@ void main() {
       // 引擎的准入规则是"文字或附件"，所以只有附件也必须能发。
       expect(ink.onTap, isNotNull, reason: '只挂附件也应当能发送');
 
+      await teardown(tester);
+    });
+
+    testWidgets('长按麦克风打开语音诊断（"点了没反应"的排查入口）', (tester) async {
+      await pumpChat(tester);
+
+      final mic = find.byWidgetPredicate(
+        (w) =>
+            w is Icon &&
+            (w.icon == Icons.mic_none_rounded || w.icon == Icons.mic_off_rounded),
+      );
+      expect(mic, findsOneWidget);
+
+      await tester.longPress(mic);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // 对话框必须**立刻**出现，不能等诊断结果 —— 诊断要跑四五次平台查询，
+      // 让它先转圈、结果后填，比"点了半天才弹窗"好得多。
+      expect(find.text('语音输入诊断'), findsOneWidget,
+          reason: '长按麦克风必须能打开诊断，否则用户遇到"没反应"时无从下手');
+
+      await tester.pump(const Duration(seconds: 1));
       await teardown(tester);
     });
 

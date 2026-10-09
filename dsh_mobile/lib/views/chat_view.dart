@@ -2165,9 +2165,16 @@ class _ChatViewState extends State<ChatView> {
     final unavailable = _voiceSupported == false;
 
     return Tooltip(
-      message: unavailable ? '语音输入不可用' : '语音输入',
+      message: unavailable ? '语音输入不可用（长按查看诊断）' : '语音输入（长按查看诊断）',
       child: InkWell(
         onTap: () => listening ? _stopVoice(dsh) : _startVoice(dsh),
+        // 长按出诊断报告。
+        //
+        // 存在的理由：语音失败有四五种彼此无关的原因（没有识别引擎、权限被拒且
+        // 系统不再弹窗、插件卡在权限回调上、缺中文语言包、上次会话没释放），而
+        // 它们在用户眼里**都只是"点了没反应"**。让 App 把自己每一步的实测结果
+        // 直接说出来，比一轮轮猜快得多。
+        onLongPress: _showVoiceDiagnose,
         borderRadius: BorderRadius.circular(18),
         child: SizedBox(
           width: 36,
@@ -2191,8 +2198,29 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
-  Future<void> _startVoice(DshService dsh) async {
-    final ok = await VoiceInputService.instance.start(
+  /// 长按麦克风：弹出语音状态诊断。
+  ///
+  /// 用途见调用点注释 —— 把"点了没反应"拆成可判读的几条实测结果，用户截屏即可
+  /// 定位。文案刻意不用"错误"开头：多数情况不是缺陷，而是设备确实缺识别引擎。
+  Future<void> _showVoiceDiagnose() async {
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) => AlertDialog(
+        title: const Text('语音输入诊断'),
+        content: _VoiceDiagnoseBody(),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _startVoice(DshService dsh) async {    final ok = await VoiceInputService.instance.start(
       // 中间结果是累积的，必须整段替换。
       onPartial: (text, _) => _applyVoiceText(text, dsh),
       onFinal: (text) => _applyVoiceText(text, dsh),
@@ -2431,6 +2459,64 @@ class _ChatViewState extends State<ChatView> {
           ),
         );
       },
+    );
+  }
+}
+
+/// 「语音输入诊断」对话框的内容体。
+///
+/// 独立成一个 StatefulWidget 而不是在调用处内联：诊断要 await 四五次平台查询，
+/// 需要一个自己的加载态；塞进 ChatView 的 dialog builder 里会让那边没法 setState。
+class _VoiceDiagnoseBody extends StatefulWidget {
+  @override
+  State<_VoiceDiagnoseBody> createState() => _VoiceDiagnoseBodyState();
+}
+
+class _VoiceDiagnoseBodyState extends State<_VoiceDiagnoseBody> {
+  String? _report;
+
+  @override
+  void initState() {
+    super.initState();
+    // 超时兜底：诊断本身也不能变成"打不开"。
+    VoiceInputService.instance
+        .diagnose()
+        .timeout(const Duration(seconds: 20), onTimeout: () => '诊断超时：平台没有响应')
+        .then((r) {
+      if (mounted) setState(() => _report = r);
+    }).catchError((Object e) {
+      if (mounted) setState(() => _report = '诊断失败: $e');
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    return SizedBox(
+      width: 320,
+      child: _report == null
+          ? const Padding(
+              padding: EdgeInsets.symmetric(vertical: 24),
+              child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+            )
+          : SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SelectableText(
+                    _report!,
+                    style: TextStyle(fontSize: 12.5, height: 1.7, color: c.textPrimary),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    '若「服务可用」为否且「中文语言包」为空，说明这台设备没有语音识别'
+                    '服务，App 侧无法解决。',
+                    style: TextStyle(fontSize: 11.5, height: 1.6, color: c.textTertiary),
+                  ),
+                ],
+              ),
+            ),
     );
   }
 }

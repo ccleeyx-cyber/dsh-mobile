@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
@@ -32,6 +34,22 @@ class VoiceInputService {
   bool _available = false;
   bool _listening = false;
 
+  /// 上一次探测是否因为**平台不回调**而超时。
+  ///
+  /// 单独记这一位：它与"设备不支持"的处置完全不同 —— 前者值得重试一次
+  /// （权限对话框那次可能被打断了），后者重试多少次都一样。
+  bool _initTimedOut = false;
+
+  /// 平台调用超时时长。
+  ///
+  /// 做成实例字段而不是常量，是为了让测试能在几百毫秒内驱动"平台不回调"这条
+  /// 路径 —— 否则验证它就得在测试里真等 12 秒。
+  @visibleForTesting
+  Duration initTimeout = const Duration(seconds: 12);
+
+  @visibleForTesting
+  Duration listenTimeout = const Duration(seconds: 6);
+
   /// 设备是否有可用的语音识别服务。
   bool get isAvailable => _available;
 
@@ -52,22 +70,49 @@ class VoiceInputService {
   Future<bool> init() async {
     if (_initialized) return _available;
     _initialized = true;
+    _initTimedOut = false;
     try {
-      _available = await _speech.initialize(
-        onStatus: (status) {
-          // done / notListening：自动结束，UI 据此把麦克风按钮恢复常态。
-          if (status == 'done' || status == 'notListening') {
-            _listening = false;
-          }
-        },
-        onError: (e) {
-          _listening = false;
-          debugPrint('[VoiceInput] 识别错误: ${e.errorMsg}');
-        },
-        // 用户说完但系统没给出终止信号时的兜底。给太短会在用户思考措辞时
-        // 直接掐断，太长则会让"忘了关"的情况一直占着麦克风。
-        finalTimeout: const Duration(milliseconds: 30000),
-      );
+      _available = await _speech
+          .initialize(
+            onStatus: (status) {
+              // done / notListening：自动结束，UI 据此把麦克风按钮恢复常态。
+              if (status == 'done' || status == 'notListening') {
+                _listening = false;
+              }
+            },
+            onError: (e) {
+              _listening = false;
+              debugPrint('[VoiceInput] 识别错误: ${e.errorMsg}');
+            },
+            // 用户说完但系统没给出终止信号时的兜底。给太短会在用户思考措辞时
+            // 直接掐断，太长则会让"忘了关"的情况一直占着麦克风。
+            finalTimeout: const Duration(milliseconds: 30000),
+            // ⚠️ 只申请麦克风，**不要**连带申请 BLUETOOTH_CONNECT。
+            //
+            // 插件默认会把 RECORD_AUDIO 和 BLUETOOTH_CONNECT **一起**
+            // requestPermissions（见 SpeechToTextPlugin.kt:495 的
+            // `if (!noBluetoothOpt) requiredPermissions.plus(BLUETOOTH_CONNECT)`），
+            // 而我们的 manifest 只声明了 RECORD_AUDIO。
+            //
+            // 申请一个没在 manifest 里声明的运行时权限是错误用法：Android 会直接
+            // 否掉它，整个申请流程也跟着走偏 —— 权限对话框不出现、或回调不落地。
+            // 语音输入并不需要蓝牙耳机路由，索性让插件根本不去要它。
+            options: [SpeechToText.androidNoBluetooth],
+          )
+          // 这个超时不是"防御性写法"，它修的是一个真实症状。
+          //
+          // 平台的 initialize 走的是 ActivityCompat.requestPermissions，结果**只**
+          // 由 onRequestPermissionsResult 回调送达。那个回调一旦不来（权限对话框
+          // 被系统抑制、Activity 期间重建等），插件里的 result 就永远留在
+          // activeResult 槽里 —— 这个 Future **永不完成**，await 挂死。
+          // 用户看到的就是"点了完全没反应"，连一句报错都没有。
+          //
+          // 宁可报超时，也不能无声无息。
+          .timeout(initTimeout);
+    } on TimeoutException {
+      debugPrint('[VoiceInput] 初始化超时：平台始终没有回调');
+      _available = false;
+      _initTimedOut = true;
     } catch (e) {
       debugPrint('[VoiceInput] 初始化失败: $e');
       _available = false;
@@ -87,14 +132,68 @@ class VoiceInputService {
   /// 设置开权限，后者只能换设备。混成一句"不可用"会让用户在设置里白找一圈，
   /// 而这正是"点了没反应、也没弹权限"那种体验的来源。
   Future<String> unavailableReason() async {
+    // 超时与"设备不支持"必须分开说：前者重试一次往往就好（第一次的权限对话框
+    // 可能被打断了），后者重试多少次都一样。混成一句会让用户白试。
+    if (_initTimedOut) {
+      return '语音识别没有响应（平台未回调）。请再点一次；'
+          '若仍无反应，长按麦克风查看诊断';
+    }
     try {
-      if (!await _speech.hasPermission) {
+      if (!await _speech.hasPermission.timeout(const Duration(seconds: 5))) {
         return '未获得麦克风权限：请到「系统设置 → 应用 → DSH Mobile → 权限」中允许麦克风，然后回到这里再点一次';
       }
     } catch (e) {
       debugPrint('[VoiceInput] 权限查询失败: $e');
     }
-    return '这台设备没有可用的语音识别服务（部分精简版系统不带识别引擎）';
+    return '这台设备没有可用的语音识别服务（部分精简版系统不带识别引擎）。'
+        '长按麦克风可查看诊断';
+  }
+
+  /// 一份可直接展示的语音状态报告。
+  ///
+  /// 加它的直接原因：用户报"点了没反应"。而"没反应"这个描述**无法区分**下面
+  /// 任何一种原因 —— 设备没有识别引擎、权限被拒且系统不再弹窗、插件卡在权限
+  /// 回调上、中文语言包缺失、上次会话没释放。
+  ///
+  /// 与其反复猜，不如让 App 把每一步的实测结果说出来：用户截一张图，就能直接
+  /// 定位到是哪一环。
+  Future<String> diagnose() async {
+    final lines = <String>[];
+    lines.add('探测状态: ${_initialized ? "已完成" : "未完成"}');
+    lines.add('平台回调超时: ${_initTimedOut ? "是" : "否"}');
+    lines.add('服务可用: ${_available ? "是" : "否"}');
+    lines.add('正在识别: ${_listening ? "是" : "否"}');
+
+    try {
+      final granted = await _speech
+          .hasPermission
+          .timeout(const Duration(seconds: 5));
+      lines.add('麦克风权限: ${granted ? "已授予" : "未授予"}');
+    } catch (e) {
+      lines.add('麦克风权限: 查询失败 ($e)');
+    }
+
+    try {
+      final locales = await _speech
+          .locales()
+          .timeout(const Duration(seconds: 5));
+      final zh = locales.where((l) => l.localeId.toLowerCase().startsWith('zh'));
+      lines.add('可用语言数: ${locales.length}');
+      lines.add('中文语言包: ${zh.isEmpty ? "无" : zh.map((l) => l.localeId).take(4).join(", ")}');
+      if (zh.isEmpty && locales.isNotEmpty) {
+        lines.add('  → 设备没有中文识别包，即便能启动也识别不出中文');
+      }
+      if (locales.isEmpty) {
+        lines.add('  → 语言列表为空，通常意味着识别服务不可用');
+      }
+    } catch (e) {
+      lines.add('可用语言: 查询失败 ($e)');
+    }
+
+    final err = lastError;
+    if (err != null && err.isNotEmpty) lines.add('上次错误: $err');
+
+    return lines.join('\n');
   }
 
   /// 开始识别。
@@ -126,18 +225,21 @@ class VoiceInputService {
       //
       // 约定：失败**只通过抛异常**表达；成功与否以 isListening 为准（插件内部
       // 拿到 started 之后也是这么记的）。
-      await _speech.listen(
-        listenOptions: SpeechListenOptions(
-          // 语言放这里而不是 listen() 的顶层参数：后者已标记 deprecated。
-          localeId: await _resolveLocale(localeId),
-          // 流式：文字边说边出，不必等说完。
-          partialResults: true,
-          // dictation：说完一句自动停顿，把结果当成完整一段。
-          listenMode: ListenMode.dictation,
-          // 永久性错误（如权限被收回）时自动结束本次会话，避免反复重试。
-          cancelOnError: true,
-        ),
-      );
+      await _speech
+          .listen(
+            listenOptions: SpeechListenOptions(
+              // 语言放这里而不是 listen() 的顶层参数：后者已标记 deprecated。
+              localeId: await _resolveLocale(localeId),
+              // 流式：文字边说边出，不必等说完。
+              partialResults: true,
+              // dictation：说完一句自动停顿，把结果当成完整一段。
+              listenMode: ListenMode.dictation,
+              // 永久性错误（如权限被收回）时自动结束本次会话，避免反复重试。
+              cancelOnError: true,
+            ),
+          )
+          // 同 init()：平台不回调就会永久挂住，那又变成"点了没反应"。
+          .timeout(listenTimeout);
 
       // 判定"到底开没开"，这里有两个坑叠在一起：
       //
@@ -165,6 +267,14 @@ class VoiceInputService {
       _initialized = false;
       _listening = false;
       onError?.call('语音识别尚未就绪，请再点一次');
+      return false;
+    } on TimeoutException {
+      // 平台对 listen() 没回调：系统语音服务收下了请求却没应答。
+      // 常见于识别引擎被停用、或上一次会话没释放。
+      _initialized = false; // 允许下次重新初始化，别把状态记死
+      _listening = false;
+      onError?.call('启动语音识别超时：系统语音服务没有响应。'
+          '请确认系统里已启用语音识别（或它正被其他应用占用），然后重试');
       return false;
     } on ListenFailedException catch (e) {
       _listening = false;
