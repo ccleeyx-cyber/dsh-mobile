@@ -24,6 +24,17 @@
 -keep class io.flutter.plugins.googleassistant** { *; }
 -dontwarn com.google.android.gms.**
 
+# Play Core（deferred components）是 Flutter 的 PlayStoreSplitApplication /
+# PlayStoreDeferredComponentManager 引用的可选依赖。这个 App **不使用** deferred
+# components（用的是标准 split-per-abi 打包），所以这些类根本不会在 classpath 上。
+# 但 R8 仍会因为 Flutter 的代码路径引用它们而报 "Missing class" 并中断构建。
+#
+# 处理方式不是去加 Play Core 依赖（那会平白多几 MB 且引入一个用不到的库），
+# 而是声明"知道它们缺失、我不用"。这是 R8 官方推荐的 -dontwarn 用法。
+-dontwarn com.google.android.play.core.**
+-dontwarn io.flutter.embedding.engine.deferredcomponents.**
+-dontwarn io.flutter.app.FlutterPlayStoreSplitApplication
+
 # Dart 侧反射用到的类型（dart:mirrors / json 序列化常见）。
 -keepattributes *Annotation*, Signature, InnerClasses, EnclosingMethod
 
