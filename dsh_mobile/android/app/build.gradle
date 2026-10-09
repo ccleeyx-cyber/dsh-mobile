@@ -1,0 +1,95 @@
+import java.util.Properties
+import java.io.FileInputStream
+
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+// 签名材料由 CI 从 GitHub Secrets 写入 android/key.properties（不入库）。
+//
+// 在这里读它而不是无条件 `signingConfigs.debug` 的原因：debug key 是每个 CI
+// runner 临时生成的，**每个版本都不一样**。而 Android 只允许同一 applicationId
+// 的 APK 用同一把 key 升级 —— 于是旧做法产出的 APK 装到手机上会报
+// "INSTALL_FAILED_UPDATE_INCOMPATIBLE"，只能卸载重装，而卸载会连带清掉
+// SharedPreferences 里保存的网关地址与访问令牌，用户必须重新填一遍。
+//
+// 没有 key.properties 时（如本地 `flutter run`）回落到 debug，这样开发不受影响；
+// 但 CI 里会打印醒目警告，避免"以为签名好了"其实没生效。
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("key.properties")
+def hasReleaseKeystore = keystorePropertiesFile.exists()
+if (hasReleaseKeystore) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
+android {
+    namespace = "com.example.dsh_mobile"
+    compileSdk = flutter.compileSdkVersion
+    ndkVersion = flutter.ndkVersion
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+        // flutter_local_notifications ≥10 依赖 java.time 的向下兼容实现。Android
+        // 在 API 26 以下没有这些类，必须开启 desugaring，否则**构建直接失败**
+        // （不是运行时报错，是编译期就过不去）。源码兼容仍必须保持 1_8。
+        coreLibraryDesugaringEnabled true
+    }
+
+    dependencies {
+        // desugaring 的运行库，版本按插件 README 指定，勿随意升级。
+        coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:1.2.2"
+    }
+
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_1_8
+    }
+
+    defaultConfig {
+        applicationId = "com.example.dsh_mobile"
+        // speech_to_text 需要 21+；flutter.minSdkVersion 已经是 21，这里显式写死
+        // 是为了让"改 Flutter 版本不会悄悄把语音功能的最低要求降下去"。
+        minSdk = 21
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+    }
+
+    signingConfigs {
+        release {
+            if (hasReleaseKeystore) {
+                keyAlias = keystoreProperties['keyAlias']
+                keyPassword = keystoreProperties['keyPassword']
+                storeFile = keystoreProperties['storeFile'] ? file(keystoreProperties['storeFile']) : null
+                storePassword = keystoreProperties['storePassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            // 有 key.properties 就用真签名（可覆盖安装）；没有就退回 debug，
+            // 并在下面警告 —— 不静默地产出一个"看起来成功但装不上去"的包。
+            signingConfig = hasReleaseKeystore ? signingConfigs.release : signingConfigs.debug
+            minifyEnabled = true
+            shrinkResources = true
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+}
+
+if (!hasReleaseKeystore) {
+    logger.warn("==========================================================")
+    logger.warn(" android/key.properties 不存在：release 包将用 debug key 签名。")
+    logger.warn(" 这样的 APK 无法覆盖安装旧版本（Android 会拒绝不同签名）。")
+    logger.warn(" CI 需要配置 secrets: ANDROID_KEYSTORE_BASE64 / _PASSWORD /")
+    logger.warn(" KEY_PASSWORD / KEY_ALIAS 才能产出可升级的包。")
+    logger.warn("==========================================================")
+}
+
+flutter {
+    source = "../.."
+}

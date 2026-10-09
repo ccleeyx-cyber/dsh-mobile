@@ -7,6 +7,27 @@
     <!-- 触觉反馈与震动权限 (HapticFeedback) -->
     <uses-permission android:name="android.permission.VIBRATE"/>
 
+    <!-- 语音输入（系统语音识别，§4.2） -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <!-- 语音识别需要查询设备上是否存在语音服务；在 Android 11+ 这也是必须的 -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService"/>
+        </intent>
+    </queries>
+
+    <!-- 通知（§4.2 推送通知）。
+         Android 13 (API 33) 起必须由用户显式授权，否则通知不显示；
+         旧版本由系统自动放行，所以要同时声明 maxSdkVersion 以免多要权限。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+    <!-- 前台服务：让 WebSocket 在 App 退到后台后仍保持连接。
+         Android 9+ 限制后台启动服务，Android 14 (API 34) 起还必须声明
+         foregroundServiceType 且类型要与你实际做的事一致。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <!-- 息屏后仍要收到推送，需要绕过 Doze 的省电限制 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
     <!-- 允许非加密明文流量(ws:// 和 http://)，方便公网 IP 直接连接 -->
     <application
@@ -14,7 +35,7 @@
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">
-        
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -32,7 +53,22 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
-        
+
+        <!-- 后台保活前台服务：进程被系统回收后由系统重建（START_STICKY），
+             否则 WebSocket 随进程一起消失，后台推送就永远不会发生。
+             foregroundServiceType 必须与 build.gradle/代码里 startForeground
+             传入的类型一致，否则 Android 10+ 会抛 IllegalStateException。 -->
+        <service
+            android:name=".GatewayKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 推送通道：低重要性（默认渠道），避免每次事件都弹出横幅打断操作。
+             高重要性渠道只在用户主动开启"重要提醒"时使用。 -->
+        <meta-data
+            android:name="com.example.dsh_mobile.NOTIFICATION_CHANNEL_ID"
+            android:value="dsh_events" />
+
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />

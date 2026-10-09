@@ -36,8 +36,19 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final dsh = Provider.of<DshService>(context, listen: false);
     if (state == AppLifecycleState.resumed) {
       dsh.handleAppResumed();
+      // 回到前台：停止后台保活（前台不需要它），并且此后不再发通知 ——
+      // 界面就在眼前，再弹通知是噪音。
+      dsh.setAppForeground(true);
     } else if (state == AppLifecycleState.paused) {
       dsh.handleAppPaused();
+      // 进后台：此后才需要通知。同时尝试拉起前台服务把进程钉住，否则系统
+      // 随时可能回收它，WebSocket 随之断开，通知就永远不会来。
+      dsh.setAppForeground(false);
+      dsh.enableBackgroundNotifications();
+    } else if (state == AppLifecycleState.hidden) {
+      // Android 上从后台划掉任务会先走 hidden 再走 paused；这里只标记状态，
+      // 不重复拉起服务。
+      dsh.setAppForeground(false);
     }
   }
 

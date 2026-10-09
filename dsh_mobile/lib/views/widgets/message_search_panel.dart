@@ -90,7 +90,7 @@ class _MessageSearchPanelState extends State<MessageSearchPanel> {
                         hintStyle: TextStyle(fontSize: 13, color: context.c.textTertiary),
                         border: InputBorder.none,
                         isDense: true,
-                        contentPadding: EdgeInsets.symmetric(vertical: 6),
+                        contentPadding: const EdgeInsets.symmetric(vertical: 6),
                       ),
                     ),
                   ),
@@ -99,7 +99,7 @@ class _MessageSearchPanelState extends State<MessageSearchPanel> {
                     onTap: widget.onClose,
                     borderRadius: BorderRadius.circular(6),
                     child: Padding(
-                      padding: EdgeInsets.all(6),
+                      padding: const EdgeInsets.all(6),
                       child: Icon(Icons.close_rounded, size: 18, color: context.c.textSecondary),
                     ),
                   ),

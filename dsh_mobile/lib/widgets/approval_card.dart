@@ -254,7 +254,7 @@ class _ApprovalCardState extends State<ApprovalCard> {
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
             decoration: BoxDecoration(
               color: context.c.warningBadgeSurface,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(11)),
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(11)),
             ),
             child: Row(
               children: [
@@ -351,11 +351,11 @@ class _ApprovalCardState extends State<ApprovalCard> {
                                 onTap: () => _copyToClipboard(context, req.command!, '执行指令'),
                                 borderRadius: BorderRadius.circular(4),
                                 child: Padding(
-                                  padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                                   child: Row(
                                     children: [
                                       Icon(Icons.copy_rounded, size: 12, color: context.c.textSecondary),
-                                      SizedBox(width: 3),
+                                      const SizedBox(width: 3),
                                       Text('复制', style: TextStyle(color: context.c.textSecondary, fontSize: 11)),
                                     ],
                                   ),

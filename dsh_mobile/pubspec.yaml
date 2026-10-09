@@ -1,7 +1,7 @@
 name: dsh_mobile
 description: "A modern Android client for DeepSeek Harness (DSH)"
 publish_to: "none"
-version: 1.7.0+19
+version: 1.8.0+20
 
 environment:
   sdk: ">=3.0.0 <4.0.0"
@@ -25,6 +25,16 @@ dependencies:
 
   # Markdown & Code Display
   flutter_markdown: ^0.7.2+1
+
+  # 语音输入（§4.2）：调用系统语音识别服务，转成文字填入输入框。
+  # 选它而不是自建录音+上传，是因为它零权限成本（RECORD_AUDIO 已在 manifest 声明）、
+  # 不需要服务端配合、且能复用手机上已有的识别模型。
+  speech_to_text: ^7.0.0
+
+  # 本地通知（§4.2 推送通知）：事件发生时弹系统通知。
+  # 只用本地通知 + 保持 WS 长连接，不接 FCM —— 这样不依赖任何外部推送服务，
+  # 也不需要 Google 服务（国内网络下不可靠）。
+  flutter_local_notifications: ^17.2.3
 
   # Utilities
   intl: ^0.19.0

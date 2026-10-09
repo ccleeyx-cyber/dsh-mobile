@@ -14,6 +14,7 @@ import '../models/dsh_settings.dart';
 import '../models/permission_config.dart';
 import '../models/user_question.dart';
 import 'draft_store.dart';
+import 'notification_service.dart';
 import '../models/audit_log.dart';
 import '../models/persona.dart';
 
@@ -112,6 +113,57 @@ class DshService extends ChangeNotifier {
   /// 挂在 service 上（而不是 widget 上），是为了让「发送失败 / 离线」这条路径
   /// 也能决定草稿去留 —— 草稿规则取决于会话状态，不只是文本框内容。
   final DraftStore drafts = DraftStore.instance;
+
+  /// 用于通知正文的会话名。找不到就用 id 前 8 位 —— 总比空白强。
+  String _sessionDisplayTitle(String sessionId) {
+    for (final ws in _workspaces) {
+      for (final s in ws.sessions) {
+        if (s.matchesSessionId(sessionId)) {
+          final t = s.title.trim();
+          return t.isEmpty ? '会话 ${sessionId.substring(0, sessionId.length.clamp(0, 8))}' : t;
+        }
+      }
+    }
+    final short = sessionId.length > 8 ? sessionId.substring(0, 8) : sessionId;
+    return '会话 $short';
+  }
+
+  /// 事件通知（§4.2 推送通知）。单例，便于 UI 直接开关与查询状态。
+  final NotificationService notifications = NotificationService.instance;
+
+  /// App 是否在前台。由 UI 层的生命周期回调维护。
+  bool _isAppForeground = true;
+
+  /// 由 UI 层在 AppLifecycleState 变化时调用。
+  void setAppForeground(bool value) {
+    if (_isAppForeground == value) return;
+    _isAppForeground = value;
+    // 回到前台就关掉后台保活：前台根本不需要它，留着只是白占一条常驻通知和
+    // 一份电池。关不掉也不影响功能，只是通知会多一条。
+    if (value) {
+      notifications.disableBackground();
+    }
+  }
+
+  /// 是否该发通知。
+  ///
+  /// **App 在前台时不发**：界面已经在展示这些事件，再弹一条系统通知等于把同一
+  /// 件事在屏幕上说两遍，而且会打断正在进行的操作。通知真正要解决的是"用户不在
+  /// 屏幕前、正在等结果"的场景。
+  bool get shouldNotify => notifications.permissionGranted && !_isAppForeground;
+
+  /// 开启后台通知能力（拉起前台保活服务）。
+  ///
+  /// 返回是否成功。**失败必须被如实告知用户**：Android 12+ 对后台启动前台服务
+  /// 有限制，用户手动划掉通知也会让它失效。这个场景下"App 看起来能收通知但
+  /// 其实收不到"是最糟的结果 —— 所以状态要暴露到 UI 上，而不是静默失败。
+  Future<bool> enableBackgroundNotifications() => notifications.enableBackground();
+
+  /// 后台通知是否真的开着（UI 用来显示"后台通知已关闭"这类提示）。
+  bool get backgroundNotificationsOn => notifications.backgroundEnabled;
+
+  /// 通知权限是否拿到了。
+  bool get notificationPermissionGranted => notifications.permissionGranted;
 
   /// 当前会话的草稿键。
   ///
@@ -1514,6 +1566,15 @@ class DshService extends ChangeNotifier {
         if (!_pendingApprovals.any((a) => a.eventId == req.eventId)) {
           _pendingApprovals.add(req);
           notifyListeners();
+          // 待授权是"agent 已经停下等你"的时刻，必须能打断 —— 静默处理等于
+          // 让会话永远卡住。所以用高重要性渠道，会弹横幅。
+          if (shouldNotify) {
+            notifications.show(
+              title: '需要你授权',
+              body: '${req.toolName}：${req.reason}',
+              kind: NotificationKind.actionRequired,
+            );
+          }
         }
         return;
       }
@@ -1734,6 +1795,16 @@ class DshService extends ChangeNotifier {
           if (_pendingQuestions.any((p) => p.eventId == q.eventId)) return;
           _pendingQuestions.add(q);
           notifyListeners();
+          // 同待授权：提问让 agent 挂起，必须能打断。
+          if (shouldNotify) {
+            notifications.show(
+              title: 'Agent 在等你回答',
+              // 取第一道题的问题文本；有多道题时不逐条罗列 —— 通知栏放不下，
+              // 而且点进去就能看到全部。
+              body: q.questions.first.question,
+              kind: NotificationKind.actionRequired,
+            );
+          }
         } on FormatException catch (e) {
           debugPrint('[DshService] question_request 无法解析: $e');
         }
@@ -1834,6 +1905,19 @@ class DshService extends ChangeNotifier {
       // 7. Completion
       if (type == 'done' || type == 'end') {
         final sId = json['sessionId']?.toString();
+
+        // 通知放在"是否当前会话"的判断**之前**。
+        //
+        // 这一点很容易搞反：App 在后台时，用户可能正在看另一个会话，但这次请求
+        // 是在**他刚才离开的那个会话**里跑的。如果按当前会话过滤掉，用户就永远
+        // 收不到"你跑完了"—— 而这恰恰是通知最该发挥作用的地方。
+        if (shouldNotify && sId != null) {
+          notifications.show(
+            title: '执行完成',
+            body: _sessionDisplayTitle(sId),
+          );
+        }
+
         if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
           return;
         }

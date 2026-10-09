@@ -119,7 +119,7 @@ class _QuestionCardState extends State<QuestionCard> {
                   },
                   borderRadius: BorderRadius.circular(6),
                   child: Padding(
-                    padding: EdgeInsets.all(4),
+                    padding: const EdgeInsets.all(4),
                     child: Icon(Icons.close_rounded, size: 16, color: context.c.warning),
                   ),
                 ),

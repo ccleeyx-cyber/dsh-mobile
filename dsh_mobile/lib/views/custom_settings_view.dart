@@ -112,7 +112,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
 
                               if (filtered.isEmpty) {
                                 return Padding(
-                                  padding: EdgeInsets.symmetric(vertical: 24),
+                                  padding: const EdgeInsets.symmetric(vertical: 24),
                                   child: Center(
                                     child: Text('未找到匹配的模型', style: TextStyle(color: context.c.textTertiary)),
                                   ),
@@ -186,6 +186,58 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           offset: const Offset(0, 2),
         ),
       ],
+    );
+  }
+
+  /// 通知状态卡（§4.2 推送通知）。
+  ///
+  /// 这一屏**不提供开关**，只如实显示当前能不能收到通知。理由：能不能收到不
+  /// 取决于三件用户无法在 App 内改变的事 —— 系统通知权限是否给了、Android 是否
+  /// 允许后台保活、以及用户有没有手动划掉常驻通知。给一个开关却无法保证它
+  /// 有效，比不给开关更糟。
+  ///
+  /// 真正缺权限时给出的是**可执行的指引**（去系统设置），而不是一句"不可用"。
+  Widget _buildNotificationCard(BuildContext context) {
+    final dsh = Provider.of<DshService>(context);
+    final granted = dsh.notificationPermissionGranted;
+
+    final (Color iconColor, String title, String subtitle) = granted
+        ? (
+            context.c.success,
+            '后台通知已开启',
+            'Agent 需要你授权或回答时会弹通知；App 在前台时不打扰。'
+          )
+        : (
+            context.c.warning,
+            '通知未开启，你将收不到提醒',
+            'Android 13 及以上需要授权。请到 系统设置 → 应用 → DSH Mobile → 通知 中开启。'
+          );
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: _cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.notifications_active_outlined, size: 17, color: iconColor),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: context.c.textPrimary),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            subtitle,
+            style: TextStyle(fontSize: 11.5, height: 1.5, color: context.c.textSecondary),
+          ),
+        ],
+      ),
     );
   }
 
@@ -321,7 +373,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
         title: Row(
           children: [
             Icon(Icons.tune_rounded, color: context.c.accent),
-            SizedBox(width: 8),
+            const SizedBox(width: 8),
             Text(
               '设置与深度自定义',
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: context.c.textPrimary),
@@ -337,6 +389,8 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           _buildHealthEntry(context),
           const SizedBox(height: 16),
           _buildAppearanceCard(context),
+          const SizedBox(height: 16),
+          _buildNotificationCard(context),
           const SizedBox(height: 24),
 
           // 1. Model & Reasoning Engine Section
@@ -566,7 +620,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                       width: 40,
                       height: 40,
                       decoration: BoxDecoration(
-                        gradient: LinearGradient(colors: [context.c.accent, Color(0xFF2563EB)]),
+                        gradient: LinearGradient(colors: [context.c.accent, const Color(0xFF2563EB)]),
                         borderRadius: BorderRadius.circular(10),
                       ),
                       child: const Icon(Icons.layers_rounded, color: Colors.white, size: 22),

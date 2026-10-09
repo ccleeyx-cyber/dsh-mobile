@@ -187,9 +187,9 @@ void main() {
 
   group(r'AskUserQuestionAnswer（这就是 $events/result 里的 outcome.value）', () {
     test('形状与引擎契约一致', () {
-      final batch = AskUserQuestionAnswer([
-        const AskUserQuestionAnswerItem(id: 'q1', selected: ['继续']),
-        const AskUserQuestionAnswerItem(id: 'q2', selected: ['A', 'B'], custom: '都要'),
+      final batch = const AskUserQuestionAnswer([
+        AskUserQuestionAnswerItem(id: 'q1', selected: ['继续']),
+        AskUserQuestionAnswerItem(id: 'q2', selected: ['A', 'B'], custom: '都要'),
       ]).toJson();
 
       expect(batch['answers'], hasLength(2));
@@ -205,9 +205,9 @@ void main() {
     });
 
     test('custom 会被 trim，且只有空白时不输出', () {
-      final t = AskUserQuestionAnswerItem(id: 'q', selected: const [], custom: '  hi  ');
+      const t = AskUserQuestionAnswerItem(id: 'q', selected: [], custom: '  hi  ');
       expect(t.toJson()['custom'], 'hi');
-      final blank = AskUserQuestionAnswerItem(id: 'q', selected: const [], custom: '   ');
+      const blank = AskUserQuestionAnswerItem(id: 'q', selected: [], custom: '   ');
       expect(blank.toJson().containsKey('custom'), isFalse);
     });
 

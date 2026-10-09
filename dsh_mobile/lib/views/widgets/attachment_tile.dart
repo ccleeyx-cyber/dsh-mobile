@@ -65,7 +65,7 @@ class AttachmentImageTile extends StatelessWidget {
             _placeholder(context.c.danger, '未连接网关，无法取回图片')
           else
             ConstrainedBox(
-              constraints: BoxConstraints(maxHeight: 320),
+              constraints: const BoxConstraints(maxHeight: 320),
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(7),
                 child: Image.network(

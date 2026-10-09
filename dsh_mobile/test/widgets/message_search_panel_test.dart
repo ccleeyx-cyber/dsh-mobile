@@ -185,7 +185,7 @@ void main() {
 
   group('查询含元字符时不高亮错乱', () {
     testWidgets('查询 "a.c" 时按字面匹配并正确高亮', (tester) async {
-      final text = '版本 a.c 与 aXc';
+      const text = '版本 a.c 与 aXc';
       await pumpPanel(
         tester,
         query: 'a.c',
@@ -209,7 +209,7 @@ void main() {
     });
 
     testWidgets('查询 ".*" 不崩溃也不误标多处', (tester) async {
-      final text = '没有星号';
+      const text = '没有星号';
       final at = text.indexOf('.*'); // -1：不存在
       await pumpPanel(
         tester,

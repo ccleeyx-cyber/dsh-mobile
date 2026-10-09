@@ -19,6 +19,7 @@ import 'widgets/message_search_panel.dart';
 import 'config_page.dart';
 import '../theme/app_colors.dart';
 import '../main.dart';
+import '../services/voice_input_service.dart';
 
 class ChatView extends StatefulWidget {
   final VoidCallback? onOpenWorkspaces;
@@ -54,6 +55,11 @@ class _ChatViewState extends State<ChatView> {
   final Set<String> _highlightedMessageIds = {};
 
   // ---- 离线草稿 (v1.4.2) ----
+
+  // ---- 语音输入 (v1.8.0) ----
+  // null = 尚未探测；探测结果决定按钮是可用还是禁用。
+  bool? _voiceSupported;
+  bool _voiceListening = false;
 
   void _toggleSearch() {
     setState(() {
@@ -121,6 +127,14 @@ class _ChatViewState extends State<ChatView> {
     super.initState();
     _scrollController.addListener(_onScroll);
     _inputFocusNode.addListener(_onInputFocusChange);
+
+    // 探测语音识别能力（含麦克风权限）。放在 initState 而不是 build：这是
+    // 一次性异步探测，挂在 build 上会每次重建都重跑一遍。
+    //
+    // 刻意**不阻塞界面**：探测慢或失败都不该挡住聊天，失败时按钮显示为禁用。
+    VoiceInputService.instance.init().then((ok) {
+      if (mounted) setState(() => _voiceSupported = ok);
+    });
   }
 
   @override
@@ -669,7 +683,7 @@ class _ChatViewState extends State<ChatView> {
                           constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.45),
                           child: filtered.isEmpty
                               ? Padding(
-                                  padding: EdgeInsets.symmetric(vertical: 24),
+                                  padding: const EdgeInsets.symmetric(vertical: 24),
                                   child: Center(
                                     child: Text('未找到匹配的模型', style: TextStyle(color: context.c.textTertiary)),
                                   ),
@@ -789,7 +803,7 @@ class _ChatViewState extends State<ChatView> {
         title: Row(
           children: [
             Icon(Icons.delete_outline_rounded, color: context.c.danger, size: 22),
-            SizedBox(width: 8),
+            const SizedBox(width: 8),
             Text('删除当前会话', style: TextStyle(color: context.c.textPrimary, fontSize: 17, fontWeight: FontWeight.bold)),
           ],
         ),
@@ -875,7 +889,7 @@ class _ChatViewState extends State<ChatView> {
                 Row(
                   children: [
                     Icon(Icons.folder_open_rounded, color: context.c.accent, size: 20),
-                    SizedBox(width: 8),
+                    const SizedBox(width: 8),
                     Text(
                       '选择工作区 (Select Workspace)',
                       style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: context.c.textPrimary),
@@ -985,7 +999,7 @@ class _ChatViewState extends State<ChatView> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Icon(Icons.settings_outlined, size: 13, color: context.c.danger),
-                    SizedBox(width: 4),
+                    const SizedBox(width: 4),
                     Text('前往配置', style: TextStyle(fontSize: 11.5, color: context.c.danger, fontWeight: FontWeight.bold)),
                   ],
                 ),
@@ -1309,7 +1323,7 @@ class _ChatViewState extends State<ChatView> {
                           height: 8,
                           child: CircularProgressIndicator(strokeWidth: 1.5, color: context.c.accent),
                         ),
-                        SizedBox(width: 4),
+                        const SizedBox(width: 4),
                         Text('执行中', style: TextStyle(color: context.c.accent, fontSize: 9.5, fontWeight: FontWeight.bold)),
                       ],
                     ),
@@ -1422,7 +1436,7 @@ class _ChatViewState extends State<ChatView> {
                 child: Row(
                   children: [
                     Icon(Icons.smart_toy_outlined, color: context.c.accent, size: 18),
-                    SizedBox(width: 10),
+                    const SizedBox(width: 10),
                     Text('切换模型', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
                   ],
                 ),
@@ -1432,7 +1446,7 @@ class _ChatViewState extends State<ChatView> {
                 child: Row(
                   children: [
                     Icon(Icons.shield_outlined, color: context.c.accent, size: 18),
-                    SizedBox(width: 10),
+                    const SizedBox(width: 10),
                     Text('对话权限', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
                   ],
                 ),
@@ -1442,7 +1456,7 @@ class _ChatViewState extends State<ChatView> {
                 child: Row(
                   children: [
                     Icon(Icons.folder_outlined, color: context.c.accent, size: 18),
-                    SizedBox(width: 10),
+                    const SizedBox(width: 10),
                     Text('工作区与会话', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
                   ],
                 ),
@@ -1453,7 +1467,7 @@ class _ChatViewState extends State<ChatView> {
                 child: Row(
                   children: [
                     Icon(Icons.delete_outline_rounded, color: context.c.danger, size: 18),
-                    SizedBox(width: 10),
+                    const SizedBox(width: 10),
                     Text('删除当前会话', style: TextStyle(color: context.c.danger, fontSize: 13)),
                   ],
                 ),
@@ -1493,7 +1507,7 @@ class _ChatViewState extends State<ChatView> {
                   GestureDetector(
                     onTap: () => dsh.clearError(),
                     child: Padding(
-                      padding: EdgeInsets.only(left: 6),
+                      padding: const EdgeInsets.only(left: 6),
                       child: Icon(Icons.close_rounded, color: context.c.textSecondary, size: 16),
                     ),
                   ),
@@ -1988,7 +2002,7 @@ class _ChatViewState extends State<ChatView> {
                           height: 12,
                           child: CircularProgressIndicator(strokeWidth: 2, color: context.c.accent),
                         ),
-                        SizedBox(width: 6),
+                        const SizedBox(width: 6),
                         Text('AI 正在思考并执行操作...', style: TextStyle(color: context.c.textSecondary, fontSize: 11)),
                       ],
                     ),
@@ -2021,6 +2035,93 @@ class _ChatViewState extends State<ChatView> {
             ),
           ],
         ],
+      ),
+    );
+  }
+
+  /// 麦克风按钮：点一下开始识别，再点一下停止。
+  ///
+  /// 三处刻意的行为：
+  /// * **识别中按钮变色**，用户能一眼看出还在听 —— 语音最反直觉的问题就是
+  ///   「不知道它有没有在听」，不给出视觉反馈会让人反复点。
+  /// * **识别结果替换整个输入框**而不是追加。流式识别的中间结果是累积的，
+  ///   追加会得到「你好你好你好世界世界」这种叠字。
+  /// * **设备不支持时如实说明**并禁用按钮，而不是点了没反应。
+  Widget _buildMicButton(DshService dsh) {
+    if (_voiceSupported == null) {
+      // 可用性尚未探测完成。先渲染成不可点，避免"按钮能点但点了必然失败"。
+      return const SizedBox(width: 44, height: 44);
+    }
+    if (!_voiceSupported!) {
+      return Tooltip(
+        message: '这台设备没有可用的语音识别服务',
+        child: SizedBox(
+          width: 44,
+          height: 44,
+          child: Icon(Icons.mic_off_rounded, size: 20, color: context.c.textTertiary.withOpacity(0.5)),
+        ),
+      );
+    }
+
+    final listening = _voiceListening;
+    return InkWell(
+      onTap: () => listening ? _stopVoice(dsh) : _startVoice(dsh),
+      borderRadius: BorderRadius.circular(22),
+      child: Container(
+        width: 44,
+        height: 44,
+        decoration: BoxDecoration(
+          color: listening ? context.c.dangerSurface : Colors.transparent,
+          shape: BoxShape.circle,
+          border: Border.all(
+            color: listening ? context.c.danger : context.c.border,
+            width: 1,
+          ),
+        ),
+        child: listening
+            ? Padding(
+                padding: const EdgeInsets.all(13),
+                child: CircularProgressIndicator(strokeWidth: 2, color: context.c.danger),
+              )
+            : Icon(Icons.mic_none_rounded, size: 20, color: context.c.textSecondary),
+      ),
+    );
+  }
+
+  Future<void> _startVoice(DshService dsh) async {
+    final ok = await VoiceInputService.instance.start(
+      // 中间结果是累积的，必须整段替换。
+      onPartial: (text, _) => _applyVoiceText(text, dsh),
+      onFinal: (text) => _applyVoiceText(text, dsh),
+      onError: (msg) {
+        _toast(msg);
+        if (mounted) setState(() => _voiceListening = false);
+      },
+    );
+    if (mounted) setState(() => _voiceListening = ok);
+  }
+
+  Future<void> _stopVoice(DshService dsh) async {
+    await VoiceInputService.instance.stop();
+    if (mounted) setState(() => _voiceListening = false);
+  }
+
+  void _applyVoiceText(String text, DshService dsh) {
+    if (text.trim().isEmpty) return;
+    _inputController.text = text;
+    _inputController.selection = TextSelection.collapsed(offset: text.length);
+    // 语音内容同样要进草稿，否则进程被杀后说的这段话会丢。
+    dsh.updateDraft(text);
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).clearSnackBars();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
       ),
     );
   }
@@ -2058,7 +2159,7 @@ class _ChatViewState extends State<ChatView> {
                       hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 13.5),
                       border: InputBorder.none,
                       isDense: true,
-                      contentPadding: EdgeInsets.symmetric(vertical: 11),
+                      contentPadding: const EdgeInsets.symmetric(vertical: 11),
                     ),
                     onChanged: (v) => dsh.updateDraft(v),
                     onSubmitted: (_) => _sendMessage(dsh),
@@ -2066,6 +2167,9 @@ class _ChatViewState extends State<ChatView> {
                 ),
               ),
             ),
+            // 语音输入（§4.2）。放在输入框与发送键之间：它是"另一种输入方式"，
+            // 不是"发送"，所以不能和发送键合并成一个按钮。
+            _buildMicButton(dsh),
             const SizedBox(width: 10),
             // Send / Cancel Action Button
             if (dsh.isSending || dsh.isCanceling)
@@ -2081,7 +2185,7 @@ class _ChatViewState extends State<ChatView> {
                 ),
                 child: dsh.isCanceling
                     ? Padding(
-                        padding: EdgeInsets.all(12.0),
+                        padding: const EdgeInsets.all(12.0),
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
                           color: context.c.danger,
@@ -2104,12 +2208,12 @@ class _ChatViewState extends State<ChatView> {
                 height: 44,
                 decoration: BoxDecoration(
                   gradient: LinearGradient(
-                    colors: [context.c.accent, Color(0xFF0086F8)],
+                    colors: [context.c.accent, const Color(0xFF0086F8)],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
                   shape: BoxShape.circle,
-                  boxShadow: [
+                  boxShadow: const [
                     BoxShadow(
                       color: Color(0x330078D4),
                       blurRadius: 8,

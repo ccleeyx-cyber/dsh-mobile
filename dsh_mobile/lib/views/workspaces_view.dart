@@ -144,7 +144,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
         title: Row(
           children: [
             Icon(Icons.warning_amber_rounded, color: context.c.danger, size: 22),
-            SizedBox(width: 8),
+            const SizedBox(width: 8),
             Text('删除会话', style: TextStyle(color: context.c.textPrimary, fontSize: 17, fontWeight: FontWeight.bold)),
           ],
         ),
@@ -264,7 +264,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                     decoration: InputDecoration(
                       hintText: '# 项目背景与上下文约定\n在这里编写项目的架构背景、禁止修改的文件或个性化智能体指示...',
                       hintStyle: TextStyle(color: context.c.textTertiary),
-                      contentPadding: EdgeInsets.all(12),
+                      contentPadding: const EdgeInsets.all(12),
                       border: InputBorder.none,
                     ),
                   ),
@@ -357,7 +357,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Icon(Icons.warning_amber_rounded, size: 16, color: context.c.warning),
-          SizedBox(width: 8),
+          const SizedBox(width: 8),
           Expanded(
             child: Text(
               '网关没有回显归档筛选模式，说明它仍是旧版本：它忽略了这个参数，'
@@ -920,7 +920,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                       height: 8,
                       child: CircularProgressIndicator(strokeWidth: 1.5, color: context.c.accent),
                     ),
-                    SizedBox(width: 4),
+                    const SizedBox(width: 4),
                     Text('执行中', style: TextStyle(color: context.c.accent, fontSize: 9.5, fontWeight: FontWeight.bold)),
                   ],
                 ),

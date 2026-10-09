@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'models/server_config.dart';
 import 'services/dsh_service.dart';
 import 'services/draft_store.dart';
+import 'services/notification_service.dart';
 import 'services/storage_service.dart';
 import 'theme/app_colors.dart';
 import 'views/config_page.dart';
@@ -42,6 +45,11 @@ void main() async {
   // DraftStore 先在内存里可用（早期打的字不丢），再补上持久化。
   final prefs = await SharedPreferences.getInstance();
   DraftStore.instance.attach(prefs);
+
+  // 通知权限必须在 runApp 之后申请（Android 需要 Activity），所以结果通过
+  // ThemeController 之外的一条路径回填 —— 这里只启动异步探测，实际状态由
+  // NotificationService 自己持有。
+  unawaited(NotificationService.instance.init());
 
   runApp(
     MultiProvider(

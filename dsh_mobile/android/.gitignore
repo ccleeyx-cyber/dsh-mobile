@@ -1,0 +1,20 @@
+# Gradle 产物与本机配置
+/.gradle
+/captures/
+/local.properties
+
+# GeneratedPluginRegistrant.java 由 flutter 工具在构建时生成，不应进版本库
+app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
+
+# ⚠️ 与 Flutter 默认模板的差异：
+# 默认模板把 gradle-wrapper.jar / gradlew / gradlew.bat 也 ignore 掉，因为对本地
+# 开发者来说它们只是让 `flutter run` 能跑的附带文件。但这个仓库的 Android 工程
+# 是**构建必需**的 —— CI 不再执行 `flutter create .` 来合成它，所以 wrapper 必须
+# 提交：没有 gradlew + wrapper.jar，CI 上没有可用的 Gradle；没有
+# wrapper.properties，构建用的 Gradle 版本会随环境漂移。固定版本是构建可复现的
+# 前提，不是可选优化。
+
+# 签名材料绝不入库（key.properties 与 keystore 由 CI 从 secrets 写入）
+key.properties
+**/*.keystore
+**/*.jks

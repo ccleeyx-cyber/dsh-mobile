@@ -327,7 +327,7 @@ class _ConfigPageState extends State<ConfigPage> {
           ),
           if (selected != null)
             Padding(
-              padding: EdgeInsets.only(left: 10, bottom: 6),
+              padding: const EdgeInsets.only(left: 10, bottom: 6),
               child: Text(
                 '切换只填入下方表单；点「保存并进入聊天」才会连接并记住。',
                 style: TextStyle(fontSize: 11, color: context.c.textTertiary),

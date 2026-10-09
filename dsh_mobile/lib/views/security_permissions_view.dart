@@ -56,7 +56,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
         title: Row(
           children: [
             Icon(Icons.security_rounded, color: context.c.accent),
-            SizedBox(width: 8),
+            const SizedBox(width: 8),
             Text(
               '权限与安全中心',
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: context.c.textPrimary),
@@ -99,7 +99,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
               child: Row(
                 children: [
                   Icon(Icons.verified_user_rounded, color: context.c.success, size: 28),
-                  SizedBox(width: 14),
+                  const SizedBox(width: 14),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -108,7 +108,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                           '安全状态良好',
                           style: TextStyle(color: context.c.textPrimary, fontSize: 15, fontWeight: FontWeight.bold),
                         ),
-                        SizedBox(height: 2),
+                        const SizedBox(height: 2),
                         Text(
                           '所有后台操作已就绪，当前无阻塞性工具审批请求。',
                           style: TextStyle(color: context.c.textSecondary, fontSize: 12),
@@ -311,7 +311,7 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
             ),
             child: auditLogs.isEmpty
                 ? Padding(
-                    padding: EdgeInsets.symmetric(vertical: 24),
+                    padding: const EdgeInsets.symmetric(vertical: 24),
                     child: Center(
                        child: Text('暂无历史审计记录', style: TextStyle(color: context.c.textTertiary, fontSize: 13)),
                     ),
@@ -552,8 +552,8 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
           title: Row(
             children: [
               Icon(Icons.warning_amber_rounded, color: context.c.danger, size: 22),
-              SizedBox(width: 8),
-              Text('套用「完全信任」？'),
+              const SizedBox(width: 8),
+              const Text('套用「完全信任」？'),
             ],
           ),
           content: const Text(

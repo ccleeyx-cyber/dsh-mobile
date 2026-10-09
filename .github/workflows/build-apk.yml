@@ -51,16 +51,10 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          # `cache: 'gradle'` must stay OFF here. setup-java hashes the Gradle
-          # build files to build its cache key, and it FAILS THE JOB when none
-          # match:
-          #   No file in /home/runner/work/... matched to
-          #   [**/*.gradle*,**/gradle-wrapper.properties,...]
-          # This repo commits only android/app/src/main/AndroidManifest.xml — the
-          # rest of the Gradle project is synthesised later by `flutter create .`,
-          # i.e. after this step has already run. Re-enable the cache once
-          # android/ is committed properly (ANALYSIS §1.1); until then it can only
-          # ever break the build.
+          # Gradle cache 曾必须关闭：当时仓库只提交了 AndroidManifest.xml，
+          # setup-java 找不到任何 **/*.gradle* 可哈希，会直接让 job 失败。android/
+          # 现已提交，可以启用。
+          cache: 'gradle'
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -94,29 +88,39 @@ jobs:
       - name: Prepare Android Project & Dependencies
         working-directory: ./dsh_mobile
         run: |
-          # 备份定制的 Android 配置文件
-          cp android/app/src/main/AndroidManifest.xml /tmp/AndroidManifest.xml || true
-          flutter create . --platforms=android --project-name=dsh_mobile
-          cp /tmp/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          # android/ 现在是**已提交**的（含 build.gradle、MainActivity.kt、
+          # proguard-rules.pro、gradle wrapper）。这里不再执行 `flutter create .`
+          # 去合成它 —— 那会把上面这些定制文件全部覆盖成模板版本：
+          #   - build.gradle 的 signingConfig（可覆盖安装的关键）会被重置成
+          #     signingConfigs.debug，导致 APK 再次变成"卸载才能装"；
+          #   - MainActivity.kt 里的前台保活服务会消失，推送通知静默失效；
+          #   - proguard-rules.pro 会被删掉，而 minifyEnabled 依赖它。
+          # `flutter create .` 只在需要从零重建时才有意义，而现在不再是那种情况。
+          #
+          # 保留 flutter pub get：它负责拉取新增的语音/通知插件依赖。
           flutter pub get
 
-      # Until android/ is committed to this repo, `flutter create .` above
-      # regenerates a stock Gradle project whose release build type falls back to
-      # signingConfigs.debug. The keystore is ephemeral per runner, so EVERY
-      # build is signed with a different key and Android refuses an in-place
-      # upgrade — the user has to uninstall, which also wipes the saved host and
-      # token. This check cannot fix that (the fix is committing android/ plus a
-      # signingConfig that reads key.properties, ANALYSIS §1.1) but it makes the
-      # situation visible on every run instead of silently shipping
-      # uninstall-only APKs.
-      - name: Warn if release signing is not configured
-        # Tests the job-level env var instead of a `${{ secrets.* != '' }}`
-        # expression, which GitHub does not accept in a step-level `env:`/`if:`.
+      # 构建用的 Gradle 版本固定在 gradle/wrapper/gradle-wrapper.properties，
+      # 因此 gradle cache 可以安全启用 —— 它此前会硬失败，是因为那时仓库里
+      # 没有任何 **/*.gradle* 供 cache 的 key 计算使用。
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('dsh_mobile/android/**/*.gradle*', 'dsh_mobile/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Report signing configuration
+        # 用 job 级 env 而不是 `${{ secrets.* != '' }}` 表达式 —— GitHub 不接受
+        # 在 step 级 env/if 里引用 secrets 上下文。守卫写在脚本里。
         run: |
           if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
-            echo "::warning title=Unsigned release build::ANDROID_KEYSTORE_BASE64 is not set and dsh_mobile/android/ is not committed. This APK is signed with the runner's ephemeral debug key, so it CANNOT be installed over a previous build - the user must uninstall first, losing their saved gateway address and token. The fix is committing dsh_mobile/android/ together with a signingConfig that reads key.properties."
+            echo "::warning title=Unsigned release build::ANDROID_KEYSTORE_BASE64 未设置，本次 APK 将用 debug key 签名。它无法覆盖安装旧版本（Android 拒绝不同签名），需要先卸载。设置该 secret 后即可产出可升级的包。"
           else
-            echo "ANDROID_KEYSTORE_BASE64 is set."
+            echo "ANDROID_KEYSTORE_BASE64 已设置，将产出可覆盖安装的签名包。"
           fi
 
       - name: Write signing material (when provided)
@@ -138,7 +142,7 @@ jobs:
           storeFile=keystore/release.jks
           EOF
           chmod 600 android/key.properties android/keystore/release.jks
-          echo "Signing material written. Takes effect once android/app/build.gradle is committed with a signingConfig that reads key.properties."
+          echo "签名材料已写入，android/app/build.gradle 会读取它。"
 
       - name: Build APK (Release, split per ABI)
         working-directory: ./dsh_mobile

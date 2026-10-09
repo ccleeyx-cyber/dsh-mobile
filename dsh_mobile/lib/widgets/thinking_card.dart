@@ -189,7 +189,7 @@ class _ThinkingCardState extends State<ThinkingCard> {
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
                                   Icon(Icons.copy_rounded, size: 12, color: context.c.textSecondary),
-                                  SizedBox(width: 4),
+                                  const SizedBox(width: 4),
                                   Text('复制', style: TextStyle(fontSize: 11, color: context.c.textSecondary)),
                                 ],
                               ),
@@ -210,7 +210,7 @@ class _ThinkingCardState extends State<ThinkingCard> {
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
                                   Icon(Icons.keyboard_arrow_up_rounded, size: 13, color: context.c.textSecondary),
-                                  SizedBox(width: 2),
+                                  const SizedBox(width: 2),
                                   Text('收起', style: TextStyle(fontSize: 11, color: context.c.textSecondary)),
                                 ],
                               ),

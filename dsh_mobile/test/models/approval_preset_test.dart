@@ -145,7 +145,7 @@ void main() {
 
     test('Git 保护的开关方向正确', () {
       // 用与目标快照相同的其它三项，让差异只剩 Git 保护这一条。
-      final targetOff = const PermissionConfigSnapshot(
+      const targetOff = PermissionConfigSnapshot(
         defaultPolicy: 'ask', sandboxMode: 'sandboxed', maxSteps: 15, protectGit: false,
       );
       final base = PermissionConfig(
@@ -154,7 +154,7 @@ void main() {
       expect(off, hasLength(1));
       expect(off.single, contains('开 → 关'));
 
-      final targetOn = const PermissionConfigSnapshot(
+      const targetOn = PermissionConfigSnapshot(
         defaultPolicy: 'ask', sandboxMode: 'sandboxed', maxSteps: 15, protectGit: true,
       );
       final base2 = PermissionConfig(

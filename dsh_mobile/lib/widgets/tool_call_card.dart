@@ -183,7 +183,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                             child: Row(
                               children: [
                                 Icon(Icons.copy_rounded, size: 11, color: context.c.textSecondary),
-                                SizedBox(width: 3),
+                                const SizedBox(width: 3),
                                 Text('复制', style: TextStyle(fontSize: 10.5, color: context.c.textSecondary)),
                               ],
                             ),
@@ -239,7 +239,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                               child: Row(
                                 children: [
                                   Icon(Icons.copy_rounded, size: 11, color: context.c.textSecondary),
-                                  SizedBox(width: 3),
+                                  const SizedBox(width: 3),
                                   Text('复制', style: TextStyle(fontSize: 10.5, color: context.c.textSecondary)),
                                 ],
                               ),
@@ -288,7 +288,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
                           Icon(Icons.keyboard_arrow_up_rounded, size: 14, color: context.c.textSecondary),
-                          SizedBox(width: 4),
+                          const SizedBox(width: 4),
                           Text(
                             '收起工具调用',
                             style: TextStyle(

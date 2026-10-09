@@ -208,7 +208,7 @@ class _MemoryCardState extends State<MemoryCard> {
                           styleSheet: MarkdownStyleSheet(
                             p: TextStyle(fontSize: 12.5, color: context.c.textPrimary, height: 1.45),
                             code: TextStyle(
-                              color: Color(0xFF0369A1),
+                              color: const Color(0xFF0369A1),
                               backgroundColor: context.c.background,
                               fontSize: 11.5,
                               fontFamily: 'monospace',

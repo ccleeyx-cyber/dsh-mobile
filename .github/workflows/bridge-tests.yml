@@ -115,12 +115,12 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          # No `cache: 'gradle'`: setup-java fails the job with "No file in
-          # /home/runner/work/... matched to [**/*.gradle*, ...]" when it finds no
-          # Gradle build file to hash, and this repo commits only
-          # android/app/src/main/AndroidManifest.xml. The Gradle project is
-          # synthesised by `flutter create .` further down, i.e. after this step.
-          # Re-enable it once android/ is committed properly.
+          # 曾刻意关掉 `cache: 'gradle'`：仓库里只有 AndroidManifest.xml，
+          # setup-java 找不到任何 **/*.gradle* 可哈希，会直接让 job 失败
+          # （"No file in ... matched to [**/*.gradle*, ...]"），而当时
+          # Gradle 工程是后面由 `flutter create .` 临时合成的。
+          # android/ 现已提交，可以安全启用。
+          cache: 'gradle'
 
       - uses: subosito/flutter-action@v2
         with:
@@ -139,32 +139,25 @@ jobs:
 
       - name: Prepare project & dependencies
         working-directory: ./dsh_mobile
-        # The android/ Gradle project is not committed to this repo — only
-        # AndroidManifest.xml is. CI has to synthesise the rest, and the manifest
-        # has to survive that. Committing android/ properly (ANALYSIS §1.1) would
-        # let this whole dance and the cp hack disappear.
+        # android/ 现在是**已提交**的，因此不再执行 `flutter create .` 去合成它。
+        # 那一步过去必须做，是因为仓库里只有 AndroidManifest.xml 一个文件；
+        # 现在它会把已提交的 build.gradle / MainActivity.kt / proguard-rules.pro
+        # 全部覆盖成模板版本（连带把可覆盖安装的签名配置和后台保活服务抹掉）。
         #
-        # `flutter create .` also synthesises two files that must NOT survive,
-        # because neither is part of this repo and both change what gets judged:
+        # `flutter create .` 曾顺带生成两个不该存在的文件，两者都已从仓库中删除，
+        # 手工再执行一次也不会复活它们：
         #
-        #   - analysis_options.yaml. Its presence activates the `flutter_lints`
-        #     package that pubspec declares but the repo has never configured, and
-        #     `flutter analyze` treats infos as fatal by default. Measured on the
-        #     first run of this gate: 33 prefer_const_constructors /
-        #     prefer_const_literals_to_create_immutables infos, all fatal, so the
-        #     job died before reaching a single real problem.
-        #   - test/widget_test.dart, the stock counter-increment smoke test. This
-        #     app has no counter, so that test can only ever fail. It never
-        #     surfaced before because no workflow ran a Dart test at all.
+        #   - analysis_options.yaml。它的存在会激活 pubspec 声明却从未配置过的
+        #     `flutter_lints`，而 `flutter analyze` 默认把 infos 当致命问题。首次
+        #     跑这个门禁时实测到 33 条 prefer_const_constructors 之类，全部致命，
+        #     于是 job 在碰到任何真实问题之前就死了。
+        #   - test/widget_test.dart，模板自带的计数器冒烟测试。本 App 没有计数器，
+        #     这个测试只可能失败；它此前从未暴露，因为没有任何 workflow 跑过
+        #     Dart 测试。
         #
-        # Deleting both makes CI analyze and test exactly the committed sources,
-        # which is also what a local `flutter analyze` / `flutter test` sees.
-        run: |
-          cp android/app/src/main/AndroidManifest.xml /tmp/AndroidManifest.xml || true
-          flutter create . --platforms=android --project-name=dsh_mobile
-          cp /tmp/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
-          rm -f analysis_options.yaml test/widget_test.dart
-          flutter pub get
+        # 现在 CI 评判的与本地 `flutter analyze` / `flutter test` 看到的是同一份
+        # 已提交源码。
+        run: flutter pub get
 
       - name: Analyze
         working-directory: ./dsh_mobile
