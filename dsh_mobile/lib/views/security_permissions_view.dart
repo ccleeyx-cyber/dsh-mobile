@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../models/audit_log.dart';
+import '../models/approval_preset.dart';
+import '../models/permission_config.dart';
 import '../services/dsh_service.dart';
 import '../widgets/approval_card.dart';
 
@@ -127,6 +129,14 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
               );
             }),
 
+          const SizedBox(height: 24),
+
+          // 1.5 审批预设 (v1.4.2)
+          //
+          // 放在四个原始开关之前，因为预设回答的是用户真正在问的问题
+          // （"我该用哪个档位"），而下面四个开关回答的是另一个问题
+          // （"把这个具体值改掉"）。反过来摆会让人先陷进细节。
+          _buildPresetSection(context, dsh, permissions),
           const SizedBox(height: 24),
 
           // 2. Global Execution & Security Policy Matrix
@@ -317,6 +327,268 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                   ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 审批预设卡片（v1.4.2 审批规则化）。
+  ///
+  /// 三件事刻意做在这里：
+  /// 1. **先讲后果再给按钮。** 每个预设展开后列出它实际会怎样，而不是只给一个
+  ///    名字。让用户在点之前就知道"完全信任"意味着命令能写到工作区以外。
+  /// 2. **切换前先给差异。** 用 PermissionConfigSnapshot.describeDiff 列出这次
+  ///    切换会改哪几项、改成什么；没有差异就直说"与当前设置相同"，而不是默默
+  ///    提交一个空改动。
+  /// 3. **危险预设二次确认。** 只有 danger-full-access 弹窗。给"严格"也弹窗
+  ///    会训练用户闭眼点确认，那比不确认更糟。
+  Widget _buildPresetSection(BuildContext context, DshService dsh, PermissionConfig permissions) {
+    final current = PermissionConfigSnapshot.matching(permissions);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _buildSectionHeader('审批预设 (Approval Presets)', Icons.auto_awesome_rounded, const Color(0xFF7C3AED)),
+        const SizedBox(height: 4),
+        const Text(
+          '一键套用一组经过审阅的策略组合。下面每个预设都列出了它实际会做什么，'
+          '套用后仍可在下方逐项微调。',
+          style: TextStyle(fontSize: 11.5, color: Color(0xFF6B7280), height: 1.45),
+        ),
+        const SizedBox(height: 10),
+        ...ApprovalPreset.values.map((p) => _buildPresetTile(context, dsh, permissions, p, current)),
+      ],
+    );
+  }
+
+  Widget _buildPresetTile(
+    BuildContext context,
+    DshService dsh,
+    PermissionConfig permissions,
+    ApprovalPreset preset,
+    ApprovalPreset? current,
+  ) {
+    final isActive = current?.id == preset.id;
+    final borderColor = isActive
+        ? const Color(0xFF7C3AED)
+        : (preset.isDangerous ? const Color(0xFFFCA5A5) : const Color(0xFFE5E7EB));
+    final diff = PermissionConfigSnapshot.describeDiff(permissions, preset.config);
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: borderColor, width: isActive ? 1.6 : 1),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.02), blurRadius: 4, offset: const Offset(0, 1)),
+        ],
+      ),
+      child: Theme(
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          initiallyExpanded: isActive,
+          tilePadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
+          childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+          shape: const Border(),
+          collapsedShape: const Border(),
+          title: Row(
+            children: [
+              Text(
+                preset.label,
+                style: TextStyle(
+                  fontSize: 14.5,
+                  fontWeight: FontWeight.w600,
+                  color: preset.isDangerous ? const Color(0xFFB91C1C) : const Color(0xFF111827),
+                ),
+              ),
+              const SizedBox(width: 8),
+              if (isActive)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF7C3AED).withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: const Text(
+                    '当前',
+                    style: TextStyle(fontSize: 10, color: Color(0xFF7C3AED), fontWeight: FontWeight.bold),
+                  ),
+                ),
+              if (preset.isDangerous) ...[
+                const SizedBox(width: 6),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFEE2E2),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: const Color(0xFFFCA5A5)),
+                  ),
+                  child: const Text(
+                    '高风险',
+                    style: TextStyle(fontSize: 10, color: Color(0xFFB91C1C), fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ],
+          ),
+          subtitle: Text(
+            preset.summary,
+            style: const TextStyle(fontSize: 11.5, color: Color(0xFF6B7280)),
+          ),
+          children: [
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                '这个档位会：',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: preset.isDangerous ? const Color(0xFFB91C1C) : const Color(0xFF374151),
+                ),
+              ),
+            ),
+            const SizedBox(height: 5),
+            ...preset.effects.map(
+              (e) => Padding(
+                padding: const EdgeInsets.only(bottom: 3),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.only(top: 5, right: 6),
+                      child: Container(
+                        width: 3,
+                        height: 3,
+                        decoration: BoxDecoration(
+                          color: preset.isDangerous ? const Color(0xFFB91C1C) : const Color(0xFF9CA3AF),
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: Text(
+                        e,
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          height: 1.45,
+                          color: preset.isDangerous ? const Color(0xFFB91C1C) : const Color(0xFF4B5563),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            // 差异预览：切换前就说清楚会改什么。
+            if (diff.isNotEmpty) ...[
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(9),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF9FAFB),
+                  borderRadius: BorderRadius.circular(7),
+                  border: Border.all(color: const Color(0xFFE5E7EB)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '套用后会改变：',
+                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: Color(0xFF6B7280)),
+                    ),
+                    const SizedBox(height: 4),
+                    ...diff.map(
+                      (d) => Text('· $d', style: const TextStyle(fontSize: 11, color: Color(0xFF6B7280), height: 1.5)),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 10),
+            ] else ...[
+              const Text(
+                '与当前设置完全相同，套用不会改变任何配置项。',
+                style: TextStyle(fontSize: 11, color: Color(0xFF9CA3AF)),
+              ),
+              const SizedBox(height: 10),
+            ],
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                onPressed: isActive
+                    ? null
+                    : () => _applyPreset(context, dsh, permissions, preset, diff),
+                style: FilledButton.styleFrom(
+                  backgroundColor: preset.isDangerous ? const Color(0xFFDC2626) : const Color(0xFF7C3AED),
+                  disabledBackgroundColor: const Color(0xFFE5E7EB),
+                  disabledForegroundColor: const Color(0xFF9CA3AF),
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                ),
+                child: Text(
+                  isActive ? '当前正在使用' : '套用此预设',
+                  style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 应用预设。只有「完全信任」需要二次确认。
+  Future<void> _applyPreset(
+    BuildContext context,
+    DshService dsh,
+    PermissionConfig permissions,
+    ApprovalPreset preset,
+    List<String> diff,
+  ) async {
+    if (preset.isDangerous) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Row(
+            children: [
+              Icon(Icons.warning_amber_rounded, color: Color(0xFFDC2626), size: 22),
+              SizedBox(width: 8),
+              Text('套用「完全信任」？'),
+            ],
+          ),
+          content: const Text(
+            '套用后 Agent 执行的任何命令都不再弹窗确认，并且可以写到工作区以外'
+            '的任意路径。\n\n'
+            '这相当于把宿主机上的执行权限交给模型。如果这台机器上有你不能承受'
+            '损失的数据或凭据，请不要继续。',
+            style: TextStyle(height: 1.5),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+            FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: const Color(0xFFDC2626)),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('我明白风险，套用'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+    }
+
+    final ok = await dsh.updatePermissions(preset.config.applyTo(permissions));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).clearSnackBars();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          ok
+              ? (diff.isEmpty
+                  ? '已套用「${preset.label}」（配置无变化）'
+                  : '已套用「${preset.label}」，改动 ${diff.length} 项')
+              : '套用失败: ${dsh.lastError}',
+        ),
+        duration: const Duration(seconds: 3),
+        behavior: SnackBarBehavior.floating,
       ),
     );
   }

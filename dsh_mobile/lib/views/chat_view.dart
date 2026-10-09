@@ -14,6 +14,8 @@ import '../widgets/memory_card.dart';
 import '../widgets/safe_markdown.dart';
 import 'widgets/question_card.dart';
 import 'widgets/attachment_tile.dart';
+import 'widgets/message_search.dart';
+import 'widgets/message_search_panel.dart';
 import 'config_page.dart';
 
 class ChatView extends StatefulWidget {
@@ -39,6 +41,68 @@ class _ChatViewState extends State<ChatView> {
   int _lastMessageCount = 0;
   bool _wasLoadingHistory = false;
 
+  // ---- 会话内查找 (v1.4.2) ----
+  final TextEditingController _searchController = TextEditingController();
+  final Map<String, GlobalKey> _messageKeys = {};
+  bool _searchOpen = false;
+  String _searchQuery = '';
+
+  /// 当前被高亮的命中消息 id。高亮只保留一条 —— 一次跳到第一条就够用户确认
+  /// "查找能用了"，剩下的自己点；全部高亮反而让页面变成一片黄。
+  final Set<String> _highlightedMessageIds = {};
+
+  // ---- 离线草稿 (v1.4.2) ----
+
+  void _toggleSearch() {
+    setState(() {
+      _searchOpen = !_searchOpen;
+      if (!_searchOpen) {
+        // 只清文本，不 dispose：controller 在 State 生命周期内复用，关闭再打开
+        // 是常态，dispose 后再用会抛。
+        _searchController.clear();
+        _searchQuery = '';
+        _highlightedMessageIds.clear();
+      }
+    });
+    if (!_searchOpen) {
+      _inputFocusNode.requestFocus();
+    }
+  }
+
+  void _onSearchChanged(String q) {
+    setState(() {
+      _searchQuery = q;
+      _highlightedMessageIds.clear();
+    });
+  }
+
+  /// 跳到命中的消息并短暂高亮。
+  void _jumpToHit(SearchHit hit, DshService dsh) {
+    final msg = hit.messageIndex < dsh.messages.length ? dsh.messages[hit.messageIndex] : null;
+    if (msg == null) return;
+    setState(() {
+      _highlightedMessageIds
+        ..clear()
+        ..add(msg.id);
+    });
+    final key = _messageKeys[msg.id];
+    final ctx = key?.currentContext;
+    if (ctx != null) {
+      Scrollable.ensureVisible(
+        ctx,
+        duration: const Duration(milliseconds: 320),
+        curve: Curves.easeOutCubic,
+        alignment: 0.28,
+      );
+    }
+    // 高亮会淡出，所以不必永久留在 _highlightedMessageIds 里。
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _highlightedMessageIds.remove(msg.id));
+    });
+  }
+
+  GlobalKey _keyForMessage(String id) => _messageKeys.putIfAbsent(id, () => GlobalKey());
+
   // Keyboard & viewport avoidance state
   double _lastBottomInset = 0.0;
   bool _wasNearBottomBeforeKeyboard = true;
@@ -63,6 +127,7 @@ class _ChatViewState extends State<ChatView> {
     _scrollController.removeListener(_onScroll);
     _inputFocusNode.dispose();
     _inputController.dispose();
+    _searchController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
@@ -1109,6 +1174,12 @@ class _ChatViewState extends State<ChatView> {
       _lastMessageCount = dsh.messages.length;
       _lastStreamRevision = dsh.streamRevision;
       _userScrolledUp = false;
+      // 切会话时换草稿（v1.4.2）。先把当前输入框里的字存进它所属的会话，再读
+      // 新会话的 —— 顺序反了就会把上一个会话的字写进新会话。
+      dsh.updateDraft(_inputController.text);
+      final restored = dsh.currentDraft;
+      _inputController.text = restored;
+      _inputController.selection = TextSelection.collapsed(offset: restored.length);
       _jumpToBottom();
     } else if (_wasLoadingHistory && !dsh.isLoadingHistory) {
       _lastStreamRevision = dsh.streamRevision;
@@ -1286,6 +1357,17 @@ class _ChatViewState extends State<ChatView> {
               await dsh.createNewSession();
               _scrollToBottom();
             },
+          ),
+
+          // 会话内查找
+          IconButton(
+            tooltip: '在当前会话中查找',
+            icon: Icon(
+              _searchOpen ? Icons.search_off_rounded : Icons.search_rounded,
+              color: _searchOpen ? const Color(0xFF0078D4) : const Color(0xFF374151),
+              size: 22,
+            ),
+            onPressed: _toggleSearch,
           ),
 
           // More Options Popup Menu
@@ -1545,7 +1627,32 @@ class _ChatViewState extends State<ChatView> {
                             itemBuilder: (context, index) {
                               // 1. Messages first (historical and streaming assistant response)
                               if (index < dsh.messages.length) {
-                                return _buildMessageItem(dsh.messages[index]);
+                                final m = dsh.messages[index];
+                                // 附 GlobalKey：会话内查找要靠 ensureVisible 精确滚到
+                                // 命中的那条消息。没有 key 只能按索引估算 offset，而
+                                // 消息高度是可变的，估算必然滚偏。
+                                final highlighted = _highlightedMessageIds.contains(m.id);
+                                Widget built = _buildMessageItem(m);
+                                if (highlighted) {
+                                  // 高亮放在这里而不是 _buildMessageItem 内部：这样
+                                  // 记忆卡、工具卡等所有分支都被同一层覆盖，不必逐个
+                                  // 分支记得包一次（漏一个就是"某些消息不高亮"）。
+                                  built = DecoratedBox(
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFFFEF3C7).withOpacity(0.5),
+                                      borderRadius: BorderRadius.circular(8),
+                                      border: Border.all(
+                                        color: const Color(0xFFF59E0B),
+                                        width: 1.2,
+                                      ),
+                                    ),
+                                    child: built,
+                                  );
+                                }
+                                return KeyedSubtree(
+                                  key: _keyForMessage(m.id),
+                                  child: built,
+                                );
                               }
 
                               // 2. Pending approvals appended at the end of active chat stream
@@ -1593,6 +1700,22 @@ class _ChatViewState extends State<ChatView> {
                     ],
                   ),
           ),
+
+          // 会话内查找面板（v1.4.2）。位置在交互块之上、输入框之下：查找是会话级
+          // 操作，不该被某个提问卡片挤到屏幕外。
+          if (_searchOpen)
+            MessageSearchPanel(
+              query: _searchQuery,
+              results: _searchQuery.trim().isEmpty
+                  ? const []
+                  : MessageSearch.collapse(MessageSearch.search(dsh.messages, _searchQuery)),
+              totalHits: _searchQuery.trim().isEmpty
+                  ? 0
+                  : MessageSearch.search(dsh.messages, _searchQuery).length,
+              onQueryChanged: _onSearchChanged,
+              onClose: _toggleSearch,
+              onJumpTo: (hit) => _jumpToHit(hit, dsh),
+            ),
 
           // 提问卡片 / TODO 面板 / 图片附件（patch 0003）。
           //
@@ -1919,6 +2042,7 @@ class _ChatViewState extends State<ChatView> {
                       isDense: true,
                       contentPadding: EdgeInsets.symmetric(vertical: 11),
                     ),
+                    onChanged: (v) => dsh.updateDraft(v),
                     onSubmitted: (_) => _sendMessage(dsh),
                   ),
                 ),

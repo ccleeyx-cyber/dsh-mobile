@@ -13,6 +13,7 @@ import '../models/approval_request.dart';
 import '../models/dsh_settings.dart';
 import '../models/permission_config.dart';
 import '../models/user_question.dart';
+import 'draft_store.dart';
 import '../models/audit_log.dart';
 import '../models/persona.dart';
 
@@ -103,6 +104,35 @@ class DshService extends ChangeNotifier {
   /// 每个会话已知的图片附件元信息。**只有元数据，没有字节** —— 图片通过已鉴权
   /// 的附件路由按需拉取，所以这个 map 的内存占用与图片大小无关。
   final Map<String, Map<String, AttachmentRef>> _attachments = {};
+
+  /// 按会话保存的输入草稿（v1.4.2 离线草稿）。
+  ///
+  /// 单例：main() 在 runApp 之前把 SharedPreferences 挂到 DraftStore.instance 上，
+  /// 而这里是同一个实例。挂成两个实例会让"写进去的草稿读不出来"。
+  /// 挂在 service 上（而不是 widget 上），是为了让「发送失败 / 离线」这条路径
+  /// 也能决定草稿去留 —— 草稿规则取决于会话状态，不只是文本框内容。
+  final DraftStore drafts = DraftStore.instance;
+
+  /// 当前会话的草稿键。
+  ///
+  /// 尚未创建首个会话时用固定键 `__new__`：用户在会话产生之前打的字也不该
+  /// 丢。网关返回真实 id 后草稿自然归属到新会话。
+  String get _draftKey => _currentSession?.sessionId ?? '__new__';
+
+  String get currentDraft => drafts.read(_draftKey);
+
+  void updateDraft(String text) => drafts.write(_draftKey, text);
+
+  /// 发出成功后清草稿。**只在这里清** —— 见 [sendChatMessage] 的失败分支。
+  void _clearDraftAfterSend() => drafts.clear(_draftKey);
+
+  /// 离线 / 发送失败时把正文还回草稿。
+  ///
+  /// 这是草稿功能真正的价值：用户点发送 → 手机没信号 → 正文凭空消失，用户
+  /// 只能凭记忆重打。所以失败时正文必须回到输入框。
+  void restoreDraft(String text) => drafts.write(_draftKey, text);
+
+  List<MapEntry<String, String>> get allDrafts => drafts.all();
 
   // Getters
   ConnectionStatus get status => _status;
@@ -781,6 +811,9 @@ class DshService extends ChangeNotifier {
       if (res != null && res.statusCode == 200) {
         // 3. Start fallback session polling
         _startSessionPolling(sessionId);
+        // 只在真正被网关接受后清草稿。放在失败分支之前清，会让"重试"失去
+        // 正文。
+        _clearDraftAfterSend();
       } else {
         if (_isCanceling || turnId <= _cancelledTurnSeq) return;
         String errStr = '发送失败 (HTTP ${res?.statusCode})';
@@ -794,6 +827,8 @@ class DshService extends ChangeNotifier {
         assistantMsg.content = '❌ 发送失败: $errStr';
         assistantMsg.isStreaming = false;
         _isSending = false;
+        // 正文还回草稿：网关没收到，用户不该只能凭记忆重打。
+        restoreDraft(text);
         notifyListeners();
       }
     } catch (e) {
@@ -803,6 +838,7 @@ class DshService extends ChangeNotifier {
       assistantMsg.content = '❌ 发送指令失败: $e';
       assistantMsg.isStreaming = false;
       _isSending = false;
+      restoreDraft(text);
       notifyListeners();
     }
   }
@@ -2011,6 +2047,9 @@ class DshService extends ChangeNotifier {
     debugPrint('[DshService] App paused to background');
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
+    // 切后台是 Android 杀进程前的最后机会。草稿的防抖写盘可能还有几百毫秒
+    // 才落盘，而这里的 flushNow 是同步的 —— 不 flush 就会丢掉用户刚打的字。
+    drafts.flushNow();
   }
 
   void disconnect() {

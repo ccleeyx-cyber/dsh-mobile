@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'models/server_config.dart';
 import 'services/dsh_service.dart';
+import 'services/draft_store.dart';
 import 'services/storage_service.dart';
 import 'views/config_page.dart';
 import 'views/main_shell.dart';
@@ -28,6 +30,12 @@ void main() async {
     );
   };
   final savedConfig = await StorageService.loadConfig();
+
+  // 草稿存储要在 runApp 之前接好 SharedPreferences（v1.4.2）。DshService 构造时
+  // 就 new 出了 DraftStore，所以这里只挂实例、不改 provider 结构 —— 让
+  // DraftStore 先在内存里可用（早期打的字不丢），再补上持久化。
+  final prefs = await SharedPreferences.getInstance();
+  DraftStore.instance.attach(prefs);
 
   runApp(
     MultiProvider(

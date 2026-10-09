@@ -1,6 +1,6 @@
 /// Build identity for the app.
 ///
-/// Keep in sync with `pubspec.yaml` (`version: 1.4.1+16`). The bridge exposes a
+/// Keep in sync with `pubspec.yaml` (`version: 1.5.0+17`). The bridge exposes a
 /// comparable value via `GET /api/mobile/health` as `version`, so the two can be
 /// checked against each other.
 ///
@@ -19,6 +19,6 @@
 class AppVersion {
   const AppVersion._();
 
-  static const String version = '1.4.1';
-  static const String buildNumber = '16';
+  static const String version = '1.5.0';
+  static const String buildNumber = '17';
 }
