@@ -1,0 +1,194 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:dsh_mobile/models/server_config.dart';
+import 'package:dsh_mobile/services/dsh_service.dart';
+
+/// 「agent 弹出的选择手机端没显示出来」的回归测试。
+///
+/// ## 缺陷本体
+///
+/// App 要向网关声明"这台手机愿意回答交互式提问"（`subscribe_questions`），网关
+/// 才把提问转发过来；否则它按设计把提问留给 Web UI。
+///
+/// 而声明原来的发送时机是错的：它在 `_channel.stream.listen(...)` 刚注册完就调
+/// `_sendWsJson({'type':'subscribe_questions'})`，但 `_sendWsJson` 的守卫要求
+/// `_status == connected` —— 而 `_status` 恰恰是**收到第一条消息时**才被置位的。
+/// 于是那一次订阅被静默丢弃，网关永远认为没有手机订阅者，提问一个都到不了手机。
+///
+/// ## 为什么必须用真实 WebSocket 服务器测
+///
+/// 这个 bug 是**时序**问题：谁先谁后。打桩 `_sendWsJson` 只能验证"调用了"，
+/// 验证不了"在那一刻发得出去"。起一个真的 WS 服务器、断言它**实际收到**了
+/// subscribe_questions，才是能抓到这个 bug 的判据。
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  // ⚠️ flutter_test 默认装一个 HttpOverrides，把所有真实 HTTP 请求换成假的响应
+  // （意图是防止单测打网络）。WebSocketChannel 底层走 HttpClient，会被一起拦掉,
+  // 表现为"连接被拒绝"、服务器一条消息都收不到 —— 而代码其实没问题。
+  //
+  // 关键：必须在**每个测试体内部**解除它。放在 setUpAll / setUp 里不生效 ——
+  // flutter_test 是在每个测试自己的 Zone 里应用 override 的，外层赋值会被覆盖。
+  // （这个坑实测踩过：setUpAll 里设 null 之后仍然全是 ECONNREFUSED。）
+  void allowRealNetwork() => HttpOverrides.global = null;
+
+  late HttpServer server;
+  late int port;
+  late List<String> received;
+  late List<WebSocket> sockets;
+
+  setUp(() async {
+    received = [];
+    sockets = [];
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    port = server.port;
+
+    server.listen((req) async {
+      if (WebSocketTransformer.isUpgradeRequest(req)) {
+        final ws = await WebSocketTransformer.upgrade(req);
+        sockets.add(ws);
+        ws.listen(
+          (data) {
+            if (data is String) received.add(data);
+          },
+          onError: (_) {},
+          cancelOnError: false,
+        );
+        return;
+      }
+      // connect() 还会顺手拉一批 REST 数据。这里一律 404，让它们快速失败，
+      // 不要在测试里挂住。
+      req.response.statusCode = HttpStatus.notFound;
+      await req.response.close();
+    });
+  });
+
+  tearDown(() async {
+    for (final ws in sockets) {
+      try { await ws.close(); } catch (_) {}
+    }
+    try { await server.close(force: true); } catch (_) {}
+  });
+
+  /// 等到 [test] 为真，或超时。返回是否等到。
+  Future<bool> waitFor(bool Function() test,
+      {Duration timeout = const Duration(seconds: 5)}) async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      if (test()) return true;
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+    }
+    return test();
+  }
+
+  List<Map<String, dynamic>> parsed() => received
+      .map((s) {
+        try {
+          final v = jsonDecode(s);
+          return v is Map<String, dynamic> ? v : <String, dynamic>{};
+        } catch (_) {
+          return <String, dynamic>{};
+        }
+      })
+      .toList();
+
+  test('连接建立后必须真的把 subscribe_questions 发出去', () async {
+    allowRealNetwork();
+    final dsh = DshService();
+    // 不 await：connect 末尾还会 await 一批会 404 的 REST 拉取，我们只关心
+    // WS 这条线。
+    unawaited(dsh.connect(ServerConfig(
+      host: '127.0.0.1',
+      port: port,
+      token: 'test-token',
+    )));
+
+    final got = await waitFor(
+      () => parsed().any((m) => m['type'] == 'subscribe_questions'),
+    );
+
+    expect(
+      got,
+      isTrue,
+      reason: '服务器实际收到的消息里必须有 subscribe_questions —— '
+          '旧代码在 _status 还是 connecting 时就发，会被守卫丢掉，'
+          '结果网关认为没有手机订阅者，所有提问都只留给 Web UI。'
+          '实际收到：$received',
+    );
+
+    dsh.disconnect();
+  });
+
+  test('订阅是在连接确立之后发的，不是刚建连就发', () async {
+    allowRealNetwork();
+    final dsh = DshService();
+    unawaited(dsh.connect(ServerConfig(
+      host: '127.0.0.1',
+      port: port,
+      token: 'test-token',
+    )));
+
+    final got = await waitFor(
+      () => parsed().any((m) => m['type'] == 'subscribe_questions'),
+    );
+    expect(got, isTrue);
+
+    // 关键：消息确实到达了服务器。如果它是在 _status 还是 connecting 的时候
+    // 被发送的，它就永远不会出现在这里 —— 这正是旧的失败方式。
+    expect(received, isNotEmpty);
+    dsh.disconnect();
+  });
+
+  test('网关回的 pending 提问能被重放出来（连接前就挂着的提问）', () async {
+    allowRealNetwork();
+    final dsh = DshService();
+    unawaited(dsh.connect(ServerConfig(
+      host: '127.0.0.1',
+      port: port,
+      token: 'test-token',
+    )));
+
+    // 等服务器拿到握手/订阅，再模拟网关回一条带 pending 的确认。
+    final subscribed = await waitFor(
+      () => parsed().any((m) => m['type'] == 'subscribe_questions'),
+    );
+    expect(subscribed, isTrue, reason: '前置条件：必须先订阅');
+
+    expect(sockets, isNotEmpty);
+    sockets.first.add(jsonEncode({
+      'type': 'question_subscribed',
+      'ok': true,
+      'pending': [
+        {
+          'eventId': 'evt-1',
+          'sessionId': 's1',
+          'questions': [
+            {
+              'id': 'q1',
+              'question': '要继续吗？',
+              'options': [
+                {'label': '继续'},
+                {'label': '停止'},
+              ],
+            }
+          ],
+        }
+      ],
+    }));
+
+    final shown = await waitFor(() => dsh.pendingQuestions.isNotEmpty);
+    expect(
+      shown,
+      isTrue,
+      reason: '网关回放的挂起提问必须被解析留存，否则重连后看不到任何提问。'
+          '实际：${dsh.pendingQuestions.length} 条',
+    );
+    expect(dsh.pendingQuestions.first.eventId, 'evt-1');
+
+    dsh.disconnect();
+  });
+}

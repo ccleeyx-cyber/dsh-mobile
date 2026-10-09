@@ -97,6 +97,9 @@ class DshService extends ChangeNotifier {
   /// 是否已向网关声明本机可以回答提问。断线重连后要重新订阅。
   bool _questionsSubscribed = false;
 
+  /// 本次连接是否已经发过订阅请求（幂等用；每次 connect 重置）。
+  bool _subscribeRequested = false;
+
   /// 最近一次提问失败/失效的原因，用于卡片上的提示。成功作答后清空。
   String? _lastQuestionError;
 
@@ -381,6 +384,8 @@ class DshService extends ChangeNotifier {
     _reconnectAttempts = 0;
 
     _status = ConnectionStatus.connecting;
+    // 新连接：允许重新发一次订阅。
+    _subscribeRequested = false;
     notifyListeners();
 
     try {
@@ -391,12 +396,9 @@ class DshService extends ChangeNotifier {
 
       _channelSubscription = _channel!.stream.listen(
         (data) {
-          if (_status != ConnectionStatus.connected) {
-            _status = ConnectionStatus.connected;
-            _reconnectAttempts = 0;
-            _isReconnecting = false;
-            notifyListeners();
-          }
+          // 兜底：正常情况下 ready 已经把状态翻好了，这里再兜一次是为了应对
+          // "消息比 ready 先到"的实现细节差异。
+          _onSocketReady();
           _handleRawMessage(data);
         },
         onError: (error) {
@@ -430,12 +432,20 @@ class DshService extends ChangeNotifier {
 
       _startHeartbeat();
 
-      // Opt in to interactive prompts. Re-sent on every (re)connect because the
-      // gateway keeps subscriptions per live socket: a reconnect lands on a new
-      // socket that has never heard of this phone, and without this the user
-      // would silently stop being able to answer questions.
-      _questionsSubscribed = false;
-      _sendWsJson({'type': 'subscribe_questions'});
+      // 等连接**真正打开**再标记 connected 并订阅。
+      //
+      // 为什么必须显式等 ready，而不能像原来那样"等第一条消息再翻状态"：
+      // 网关那边是"收到订阅才发消息"，而 App 这边是"收到消息才订阅" —— 两边
+      // 互等就是死锁，提问一个都到不了手机。实测就是这个表现：连接建立了、
+      // 没有任何报错，但服务器一条 subscribe_questions 都没收到。
+      try {
+        await _channel!.ready;
+        _onSocketReady();
+      } catch (e) {
+        // ready 失败会走 stream 的 onError/onDone，由它们负责重连；这里只记录，
+        // 不重复触发，避免两条路径同时排重连。
+        debugPrint('[DshService] WS ready 失败: $e');
+      }
 
       // Fetch initial data
       await fetchWorkspaces();
@@ -692,6 +702,37 @@ class DshService extends ChangeNotifier {
       throw const AttachmentError('上传成功但服务端没有返回凭据，请重试');
     }
     return receiptId;
+  }
+
+  /// 连接已确立：标记状态，并声明愿意回答提问。
+  ///
+  /// 两处调用：`await _channel.ready`（主路径）与收到第一条消息时（兜底）。
+  /// 幂等 —— 同一条连接上重复调用不会重复发订阅。
+  void _onSocketReady() {
+    if (_status != ConnectionStatus.connected) {
+      _status = ConnectionStatus.connected;
+      _reconnectAttempts = 0;
+      _isReconnecting = false;
+      notifyListeners();
+    }
+    if (_subscribeRequested) return;
+    _subscribeRequested = true;
+    _subscribeToQuestions();
+  }
+
+  /// 向网关声明"这台手机愿意回答交互式提问"。
+  ///
+  /// 只在连接确立时调用（每次重连都要重新调用：网关按**活的 socket** 记录订阅，
+  /// 重连会落到一个从没见过这台手机的新 socket 上，不重新声明就会静默地再也
+  /// 收不到提问）。
+  ///
+  /// 网关那边的行为是二选一的：有订阅者才转发 `question_request` 给手机；
+  /// 没有订阅者就把这次提问留给 Web UI（见 dsh-server-plugin 的
+  /// `questionSubscribers.size === 0` 分支）。所以这一步漏了，表现就是
+  /// 「agent 弹的选择在手机上完全不显示」—— 不是渲染问题，而是根本没收到。
+  void _subscribeToQuestions() {
+    _questionsSubscribed = false;
+    _sendWsJson({'type': 'subscribe_questions'});
   }
 
   /// 返回是否真的发出去了。
@@ -2085,7 +2126,11 @@ class DshService extends ChangeNotifier {
     _channelSubscription = null;
     if (_channel != null) {
       try {
-        await _channel!.sink.close(ws_status.goingAway).timeout(
+        // 同 disconnect()：必须用 1000 normalClosure，不能用 goingAway(1001)。
+        // 1001 是协议保留码，客户端发它会被底层直接拒绝并抛异常 —— 而这里是
+        // 同步抛出，所以 await/timeout 都来不及生效，close 根本没开始。
+        // 表现是"每次重连都只是把旧 socket 丢掉而不关闭它"，连接在两端泄漏。
+        await _channel!.sink.close(ws_status.normalClosure).timeout(
           const Duration(milliseconds: 500),
           onTimeout: () {},
         );
@@ -2140,6 +2185,8 @@ class DshService extends ChangeNotifier {
 
     _isReconnecting = true;
     _status = ConnectionStatus.connecting;
+    // 新连接：允许重新发一次订阅。
+    _subscribeRequested = false;
     notifyListeners();
 
     try {
@@ -2261,10 +2308,31 @@ class DshService extends ChangeNotifier {
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _stopHeartbeat();
-    _channel?.sink.close(ws_status.goingAway);
+
+    // 先把状态落定、再关底层 socket。
+    //
+    // 顺序很重要：关闭码、socket 是否已半关，这些都取决于底层库，任何一种失败
+    // 都不该让"已断开"这个状态写不上去。
+    final closing = _channel;
     _channel = null;
     _status = ConnectionStatus.disconnected;
     notifyListeners();
+
+    try {
+      // 必须是 1000（正常关闭），**不能**用 ws_status.goingAway。
+      //
+      // goingAway 是 1001，属于协议保留码：客户端只允许发 1000 或 3000-4999，
+      // 发 1001 会被底层直接拒绝并抛
+      //   "Invalid argument: 1001, close code must be 1000 or in the range 3000-4999"。
+      //
+      // 这不是理论问题，是实测到的真实缺陷：那个异常会中断 disconnect()，使它
+      // 后面的 _channel = null / _status = disconnected / notifyListeners() 全部
+      // 不执行 —— 调用方以为断开了，实际状态仍是 connected、界面也不刷新；
+      // dispose() 里的 super.dispose() 同样被跳过。由订阅集成测试暴露。
+      closing?.sink.close(ws_status.normalClosure);
+    } catch (e) {
+      debugPrint('[DshService] 关闭 WS 失败（状态已更新，忽略）: $e');
+    }
   }
 
   @override

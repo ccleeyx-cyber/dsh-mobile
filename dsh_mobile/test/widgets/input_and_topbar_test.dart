@@ -39,8 +39,14 @@ void main() {
   }
 
   Future<void> teardown(WidgetTester tester) async {
+    // 先把待定的计时器跑完再拆树。
+    //
+    // 必要性：输入框的 onChanged 会调用 dsh.updateDraft()，而草稿存储有 600ms
+    // 防抖计时器。测试若在它到期前结束，Flutter 会以
+    // "A Timer is still pending even after the widget tree was disposed" 失败、
+    // 而那个失败与产品行为无关，纯粹是测试没把时间轴走完。
     await tester.pumpWidget(const SizedBox.shrink());
-    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 800));
   }
 
   group('语音按钮必须永远可点（用户报「有按钮但没法点击、也没弹权限」）', () {
@@ -120,7 +126,7 @@ void main() {
     testWidgets('输入栏有附件按钮，且可点', (tester) async {
       await pumpChat(tester);
 
-      final icon = find.byIcon(Icons.attach_file_rounded);
+      final icon = find.byIcon(Icons.add_rounded);
       expect(icon, findsOneWidget, reason: '输入栏必须有附件入口');
 
       final ink = tester.widget<InkWell>(
@@ -138,7 +144,7 @@ void main() {
       dsh.debugSetConnection(true);
       await tester.pump();
 
-      await tester.tap(find.byIcon(Icons.attach_file_rounded));
+      await tester.tap(find.byIcon(Icons.add_rounded));
       await tester.pumpAndSettle();
 
       expect(find.text('图片'), findsOneWidget);
@@ -150,7 +156,7 @@ void main() {
     testWidgets('离线时点附件不打开选择器，而是提示先重连', (tester) async {
       await pumpChat(tester);
 
-      await tester.tap(find.byIcon(Icons.attach_file_rounded));
+      await tester.tap(find.byIcon(Icons.add_rounded));
       await tester.pumpAndSettle();
 
       // 离线时打开选择器只会让用户白选一次、上传必然失败，所以必须先拦住。
@@ -268,6 +274,129 @@ void main() {
         isTrue,
         reason: '输入栏底边 ${bar.bottom} 应等于键盘顶边 $keyboardTop；'
             '两者之差就是输入框下方那条空白的高度',
+      );
+
+      await teardown(tester);
+    });
+  });
+
+  group('输入卡片：全部控件都在框内（v1.10.2 的布局重做）', () {
+    testWidgets('四个控件都在输入卡片内部，而不是并排在它外面', (tester) async {
+      await pumpChat(tester);
+
+      // 卡片的判定用"包含输入框的最内层那个圆角容器"来表达：直接量几何关系
+      // 比找一个样式常量稳。附件、模型、麦克风、发送都必须在它内部。
+      final card = find.ancestor(
+        of: find.byType(TextField),
+        matching: find.byType(Container),
+      );
+      expect(card, findsWidgets);
+
+      for (final probe in <(String, Finder)>[
+        ('附件', find.byIcon(Icons.add_rounded)),
+        // 语音图标取决于可用性探测结果：测试环境里插件拿不到，探测会失败，
+        // 于是渲染的是"划掉的麦克风"。所以两种都接受 —— 这里要断言的是
+        // **位置**（在卡片内），不是可用状态。
+        (
+          '麦克风',
+          find.byWidgetPredicate(
+            (w) =>
+                w is Icon &&
+                (w.icon == Icons.mic_none_rounded || w.icon == Icons.mic_off_rounded),
+          )
+        ),
+        ('发送', find.byIcon(Icons.arrow_upward_rounded)),
+      ]) {
+        final (label, finder) = probe;
+        expect(finder, findsOneWidget, reason: '$label 控件必须存在');
+
+        // 几何判定：控件的水平范围必须落在卡片内，而不是卡片右侧的空白里。
+        final cardRect = tester.getRect(card.last);
+        final ctlRect = tester.getRect(finder);
+        expect(
+          ctlRect.left >= cardRect.left - 1 && ctlRect.right <= cardRect.right + 1,
+          isTrue,
+          reason: '$label 应位于输入卡片内部：控件 $ctlRect vs 卡片 $cardRect',
+        );
+      }
+
+      await teardown(tester);
+    });
+
+    testWidgets('模型选择在输入卡片里，且可点开', (tester) async {
+      final dsh = await pumpChat(tester);
+      dsh.debugSetConnection(true);
+      await tester.pump();
+
+      // 模型名来自 dsh.currentModel；这里只校验"有一处可点的模型入口"。
+      final pill = find.byIcon(Icons.keyboard_arrow_down_rounded);
+      expect(pill, findsOneWidget, reason: '模型选择下拉必须在输入卡片里');
+
+      final ink = tester.widget<InkWell>(
+        find.ancestor(of: pill, matching: find.byType(InkWell)).first,
+      );
+      expect(ink.onTap, isNotNull, reason: '模型选择必须可点');
+
+      await teardown(tester);
+    });
+
+    testWidgets('发送键在没内容时不可点、有文字后可点', (tester) async {
+      await pumpChat(tester);
+
+      InkWell sendInk() => tester.widget<InkWell>(
+            find.ancestor(
+              of: find.byIcon(Icons.arrow_upward_rounded),
+              matching: find.byType(InkWell),
+            ).first,
+          );
+
+      // 空输入框：发送键必须是禁用的 —— 上一版无论有没有文字都是亮着的，
+      // 点下去没反应，用户会以为卡住了。
+      expect(sendInk().onTap, isNull, reason: '没有可发内容时发送键应禁用');
+
+      await tester.enterText(find.byType(TextField), '你好');
+      await tester.pump();
+
+      expect(sendInk().onTap, isNotNull, reason: '有文字后发送键必须可点');
+
+      await teardown(tester);
+    });
+
+    testWidgets('挂了附件但没写字时，发送键也可点', (tester) async {
+      await pumpChat(tester);
+      final state = tester.state(find.byType(ChatView));
+
+      (state as dynamic).debugAddPendingAttachment(
+        const PendingFile(localId: 'f1', name: 'a.txt', byteLength: 8, receiptId: 'r'),
+      );
+      await tester.pump();
+
+      final ink = tester.widget<InkWell>(
+        find.ancestor(
+          of: find.byIcon(Icons.arrow_upward_rounded),
+          matching: find.byType(InkWell),
+        ).first,
+      );
+      // 引擎的准入规则是"文字或附件"，所以只有附件也必须能发。
+      expect(ink.onTap, isNotNull, reason: '只挂附件也应当能发送');
+
+      await teardown(tester);
+    });
+
+    testWidgets('顶栏不再有工作区/模型胶囊（已移进输入卡片，避免重复）', (tester) async {
+      await pumpChat(tester);
+
+      // 顶栏里不应该再出现工作区或模型胶囊：
+      //   * 工作区胶囊用 Icons.folder_rounded
+      //   * 模型胶囊用 Icons.smart_toy_outlined + 下拉箭头
+      // 输入卡片里的模型入口用的是 keyboard_arrow_down_rounded，两者不同，
+      // 所以这里的断言不会误伤。
+      expect(find.byIcon(Icons.folder_rounded), findsNothing,
+          reason: '工作区胶囊已从顶栏移除');
+      expect(
+        find.descendant(of: find.byType(AppBar), matching: find.byIcon(Icons.arrow_drop_down)),
+        findsNothing,
+        reason: '顶栏不应再有胶囊式下拉',
       );
 
       await teardown(tester);

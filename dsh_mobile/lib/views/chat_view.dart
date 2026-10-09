@@ -1256,7 +1256,6 @@ class _ChatViewState extends State<ChatView> {
     final currentWs = dsh.currentWorkspace;
     final sessionId = currentSession?.sessionId ?? 'default';
     final policy = dsh.getSessionPermission(sessionId);
-    final modelName = dsh.currentModel;
     final currentSessionId = currentSession?.sessionId;
     final isSessionRunning = (currentSession?.isRunning ?? false) ||
         (dsh.isSending && (currentSession?.matchesSessionId(dsh.currentSession?.sessionId) ?? false));
@@ -1333,87 +1332,7 @@ class _ChatViewState extends State<ChatView> {
           child: Container(color: context.c.border, height: 1),
         ),
         titleSpacing: 12,
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // 两个胶囊都必须包 Flexible。
-            //
-            // 它们的自然宽度之和约 300px（工作区胶囊 110 + 图标/箭头/内边距，
-            // 模型胶囊同理），而 AppBar 的 title 在 400dp 宽的手机上只剩 232px ——
-            // 实测会 RenderFlex overflowed by 23 pixels，画出黄黑条纹并把内容裁掉。
-            // 这正是用户说的「图标挤在一起」。
-            //
-            // Flexible 默认是 loose 的：空间够时按内容自然宽度渲染（不浪费），
-            // 不够时收缩到分到的宽度，里面的 Text 已经设了 ellipsis，于是优雅截断
-            // 而不是溢出。
-            Row(
-              children: [
-                // Workspace Selector Pill (Fluent Command Style)
-                Flexible(
-                  child: GestureDetector(
-                    onTap: () => _showWorkspaceSwitchSheet(context, dsh),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: context.c.accent.withOpacity(0.08),
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: context.c.accent.withOpacity(0.25)),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.folder_rounded, size: 12, color: context.c.accent),
-                          const SizedBox(width: 4),
-                          Flexible(
-                            child: Text(
-                              currentWs?.title ?? '选择工作区',
-                              style: TextStyle(fontSize: 11.5, color: context.c.textPrimary, fontWeight: FontWeight.w600),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                          Icon(Icons.arrow_drop_down, size: 14, color: context.c.textSecondary),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 6),
-
-                // Model Selector Pill (Fluent Command Style)
-                Flexible(
-                  child: GestureDetector(
-                    onTap: () => _showModelSwitchSheet(context, dsh),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: context.c.surfaceMuted,
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: context.c.border),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.smart_toy_outlined, size: 12, color: context.c.textPrimary),
-                          const SizedBox(width: 4),
-                          Flexible(
-                            child: Text(
-                              modelName.replaceFirst('cn:', ''),
-                              style: TextStyle(fontSize: 11.5, color: context.c.textPrimary, fontWeight: FontWeight.w600),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                          Icon(Icons.arrow_drop_down, size: 14, color: context.c.textSecondary),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 2),
-            Row(
+        title: Row(
               children: [
                 // 当前权限状态色点。它原本是顶栏那个盾牌按钮的一部分；盾牌移进
                 // 「更多」菜单后，用这个 7px 的点保住「当前是什么权限」的一眼信息，
@@ -1458,8 +1377,6 @@ class _ChatViewState extends State<ChatView> {
                 ],
               ],
             ),
-          ],
-        ),
         // 顶栏只保留 3 个高频按钮（新建 / 查找 / 更多）。
         //
         // 原先有 5 个：权限、新建、主题、查找、更多。再叠加两行标题（句柄选择 +
@@ -1528,6 +1445,12 @@ class _ChatViewState extends State<ChatView> {
                     ),
                   );
                   break;
+                case 'switchWorkspace':
+                  // 顶栏那个工作区胶囊被去掉后（它占了约 156px，而 AppBar 只有
+                  // 188px 可用），这里必须保留同一个能力 —— 否则用户就没法在
+                  // 对话过程中切换工作区了。只是把入口从"常驻胶囊"换成"菜单项"。
+                  _showWorkspaceSwitchSheet(context, dsh);
+                  break;
                 case 'workspaces':
                   widget.onOpenWorkspaces?.call();
                   break;
@@ -1557,6 +1480,16 @@ class _ChatViewState extends State<ChatView> {
                     Icon(Icons.shield_outlined, color: context.c.accent, size: 18),
                     const SizedBox(width: 10),
                     Text('对话权限', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'switchWorkspace',
+                child: Row(
+                  children: [
+                    Icon(Icons.swap_horiz_rounded, color: context.c.accent, size: 18),
+                    const SizedBox(width: 10),
+                    Text('切换工作区', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
                   ],
                 ),
               ),
@@ -2177,30 +2110,6 @@ class _ChatViewState extends State<ChatView> {
   /// 根因是把「申请权限」和「探测能力」合并成了一次性的初始化，且失败后永久
   /// 记为不可用。现在无论什么状态都保持可点：点下去会重新探测并触发权限申请；
   /// 确实不行时用 SnackBar 说清是哪种原因，给出可执行的下一步。
-  /// 附件入口按钮。
-  Widget _buildAttachButton(DshService dsh) {
-    // 已有待发附件时按钮点亮，给出"已经挂了东西"的持续提示。
-    final hasPending = _pendingAttachments.isNotEmpty;
-    final color = hasPending ? context.c.accent : context.c.textSecondary;
-    return Tooltip(
-      message: '添加图片或文件',
-      child: InkWell(
-        onTap: () => _showAttachSheet(dsh),
-        borderRadius: BorderRadius.circular(22),
-        child: Container(
-          width: 44,
-          height: 44,
-          decoration: BoxDecoration(
-            color: hasPending ? context.c.accentSurface : Colors.transparent,
-            shape: BoxShape.circle,
-            border: Border.all(color: context.c.border, width: 1),
-          ),
-          child: Icon(Icons.attach_file_rounded, size: 20, color: color),
-        ),
-      ),
-    );
-  }
-
   /// 待发附件条。每个附件显示名字与体积，可单项删除。
   Widget _buildPendingAttachments() {
     return Padding(
@@ -2255,30 +2164,29 @@ class _ChatViewState extends State<ChatView> {
     // 用空白会让功能看起来不存在。
     final unavailable = _voiceSupported == false;
 
-    return InkWell(
-      onTap: () => listening ? _stopVoice(dsh) : _startVoice(dsh),
-      borderRadius: BorderRadius.circular(22),
-      child: Container(
-        width: 44,
-        height: 44,
-        decoration: BoxDecoration(
-          color: listening ? context.c.dangerSurface : Colors.transparent,
-          shape: BoxShape.circle,
-          border: Border.all(
-            color: listening ? context.c.danger : context.c.border,
-            width: 1,
-          ),
+    return Tooltip(
+      message: unavailable ? '语音输入不可用' : '语音输入',
+      child: InkWell(
+        onTap: () => listening ? _stopVoice(dsh) : _startVoice(dsh),
+        borderRadius: BorderRadius.circular(18),
+        child: SizedBox(
+          width: 36,
+          height: 36,
+          child: listening
+              ? Padding(
+                  padding: const EdgeInsets.all(9),
+                  child: CircularProgressIndicator(strokeWidth: 2, color: context.c.danger),
+                )
+              : Center(
+                  child: Icon(
+                    unavailable ? Icons.mic_off_rounded : Icons.mic_none_rounded,
+                    size: 21,
+                    color: listening
+                        ? context.c.danger
+                        : (unavailable ? context.c.textTertiary : context.c.textSecondary),
+                  ),
+                ),
         ),
-        child: listening
-            ? Padding(
-                padding: const EdgeInsets.all(13),
-                child: CircularProgressIndicator(strokeWidth: 2, color: context.c.danger),
-              )
-            : Icon(
-                unavailable ? Icons.mic_off_rounded : Icons.mic_none_rounded,
-                size: 20,
-                color: unavailable ? context.c.textTertiary : context.c.textSecondary,
-              ),
       ),
     );
   }
@@ -2329,126 +2237,200 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
+  /// 输入栏：**一个卡片装下全部**（文本区 + 操作行）。
+  ///
+  /// 上一版是"胶囊输入框 + 三个独立圆形按钮"横向并排。在 360dp 宽的手机上留给
+  /// 输入框的只有 170px（约 12 个汉字就满），而且三个圆圈加一个胶囊并列，视觉上
+  /// 很碎。改成卡片式后横向只剩一个容器：文本在上、操作在下，输入区反而更宽，
+  /// 操作区也不再和文字抢横向空间。
+  ///
+  /// 操作行的顺序按使用频率从右往左递减：发送最右（拇指最容易够到），
+  /// 然后语音、模型、添加。
   Widget _buildInputBar(DshService dsh) {
     return Container(
       // 测试用来量输入栏的实际位置：键盘弹出后它的底边必须紧贴键盘顶边，
       // 中间不允许出现空白（这正是用户报的那个问题）。
       key: const ValueKey('chat-input-bar'),
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
       decoration: BoxDecoration(
         color: context.c.surface,
         border: Border(top: BorderSide(color: context.c.border)),
       ),
       child: SafeArea(
-        child: Column(
+        child: Container(
+          decoration: BoxDecoration(
+            color: context.c.surfaceMuted,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: context.c.border),
+          ),
+          padding: const EdgeInsets.fromLTRB(10, 8, 8, 6),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // 待发附件也放进卡片内 —— 它与"这条消息要发什么"是同一件事，
+              // 摆在卡片外会显得是两个不相干的东西。
+              if (_pendingAttachments.isNotEmpty) _buildPendingAttachments(),
+              TextField(
+                controller: _inputController,
+                focusNode: _inputFocusNode,
+                style: TextStyle(color: context.c.textPrimary, fontSize: 14.5),
+                maxLines: 5,
+                minLines: 1,
+                decoration: InputDecoration(
+                  hintText: '发送指令或提问...',
+                  hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 13.5),
+                  border: InputBorder.none,
+                  isDense: true,
+                  contentPadding: const EdgeInsets.fromLTRB(6, 4, 6, 8),
+                ),
+                onChanged: (v) => dsh.updateDraft(v),
+                onSubmitted: (_) => _sendMessage(dsh),
+              ),
+              Row(
+                children: [
+                  _buildComposerIcon(
+                    icon: Icons.add_rounded,
+                    tooltip: '添加图片或文件',
+                    highlighted: _pendingAttachments.isNotEmpty,
+                    onTap: () => _showAttachSheet(dsh),
+                  ),
+                  const Spacer(),
+                  _buildModelPill(dsh),
+                  const SizedBox(width: 2),
+                  _buildMicButton(dsh),
+                  const SizedBox(width: 4),
+                  _buildSendButton(dsh),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 操作行里的图标按钮。
+  ///
+  /// 刻意**不画圆圈边框**：这一行里已经有一个模型胶囊和一个实心发送键，再套三个
+  /// 圆圈就又回到"一堆控件并列"的碎感。图标本身足够表达功能，触摸区仍给足 36px。
+  Widget _buildComposerIcon({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onTap,
+    bool highlighted = false,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(18),
+        child: SizedBox(
+          width: 36,
+          height: 36,
+          child: Center(
+            child: Icon(
+              icon,
+              size: 22,
+              color: highlighted ? context.c.accent : context.c.textSecondary,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 输入卡片里的模型选择。
+  ///
+  /// 从顶栏移到这里：它是"这条消息要发给谁"的设定，和输入内容属于同一个决策
+  /// 单元，放在手边更顺手，也省掉顶栏一整行。顶栏那个胶囊随之去掉 —— 同一件事
+  /// 不该在两处各显示一份。
+  Widget _buildModelPill(DshService dsh) {
+    final name = dsh.currentModel.replaceFirst('cn:', '');
+    return InkWell(
+      onTap: () => _showModelSwitchSheet(context, dsh),
+      borderRadius: BorderRadius.circular(9),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+        child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // 待发附件条：钉在输入栏正上方，让"附件到底挂上了没有"始终可见，
-            // 每一项都能单独摘掉。
-            if (_pendingAttachments.isNotEmpty) _buildPendingAttachments(),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-            // Text Input Pill
-            Expanded(
-              child: Container(
-                constraints: const BoxConstraints(minHeight: 44, maxHeight: 120),
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                decoration: BoxDecoration(
-                  color: context.c.surfaceMuted,
-                  borderRadius: BorderRadius.circular(22),
-                  border: Border.all(color: context.c.border),
-                ),
-                child: Center(
-                  child: TextField(
-                    controller: _inputController,
-                    focusNode: _inputFocusNode,
-                    style: TextStyle(color: context.c.textPrimary, fontSize: 14),
-                    maxLines: 4,
-                    minLines: 1,
-                    decoration: InputDecoration(
-                      hintText: '发送指令或提问...',
-                      hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 13.5),
-                      border: InputBorder.none,
-                      isDense: true,
-                      contentPadding: const EdgeInsets.symmetric(vertical: 11),
-                    ),
-                    onChanged: (v) => dsh.updateDraft(v),
-                    onSubmitted: (_) => _sendMessage(dsh),
-                  ),
-                ),
+            Icon(Icons.smart_toy_outlined, size: 14, color: context.c.textSecondary),
+            const SizedBox(width: 5),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 104),
+              child: Text(
+                name,
+                style: TextStyle(fontSize: 12, color: context.c.textSecondary),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
               ),
             ),
-            // 语音输入（§4.2）。放在输入框与发送键之间：它是"另一种输入方式"，
-            // 不是"发送"，所以不能和发送键合并成一个按钮。
-            // 附件入口（§4.2）。放在麦克风之前：它比语音更高频，而且形状上
-            // 属于"往输入框里加东西"，与"用另一种方式输入"分开更符合直觉。
-            _buildAttachButton(dsh),
-            const SizedBox(width: 6),
-            _buildMicButton(dsh),
-            const SizedBox(width: 10),
-            // Send / Cancel Action Button
-            if (dsh.isSending || dsh.isCanceling)
-              Container(
-                width: 44,
-                height: 44,
-                decoration: BoxDecoration(
-                  color: dsh.isCanceling ? context.c.surfaceMuted : context.c.dangerSurface,
-                  shape: BoxShape.circle,
-                  border: Border.all(
-                    color: dsh.isCanceling ? context.c.border : const Color(0xFFFCA5A5),
-                  ),
-                ),
-                child: dsh.isCanceling
-                    ? Padding(
-                        padding: const EdgeInsets.all(12.0),
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: context.c.danger,
-                        ),
-                      )
-                    : IconButton(
-                        padding: EdgeInsets.zero,
-                        icon: Icon(Icons.stop_rounded, color: context.c.danger, size: 24),
-                        tooltip: '停止生成',
-                        onPressed: () {
-                          HapticFeedback.mediumImpact();
-                          dsh.cancelActiveTurn();
-                        },
-                      ),
-              )
-            else
-
-              Container(
-                width: 44,
-                height: 44,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [context.c.accent, const Color(0xFF0086F8)],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  shape: BoxShape.circle,
-                  boxShadow: const [
-                    BoxShadow(
-                      color: Color(0x330078D4),
-                      blurRadius: 8,
-                      offset: Offset(0, 2),
-                    ),
-                  ],
-                ),
-                child: IconButton(
-                  padding: EdgeInsets.zero,
-                  icon: const Icon(Icons.arrow_upward_rounded, color: Colors.white, size: 22),
-                  tooltip: '发送',
-                  onPressed: () => _sendMessage(dsh),
-                ),
-              ),
-          ],
-        ),
+            Icon(Icons.keyboard_arrow_down_rounded, size: 16, color: context.c.textTertiary),
           ],
         ),
       ),
+    );
+  }
+
+  /// 发送键。
+  ///
+  /// * 没有可发的内容时**置灰且不可点** —— 上一版无论有没有文字都是亮着的，
+  ///   点下去没反应，用户会以为卡住了。
+  /// * 正在生成/取消时变成停止键：这时用户最想要的是"停下来"，而不是再发一条。
+  Widget _buildSendButton(DshService dsh) {
+    if (dsh.isSending || dsh.isCanceling) {
+      return SizedBox(
+        width: 38,
+        height: 38,
+        child: dsh.isCanceling
+            ? Padding(
+                padding: const EdgeInsets.all(10),
+                child: CircularProgressIndicator(strokeWidth: 2, color: context.c.danger),
+              )
+            : InkWell(
+                onTap: () {
+                  HapticFeedback.mediumImpact();
+                  dsh.cancelActiveTurn();
+                },
+                borderRadius: BorderRadius.circular(19),
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: context.c.dangerSurface,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: context.c.danger),
+                  ),
+                  child: Icon(Icons.stop_rounded, color: context.c.danger, size: 20),
+                ),
+              ),
+      );
+    }
+
+    // 只重建这一小块，不因为每次按键就重建整个输入栏。
+    return ValueListenableBuilder<TextEditingValue>(
+      valueListenable: _inputController,
+      builder: (context, value, _) {
+        final canSend = value.text.trim().isNotEmpty || _pendingAttachments.isNotEmpty;
+        return SizedBox(
+          width: 38,
+          height: 38,
+          child: InkWell(
+            onTap: canSend ? () => _sendMessage(dsh) : null,
+            borderRadius: BorderRadius.circular(19),
+            child: Container(
+              decoration: BoxDecoration(
+                color: canSend ? context.c.accent : context.c.border,
+                shape: BoxShape.circle,
+              ),
+              child: Icon(
+                Icons.arrow_upward_rounded,
+                size: 20,
+                color: canSend ? Colors.white : context.c.textTertiary,
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
