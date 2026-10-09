@@ -12,6 +12,8 @@ import '../widgets/tool_call_card.dart';
 import '../widgets/approval_card.dart';
 import '../widgets/memory_card.dart';
 import '../widgets/safe_markdown.dart';
+import 'widgets/question_card.dart';
+import 'widgets/attachment_tile.dart';
 import 'config_page.dart';
 
 class ChatView extends StatefulWidget {
@@ -1592,11 +1594,64 @@ class _ChatViewState extends State<ChatView> {
                   ),
           ),
 
+          // 提问卡片 / TODO 面板 / 图片附件（patch 0003）。
+          //
+          // 顺序是有意的：提问在最上面，因为它阻塞着 agent 的下一步 —— 用户
+          // 必须先看到并回答它，TODO 和图片都是背景信息。附件紧贴输入框，因为
+          // 它是"这轮对话里出现的图"，不是一条独立消息。
+          ..._buildInteractiveBlocks(dsh),
+
           // Modern Clean Input Bar
           _buildInputBar(dsh),
         ],
       ),
     );
+  }
+
+  /// 提问 / TODO / 附件三块。抽出来是因为它们共享「只属于当前会话」这条约束，
+  /// 放在一起比散在 build 里更容易看出这个约束。
+  List<Widget> _buildInteractiveBlocks(DshService dsh) {
+    final blocks = <Widget>[];
+    final questions = dsh.currentSessionQuestions;
+
+    for (final q in questions) {
+      blocks.add(
+        QuestionCard(
+          key: ValueKey(q.eventId),
+          pending: q,
+          // 只有真的连着网关才允许提交：离线时 send 会静默失败，用户会对着一个
+          // 按不动的按钮以为是自己没点到。
+          canAnswer: dsh.isConnected,
+          onSubmit: (selections, customs) => dsh.answerQuestion(
+            q,
+            selections: selections,
+            customs: customs,
+          ),
+          onDismiss: () => dsh.dismissQuestion(q),
+        ),
+      );
+    }
+
+    final qErr = dsh.lastQuestionError;
+    if (qErr != null && questions.isNotEmpty) {
+      blocks.add(QuestionErrorBanner(message: qErr));
+    }
+
+    final todos = dsh.currentTodos;
+    if (todos.isNotEmpty) {
+      blocks.add(TodoPanel(todos: todos));
+    }
+
+    for (final att in dsh.currentAttachments) {
+      blocks.add(
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: AttachmentImageTile(ref: att, endpoint: dsh.attachmentUrl(att)),
+        ),
+      );
+    }
+
+    return blocks;
   }
 
   Widget _buildSuggestionChip(String text, VoidCallback onTap) {

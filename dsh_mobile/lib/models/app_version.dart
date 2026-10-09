@@ -1,6 +1,6 @@
 /// Build identity for the app.
 ///
-/// Keep in sync with `pubspec.yaml` (`version: 1.4.0+15`). The bridge exposes a
+/// Keep in sync with `pubspec.yaml` (`version: 1.4.1+16`). The bridge exposes a
 /// comparable value via `GET /api/mobile/health` as `version`, so the two can be
 /// checked against each other.
 ///
@@ -11,12 +11,14 @@
 ///
 /// Do NOT use these strings to decide whether the gateway supports a feature.
 /// They drift, and the bridge keeps its own independent numbering. Negotiate by
-/// capability instead — e.g. `DshService.archivedFilterSupported`, which is
-/// driven by the `archivedMode` the gateway echoes back on
-/// `GET /api/mobile/workspaces`.
+/// capability instead — e.g. `DshService.archivedFilterSupported` (driven by
+/// the `archivedMode` the gateway echoes on `GET /api/mobile/workspaces`) or
+/// `DshService.questionsSubscribed` (driven by the gateway answering
+/// `subscribe_questions`), since 1.4.1's question/TODO/image features need
+/// patch 0003 and an older gateway would silently ignore those frames.
 class AppVersion {
   const AppVersion._();
 
-  static const String version = '1.4.0';
-  static const String buildNumber = '15';
+  static const String version = '1.4.1';
+  static const String buildNumber = '16';
 }

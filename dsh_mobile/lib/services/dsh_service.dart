@@ -12,6 +12,7 @@ import '../models/workspace.dart';
 import '../models/approval_request.dart';
 import '../models/dsh_settings.dart';
 import '../models/permission_config.dart';
+import '../models/user_question.dart';
 import '../models/audit_log.dart';
 import '../models/persona.dart';
 
@@ -83,6 +84,26 @@ class DshService extends ChangeNotifier {
   int _sessionLoadSeq = 0;
   int _streamRevision = 0;
 
+  /// 等待本机用户回答的提问（patch 0003）。
+  ///
+  /// 只有订阅者才会收到这些，所以这里非空就意味着「agent 正在等一个人回答」，
+  /// 而这个人应当就是拿着这台手机的人。切换会话时必须清空，否则会把上一个会话
+  /// 的提问卡片显示到新会话里。
+  final List<PendingQuestion> _pendingQuestions = [];
+
+  /// 是否已向网关声明本机可以回答提问。断线重连后要重新订阅。
+  bool _questionsSubscribed = false;
+
+  /// 最近一次提问失败/失效的原因，用于卡片上的提示。成功作答后清空。
+  String? _lastQuestionError;
+
+  /// 每个会话当前的 TODO 整表（`todo/write` 是整表替换，不是增量）。
+  final Map<String, List<TodoItem>> _todos = {};
+
+  /// 每个会话已知的图片附件元信息。**只有元数据，没有字节** —— 图片通过已鉴权
+  /// 的附件路由按需拉取，所以这个 map 的内存占用与图片大小无关。
+  final Map<String, Map<String, AttachmentRef>> _attachments = {};
+
   // Getters
   ConnectionStatus get status => _status;
   String get lastError => _lastError;
@@ -99,6 +120,41 @@ class DshService extends ChangeNotifier {
   /// 网关是否支持归档筛选。为 false 时 UI 必须把筛选器藏起来或禁用，
   /// 而不是显示一个点了没反应的开关。
   bool get archivedFilterSupported => _archivedFilterSupported;
+
+  /// 等待本机回答的提问，按到达顺序。非空即表示 agent 被卡在人机交互上。
+  List<PendingQuestion> get pendingQuestions => _pendingQuestions;
+
+  /// 当前会话（不是全部会话）的提问卡片。UI 应当只渲染这一份，否则会把
+  /// 后台其它会话的提问显示到前台会话的输入框上方。
+  List<PendingQuestion> get currentSessionQuestions {
+    final s = _currentSession;
+    if (s == null) return const [];
+    return _pendingQuestions
+        .where((q) => s.matchesSessionId(q.sessionId))
+        .toList(growable: false);
+  }
+
+  /// 最近一次提问失败/失效原因；无则 null。
+  String? get lastQuestionError => _lastQuestionError;
+
+  /// 是否已订阅提问。重连后需要重新订阅，UI 可据此提示「提问功能未就绪」。
+  bool get questionsSubscribed => _questionsSubscribed;
+
+  /// 当前会话的 TODO 整表；没有则空列表。
+  List<TodoItem> get currentTodos {
+    final s = _currentSession;
+    if (s == null) return const [];
+    return _todos[s.sessionId.replaceFirst(RegExp(r'^session-'), '')] ?? const [];
+  }
+
+  /// 当前会话的图片附件元信息（仅元数据，不含字节）。
+  List<AttachmentRef> get currentAttachments {
+    final s = _currentSession;
+    if (s == null) return const [];
+    final m = _attachments[s.sessionId.replaceFirst(RegExp(r'^session-'), '')];
+    return m == null ? const [] : m.values.toList(growable: false);
+  }
+
   Workspace? get currentWorkspace => _currentWorkspace;
   SessionMeta? get currentSession => _currentSession;
   List<ChatMessage> get messages => _messages;
@@ -291,6 +347,13 @@ class DshService extends ChangeNotifier {
 
       _startHeartbeat();
 
+      // Opt in to interactive prompts. Re-sent on every (re)connect because the
+      // gateway keeps subscriptions per live socket: a reconnect lands on a new
+      // socket that has never heard of this phone, and without this the user
+      // would silently stop being able to answer questions.
+      _questionsSubscribed = false;
+      _sendWsJson({'type': 'subscribe_questions'});
+
       // Fetch initial data
       await fetchWorkspaces();
       await fetchSettings();
@@ -407,14 +470,76 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  void _sendWsJson(Map<String, dynamic> data) {
+  /// 回答一个待决提问。
+  ///
+  /// 只允许提交「每一道题都答了」的批次：引擎会把 `answers` 原样交给
+  /// `ask_user_question`，漏答一道会让 agent 拿到一个残缺的答案，而空
+  /// `selected` 会被理解成「用户跳过了这道题」—— 与用户实际看到的东西不符。
+  ///
+  /// 提交失败时**不**从 [_pendingQuestions] 里移除：网关可能仍然持有这个
+  /// 请求（本方法只是没能把答复送出去），此时删掉卡片会让用户失去重试的
+  /// 机会，也拿不到任何解释。
+  bool answerQuestion(
+    PendingQuestion pending, {
+    required Map<String, List<String>> selections,
+    required Map<String, String> customs,
+  }) {
+    final answers = <AskUserQuestionAnswerItem>[];
+    for (final item in pending.questions) {
+      final selected = selections[item.id] ?? const <String>[];
+      final custom = customs[item.id] ?? '';
+      final answer = AskUserQuestionAnswerItem(id: item.id, selected: selected, custom: custom);
+      if (!answer.isAnswered) return false;
+      answers.add(answer);
+    }
+    final ok = _sendWsJson({
+      'type': 'question_answer',
+      'eventId': pending.eventId,
+      'answer': AskUserQuestionAnswer(answers).toJson(),
+    });
+    if (ok) _lastQuestionError = null;
+    return ok;
+  }
+
+  /// 放弃一个待决提问。
+  ///
+  /// 这里**不**发送任何作答，也不叫网关代答 —— 只是把卡片收起来。真正的
+  /// 释放由引擎侧的 waterfall 决定（网关在订阅者消失时会让 waterfall 落到
+  /// Web UI）。所以桌面端仍可回答，手机上只是不再显示一个已经过期的输入框。
+  void dismissQuestion(PendingQuestion pending) {
+    if (_pendingQuestions.remove(pending)) {
+      notifyListeners();
+    }
+  }
+
+  /// 当前会话的图片附件下载地址。
+  ///
+  /// 走网关的已鉴权附件路由，因此必须把 Authorization 头一起带上 ——
+  /// 裸 `Image.network(url)` 会 401。这里返回的是 URL + 头，由 UI 侧用
+  /// `Image.network(..., headers: ...)` 渲染。
+  ({String url, Map<String, String> headers})? attachmentUrl(AttachmentRef ref) {
+    final cfg = _currentConfig;
+    if (cfg == null) return null;
+    final uri = Uri.parse('${cfg.httpBaseUrl}/api/mobile/attachment').replace(
+      queryParameters: {'id': ref.id},
+    );
+    return (url: uri.toString(), headers: _authHeaders);
+  }
+
+  /// 返回是否真的发出去了。
+  ///
+  /// 提问的提交需要这个返回值：离线时 send 静默失败，而用户以为已经提交，
+  /// 结果提问卡片一直挂在屏幕上、agent 一直等着 —— 必须当场告诉他没发出去。
+  bool _sendWsJson(Map<String, dynamic> data) {
     if (_status == ConnectionStatus.connected && _channel != null) {
       try {
         _channel?.sink.add(jsonEncode(data));
+        return true;
       } catch (e) {
         debugPrint('[DshService] _sendWsJson error: $e');
       }
     }
+    return false;
   }
 
   // Session Management
@@ -426,6 +551,11 @@ class DshService extends ChangeNotifier {
     _activeTurnSeq++;
     _cancelledTurnSeq = _activeTurnSeq;
     _messages = []; // Clear immediately to prevent cross-contamination
+    // 提问是**会话级**的，不是全局的。切会话时丢掉旧提问，否则会把上一个会话的
+    // 输入卡片挂到新会话的输入框上方 —— 用户会对着一个跟自己无关的问题作答。
+    // TODO 与附件表相反：它们按会话分别存着，切过去直接就能显示。
+    _pendingQuestions.clear();
+    _lastQuestionError = null;
     _isSending = false; // Reset sending state immediately
     _isLoadingHistory = true;
     _lastError = '';
@@ -1528,6 +1658,139 @@ class DshService extends ChangeNotifier {
           lastTool.output = _coerceToolInput(json['output'] ?? json['result'] ?? '完成');
           _streamRevision++;
           notifyListeners();
+        }
+        return;
+      }
+
+      // 8. user-questions (patch 0003)
+      //
+      // Opt-in: a phone that is only browsing the session list must not receive
+      // prompts, or the gateway would hold requests it can never answer. The
+      // gateway only offers questions to subscribers and relays the answer over
+      // $events/result, so this side is pure bookkeeping plus one request.
+      if (type == 'question_subscribed') {
+        // Replay whatever the gateway is still holding. Without this a phone
+        // that connects mid-question sees a session that just looks wedged.
+        _questionsSubscribed = true;
+        final pending = json['pending'];
+        if (pending is List) {
+          for (final raw in pending) {
+            if (raw is! Map<String, dynamic>) continue;
+            try {
+              final q = PendingQuestion.fromJson(raw);
+              // The gateway may have re-offered something we already answered
+              // (e.g. a reconnect landed between its send and our reply).
+              if (_pendingQuestions.any((p) => p.eventId == q.eventId)) continue;
+              _pendingQuestions.add(q);
+            } on FormatException catch (e) {
+              // One malformed item must not cost us the rest of the replay.
+              debugPrint('[DshService] question replay 丢弃不可解析项: $e');
+            }
+          }
+        }
+        notifyListeners();
+        return;
+      }
+
+      if (type == 'question_request') {
+        try {
+          final q = PendingQuestion.fromJson(json);
+          if (_pendingQuestions.any((p) => p.eventId == q.eventId)) return;
+          _pendingQuestions.add(q);
+          notifyListeners();
+        } on FormatException catch (e) {
+          debugPrint('[DshService] question_request 无法解析: $e');
+        }
+        return;
+      }
+
+      if (type == 'question_settled') {
+        final eventId = json['eventId'];
+        final ok = json['ok'] == true;
+        _lastQuestionError = ok ? null : (json['reason']?.toString() ?? '提问未能送达');
+        // removeWhere returns void, so "did anything change" needs the length
+        // comparison rather than the return value.
+        final before = _pendingQuestions.length;
+        _pendingQuestions.removeWhere((p) => p.eventId == eventId);
+        if (_pendingQuestions.length != before) {
+          notifyListeners();
+        }
+        return;
+      }
+
+      // The gateway withdrew every open prompt (turn cancelled, subscriber went
+      // away, upstream link dropped). Clear them rather than leaving cards on
+      // screen that can no longer be answered.
+      if (type == 'questions_invalidated') {
+        if (_pendingQuestions.isNotEmpty) {
+          _pendingQuestions.clear();
+          _lastQuestionError = '提问已失效：${json['reason']?.toString() ?? '会话状态变化'}';
+          notifyListeners();
+        }
+        return;
+      }
+
+      if (type == 'question_ack') {
+        // The gateway already emits question_settled on success, so this is only
+        // the failure report. Do NOT remove on ok:false — the engine may still
+        // have the request open, and dropping the card would strand the user.
+        if (json['ok'] == true) {
+          _lastQuestionError = null;
+          final before = _pendingQuestions.length;
+          _pendingQuestions.removeWhere((p) => p.eventId == json['eventId']);
+          if (_pendingQuestions.length != before) notifyListeners();
+        } else {
+          _lastQuestionError = json['error']?.toString() == 'unknown-question'
+              ? '该提问已过期（可能已被其它设备回答）'
+              : '提交失败：${json['error'] ?? '未知错误'}';
+          // Here the request is genuinely gone (unknown / not claimable), so
+          // the card would otherwise stay forever with no way forward.
+          final before = _pendingQuestions.length;
+          _pendingQuestions.removeWhere((p) => p.eventId == json['eventId']);
+          if (_pendingQuestions.length != before) notifyListeners();
+        }
+        return;
+      }
+
+      // 9. todo/write — whole-list replacement, broadcast to every client.
+      if (type == 'todo_list') {
+        final sId = json['sessionId']?.toString() ?? '';
+        final rawTodos = json['todos'];
+        if (rawTodos is! List) return;
+        final items = <TodoItem>[];
+        for (final raw in rawTodos) {
+          if (raw is! Map<String, dynamic>) continue;
+          try {
+            items.add(TodoItem.fromJson(raw));
+          } on FormatException {
+            // Skip an unparseable row, keep the rest of the list.
+          }
+        }
+        // Keyed by the bare id too: the gateway forwards whichever spelling the
+        // engine used, and the open session may hold the prefixed one.
+        final key = sId.replaceFirst(RegExp(r'^session-'), '');
+        _todos.remove(sId);
+        _todos.remove(key);
+        if (items.isNotEmpty) _todos[key] = items;
+        notifyListeners();
+        return;
+      }
+
+      // 10. Attachment metadata (images). Bytes are NOT inlined: the phone
+      // fetches them through the authenticated attachment route.
+      if (type == 'attachment') {
+        final sId = json['sessionId']?.toString() ?? '';
+        final raw = json['attachment'];
+        if (raw is! Map<String, dynamic>) return;
+        try {
+          final ref = AttachmentRef.fromJson(raw);
+          if (!ref.isImage) return;
+          final key = sId.replaceFirst(RegExp(r'^session-'), '');
+          _attachments.putIfAbsent(key, () => <String, AttachmentRef>{});
+          _attachments[key]![ref.id] = ref;
+          notifyListeners();
+        } on FormatException catch (e) {
+          debugPrint('[DshService] attachment 无法解析: $e');
         }
         return;
       }

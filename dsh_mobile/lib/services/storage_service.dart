@@ -20,12 +20,27 @@ class StorageService {
   static const String _keyProfiles = 'dsh_server_profiles';
   static const String _keyActiveId = 'dsh_active_profile_id';
 
-  static final Random _rng = Random();
+  static final Random _rng = Random.secure();
 
-  /// A short, collision-resistant id. Uniqueness only has to hold within one
-  /// device's saved list, and these are created by deliberate user actions.
-  static String newId() =>
-      'gw-${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}-${_rng.nextInt(0xFFFFFF).toRadixString(36)}';
+  /// Guarantees uniqueness **by construction**, not by luck.
+  ///
+  /// The earlier form was `'gw-' + microsecondsSinceEpoch + '-' + nextInt(0xFFFFFF)`.
+  /// That is probabilistic: inside `flutter test` the wall clock is effectively
+  /// frozen, so a tight loop of newId() calls produces many ids sharing the same
+  /// timestamp component and depends entirely on the RNG for the rest. The
+  /// "no collision across 2000 ids" test failed intermittently because of it —
+  /// a real (if rare) defect, not just a flaky test.
+  ///
+  /// A monotonic counter makes it impossible: two calls in the same process
+  /// always differ in the counter. Randomness is still there so ids created in
+  /// different processes/after reinstall don't look sequential.
+  static int _idSeq = 0;
+
+  static String newId() {
+    final seq = _idSeq++;
+    final stamp = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
+    return 'gw-$stamp-${seq.toRadixString(36)}${_rng.nextInt(0xFFFF).toRadixString(36)}';
+  }
 
   // ---------------------------------------------------------------- active --
 
