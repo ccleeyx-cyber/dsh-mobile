@@ -156,6 +156,21 @@ class DshService extends ChangeNotifier {
   /// 屏幕前、正在等结果"的场景。
   bool get shouldNotify => notifications.permissionGranted && !_isAppForeground;
 
+  /// 通知链路是否**真的**可用。
+  ///
+  /// 与 [shouldNotify] 的区别：那个只问"该不该发"，这个问"发了能不能到"。
+  ///
+  /// 加它的原因是一处真实误导：设置页原来只看权限就显示绿色的「后台通知已开启」，
+  /// 而插件其实从未初始化成功（Android 上少了初始化设置会抛，异常被吞掉），
+  /// 一条通知都发不出去 —— 用户看到的是"开关是开的，但就是没有通知"。
+  bool get notificationsReady => notifications.ready;
+
+  /// 通知链路最近一次失败的原因；正常时为 null。
+  String? get notificationError => notifications.lastError;
+
+  /// 是否已拉起前台保活服务（进程能在后台存活、连接不断）。
+  bool get notificationBackgroundOn => notifications.backgroundEnabled;
+
   /// 开启后台通知能力（拉起前台保活服务）。
   ///
   /// 返回是否成功。**失败必须被如实告知用户**：Android 12+ 对后台启动前台服务

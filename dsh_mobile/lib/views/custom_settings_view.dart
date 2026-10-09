@@ -197,21 +197,43 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
   /// 有效，比不给开关更糟。
   ///
   /// 真正缺权限时给出的是**可执行的指引**（去系统设置），而不是一句"不可用"。
+  /// 通知状态卡片。
+  ///
+  /// 这里必须看**插件的真实就绪状态**，不能只看权限。
+  ///
+  /// 原先只看 `notificationPermissionGranted`，于是出现了一处真实误导：Android 上
+  /// 初始化少了必要设置会抛异常、被 catch 吞掉，插件从未初始化成功、一条通知都发
+  /// 不出去 —— 而这张卡片一直显示绿色的「后台通知已开启」。用户看到的是
+  /// "开关是开的，但就是没有通知"，无从判断。
+  ///
+  /// 现在三态分明：可用 / 有权限但链路异常（并给出原因）/ 没有权限。
   Widget _buildNotificationCard(BuildContext context) {
     final dsh = Provider.of<DshService>(context);
     final granted = dsh.notificationPermissionGranted;
+    final ready = dsh.notificationsReady;
+    final err = dsh.notificationError;
+    final backgroundOn = dsh.notificationBackgroundOn;
 
-    final (Color iconColor, String title, String subtitle) = granted
+    final (Color iconColor, String title, String subtitle) = ready
         ? (
             context.c.success,
             '后台通知已开启',
             'Agent 需要你授权或回答时会弹通知；App 在前台时不打扰。'
+                '${backgroundOn ? "前台保活已启动。" : "前台保活未启动 —— App 被系统回收后连接会断，届时收不到通知。"}'
           )
-        : (
-            context.c.warning,
-            '通知未开启，你将收不到提醒',
-            'Android 13 及以上需要授权。请到 系统设置 → 应用 → DSH Mobile → 通知 中开启。'
-          );
+        : granted
+            ? (
+                // 最容易被忽略的一态：权限有、链路坏。旧版把这种情况也说成"已开启"。
+                context.c.danger,
+                '通知链路异常，通知发不出去',
+                '已获得通知权限，但通知组件没有就绪，因此一条也发不出来。'
+                    '${err == null ? "" : "原因：$err"}'
+              )
+            : (
+                context.c.warning,
+                '通知未开启，你将收不到提醒',
+                'Android 13 及以上需要授权。请到 系统设置 → 应用 → DSH Mobile → 通知 中开启。'
+              );
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -221,7 +243,11 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
         children: [
           Row(
             children: [
-              Icon(Icons.notifications_active_outlined, size: 17, color: iconColor),
+              Icon(
+                ready ? Icons.notifications_active_outlined : Icons.notifications_off_outlined,
+                size: 17,
+                color: iconColor,
+              ),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(

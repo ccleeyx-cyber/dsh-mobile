@@ -36,6 +36,15 @@ class NotificationService {
   /// 用户是否授权了通知权限。Android 13+ 需要显式申请。
   bool _granted = false;
 
+  /// 插件是否真的初始化成功。
+  ///
+  /// 单独记这一位：权限拿到了不等于能发通知 —— 插件初始化失败时 `show()` 会抛，
+  /// 而在没有这个标志之前，那两处异常都被 catch 吞掉，整条通知链路**静默失效**。
+  bool _pluginReady = false;
+
+  /// 初始化/发送过程中最近一次的失败原因，供 UI 如实告知用户。
+  String? _lastError;
+
   /// 是否已拉起前台保活服务。
   bool get backgroundEnabled => _backgroundOn;
 
@@ -65,15 +74,45 @@ class NotificationService {
     try {
       await _plugin.initialize(
         const InitializationSettings(
-          // iOS 用不到，这里给个占位以免构造报错。
+          // ⚠️ Android 上这一项**必须**给。
+          //
+          // 这就是「审批/提问一条通知都收不到」的真凶：本来的写法只给了 iOS：
+          //     const InitializationSettings(iOS: DarwinInitializationSettings())
+          // 而 flutter_local_notifications 在 Android 平台上是这么校验的：
+          //     // flutter_local_notifications_plugin.dart:132
+          //     if (defaultTargetPlatform == TargetPlatform.android
+          //         && initializationSettings.android == null) {
+          //       throw ArgumentError(
+          //           'Android settings must be set when targeting Android platform.');
+          //     }
+          //
+          // 于是 initialize() 每次都在这里抛异常，被下面的 catch 吞成一行
+          // debugPrint；插件从未初始化成功，之后每个 show() 也在未初始化的插件上
+          // 抛异常、同样被吞掉 —— **整条通知链路彻底静默失效**，界面上完全看不出。
+          //
+          // 图标用 launcher 的 mipmap：原生保活服务那条常驻通知用的也是系统图标，
+          // 这里保持"有图标、能显示"即可。
+          android: AndroidInitializationSettings('@mipmap/ic_launcher'),
           iOS: DarwinInitializationSettings(),
         ),
       );
+      _pluginReady = true;
+      _lastError = null;
     } catch (e) {
+      // 刻意不再只写 debugPrint：这个失败以前完全不可见，用户只能看到
+      // "就是没有通知"这个现象。现在记进 _lastError，由设置页如实展示。
       debugPrint('[NotificationService] 初始化失败: $e');
+      _pluginReady = false;
+      _lastError = '通知插件初始化失败：$e';
     }
     return _granted;
   }
+
+  /// 通知链路是否可用（权限 + 插件都就绪）。
+  bool get ready => _granted && _pluginReady;
+
+  /// 最近一次失败原因；正常时为 null。
+  String? get lastError => _lastError;
 
   bool get permissionGranted => _granted;
 
@@ -119,7 +158,17 @@ class NotificationService {
     NotificationKind kind = NotificationKind.info,
     bool onlyWhenBackground = true,
   }) async {
-    if (!_granted) return;
+    if (!_granted) {
+      _lastError = '没有通知权限，通知未发出';
+      return;
+    }
+    if (!_pluginReady) {
+      // 这里以前是"继续往下走然后让 show() 抛、再被吞掉"。明确拦下来并留痕，
+      // 否则用户看到的只是"什么也没发生"。
+      _lastError = '通知插件未就绪，通知未发出';
+      debugPrint('[NotificationService] 插件未就绪，跳过通知: $title');
+      return;
+    }
     if (title.trim().isEmpty) return;
 
     try {
@@ -143,8 +192,10 @@ class NotificationService {
         ),
         payload: kind.name,
       );
+      _lastError = null;
     } catch (e) {
       debugPrint('[NotificationService] 发通知失败: $e');
+      _lastError = '发通知失败：$e';
     }
   }
 
@@ -163,7 +214,37 @@ class NotificationService {
   @visibleForTesting
   void debugSetGranted(bool v) {
     _granted = v;
+    // 测试里"授权"即代表插件也就绪；真实链路的 _pluginReady 由 initialize() 设置。
+    _pluginReady = v;
     _initialized = true;
+    _lastError = null;
+  }
+
+  /// 测试用：只看插件是否就绪（与权限分开，便于断言"权限有但插件没就绪"）。
+  @visibleForTesting
+  bool get debugPluginReady => _pluginReady;
+
+  /// 测试用：单独摆布"插件是否就绪"，用来复现「权限有、链路坏」那一态 ——
+  /// 那一态正是旧版设置页误报成绿色"已开启"的情况。
+  @visibleForTesting
+  void debugSetPluginReady(bool v, {String? error}) {
+    _pluginReady = v;
+    _lastError = error;
+    _initialized = true;
+  }
+
+  /// 测试用：把单例状态清回初始态。
+  ///
+  /// 这个类是单例，`init()` 有 `_initialized` 短路 —— 不清就会让后一个用例
+  /// 根本走不到真实初始化路径，断言变成对着缓存值自说自话。
+  @visibleForTesting
+  void debugReset() {
+    _initialized = false;
+    _granted = false;
+    _pluginReady = false;
+    _backgroundOn = false;
+    _lastError = null;
+    _seq = 0;
   }
 }
 
