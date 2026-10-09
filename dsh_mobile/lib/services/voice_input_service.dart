@@ -22,6 +22,10 @@ class VoiceInputService {
   VoiceInputService._();
   static final VoiceInputService instance = VoiceInputService._();
 
+  /// 语音后端。
+  ///
+  /// 注意 `SpeechToText()` 是**工厂单例**（见 [debugReset] 的说明），所以这个字段
+  /// 持有的是一个进程级共享对象 —— 别试图靠"换一个实例"来隔离状态，那做不到。
   final SpeechToText _speech = SpeechToText();
 
   bool _initialized = false;
@@ -41,7 +45,11 @@ class VoiceInputService {
   /// 返回是否可用。**权限被拒与设备不支持是两回事**：
   /// 前者应该引导用户去设置里开权限，后者只能告知不支持。两种都返回 false，
   /// 由 [lastError] / 调用方区分，避免给用户错误的指引。
-  Future<bool> init({String localeId = defaultLocaleId}) async {
+  ///
+  /// 这里刻意**不接受 localeId**：语言是在 [start] 里选的，而选择需要先拿到
+  /// 设备支持的语言列表 —— 那份列表正是 initialize() 的产物。把语言参数放在
+  /// 这里只会诱使人以为它能起作用。
+  Future<bool> init() async {
     if (_initialized) return _available;
     _initialized = true;
     try {
@@ -102,17 +110,26 @@ class VoiceInputService {
     void Function(String message)? onError,
     String localeId = defaultLocaleId,
   }) async {
-    if (!_available && !await init(localeId: localeId)) {
+    if (!_available && !await init()) {
       onError?.call(await unavailableReason());
       return false;
     }
 
     try {
-      final started = await _speech.listen(
+      // ⚠️ 绝对不要用 listen() 的返回值判断成败。
+      //
+      // speech_to_text 6.6.2 的签名是 `Future listen(...)` —— 成功时返回 **null**
+      // （只有 7.x 才是 `Future<bool>`）。按 7.x 的写法写 `if (!started)`，在
+      // 6.6.2 下 `!null` 会抛 TypeError，而那个异常被下面的 catch 吞掉、报成一句
+      // 笼统的「无法启动语音识别」—— 在任何设备上都必然复现，且完全看不出原因。
+      // 这个坑已经踩过一次（v1.8.0 起语音一直不可用，就是这个）。
+      //
+      // 约定：失败**只通过抛异常**表达；成功与否以 isListening 为准（插件内部
+      // 拿到 started 之后也是这么记的）。
+      await _speech.listen(
         listenOptions: SpeechListenOptions(
           // 语言放这里而不是 listen() 的顶层参数：后者已标记 deprecated。
-          // 不指定的话部分 ROM 会拿英文模型去识别中文。
-          localeId: localeId,
+          localeId: await _resolveLocale(localeId),
           // 流式：文字边说边出，不必等说完。
           partialResults: true,
           // dictation：说完一句自动停顿，把结果当成完整一段。
@@ -121,16 +138,76 @@ class VoiceInputService {
           cancelOnError: true,
         ),
       );
-      if (!started) {
-        onError?.call(lastError ?? '无法启动语音识别');
+
+      // 判定"到底开没开"，这里有两个坑叠在一起：
+      //
+      //   1. 6.6.2 的 listen() 在平台返回 **false** 时也**不会抛异常** ——
+      //      它内部拿到 started 后只在 true 分支里做事，false 被静默吞掉。
+      //      所以"没抛异常"并不等于"已经开始"。
+      //   2. isListening 不是 listen() 里同步置位的，而是由平台的状态回调
+      //      经 _updateStatus 异步设置（6.6.2 的 speech_to_text.dart:679）。
+      //      刚 await 完就查它，会是 false，从而把成功误判成失败。
+      //
+      // 因此：等回调到达（最多 600ms，每 100ms 查一次），再以 isListening 为准。
+      // 代价最多 600ms，只在真正启动失败时才会走到最后一步；而麦克风按钮本来
+      // 就显示着转圈，用户感知不到。
+      for (var attempt = 0; attempt < 6; attempt++) {
+        if (_speech.isListening) break;
+        await Future<void>.delayed(const Duration(milliseconds: 100));
       }
-      _listening = started;
-      return started;
-    } catch (e) {
-      debugPrint('[VoiceInput] 启动识别失败: $e');
+      _listening = _speech.isListening;
+      if (!_listening) {
+        onError?.call(lastError ?? '麦克风没有开始录音，可能被其他应用占用');
+      }
+      return _listening;
+    } on SpeechToTextNotInitializedException {
+      // 允许下次点击重新初始化，不要把它变成永久失败。
+      _initialized = false;
       _listening = false;
-      onError?.call('无法启动语音识别');
+      onError?.call('语音识别尚未就绪，请再点一次');
       return false;
+    } on ListenFailedException catch (e) {
+      _listening = false;
+      // 插件把**平台侧的真实原因**放在 message 里，直接透出去 —— 别再吞成一句
+      // 笼统的"无法启动"。像"未授权录音""语言不可用"都是用户能自己处理的。
+      final msg = e.message?.trim() ?? '';
+      onError?.call(msg.isNotEmpty ? msg : '无法启动语音识别');
+      return false;
+    } catch (e) {
+      _listening = false;
+      debugPrint('[VoiceInput] 启动识别失败: $e');
+      // 带上真实异常类型：下次再出问题，提示里就有能定位的线索，
+      // 而不是又一个无从下手的笼统文案。
+      onError?.call('无法启动语音识别：${e.runtimeType}');
+      return false;
+    }
+  }
+
+  /// 挑一个**设备真正支持**的语言。
+  ///
+  /// 硬传 zh_CN 在没装中文识别包的设备上会让 listen 直接失败，用户只会看到
+  /// "无法启动"。所以先查 `locales`：能用中文就用中文，退一步只匹配语言码
+  /// （设备只有 zh_TW 时也总比失败强），都没有就返回 null 让插件用系统默认。
+  ///
+  /// 一个能工作的近似请求，好过一个必然失败的精确请求。
+  Future<String?> _resolveLocale(String preferred) async {
+    try {
+      // 6.6.2 里 locales 是**方法**（返回 Future），不是 getter。
+      final available = await _speech.locales();
+      if (available.isEmpty) return preferred;
+      String norm(String s) => s.replaceAll('-', '_').toLowerCase();
+      final want = norm(preferred);
+      for (final l in available) {
+        if (norm(l.localeId) == want) return l.localeId;
+      }
+      final lang = want.split('_').first;
+      for (final l in available) {
+        if (norm(l.localeId).split('_').first == lang) return l.localeId;
+      }
+      return null;
+    } catch (e) {
+      debugPrint('[VoiceInput] 语言列表查询失败: $e');
+      return preferred;
     }
   }
 
@@ -160,6 +237,24 @@ class VoiceInputService {
   void debugSetAvailable(bool v) {
     _available = v;
     _initialized = true;
+  }
+
+  /// 把单例恢复到"从未初始化"的状态。
+  ///
+  /// ⚠️ 只能重置**本服务**自己的状态，重置不了插件内部的。
+  ///
+  /// speech_to_text 的 `SpeechToText()` 是**工厂单例**
+  /// （speech_to_text.dart:190 `factory SpeechToText() => _instance;`），
+  /// 所以它内部的 `_initWorked` / `_listening` 是进程级的、外部换不掉也清不了。
+  /// 写测试的人必须知道这一点：一个用例里成功 initialize 过之后，后面的用例就
+  /// **不可能**再观察到 initialize 走到平台（插件会直接返回缓存值）。
+  /// 这一条踩过坑 —— 曾经以为 `_speech = SpeechToText()` 是"换个新实例"，
+  /// 实际是空操作，导致几个用例连环假通过。
+  @visibleForTesting
+  void debugReset() {
+    _initialized = false;
+    _available = false;
+    _listening = false;
   }
 
   @visibleForTesting

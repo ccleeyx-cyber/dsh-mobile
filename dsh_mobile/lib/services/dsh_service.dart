@@ -547,6 +547,15 @@ class DshService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 测试用：当前是否还会接受流式增量块。
+  ///
+  /// 单独把这条判断暴露出来，是因为"打开正在执行的会话看不到流式信息"这个 bug
+  /// 就藏在这两个计数器的关系里（`_activeTurnSeq <= _cancelledTurnSeq` 恒真 ⇒
+  /// 所有增量块被丢弃）。它只能靠真实走一遍 selectSession 才暴露得出来，所以
+  /// 需要一个能直接观察的出口。
+  @visibleForTesting
+  bool get debugAcceptsStreamChunks => _activeTurnSeq > _cancelledTurnSeq;
+
   void selectWorkspace(Workspace ws, {bool autoSelectSession = true}) {
     _currentWorkspace = ws;
     _sessionPollTimer?.cancel();
@@ -707,8 +716,18 @@ class DshService extends ChangeNotifier {
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _currentSession = session;
+    // 只自增 _activeTurnSeq，**不要**跟着把 _cancelledTurnSeq 也提上来。
+    //
+    // 这是"打开正在执行的会话看不到流式信息"的成因：流式块的守卫是
+    //   if (_activeTurnSeq <= _cancelledTurnSeq) return;
+    // 两者相等时该条件恒为真，于是每一个增量块都被丢掉 —— 用户看到的是一个
+    // 一动不动、只有历史内容的会话。而从本机 sendChatMessage 发起的会话之所以
+    // 正常，正是因为那里只自增 _activeTurnSeq（见 L915），不动 _cancelledTurnSeq。
+    //
+    // 切会话真正需要的是"丢弃上一个会话的残余块"，那由事件里的
+    // matchesSessionId(sId) 判断负责（见流式块处理的开头）。turn 计数在这里只是
+    // 让在途的旧块失效，不该被当成"这一轮已被取消"。
     _activeTurnSeq++;
-    _cancelledTurnSeq = _activeTurnSeq;
     _messages = []; // Clear immediately to prevent cross-contamination
     // 提问是**会话级**的，不是全局的。切会话时丢掉旧提问，否则会把上一个会话的
     // 输入卡片挂到新会话的输入框上方 —— 用户会对着一个跟自己无关的问题作答。
@@ -793,8 +812,9 @@ class DshService extends ChangeNotifier {
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _isSending = false;
+    // 同 selectSession：只自增，不要跟着把 _cancelledTurnSeq 提上来。
+    // 新会话里本来没有在跑的回合，把两者设成相等只是给后面埋下同一个雷。
     _activeTurnSeq++;
-    _cancelledTurnSeq = _activeTurnSeq;
     _isLoadingHistory = false;
     _lastError = '';
 
