@@ -22,7 +22,6 @@ import 'notification_service.dart';
 import '../models/audit_log.dart';
 import '../models/persona.dart';
 import '../models/gateway_features.dart';
-import '../models/app_version.dart';
 import '../models/task_center.dart';
 
 enum ConnectionStatus {
@@ -124,9 +123,6 @@ class DshService extends ChangeNotifier {
 
   /// 提示词模板（quick replies），来自网关 /api/mobile/snippets。
   List<Snippet> _snippets = [];
-
-  /// 网关版本信息（/api/mobile/version），供设置页做更新检查。
-  GatewayVersionInfo? _gatewayVersion;
 
   /// 当前会话最近一次回合的失败说明（网关 lastTurn / 实时 error 帧）。
   ///
@@ -375,7 +371,6 @@ class DshService extends ChangeNotifier {
 
   List<AgentPersona> get personas => _personas;
   List<Snippet> get snippets => _snippets;
-  GatewayVersionInfo? get gatewayVersion => _gatewayVersion;
   String? get activePersonaId => _activePersonaId;
   int get pingMs => _pingMs;
   int get reasoningBudget => _reasoningBudget;
@@ -1955,29 +1950,13 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  /// 拉取网关版本信息并判断是否需要更新。
-  ///
-  /// 返回 true = 有新版本。latestVersion 未配置时永远返回 false
-  /// （"不知道"≠"没有"），UI 需要另行展示"网关未配置"。
-  Future<bool> checkForUpdate() async {
-    if (_currentConfig == null) return false;
-    try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/version');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
-      if (_checkResponseAuth(res)) return false;
-      if (res.statusCode == 200) {
-        final data = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
-        _gatewayVersion = GatewayVersionInfo.fromJson(data);
-        notifyListeners();
-        final latest = _gatewayVersion!.latestVersion;
-        if (latest == null || latest.isEmpty) return false;
-        return GatewayVersionInfo.isOlder(AppVersionConst.version, latest);
-      }
-    } catch (e) {
-      debugPrint('[DshService] checkForUpdate error: $e');
-    }
-    return false;
-  }
+  // 客户端更新不再走网关。
+  //
+  // 这里原先有 `checkForUpdate()`：调 `/api/mobile/version`，与网关侧环境变量
+  // `DSH_LATEST_APP_VERSION`（以及手工放进盘里的 APK）比对。它有三个失败面 ——
+  // 网关没设变量、APK 没放、变量写的是旧号 —— 而任一失败都会让界面言之凿凿地
+  // 说"已是最新"。改为直接指向 GitHub Releases（见 `AppVersion.releasesUrl`），
+  // 「有没有新版」由发布页本身回答，没有可漂移的中间状态。
 
   /// 归档 / 取消归档一个会话。
   Future<bool> setSessionArchived(String sessionId, bool archived) async {

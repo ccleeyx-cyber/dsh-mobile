@@ -999,29 +999,34 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                   ],
                 ),
                 const SizedBox(height: 12),
+                // 更新动线就一条：打开 GitHub Releases。刻意**不**做版本比对、
+                // 不查网关的 /api/mobile/version、不用 DSH_LATEST_APP_VERSION ——
+                // 那套东西要求网关侧额外配置一个环境变量并手工把 APK 放到盘上，
+                // 任何一个漏了就会显示"已是最新"（或者说"打不开浏览器"），比不做
+                // 更糟。releases/latest 永远指向最新一次发布，不需要任何人维护。
+                Text(
+                  '客户端是自签名侧载安装的，系统不会自动更新；装新版请从发布页下载对应 ABI 的 APK。',
+                  style: TextStyle(fontSize: 11, color: context.c.textTertiary, height: 1.35),
+                ),
+                const SizedBox(height: 8),
                 Row(
                   children: [
                     Expanded(
                       child: TextButton.icon(
-                        icon: Icon(Icons.system_update_rounded, size: 16, color: context.c.accent),
-                        label: Text('检查更新', style: TextStyle(color: context.c.accent, fontSize: 12, fontWeight: FontWeight.w600)),
-                        onPressed: () => _checkForUpdate(context, dsh),
+                        icon: Icon(Icons.open_in_new_rounded, size: 16, color: context.c.accent),
+                        label: Text('打开发布页', style: TextStyle(color: context.c.accent, fontSize: 12, fontWeight: FontWeight.w600)),
+                        onPressed: () => _openDownloadPage(context),
                       ),
                     ),
                     Expanded(
                       child: TextButton.icon(
-                        icon: Icon(Icons.download_rounded, size: 16, color: context.c.accent),
-                        label: Text('复制 APK 下载直链', style: TextStyle(color: context.c.accent, fontSize: 12, fontWeight: FontWeight.w600)),
+                        icon: Icon(Icons.link_rounded, size: 16, color: context.c.accent),
+                        label: Text('复制发布页链接', style: TextStyle(color: context.c.accent, fontSize: 12, fontWeight: FontWeight.w600)),
                         onPressed: () {
-                          // Build the download URL from the gateway the user is
-                          // actually connected to, instead of a baked-in host
-                          // that silently breaks on LAN / tunnel / port changes.
-                          final cfg = dsh.currentConfig;
-                          final apkUrl = '${cfg?.httpBaseUrl ?? 'http://127.0.0.1:3088'}/dsh-agent.apk';
-                          Clipboard.setData(ClipboardData(text: apkUrl));
+                          Clipboard.setData(const ClipboardData(text: AppVersion.releasesUrl));
                           ScaffoldMessenger.of(context).showSnackBar(
                             SnackBar(
-                              content: Text('已复制直链: $apkUrl'),
+                              content: Text('已复制: ${AppVersion.releasesUrl}'),
                               backgroundColor: context.c.accent,
                               behavior: SnackBarBehavior.floating,
                             ),
@@ -1095,39 +1100,22 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     await dsh.saveSnippets(next);
   }
 
-  /// 检查更新：调网关 /api/mobile/version，比较 App 版本与 latestVersion。
-  Future<void> _checkForUpdate(BuildContext context, DshService dsh) async {
+  /// 打开发布页；打不开（无浏览器等）就把链接复制下来，绝不静默失败。
+  ///
+  /// 这里不再做版本比对：唯一真值来源是发布页本身，而"告诉用户有没有新版"需要
+  /// 一个能问的服务端（GitHub API 或网关自报），那是用户明确不要的复杂度。
+  /// 宁可不猜，也不给出一个可能过期的"已是最新"。
+  Future<void> _openDownloadPage(BuildContext context) async {
     final messenger = ScaffoldMessenger.of(context);
-    final hasUpdate = await dsh.checkForUpdate();
+    final ok = await UrlOpener.open(AppVersion.releasesUrl);
     if (!mounted) return;
-    final info = dsh.gatewayVersion;
-    final cfg = dsh.currentConfig;
-    if (hasUpdate && info?.latestVersion != null) {
-      // 有新版：直接给"去下载"动线（浏览器打开网关的 APK 直链）。
-      final apkUrl = '${cfg?.httpBaseUrl ?? 'http://127.0.0.1:3088'}/dsh-agent.apk';
-      final ok = await UrlOpener.open(apkUrl);
-      if (!mounted) return;
-      if (!ok) {
-        Clipboard.setData(ClipboardData(text: apkUrl));
-        messenger.showSnackBar(SnackBar(
-          content: Text('发现新版本 v${info!.latestVersion}，但打不开浏览器。直链已复制：$apkUrl'),
-          backgroundColor: context.c.warning,
-          behavior: SnackBarBehavior.floating,
-        ));
-      }
-    } else if (info?.latestVersion == null) {
-      messenger.showSnackBar(SnackBar(
-        content: const Text('网关未配置最新版本号（DSH_LATEST_APP_VERSION）。当前已是客户端最新版。'),
-        backgroundColor: context.c.success,
-        behavior: SnackBarBehavior.floating,
-      ));
-    } else {
-      messenger.showSnackBar(SnackBar(
-        content: Text('当前已是最新版本 (v${AppVersion.version})'),
-        backgroundColor: context.c.success,
-        behavior: SnackBarBehavior.floating,
-      ));
-    }
+    if (ok) return;
+    await Clipboard.setData(const ClipboardData(text: AppVersion.releasesUrl));
+    messenger.showSnackBar(SnackBar(
+      content: Text('打不开浏览器，链接已复制：${AppVersion.releasesUrl}'),
+      backgroundColor: context.c.warning,
+      behavior: SnackBarBehavior.floating,
+    ));
   }
 
   Widget _buildSectionHeader(String title, IconData icon, Color color) {
