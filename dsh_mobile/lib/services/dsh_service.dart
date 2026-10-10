@@ -22,6 +22,7 @@ import '../models/audit_log.dart';
 import '../models/persona.dart';
 import '../models/gateway_features.dart';
 import '../models/app_version.dart';
+import '../models/task_center.dart';
 
 enum ConnectionStatus {
   disconnected,
@@ -360,6 +361,14 @@ class DshService extends ChangeNotifier {
   bool get isLoadingHistory => _isLoadingHistory;
   bool get isSending => _isSending;
   bool get isCanceling => _isCanceling;
+
+  /// 当前会话是否在跑（本机发起的或别的客户端发起的都算）。
+  ///
+  /// 输入栏据此切换"发送 → 排队/插话"，队列行的"插话"按钮也据此置灰。
+  /// 只用 _isSending 判断会漏掉另一种常见情形：会话是电脑端发起、手机只是
+  /// 在看 —— 那时同样不能直接发一条新回合。
+  bool get isSessionRunning =>
+      _isSending || (_currentSession?.isRunning ?? false);
   int get streamRevision => _streamRevision;
 
   // Connection Status Helpers & Reconnect Info (F3.1, F3.4)
@@ -598,6 +607,8 @@ class DshService extends ChangeNotifier {
       await fetchAuditLogs();
       await fetchPersonas();
       await fetchSnippets();
+      await loadDeliveryMode();
+      await fetchPushConfig();
       await measurePing();
     } catch (e) {
       _status = ConnectionStatus.error;
@@ -707,6 +718,16 @@ class DshService extends ChangeNotifier {
     _workspaces = workspaces;
     if (archivedFilterSupported != null) _archivedFilterSupported = archivedFilterSupported;
     if (archivedFilter != null) _archivedFilter = archivedFilter;
+    notifyListeners();
+  }
+
+  /// 测试用：直接设定"当前会话"，不联网。
+  ///
+  /// 任务页/排队面板都只在**有当前会话**时才渲染内容（没有会话时给的是
+  /// "先去打开一个会话"的指引），所以没有这个缝就测不到它们真正要测的东西。
+  @visibleForTesting
+  void debugSetCurrentSession(SessionMeta session) {
+    _currentSession = session;
     notifyListeners();
   }
 
@@ -1027,6 +1048,8 @@ class DshService extends ChangeNotifier {
       if (currentSeq == _sessionLoadSeq) {
         _isLoadingHistory = false;
         notifyListeners();
+        // 排队消息属于会话：切过去就要看到它在等什么（v1.13）。
+        unawaited(fetchQueue());
       }
     }
   }
@@ -2092,6 +2115,502 @@ class DshService extends ChangeNotifier {
     }
   }
 
+  // ---------------------------------------------------------------- 任务中心 --
+  //
+  // 一个会话"正在等什么/改了什么/产出什么/烧了多少"的只读视图（v1.13）。
+  // 所有读取都允许失败并保留上一次结果：手机在地铁里断网时，页面显示的是
+  // 上一次的真值 + 一个错误提示，而不是一片空白。
+
+  List<QueueItem> _queueItems = [];
+  String _queueError = '';
+  bool _queueLoading = false;
+  List<DeliverableItem> _deliverables = [];
+  List<WorkspaceChange> _workspaceChanges = [];
+  String _workspaceChangesReason = '';
+  bool _workspaceChangesAvailable = false;
+  List<ScheduleItem> _schedules = [];
+  List<JobItem> _jobs = [];
+  SessionStats? _sessionStats;
+  PushConfig? _pushConfig;
+  String _deliveryMode = 'queue';
+
+  List<QueueItem> get queueItems => _queueItems;
+  String get queueError => _queueError;
+  bool get queueLoading => _queueLoading;
+  List<DeliverableItem> get deliverables => _deliverables;
+  List<WorkspaceChange> get workspaceChanges => _workspaceChanges;
+  String get workspaceChangesReason => _workspaceChangesReason;
+  bool get workspaceChangesAvailable => _workspaceChangesAvailable;
+  List<ScheduleItem> get schedules => _schedules;
+  List<JobItem> get jobs => _jobs;
+  SessionStats? get sessionStats => _sessionStats;
+  PushConfig? get pushConfig => _pushConfig;
+
+  /// 运行中发消息的投递方式：'queue' 排队 / 'steer' 插话。
+  String get deliveryMode => _deliveryMode;
+
+  Future<void> setDeliveryMode(String mode) async {
+    final next = mode == 'steer' ? 'steer' : 'queue';
+    if (next == _deliveryMode) return;
+    _deliveryMode = next;
+    notifyListeners();
+    await StorageService.saveDeliveryMode(next);
+  }
+
+  /// 启动时读取上次选择的投递方式。
+  Future<void> loadDeliveryMode() async {
+    _deliveryMode = await StorageService.loadDeliveryMode();
+    notifyListeners();
+  }
+
+  /// 拉取当前会话的排队消息。
+  Future<void> fetchQueue() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return;
+    _queueLoading = true;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/queue')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
+      if (_checkResponseAuth(res)) return;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final list = data['queue'] as List<dynamic>? ?? [];
+        _queueItems = list
+            .whereType<Map>()
+            .map((e) => QueueItem.fromJson(Map<String, dynamic>.from(e)))
+            .where((q) => q.id.isNotEmpty)
+            .toList(growable: false);
+        _queueError = '';
+      } else {
+        _queueError = '读取排队消息失败 (HTTP ${res.statusCode})';
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchQueue error: $e');
+      _queueError = '读取排队消息失败: $e';
+    } finally {
+      _queueLoading = false;
+      notifyListeners();
+    }
+  }
+
+  /// 对一条排队消息执行 edit / remove / steer。
+  ///
+  /// 返回是否成功。**失败必须让卡片留着** —— 网关侧失败时条目仍在队列里，
+  /// 本地乐观删除会让用户以为已经撤掉了，而 agent 依然会执行它。
+  Future<bool> queueAction(String itemId, String kind, {String? text}) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null || itemId.isEmpty) return false;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/queue');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({
+          'sessionId': sessionId,
+          'itemId': itemId,
+          'action': {
+            'kind': kind,
+            if (text != null) 'text': text,
+          },
+        }),
+      ).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return false;
+      if (res.statusCode == 200) {
+        _queueError = '';
+        await fetchQueue();
+        return true;
+      }
+      var msg = 'HTTP ${res.statusCode}';
+      try {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        if (data['error'] != null) msg = data['error'].toString();
+      } catch (_) {}
+      _queueError = '操作失败: $msg';
+      notifyListeners();
+      return false;
+    } catch (e) {
+      debugPrint('[DshService] queueAction error: $e');
+      _queueError = '操作失败: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// 运行中投递一条消息（排队或插话）。返回是否被网关接受。
+  ///
+  /// 与 [sendChatMessage] 分开是刻意的：那条路径会乐观插入"用户气泡 + 助手
+  /// 占位"，而排队/插话的消息属于 inbox 或正在跑的回合，插入的气泡会和引擎
+  /// 回传的真值重复。这里只发、然后以服务端的队列为准刷新界面。
+  Future<bool> deliverWhileRunning(String text, {List<PendingAttachment> attachments = const []}) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return false;
+    if (text.trim().isEmpty && attachments.isEmpty) return false;
+
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/prompt');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({
+          'sessionId': sessionId,
+          'text': text,
+          'model': currentModel,
+          'mode': _deliveryMode,
+          if (attachments.isNotEmpty)
+            'attachments': attachments.map((a) => a.toWirePart()).toList(),
+        }),
+      ).timeout(const Duration(seconds: 20));
+      if (_checkResponseAuth(res)) return false;
+      if (res.statusCode == 200) {
+        await fetchQueue();
+        return true;
+      }
+      _lastError = '发送失败 (HTTP ${res.statusCode})';
+      notifyListeners();
+      return false;
+    } catch (e) {
+      debugPrint('[DshService] deliverWhileRunning error: $e');
+      _lastError = '发送失败: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// 供下载类请求复用鉴权头（交付物下载走同一个令牌，不额外暴露任何东西）。
+  Map<String, String> get authHeadersForDownload => _authHeaders;
+
+  // ---- 测试注入点（任务中心）----
+  //
+  // 这些字段只有 HTTP 一条写入路径，而单测里打真实网关会污染用户数据
+  //（历史上正是这么累积出 1270 条空会话的）。所以给 UI 测试一个纯内存的
+  // 注入口，让"页面渲染了什么"可以被钉住，而不必联网。
+  @visibleForTesting
+  void debugSetQueue(List<QueueItem> rows, {bool loading = false, String error = ''}) {
+    _queueItems = rows;
+    _queueLoading = loading;
+    _queueError = error;
+    notifyListeners();
+  }
+
+  @visibleForTesting
+  void debugSetDeliveryMode(String mode) {
+    _deliveryMode = mode == 'steer' ? 'steer' : 'queue';
+    notifyListeners();
+  }
+
+  /// 摆布"当前会话在跑"这个状态（输入栏据此在发送/停止之间切换）。
+  @visibleForTesting
+  void debugSetRunning(bool running) {
+    _isSending = running;
+    notifyListeners();
+  }
+
+  @visibleForTesting
+  void debugSetTaskCenter({
+    List<DeliverableItem>? deliverables,
+    List<WorkspaceChange>? changes,
+    bool changesAvailable = false,
+    String changesReason = '',
+    List<ScheduleItem>? schedules,
+    List<JobItem>? jobs,
+    SessionStats? stats,
+    PushConfig? push,
+  }) {
+    if (deliverables != null) _deliverables = deliverables;
+    if (changes != null) _workspaceChanges = changes;
+    _workspaceChangesAvailable = changesAvailable;
+    _workspaceChangesReason = changesReason;
+    if (schedules != null) _schedules = schedules;
+    if (jobs != null) _jobs = jobs;
+    if (stats != null) _sessionStats = stats;
+    if (push != null) _pushConfig = push;
+    notifyListeners();
+  }
+
+  /// 交付物清单（Agent 用 present 声明的文件）。
+  Future<void> fetchDeliverables() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/deliverables')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final list = data['deliverables'] as List<dynamic>? ?? [];
+        _deliverables = list
+            .whereType<Map>()
+            .map((e) => DeliverableItem.fromJson(Map<String, dynamic>.from(e)))
+            .where((d) => d.path.isNotEmpty)
+            .toList(growable: false);
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchDeliverables error: $e');
+    }
+  }
+
+  /// 交付物下载地址（带鉴权头的请求由调用方发起）。
+  Uri? deliverableUrl(DeliverableItem item) {
+    if (_currentConfig == null || _currentSession == null) return null;
+    return Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/deliverables/download')
+        .replace(queryParameters: {
+      'sessionId': _currentSession!.sessionId,
+      'path': item.path,
+    });
+  }
+
+  /// 本次任务改动的文件（git 工作树）。
+  Future<void> fetchWorkspaceChanges() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/changes')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
+      if (_checkResponseAuth(res)) return;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final list = data['files'] as List<dynamic>? ?? [];
+        _workspaceChanges = list
+            .whereType<Map>()
+            .map((e) => WorkspaceChange.fromJson(Map<String, dynamic>.from(e)))
+            .where((c) => c.path.isNotEmpty)
+            .toList(growable: false);
+        _workspaceChangesAvailable = data['available'] == true;
+        _workspaceChangesReason = data['reason']?.toString() ?? '';
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchWorkspaceChanges error: $e');
+    }
+  }
+
+  /// 单个文件的 diff。返回空列表表示"无文本差异/二进制/读取失败"，
+  /// 调用方据 [DiffResult.ok] 区分失败。
+  Future<List<DiffHunk>> fetchDiff(String path) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return const [];
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/diff')
+          .replace(queryParameters: {'sessionId': sessionId, 'path': path});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
+      if (_checkResponseAuth(res)) return const [];
+      if (res.statusCode != 200) return const [];
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      final raw = data['hunks'] as List<dynamic>? ?? [];
+      return raw
+          .whereType<Map>()
+          .map((e) => DiffHunk.fromJson(Map<String, dynamic>.from(e)))
+          .toList(growable: false);
+    } catch (e) {
+      debugPrint('[DshService] fetchDiff error: $e');
+      return const [];
+    }
+  }
+
+  /// 当前会话的定时任务。
+  Future<void> fetchSchedules() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/schedules')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final list = data['schedules'] as List<dynamic>? ?? [];
+        _schedules = list
+            .whereType<Map>()
+            .map((e) => ScheduleItem.fromJson(Map<String, dynamic>.from(e)))
+            .toList(growable: false);
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchSchedules error: $e');
+    }
+  }
+
+  Future<bool> deleteSchedule(String id) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null || id.isEmpty) return false;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/schedules/delete');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'sessionId': sessionId, 'id': id}),
+      ).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return false;
+      if (res.statusCode == 200) {
+        await fetchSchedules();
+        return true;
+      }
+      return false;
+    } catch (e) {
+      debugPrint('[DshService] deleteSchedule error: $e');
+      return false;
+    }
+  }
+
+  /// 会话可见的后台作业。
+  Future<void> fetchJobs() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/jobs')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 12));
+      if (_checkResponseAuth(res)) return;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final list = data['jobs'] as List<dynamic>? ?? [];
+        _jobs = list
+            .whereType<Map>()
+            .map((e) => JobItem.fromJson(Map<String, dynamic>.from(e)))
+            .where((j) => j.id.isNotEmpty)
+            .toList(growable: false);
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchJobs error: $e');
+    }
+  }
+
+  Future<bool> killJob(String jobId) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null || jobId.isEmpty) return false;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/jobs/kill');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'sessionId': sessionId, 'jobId': jobId}),
+      ).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return false;
+      if (res.statusCode == 200) {
+        await fetchJobs();
+        return true;
+      }
+      return false;
+    } catch (e) {
+      debugPrint('[DshService] killJob error: $e');
+      return false;
+    }
+  }
+
+  /// 用量 / 上下文压力 / goal。
+  Future<void> fetchSessionStats() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/session/stats')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final stats = data['stats'];
+        if (stats is Map) {
+          _sessionStats = SessionStats.fromJson(Map<String, dynamic>.from(stats));
+          notifyListeners();
+        }
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchSessionStats error: $e');
+    }
+  }
+
+  /// 一次拉齐任务中心的全部数据（页面进入 / 下拉刷新）。
+  Future<void> refreshTaskCenter() async {
+    await Future.wait([
+      fetchDeliverables(),
+      fetchWorkspaceChanges(),
+      fetchSchedules(),
+      fetchJobs(),
+      fetchSessionStats(),
+      fetchQueue(),
+    ]);
+  }
+
+  // ---- 离线推送（ntfy）配置 ----
+
+  Future<void> fetchPushConfig() async {
+    if (_currentConfig == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/config');
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
+      if (_checkResponseAuth(res)) return;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final push = data['push'];
+        if (push is Map) {
+          _pushConfig = PushConfig.fromJson(Map<String, dynamic>.from(push));
+          notifyListeners();
+        }
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchPushConfig error: $e');
+    }
+  }
+
+  Future<bool> savePushConfig({
+    bool? enabled,
+    String? url,
+    String? topic,
+    String? token,
+  }) async {
+    if (_currentConfig == null) return false;
+    try {
+      final uri = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/config');
+      final res = await _httpClient.post(
+        uri,
+        headers: _authHeaders,
+        body: jsonEncode({
+          if (enabled != null) 'enabled': enabled,
+          if (url != null) 'url': url,
+          if (topic != null) 'topic': topic,
+          if (token != null) 'token': token,
+        }),
+      ).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return false;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final push = data['push'];
+        if (push is Map) {
+          _pushConfig = PushConfig.fromJson(Map<String, dynamic>.from(push));
+          notifyListeners();
+        }
+        return true;
+      }
+      _lastError = '保存推送配置失败 (HTTP ${res.statusCode})';
+      notifyListeners();
+      return false;
+    } catch (e) {
+      debugPrint('[DshService] savePushConfig error: $e');
+      _lastError = '保存推送配置失败: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  Future<bool> testPush() async {
+    if (_currentConfig == null) return false;
+    try {
+      final uri = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/test');
+      final res = await _httpClient.post(uri, headers: _authHeaders, body: '{}')
+          .timeout(const Duration(seconds: 12));
+      if (_checkResponseAuth(res)) return false;
+      return res.statusCode == 200;
+    } catch (e) {
+      debugPrint('[DshService] testPush error: $e');
+      return false;
+    }
+  }
+
   // Incoming WebSocket Message Processing
   void _handleRawMessage(dynamic raw) {
     // 任何服务器帧都喂看门狗 —— pong、系统帧、数据帧都算"连接活着"的证据。
@@ -2497,6 +3016,21 @@ class DshService extends ChangeNotifier {
         return;
       }
 
+      // 10.5 交付物与工作区变更（v1.13）：网关只推一个信号，数据按需拉。
+      //
+      // 交付物里可能有几十 MB 的文件，绝不可能内联进 WS 帧；变更清单要跑 git，
+      // 也不该由每次事件触发。所以事件只负责说"变了"，真正的读取走 REST。
+      if (type == 'deliverables' || type == 'workspace_changes') {
+        final sId = json['sessionId']?.toString() ?? '';
+        if (_currentSession == null || !_currentSession!.matchesSessionId(sId)) return;
+        if (type == 'deliverables') {
+          unawaited(fetchDeliverables());
+        } else {
+          unawaited(fetchWorkspaceChanges());
+        }
+        return;
+      }
+
       // 7. Completion
       if (type == 'done' || type == 'end') {
         final sId = json['sessionId']?.toString();
@@ -2550,6 +3084,8 @@ class DshService extends ChangeNotifier {
         _streamRevision++;
         notifyListeners();
         fetchWorkspaces();
+        // 一轮结束会领取（claim）队首消息：队列真值变了，刷新它（v1.13）。
+        unawaited(fetchQueue());
         return;
       }
 

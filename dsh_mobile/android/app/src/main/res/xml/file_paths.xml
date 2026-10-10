@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 暴露的路径。
+
+  只暴露 **cacheDir 下的两个子目录**，不是整个缓存目录、更不是 files/：
+  交付物与分享进来再外发的文件都属于"临时产物"，放在 cache 下既语义正确
+  （系统可在空间紧张时回收），也把可外发的范围压到最小。
+    deliverables/  agent 交付的文件（下载后交给系统应用打开）
+    shared/        系统分享进来的图片临时副本
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path name="deliverables" path="deliverables/" />
+    <cache-path name="shared" path="shared/" />
+</paths>

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -24,6 +25,7 @@ import '../main.dart';
 import '../services/voice_input_service.dart';
 import '../services/platform_services.dart';
 import '../models/pending_attachment.dart';
+import '../models/task_center.dart';
 import '../services/attachment_picker.dart';
 
 /// 长按说话的三个状态（v1.12.0）。
@@ -187,20 +189,57 @@ class _ChatViewState extends State<ChatView> {
       if (mounted) setState(() => _voiceSupported = ok);
     });
 
-    // 分享接收：从系统分享（SEND intent）进来的文字填进输入框。
-    // 只在首次挂载消费一次；图片分享走附件管线，此处暂只接文字
-    //（图片 URI 需要读 content:// 流，接附件管线改动大，先不做）。
+    // 分享接收：从系统分享（SEND intent）进来的内容。文字填进输入框，
+    // 图片挂成附件（原生侧已经把 content:// 流抄进缓存、必要时缩小过 ——
+    // 那个 URI 的读权限只属于原进程，Dart 侧打不开）。
     _consumePendingShare();
   }
 
   Future<void> _consumePendingShare() async {
     final shared = await ShareReceiver.consumePending();
     if (shared == null || !mounted) return;
+
     if (shared.text.isNotEmpty) {
       final cur = _inputController.text;
       _inputController.text = cur.isEmpty ? shared.text : '$cur\n${shared.text}';
       setState(() {});
       _jumpToBottom();
+    }
+
+    if (shared.imagePath.isNotEmpty) {
+      await _attachSharedImage(shared);
+    }
+  }
+
+  /// 把分享进来的图片挂成附件。
+  ///
+  /// 失败必须说清楚原因（太大/读不了），而不是静默不挂 —— 用户以为发出去了
+  /// 一张图、agent 却什么都没收到，是最坏的结果。
+  Future<void> _attachSharedImage(SharedContent shared) async {
+    try {
+      final file = File(shared.imagePath);
+      if (!await file.exists()) {
+        _toast('分享的图片读不到了');
+        return;
+      }
+      final bytes = await file.readAsBytes();
+      final name = shared.imageName.isNotEmpty ? shared.imageName : file.uri.pathSegments.last;
+      final media = PickedMedia(
+        bytes: bytes,
+        name: name.toLowerCase().endsWith('.jpg') || name.toLowerCase().endsWith('.jpeg')
+            ? name
+            : '$name.jpg',
+        mimeType: 'image/jpeg',
+      );
+      final pending = _prepareImageAttachment(media);
+      if (!mounted) return;
+      setState(() => _pendingAttachments.add(pending));
+      _toast('已从分享挂上 1 张图片');
+      _jumpToBottom();
+    } on AttachmentError catch (e) {
+      if (mounted) _toast(e.message);
+    } catch (e) {
+      if (mounted) _toast('分享的图片挂载失败: $e');
     }
   }
 
@@ -356,8 +395,41 @@ class _ChatViewState extends State<ChatView> {
     final outgoing = List<PendingAttachment>.from(_pendingAttachments);
     _inputController.clear();
     setState(() => _pendingAttachments.clear());
-    dsh.sendChatMessage(text, attachments: outgoing);
+
+    if (dsh.isSessionRunning) {
+      // agent 正在跑：这条消息按用户选的模式投递（排队/插话），**不**插入本地
+      // 乐观气泡 —— 队列与回合真值都以服务端为准，插一份本地副本只会在引擎
+      // 回传后变成两条。
+      unawaited(_deliverWhileRunning(dsh, text, outgoing));
+    } else {
+      dsh.sendChatMessage(text, attachments: outgoing);
+    }
     _scrollToBottom();
+  }
+
+  /// 运行中投递：失败必须把内容还回来。
+  ///
+  /// 输入框已经清空了（乐观清空是为了让连续发送手感正常），所以失败时要把
+  /// 正文和附件放回输入框，否则用户写的东西直接消失。
+  Future<void> _deliverWhileRunning(
+    DshService dsh,
+    String text,
+    List<PendingAttachment> attachments,
+  ) async {
+    final mode = dsh.deliveryMode;
+    final ok = await dsh.deliverWhileRunning(text, attachments: attachments);
+    if (!mounted) return;
+    if (ok) {
+      _toast(mode == 'steer' ? '已插话发送' : '已加入队列');
+      _scrollToBottom();
+      return;
+    }
+    _inputController.text = text;
+    _inputController.selection = TextSelection.collapsed(offset: text.length);
+    setState(() => _pendingAttachments
+      ..clear()
+      ..addAll(attachments));
+    _toast('发送失败，内容已还回输入框');
   }
 
   /// 选取并挂载附件（§4.2）。
@@ -391,7 +463,7 @@ class _ChatViewState extends State<ChatView> {
         );
       } else {
         // 图片：直接在本地编码成 image part，不发网络请求。
-        attachment = PendingImage.fromPicked(media, localId: _nextAttachmentId());
+        attachment = _prepareImageAttachment(media);
       }
 
       if (!mounted) return;
@@ -405,6 +477,13 @@ class _ChatViewState extends State<ChatView> {
       _toast('附件处理失败，请重试');
     }
   }
+
+  /// 把一张已就位的图片变成可发送的附件（含 base64 编码与上限校验）。
+  ///
+  /// 抽出来是因为现在有两条入口：相册选取、系统分享进来的图片。两条都必须
+  /// 走同一套校验 —— 否则分享那条能绕过 1.4MB 内联上限，直到发出去才被网关拒。
+  PendingAttachment _prepareImageAttachment(PickedMedia media) =>
+      PendingImage.fromPicked(media, localId: _nextAttachmentId());
 
   /// 选择入口：图片 / 文件。做成底部弹窗而不是两个按钮，是因为输入栏的横向
   /// 空间已经很紧（输入框 + 麦克风 + 发送），再加两个图标会挤。
@@ -2652,6 +2731,10 @@ class _ChatViewState extends State<ChatView> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // 排队消息（v1.13）：agent 正在跑时你发出去的话先在这里等。
+              // 放在输入卡片**内部**最上方：它是"这条队列属于这个输入框"，
+              // 而不是另一块独立面板。
+              _buildQueueDock(dsh),
               // 待发附件也放进卡片内 —— 它与"这条消息要发什么"是同一件事，
               // 摆在卡片外会显得是两个不相干的东西。
               if (_pendingAttachments.isNotEmpty) _buildPendingAttachments(),
@@ -2792,6 +2875,7 @@ class _ChatViewState extends State<ChatView> {
                       onTap: () => _showAttachSheet(dsh),
                     ),
                     const Spacer(),
+                    _buildDeliveryModeChip(dsh),
                     _buildModelPill(dsh),
                     const SizedBox(width: 2),
                     _buildMicButton(dsh),
@@ -2927,6 +3011,141 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
+  /// 排队消息面板（v1.13）。
+  ///
+  /// 只读 + 三个动作（编辑 / 删除 / 插话），全部以服务端为准：每次动作后
+  /// 重新拉队列，绝不本地乐观删除 —— 网关失败时条目仍在队列里等待执行，
+  /// 界面上却把它抹掉，用户会以为已经撤回了。
+  Widget _buildQueueDock(DshService dsh) {
+    final rows = dsh.queueItems;
+    if (rows.isEmpty && dsh.queueError.isEmpty) return const SizedBox.shrink();
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.fromLTRB(8, 6, 6, 6),
+      decoration: BoxDecoration(
+        color: context.c.surfaceMuted,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: context.c.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.queue_rounded, size: 14, color: context.c.textSecondary),
+              const SizedBox(width: 5),
+              Text(
+                rows.isEmpty ? '排队消息' : '${rows.length} 条排队消息',
+                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: context.c.textSecondary),
+              ),
+              const Spacer(),
+              if (dsh.queueLoading)
+                SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.6, color: context.c.textTertiary)),
+            ],
+          ),
+          if (dsh.queueError.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(dsh.queueError, style: TextStyle(fontSize: 11, color: context.c.danger)),
+            ),
+          for (final row in rows)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Text(
+                      row.label,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 12.5, color: context.c.textPrimary),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  _queueIconButton(Icons.edit_outlined, '编辑', () => _editQueueRow(dsh, row)),
+                  _queueIconButton(Icons.close_rounded, '删除', () => _removeQueueRow(dsh, row)),
+                  _queueIconButton(
+                    Icons.bolt_rounded,
+                    '立即插话',
+                    // 插话只有在 agent 跑着的时候才有意义；不跑时按钮置灰，
+                    // 而不是点了之后由引擎回一个 steer-unavailable。
+                    dsh.isSessionRunning ? () => _steerQueueRow(dsh, row) : null,
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _queueIconButton(IconData icon, String tooltip, VoidCallback? onTap) {
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Padding(
+          padding: const EdgeInsets.all(4),
+          child: Icon(
+            icon,
+            size: 16,
+            color: onTap == null ? context.c.textTertiary : context.c.textSecondary,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _removeQueueRow(DshService dsh, QueueItem row) async {
+    HapticFeedback.selectionClick();
+    final ok = await dsh.queueAction(row.id, 'remove');
+    if (!mounted) return;
+    if (!ok) _toast(dsh.queueError.isEmpty ? '删除失败' : dsh.queueError);
+  }
+
+  Future<void> _steerQueueRow(DshService dsh, QueueItem row) async {
+    HapticFeedback.mediumImpact();
+    final ok = await dsh.queueAction(row.id, 'steer');
+    if (!mounted) return;
+    _toast(ok ? '已插话发送' : (dsh.queueError.isEmpty ? '插话失败' : dsh.queueError));
+  }
+
+  Future<void> _editQueueRow(DshService dsh, QueueItem row) async {
+    final controller = TextEditingController(text: row.text);
+    final next = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('编辑排队消息'),
+        content: TextField(
+          controller: controller,
+          minLines: 2,
+          maxLines: 5,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: '只能编辑文字内容'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (next == null || !mounted) return;
+    if (next.trim().isEmpty) {
+      _toast('内容不能为空');
+      return;
+    }
+    final ok = await dsh.queueAction(row.id, 'edit', text: next);
+    if (!mounted) return;
+    if (!ok) _toast(dsh.queueError.isEmpty ? '保存失败' : dsh.queueError);
+  }
+
   /// 操作行里的图标按钮。
   ///
   /// 刻意**不画圆圈边框**：这一行里已经有一个模型胶囊和一个实心发送键，再套三个
@@ -2994,40 +3213,49 @@ class _ChatViewState extends State<ChatView> {
   ///
   /// * 没有可发的内容时**置灰且不可点** —— 上一版无论有没有文字都是亮着的，
   ///   点下去没反应，用户会以为卡住了。
-  /// * 正在生成/取消时变成停止键：这时用户最想要的是"停下来"，而不是再发一条。
+  /// * 运行中且输入框为空时是停止键：这时用户最想要的是"停下来"。
+  /// * 运行中且**有内容**时是发送键（按排队/插话投递）—— 两个意图不必抢
+  ///   同一个按钮：清空输入框就能停。
+  ///
+  /// ⚠️ 整个判断必须包在 ValueListenableBuilder 里。最初把 `hasDraft` 写在
+  /// 函数开头，而调用它的输入栏只在 DshService 通知时才重建 —— 用户敲字只
+  /// 触发 ValueListenableBuilder 这一小块重建，于是"敲了字按钮还是停止键"，
+  /// 点了就等于取消自己的回合。这个 bug 由 widget 测试抓到。
   Widget _buildSendButton(DshService dsh) {
-    if (dsh.isSending || dsh.isCanceling) {
-      return SizedBox(
-        width: 44,
-        height: 44,
-        child: dsh.isCanceling
-            ? Padding(
-                padding: const EdgeInsets.all(10),
-                child: CircularProgressIndicator(strokeWidth: 2, color: context.c.danger),
-              )
-            : InkWell(
-                onTap: () {
-                  HapticFeedback.mediumImpact();
-                  dsh.cancelActiveTurn();
-                },
-                borderRadius: BorderRadius.circular(22),
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: context.c.dangerSurface,
-                    shape: BoxShape.circle,
-                    border: Border.all(color: context.c.danger),
-                  ),
-                  child: Icon(Icons.stop_rounded, color: context.c.danger, size: 20),
-                ),
-              ),
-      );
-    }
-
-    // 只重建这一小块，不因为每次按键就重建整个输入栏。
     return ValueListenableBuilder<TextEditingValue>(
       valueListenable: _inputController,
       builder: (context, value, _) {
         final canSend = value.text.trim().isNotEmpty || _pendingAttachments.isNotEmpty;
+        if ((dsh.isSending || dsh.isCanceling) && !canSend) {
+          return SizedBox(
+            width: 44,
+            height: 44,
+            child: dsh.isCanceling
+                ? Padding(
+                    padding: const EdgeInsets.all(10),
+                    child: CircularProgressIndicator(strokeWidth: 2, color: context.c.danger),
+                  )
+                : InkWell(
+                    onTap: () {
+                      HapticFeedback.mediumImpact();
+                      dsh.cancelActiveTurn();
+                    },
+                    borderRadius: BorderRadius.circular(22),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: context.c.dangerSurface,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: context.c.danger),
+                      ),
+                      child: Icon(Icons.stop_rounded, color: context.c.danger, size: 20),
+                    ),
+                  ),
+          );
+        }
+
+        // 运行中且有内容 → 发送键按排队/插话投递（和 Web 端一致：空框才是停止键）。
+        // 图标换成 ⚡ 表示"这句话是在插话"，让用户一眼看出不是在开新回合。
+        final steering = dsh.isSessionRunning && canSend && dsh.deliveryMode == 'steer';
         return SizedBox(
           width: 44,
           height: 44,
@@ -3036,11 +3264,13 @@ class _ChatViewState extends State<ChatView> {
             borderRadius: BorderRadius.circular(22),
             child: Container(
               decoration: BoxDecoration(
-                color: canSend ? context.c.accent : context.c.border,
+                color: canSend
+                    ? (steering ? context.c.warning : context.c.accent)
+                    : context.c.border,
                 shape: BoxShape.circle,
               ),
               child: Icon(
-                Icons.arrow_upward_rounded,
+                steering ? Icons.bolt_rounded : Icons.arrow_upward_rounded,
                 size: 22,
                 color: canSend ? Colors.white : context.c.textTertiary,
               ),
@@ -3048,6 +3278,53 @@ class _ChatViewState extends State<ChatView> {
           ),
         );
       },
+    );
+  }
+
+  /// 运行中的投递方式切换（排队 / 插话）。
+  ///
+  /// 只在会话跑着的时候出现：空闲时这枚开关没有任何作用，摆在输入框旁边只会
+  /// 让人琢磨它到底影响什么。
+  Widget _buildDeliveryModeChip(DshService dsh) {
+    if (!dsh.isSessionRunning) return const SizedBox.shrink();
+    final steer = dsh.deliveryMode == 'steer';
+    return Tooltip(
+      message: steer ? '插话：打断当前回合立刻看这句话' : '排队：等这一轮跑完再执行',
+      child: InkWell(
+        onTap: () {
+          HapticFeedback.selectionClick();
+          dsh.setDeliveryMode(steer ? 'queue' : 'steer');
+        },
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          margin: const EdgeInsets.only(right: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+          decoration: BoxDecoration(
+            color: steer ? context.c.warning.withOpacity(0.12) : context.c.surface,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: steer ? context.c.warning : context.c.border),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                steer ? Icons.bolt_rounded : Icons.queue_rounded,
+                size: 13,
+                color: steer ? context.c.warning : context.c.textSecondary,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                steer ? '插话' : '排队',
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                  color: steer ? context.c.warning : context.c.textSecondary,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

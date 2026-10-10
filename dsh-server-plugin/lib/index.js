@@ -9,6 +9,8 @@
 
 import { createServer } from 'node:http';
 import http from 'node:http';
+import https from 'node:https';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -23,6 +25,15 @@ import {
   loadPermissions, savePermissions, permissionsFile
 } from './store.mjs';
 import { installRpc, RPC_CHANNEL, ENDPOINTS } from './rpc.mjs';
+import {
+  handleFeatureRoute,
+  pushForEvent,
+  buildNtfyRequest,
+  parsePorcelain,
+  parseNumstat,
+  combineChanges,
+  parseUnifiedDiff
+} from './features.mjs';
 import {
   BRIDGE_VERSION,
   MAX_BODY_SIZE,
@@ -43,6 +54,7 @@ import {
   isCarriedContext,
   describeTurnEnd,
   isFailedTurnEnd,
+  toFullSessionId,
   authenticateRequest,
   readBodyWithLimit,
   parseJsonBody,
@@ -219,6 +231,297 @@ export function apply(ctx, config = {}, internals = {}) {
   };
 
   const callDshRpc = createRpcCaller({ dshPort, cookieFactory });
+
+  /* ------------------------------------------------------------------ *
+   * v1.14 能力：队列/交付物/diff/用量/ntfy 推送
+   *
+   * 这些是"重度远程操控"所需的读取与动作面。全部只读或幂等，且**不新建
+   * 会话**；任何失败都如实回错，不假装成功。
+   * ------------------------------------------------------------------ */
+
+  /** Decoded projection-cache rows for one session (no engine round trip). */
+  function readProjectionRows(sessionId) {
+    const clean = String(sessionId || '').replace(/^session-/, '');
+    const file = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions', `${clean}.json`);
+    const record = projCacheReader.readJson(file);
+    return record?.record?.rows ?? null;
+  }
+
+  /** Session working directory from the projection cache, when recorded. */
+  function readSessionCwd(sessionId) {
+    const clean = String(sessionId || '').replace(/^session-/, '');
+    const file = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions', `${clean}.json`);
+    const record = projCacheReader.readJson(file);
+    const cwd = record?.record?.identity?.cwd;
+    return typeof cwd === 'string' && cwd ? cwd : null;
+  }
+
+  /**
+   * Read all registered projections for one session, or null.
+   *
+   * Returns null (never throws) when the session is not live: the caller falls
+   * back to the projection cache instead of showing an error card for a cold
+   * conversation, which is the common case for a phone opening yesterday's task.
+   */
+  async function readProjections(sessionId) {
+    try {
+      const value = await callDshRpc('session/projections', {
+        args: { request: { sessionId: toFullSessionId(sessionId) } }
+      });
+      return value?.values ?? null;
+    } catch (err) {
+      logger.warn('[dsh-mobile-bridge] session/projections 失败 %s: %s', sessionId, err?.message || err);
+      return null;
+    }
+  }
+
+  /**
+   * Session records plus working directory, for deliverable discovery.
+   *
+   * One bounded page is enough: `present` declarations are rare and the page
+   * carries the newest events, which is exactly the window a phone cares about.
+   */
+  async function readSessionRecords(sessionId) {
+    const cwd = readSessionCwd(sessionId);
+    try {
+      const page = await callDshRpc('session/page', {
+        args: {
+          request: {
+            address: { kind: 'session', sessionId: toFullSessionId(sessionId) },
+            maxMessages: 200
+          }
+        }
+      });
+      return { records: Array.isArray(page?.records) ? page.records : [], cwd };
+    } catch (err) {
+      logger.warn('[dsh-mobile-bridge] session/page 失败（交付物扫描）%s: %s', sessionId, err?.message || err);
+      return { records: [], cwd };
+    }
+  }
+
+  /**
+   * Changed files for a session's workspace, read with git.
+   *
+   * The engine's own `workspace/changes` event carries only the turn number and
+   * keeps its summary/snapshot on the Host, so it cannot be replayed to a phone.
+   * Reading the working tree with git gives the same practical answer — what did
+   * this task change — for any git repository, and degrades honestly (empty list
+   * + `reason`) when the workspace is not a repository.
+   */
+  async function readWorkspaceChanges(sessionId, wantedPath) {
+    const cwd = readSessionCwd(sessionId);
+    if (!cwd) return { available: false, reason: 'no-workspace', files: [] };
+
+    const runGit = (args) => new Promise((resolve) => {
+      execFile('git', args, { cwd, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, stdout) => {
+        if (error) resolve(null);
+        else resolve(String(stdout));
+      });
+    });
+
+    const inside = await runGit(['rev-parse', '--is-inside-work-tree']);
+    if (inside === null || inside.trim() !== 'true') {
+      return { available: false, reason: 'not-a-git-repository', files: [] };
+    }
+
+    if (wantedPath) {
+      // Per-file diff: `--no-color` keeps the payload renderable, and the path
+      // comes from the already-listed change set (see the route), so no user
+      // string reaches the command line unvalidated.
+      const diff = await runGit(['diff', '--no-color', '--', wantedPath]);
+      const stagedDiff = diff === null ? '' : diff;
+      const untracked = await runGit(['diff', '--no-index', '--no-color', '/dev/null', wantedPath]);
+      const text = stagedDiff.trim() ? stagedDiff : (untracked ?? '');
+      return {
+        available: true,
+        path: wantedPath,
+        hunks: parseUnifiedDiff(text),
+        empty: !text.trim(),
+        binary: /Binary files .* differ/.test(text)
+      };
+    }
+
+    const porcelain = await runGit(['status', '--porcelain=v1', '-z']);
+    const numstat = await runGit(['diff', '--numstat', 'HEAD']);
+    const files = combineChanges(parsePorcelain(porcelain ?? ''), parseNumstat(numstat ?? ''));
+    return { available: true, cwd, files };
+  }
+
+  /** Stream one file to the client with a download disposition. */
+  function sendFile(absPath, displayName) {
+    return new Promise((resolve) => {
+      let stat;
+      try {
+        stat = fs.statSync(absPath);
+      } catch {
+        resolve(false);
+        return;
+      }
+      if (!stat.isFile()) {
+        resolve(false);
+        return;
+      }
+      const safeName = encodeURIComponent(path.basename(displayName || absPath));
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': stat.size,
+        'Content-Disposition': `attachment; filename*=UTF-8''${safeName}`
+      });
+      const stream = fs.createReadStream(absPath);
+      stream.on('error', () => { try { res.destroy(); } catch (_) {} resolve(false); });
+      stream.on('end', () => resolve(true));
+      stream.pipe(res);
+    });
+  }
+
+  /**
+   * Open a stream Remote on the MUX, take its first `take` items, then cancel.
+   *
+   * `job/list` is a stream method (the unary carrier rejects it outright), and
+   * its frames are whole-set replacements, so the first frame is already the
+   * complete answer. The stream is cancelled immediately afterwards — leaving
+   * one open per phone request would leak a subscription per poll.
+   */
+  function readStreamOnce(endpoint, args, { take = 1, timeoutMs = 5000 } = {}) {
+    return new Promise((resolve) => {
+      if (!upstreamMuxWs || upstreamMuxWs.readyState !== WebSocket.OPEN) {
+        resolve(null);
+        return;
+      }
+      const streamId = `oneshot-${endpoint.replace(/\W+/g, '-')}-${crypto.randomUUID().slice(0, 8)}`;
+      const items = [];
+      let settled = false;
+
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        pendingOneshot.delete(streamId);
+        clearTimeout(timer);
+        try {
+          upstreamMuxWs?.send(JSON.stringify({ type: 'cancel', streamId }));
+        } catch (_) {}
+        resolve(value);
+      };
+
+      const timer = setTimeout(() => finish(items.length ? items[items.length - 1] : null), timeoutMs);
+      pendingOneshot.set(streamId, {
+        push(value) {
+          items.push(value);
+          if (items.length >= take) finish(items[items.length - 1]);
+        },
+        fail() { finish(null); }
+      });
+
+      try {
+        upstreamMuxWs.send(JSON.stringify({
+          type: 'open',
+          streamId,
+          endpoint,
+          payload: { args }
+        }));
+      } catch (_) {
+        finish(null);
+      }
+    });
+  }
+
+  /** One-shot stream bookkeeping, keyed by streamId. */
+  const pendingOneshot = new Map();
+
+  /**
+   * Deep link the App registers for, used as the ntfy click target.
+   *
+   * Tapping an ntfy notification must land on the right conversation — the
+   * whole point of a push for a remote operator. The App declares
+   * `dshmobile://open` and resolves `session` + `kind` into a session open.
+   */
+  function deepLinkUrl(kind, sessionId) {
+    const sid = String(sessionId || '').trim();
+    if (!sid) return '';
+    return `dshmobile://open?kind=${encodeURIComponent(kind)}&session=${encodeURIComponent(sid)}`;
+  }
+
+  /**
+   * Send one ntfy push. Fire-and-forget by design: a phone notification must
+   * never fail (or delay) the approval/question path it reports on.
+   */
+  function pushNtfy(kind, detail = {}) {
+    let cfg;
+    try {
+      cfg = loadConfig();
+    } catch {
+      return;
+    }
+    if (cfg.ntfyEnabled !== true) return;
+    const message = pushForEvent(kind, detail);
+    if (!message) return;
+    const click = detail.clickUrl
+      ? { ...message, click: detail.clickUrl }
+      : message;
+    const request = buildNtfyRequest(cfg, click);
+    if (!request) return;
+
+    try {
+      const target = new globalThis.URL(request.url);
+      const transport = target.protocol === 'https:' ? https : http;
+      const body = JSON.stringify(request.body);
+      const req = transport.request({
+        hostname: target.hostname,
+        port: target.port || (target.protocol === 'https:' ? 443 : 80),
+        path: `${target.pathname}${target.search}`,
+        method: 'POST',
+        headers: { ...request.headers, 'Content-Length': Buffer.byteLength(body) },
+        timeout: 5000
+      }, (res) => {
+        res.resume();
+        if (res.statusCode >= 400) {
+          logger.warn('[dsh-mobile-bridge] ntfy 推送被拒: HTTP %s', res.statusCode);
+        }
+      });
+      req.on('error', (err) => logger.warn('[dsh-mobile-bridge] ntfy 推送失败: %s', err?.message || err));
+      req.on('timeout', () => { try { req.destroy(); } catch (_) {} });
+      req.end(body);
+    } catch (err) {
+      logger.warn('[dsh-mobile-bridge] ntfy 推送异常: %s', err?.message || err);
+    }
+  }
+
+  /** Send a test push; returns whether ntfy accepted it. */
+  function pushTest() {
+    return new Promise((resolve) => {
+      const cfg = loadConfig();
+      if (cfg.ntfyEnabled !== true) { resolve(false); return; }
+      const request = buildNtfyRequest(cfg, {
+        title: 'DSH 推送测试',
+        body: '配置已生效：审批/提问/任务完成会推到这里',
+        priority: 3,
+        tags: ['bell']
+      });
+      if (!request) { resolve(false); return; }
+      try {
+        const target = new globalThis.URL(request.url);
+        const transport = target.protocol === 'https:' ? https : http;
+        const body = JSON.stringify(request.body);
+        const req = transport.request({
+          hostname: target.hostname,
+          port: target.port || (target.protocol === 'https:' ? 443 : 80),
+          path: `${target.pathname}${target.search}`,
+          method: 'POST',
+          headers: { ...request.headers, 'Content-Length': Buffer.byteLength(body) },
+          timeout: 5000
+        }, (res) => {
+          res.resume();
+          resolve(res.statusCode < 400);
+        });
+        req.on('error', () => resolve(false));
+        req.on('timeout', () => { try { req.destroy(); } catch (_) {} resolve(false); });
+        req.end(body);
+      } catch {
+        resolve(false);
+      }
+    });
+  }
+
 
   /**
    * 单次上传的字节上限。
@@ -1236,6 +1539,31 @@ export function apply(ctx, config = {}, internals = {}) {
       return true;
     }
 
+    if (val.event === 'deliverables/presented') {
+      // The phone shows a "交付物" row; the bytes are fetched on demand through
+      // the authenticated download route (see features.mjs), never inline.
+      const files = Array.isArray(data.files) ? data.files : [];
+      if (!files.length) return true;
+      broadcastToMobileClients({
+        type: 'deliverables',
+        sessionId,
+        files: files.map((f) => ({
+          path: typeof f?.path === 'string' ? f.path : '',
+          description: typeof f?.description === 'string' ? f.description : ''
+        })).filter((f) => f.path)
+      });
+      audit('deliverables/presented', { sessionId, count: files.length });
+      return true;
+    }
+
+    if (val.event === 'workspace/changes') {
+      // Signal only: the turn number is all the engine puts in the log, so the
+      // phone refreshes its change list (git-backed) instead of expecting a
+      // payload that does not exist.
+      broadcastToMobileClients({ type: 'workspace_changes', sessionId, turn: data.turn ?? null });
+      return true;
+    }
+
     return false;
   }
 
@@ -1350,6 +1678,12 @@ export function apply(ctx, config = {}, internals = {}) {
     upstreamMuxWs.on('close', () => {
       if (isDisposed) return;
       currentEventsClientId = null;
+      // Pending one-shot reads die with the link — settle them now so the HTTP
+      // request gets an honest failure instead of waiting out its timeout.
+      for (const [id, pending] of [...pendingOneshot]) {
+        pendingOneshot.delete(id);
+        pending.fail();
+      }
       // The engine-side link is gone, so any answer we forward would go nowhere.
       // Stop offering these rather than letting a phone answer into the void.
       for (const q of [...pendingQuestions.values()]) {
@@ -1372,6 +1706,17 @@ export function apply(ctx, config = {}, internals = {}) {
 
   async function handleUpstreamMuxMessage(msg) {
     if (!msg) return;
+
+    // 0. One-shot stream bookkeeping (job/list today). Handled before anything
+    // else so an `item`, `end`, or `error` frame for a one-shot stream can
+    // never fall into the session-follow branches below.
+    if (typeof msg.streamId === 'string' && msg.streamId.startsWith('oneshot-')) {
+      const oneshot = pendingOneshot.get(msg.streamId);
+      if (!oneshot) return;
+      if (msg.type === 'item') oneshot.push(msg.value);
+      else if (msg.type === 'end' || msg.type === 'error') oneshot.fail();
+      return;
+    }
 
     // 1. Upstream MUX Item Frames (Standard DSH MUX protocol)
     if (msg.type === 'item') {
@@ -1479,6 +1824,12 @@ export function apply(ctx, config = {}, internals = {}) {
             follower.tools = [];
             broadcastToMobileClients({ type: 'session_status', sessionId: sId, isRunning: false });
             audit('session/turn-end', { sessionId: sId, kind: end.kind });
+            // 离线推送：进程被杀/手机锁屏时，这条是唯一能叫醒用户的东西。
+            pushNtfy(isFailedTurnEnd(ev.data?.reason) ? 'turn-failed' : 'turn-end', {
+              sessionId: sId,
+              summary: end.text || '本轮已结束',
+              clickUrl: deepLinkUrl('done', sId)
+            });
           } else if (ev.type === 'tool/call') {
             const toolObj = {
               id: ev.data?.id || `tool_${Date.now()}`,
@@ -1573,6 +1924,11 @@ export function apply(ctx, config = {}, internals = {}) {
               questions
             }, questionSubscribers);
             audit('question/requested', { eventId, sessionId, count: questions.length });
+            pushNtfy('question', {
+              sessionId,
+              question: questions[0]?.question || '',
+              clickUrl: deepLinkUrl('question', sessionId)
+            });
             return;
           }
         }
@@ -1748,6 +2104,12 @@ export function apply(ctx, config = {}, internals = {}) {
               coreApprovals.put(approval);
               audit('approval/requested', approval);
               broadcastToMobileClients({ type: 'approval_request', approval });
+              pushNtfy('approval', {
+                sessionId,
+                toolName,
+                reason,
+                clickUrl: deepLinkUrl('approval', sessionId)
+              });
             }
             return;
           }
@@ -1770,6 +2132,12 @@ export function apply(ctx, config = {}, internals = {}) {
           broadcastToMobileClients({
             type: 'approval_request',
             approval
+          });
+          pushNtfy('approval', {
+            sessionId,
+            toolName,
+            reason,
+            clickUrl: deepLinkUrl('approval', sessionId)
           });
           return;
         }
@@ -2124,7 +2492,13 @@ export function apply(ctx, config = {}, internals = {}) {
       '/api/mobile/workspace/memory',
       '/api/mobile/memory',
       '/api/mobile/personas',
-      '/api/mobile/snippets'
+      '/api/mobile/snippets',
+      // v1.14：队列插话、定时任务删除、作业终止、推送配置
+      '/api/mobile/sessions/queue',
+      '/api/mobile/schedules/delete',
+      '/api/mobile/jobs/kill',
+      '/api/mobile/push/config',
+      '/api/mobile/push/test'
     ];
     if (req.method === 'POST' || req.method === 'PUT') {
       const isWrite = WRITE_PATHS.some((p) => pathname === p) ||
@@ -2446,6 +2820,11 @@ export function apply(ctx, config = {}, internals = {}) {
 
         const thisTurnSeq = coreTurns.nextTurnSeq(sessionId);
 
+        // 投递模式（v1.13）：'queue' 排队等这一轮跑完，'steer' 插进正在跑的
+        // 回合。引擎自己对空闲会话也接受 'queue'（它会落进 transcript），
+        // 所以默认值不变，只有客户端显式要求插话时才换。
+        const deliveryMode = jsonBody.mode === 'steer' ? 'steer' : 'queue';
+
         activePrompts.set(sessionId, now);
         const follower = getSessionFollower(sessionId);
         if (follower) {
@@ -2465,7 +2844,7 @@ export function apply(ctx, config = {}, internals = {}) {
               request: {
                 requestId: crypto.randomUUID(),
                 sessionId: sessionId,
-                mode: 'queue',
+                mode: deliveryMode,
                 // 文字 part 只在有文字时加入。引擎要求"非空白文字或至少一个附件"，
                 // 而 {type:'text',text:''} 这种空白 part 会让准入判定变复杂，
                 // 干脆不发。
@@ -2769,6 +3148,34 @@ export function apply(ctx, config = {}, internals = {}) {
           apkMtime,
           time: Date.now()
         });
+        return;
+      }
+
+      // ---- v1.14 能力路由（队列/定时/作业/交付物/diff/用量/推送）----
+      //
+      // 一个入口集中处理，纯逻辑留在 lib/features.mjs 里（可脱离引擎单测）。
+      // 未命中的请求原样返回 false，落到下面的既有路由与 404。
+      if (await handleFeatureRoute({
+        pathname,
+        req,
+        res,
+        parsedUrl,
+        jsonBody,
+        auth,
+        sendJson,
+        sendFile,
+        callDshRpc,
+        readStreamOnce,
+        readProjections,
+        readProjectionRows,
+        readSessionRecords,
+        readWorkspaceChanges,
+        readConfig: loadConfig,
+        writeConfig: saveConfig,
+        pushTest,
+        audit,
+        logger
+      })) {
         return;
       }
 

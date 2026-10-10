@@ -21,13 +21,27 @@ class MainActivity : FlutterActivity() {
     /** 分享接收：SEND intent 带来的内容，Dart 侧启动时消费一次。 */
     private var pendingShare: MutableMap<String, String>? = null
 
+    /** 深链接带来的会话 id（离线推送点开直达），Dart 侧消费一次。 */
+    private var pendingDeepLinkSession: String? = null
+
+    /** Dart 侧建立通道后存下来，冷启动时 intent 里的深链接要能回传。 */
+    private var deepLinkChannel: MethodChannel? = null
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         captureShareIntent(intent)
+        captureDeepLink(intent)
     }
 
-    /** 把 SEND intent 的文字/图片 URI 暂存，等 Dart 侧来取。 */
+    /**
+     * 把 SEND intent 的文字/图片 URI 暂存，等 Dart 侧来取。
+     *
+     * 图片不能只存 `content://` URI 就交给 Dart：那个 URI 的读权限只在本进程
+     * 有效，Dart 侧（以及之后的 HTTP 上传）根本打不开它。所以这里立刻用
+     * ContentResolver 把字节抄进 App 私有缓存，必要时先等比缩小 —— 手机直出
+     * 照片 3~5MB，base64 内联会直接撞上网关 2MB 的 JSON 上限。
+     */
     private fun captureShareIntent(intent: Intent?) {
         if (intent?.action != Intent.ACTION_SEND) return
         val map = mutableMapOf<String, String>()
@@ -37,15 +51,79 @@ class MainActivity : FlutterActivity() {
         } else if (intent.type?.startsWith("image/") == true) {
             @Suppress("DEPRECATION")
             val uri = intent.getParcelableExtra<android.net.Uri>(Intent.EXTRA_STREAM)
-            if (uri != null) map["imagePath"] = uri.toString()
+            if (uri != null) {
+                val copied = copySharedImage(uri)
+                if (copied != null) {
+                    map["imagePath"] = copied.absolutePath
+                    map["imageName"] = copied.name
+                }
+            }
         }
         if (map.isNotEmpty()) pendingShare = map
     }
 
+    /**
+     * 复制（必要时缩小）一张分享进来的图片到缓存目录。
+     *
+     * 缩小策略与相册选择保持一致：最长边 1600px、JPEG 质量 85 —— 与
+     * image_picker 的压缩参数同量级，输出通常 200~500KB，安全落在内联上限内。
+     * 解不出来时退回原始字节复制，让用户至少能发出原图（由 Dart 侧的上限校验
+     * 决定是否拒绝），而不是静默丢失。
+     */
+    private fun copySharedImage(uri: android.net.Uri): java.io.File? {
+        val dir = java.io.File(cacheDir, "shared").apply { mkdirs() }
+        val target = java.io.File(dir, "shared-${System.currentTimeMillis()}.jpg")
+        return try {
+            val resolver = contentResolver
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            resolver.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, bounds) }
+
+            val longest = maxOf(bounds.outWidth, bounds.outHeight)
+            var sample = 1
+            while (longest / sample > 1600) sample *= 2
+
+            val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+            val bitmap = resolver.openInputStream(uri)?.use {
+                android.graphics.BitmapFactory.decodeStream(it, null, opts)
+            }
+            if (bitmap == null) {
+                // 解不出来（HEIC/异常编码）：按原字节复制，交给 Dart 侧判定。
+                resolver.openInputStream(uri)?.use { input ->
+                    target.outputStream().use { output -> input.copyTo(output) }
+                }
+                return target
+            }
+            target.outputStream().use { output ->
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, output)
+            }
+            bitmap.recycle()
+            target
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * `dshmobile://open?session=...` —— ntfy 推送点开后直达会话。
+     *
+     * 为什么需要它：离线推送（ntfy）由系统或第三方 App 弹出，点击时打开的是一个
+     * URL；没有这条深链接，用户点完只会看到浏览器或 ntfy 本身，"收到提醒却进不去
+     * 那一轮"等于白推。
+     */
+    private fun captureDeepLink(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (data.scheme != "dshmobile") return
+        val session = data.getQueryParameter("session")
+        if (session.isNullOrBlank()) return
+        pendingDeepLinkSession = session
+        deepLinkChannel?.invokeMethod("openSession", mapOf("sessionId" to session))
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        // 冷启动分享：intent 在 Activity 创建时就已就位。
+        // 冷启动：intent 在 Activity 创建时就已就位（分享 / 深链接）。
         captureShareIntent(intent)
+        captureDeepLink(intent)
 
         // 语音输入：App 调用 startListening，插件起原生识别器；结果与错误
         // 经 EventChannel 回传。这里只做"点击时若 App 已退到后台就把前台服务
@@ -118,12 +196,82 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+
+        // 深链接（离线推送点开直达会话）。两个方向：
+        //  * Dart 侧启动后主动取一次冷启动遗留的 session id；
+        //  * 运行中再收到深链接时由原生推 openSession 给它。
+        val dlChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_DEEPLINK)
+        deepLinkChannel = dlChannel
+        dlChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "consumePending" -> {
+                    val session = pendingDeepLinkSession
+                    pendingDeepLinkSession = null
+                    result.success(session)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        // 打开交付物：Dart 侧把字节交过来，这里落盘到缓存 + FileProvider 授权后
+        // 交给系统应用。字节由 Dart 读完（带鉴权头），原生不承担网络职责。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_FILE)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "openBytes" -> {
+                        val name = call.argument<String>("name") ?: "deliverable"
+                        @Suppress("UNCHECKED_CAST")
+                        val bytes = call.argument<ByteArray>("bytes")
+                        if (bytes == null || bytes.isEmpty()) {
+                            result.success(false)
+                            return@setMethodCallHandler
+                        }
+                        result.success(openBytesInSystemApp(name, bytes))
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /**
+     * 把字节写成缓存文件并用系统应用打开。
+     *
+     * 必须过 FileProvider：Android 7+ 直接传 file:// 会抛 FileUriExposedException，
+     * 而缓存目录属于应用私有空间，外部应用需要显式授权才能读。
+     */
+    private fun openBytesInSystemApp(name: String, bytes: ByteArray): Boolean {
+        return try {
+            val dir = java.io.File(cacheDir, "deliverables").apply { mkdirs() }
+            val safeName = name.replace(Regex("[^A-Za-z0-9._\\-\\u4e00-\\u9fa5]"), "_").ifBlank { "deliverable" }
+            val file = java.io.File(dir, safeName)
+            file.outputStream().use { it.write(bytes) }
+
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                this,
+                "$packageName.fileprovider",
+                file
+            )
+            val mime = android.webkit.MimeTypeMap.getSingleton()
+                .getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mime)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            true
+        } catch (e: Exception) {
+            // 没有能打开它的应用 / provider 未配置：如实回 false，Dart 侧提示。
+            false
+        }
     }
 
     companion object {
         private const val CHANNEL_METHODS = "dsh_mobile/foreground"
         private const val CHANNEL_URL = "dsh_mobile/url"
         private const val CHANNEL_SHARE = "dsh_mobile/share"
+        private const val CHANNEL_DEEPLINK = "dsh_mobile/deeplink"
+        private const val CHANNEL_FILE = "dsh_mobile/file"
     }
 }
 

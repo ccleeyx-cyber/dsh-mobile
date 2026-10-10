@@ -36,9 +36,41 @@ ignored: ["**/node_modules", "**/.*", "cache", "data"]
 |---|---|
 | 0001 安全与崩溃修复 | **已应用并生效** —— 你在 2026-10-08 重启了 dsh web，`core.mjs` 与 `index.js` 均为打过补丁的版本 |
 | 0002 归档筛选 | **已应用并生效** —— 同一次重启加载；实测 `?archived=only` 正确回显 `archivedMode`，三态 `archivedCount` 恒为 1338 |
-| 0003 事件转发（提问 / TODO / 附件 + 背压） | **已写进 `lib/`，尚未生效** —— 需要你下一次重启 dsh web |
+| 0003 事件转发（提问 / TODO / 附件 + 背压） | **已应用并生效** —— 2026-10-10 12:00 那次重启加载（网关版本当时为 1.3.1） |
+| 0004 重度远程能力（v1.14.0，见下节） | **已写进 `lib/`，尚未生效** —— 需要你下一次重启 dsh web |
 
 补丁生成过程中活文件一个字节都没被改过（0001 生成时 SHA256 前后一致：`index.js=CB1C57D0…`、`core.mjs=3D74A56E…`）。
+
+---
+
+## 0004-gateway-heavy-remote-capabilities（bridge 1.14.0）
+
+**改动范围**：`lib/features.mjs`（新增）、`lib/index.js`、`lib/core.mjs`（仅版本号）、`lib/store.mjs`（新增 ntfy 配置字段）。
+
+这一批为"重度手机远程操控"补齐网关侧能力。**App 侧从 v1.13.0 起就有对应界面**，但下面这些路由在老网关上不存在，
+所以不重启的话：任务页五块全部为空、排队/插话会 404、ntfy 推送不会发出。**其余既有功能不受影响**（它们的路由没动）。
+
+| 新路由 | 作用 | 关键约束 |
+|---|---|---|
+| `GET /api/mobile/sessions/queue` | 列出排队消息（inbox `next-turn`） | 只读投影，不激活 Agent |
+| `POST /api/mobile/sessions/queue` | 编辑 / 删除 / 插话一条排队消息 | 引擎侧的裸动作在这里被校验：编辑必须非空文本 |
+| `GET /api/mobile/schedules` | 列出会话的定时任务 | 走 `schedule/list` |
+| `POST /api/mobile/schedules/delete` | 删除定时任务 | |
+| `GET /api/mobile/jobs` | 列出后台作业 | `job/list` 是 **stream** RPC，只能在 MUX 上开流取首帧后立刻 cancel；取不到时如实返回 `degraded: jobs-unavailable` |
+| `POST /api/mobile/jobs/kill` | 终止作业 | |
+| `GET /api/mobile/deliverables` | 交付物清单 | 扫 `session/page` 里的 `deliverables/presented` 事件 |
+| `GET /api/mobile/deliverables/download` | 下载交付物 | **只允许下载该会话声明过的路径**（精确成员判定，不做字符串过滤），否则 403 |
+| `GET /api/mobile/workspace/changes` | 本次改动的文件 | 引擎的 `workspace/changes` 事件只带轮号（摘要留在 Host，RPC 拿不到），所以这里用 `git status/diff` 读工作树；非 git 仓库如实返回 `reason` |
+| `GET /api/mobile/workspace/diff` | 单文件 diff | 路径必须先出现在变更列表里，否则 404 |
+| `GET /api/mobile/session/stats` | 用量 / 上下文压力 / goal | 优先实时投影，取不到退回投影缓存并标注 `source` |
+| `GET/POST /api/mobile/push/config` | ntfy 配置读写 | **绝不回显 token**，只回 `hasToken` |
+| `POST /api/mobile/push/test` | 发一条测试推送 | |
+
+**推送触发点**：审批请求、提问请求、回合结束（含失败）。点击推送打开 `dshmobile://open?session=…`，
+App 声明的深链接会直达那个会话 —— 进程被杀时这是唯一能叫醒用户的路径（本地通知依赖进程存活）。
+
+**顺带修掉**：`ws.on('message')` 的 `catch(_){}` 不再吞掉一切异常，改为记 warn（含帧头 200 字符）。
+
 
 ---
 

@@ -21,6 +21,80 @@ class CustomSettingsView extends StatefulWidget {
 class _CustomSettingsViewState extends State<CustomSettingsView> {
   bool _isTestingPing = false;
 
+  // ---- 离线推送（ntfy）草稿字段（v1.13）----
+  //
+  // 用 controller 而不是每敲一个字就提交：这些是"填完再保存"的配置，不存在
+  // 即时生效的语义。初始值来自网关回显，用户改完点「保存」才写回去。
+  final TextEditingController _ntfyUrlController = TextEditingController();
+  final TextEditingController _ntfyTopicController = TextEditingController();
+  final TextEditingController _ntfyTokenController = TextEditingController();
+  bool _ntfyEnabled = false;
+  bool _ntfyDirty = false;
+  bool _pushBusy = false;
+
+  @override
+  void dispose() {
+    _ntfyUrlController.dispose();
+    _ntfyTopicController.dispose();
+    _ntfyTokenController.dispose();
+    super.dispose();
+  }
+
+  /// 把网关回显的推送配置灌进表单。
+  ///
+  /// 只在**用户还没改动**（!_ntfyDirty）时灌：否则一次后台刷新会把他正在
+  /// 输入的地址覆盖掉。token 永远不回填（网关只回 hasToken 布尔），所以
+  /// 留空 + 提示"留空则不改动"。
+  void _syncPushForm(DshService dsh) {
+    final cfg = dsh.pushConfig;
+    if (cfg == null || _ntfyDirty) return;
+    if (_ntfyUrlController.text == cfg.url &&
+        _ntfyTopicController.text == cfg.topic &&
+        _ntfyEnabled == cfg.enabled) {
+      return;
+    }
+    _ntfyUrlController.text = cfg.url;
+    _ntfyTopicController.text = cfg.topic;
+    _ntfyEnabled = cfg.enabled;
+  }
+
+  Future<void> _savePush(DshService dsh) async {
+    setState(() => _pushBusy = true);
+    final ok = await dsh.savePushConfig(
+      enabled: _ntfyEnabled,
+      url: _ntfyUrlController.text.trim(),
+      topic: _ntfyTopicController.text.trim(),
+      token: _ntfyTokenController.text.trim(),
+    );
+    if (!mounted) return;
+    setState(() {
+      _pushBusy = false;
+      if (ok) {
+        _ntfyDirty = false;
+        _ntfyTokenController.clear();
+      }
+    });
+    _settingsToast(ok ? '推送配置已保存' : (dsh.lastError.isEmpty ? '保存失败' : dsh.lastError));
+  }
+
+  Future<void> _testPush(DshService dsh) async {
+    setState(() => _pushBusy = true);
+    final ok = await dsh.testPush();
+    if (!mounted) return;
+    setState(() => _pushBusy = false);
+    _settingsToast(ok ? '测试推送已发出，检查 ntfy App' : '推送发送失败：检查地址、topic 与是否已开启');
+  }
+
+  void _settingsToast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).clearSnackBars();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(msg),
+      behavior: SnackBarBehavior.floating,
+      duration: const Duration(seconds: 2),
+    ));
+  }
+
   void _showModelSwitchSheet(BuildContext context, DshService dsh) {
     final settings = dsh.settings;
     final currentModel = settings?.currentModel ?? 'cn:deepseek-v4.1-flash';
@@ -188,6 +262,121 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           offset: const Offset(0, 2),
         ),
       ],
+    );
+  }
+
+  /// 离线推送配置卡。
+  ///
+  /// 为什么需要它：App 的本地通知只在**进程活着**时才有意义；Android 杀掉进程
+  /// 后连接就断了，什么都不会来。ntfy 走的是服务器 → 第三方推送服务 → 系统通知，
+  /// 与 App 死活无关，这是"手机不在手里也能被叫醒"的唯一路径。
+  ///
+  /// 同时必须说清代价：启用后事件摘要会经第三方服务器中转。这是用户对**自己**
+  /// 的选择，不能默默打开 —— 默认关闭，并在这里写明。
+  Widget _buildPushSection(BuildContext context, DshService dsh) {
+    _syncPushForm(dsh);
+    final cfg = dsh.pushConfig;
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: _cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  cfg == null
+                      ? '网关未上报推送配置（旧版网关？）'
+                      : (cfg.configured ? '推送已开启' : '推送未开启'),
+                  style: TextStyle(
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.bold,
+                    color: cfg?.configured == true ? context.c.success : context.c.textPrimary,
+                  ),
+                ),
+              ),
+              Switch(
+                value: _ntfyEnabled,
+                onChanged: _pushBusy
+                    ? null
+                    : (v) => setState(() {
+                          _ntfyEnabled = v;
+                          _ntfyDirty = true;
+                        }),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '开启后，审批/提问/任务完成会经 ntfy 推到系统通知栏；'
+            '点开通知直接进入对应会话（App 没运行时也能收到）。'
+            '事件摘要会经该服务中转，请只在接受这一点时开启。',
+            style: TextStyle(fontSize: 11.5, color: context.c.textSecondary, height: 1.35),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _ntfyUrlController,
+            onChanged: (_) => _ntfyDirty = true,
+            decoration: const InputDecoration(
+              labelText: 'ntfy 服务器',
+              hintText: 'https://ntfy.sh',
+              isDense: true,
+              border: OutlineInputBorder(),
+            ),
+            style: const TextStyle(fontSize: 13),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _ntfyTopicController,
+            onChanged: (_) => _ntfyDirty = true,
+            decoration: const InputDecoration(
+              labelText: 'Topic（相当于收件箱名）',
+              hintText: '例如 dsh-你的随机串（不要用可猜的名字）',
+              isDense: true,
+              border: OutlineInputBorder(),
+            ),
+            style: const TextStyle(fontSize: 13),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _ntfyTokenController,
+            onChanged: (_) => _ntfyDirty = true,
+            obscureText: true,
+            decoration: InputDecoration(
+              labelText: '访问令牌（自建且需要鉴权时填）',
+              hintText: cfg?.hasToken == true ? '已保存，留空表示不改动' : '可留空',
+              isDense: true,
+              border: const OutlineInputBorder(),
+            ),
+            style: const TextStyle(fontSize: 13),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Topic 建议用一段随机串：ntfy 上知道 topic 的人就能订阅到你的通知。',
+            style: TextStyle(fontSize: 11, color: context.c.textTertiary),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              FilledButton.icon(
+                onPressed: _pushBusy ? null : () => _savePush(dsh),
+                icon: _pushBusy
+                    ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.save_outlined, size: 16),
+                label: const Text('保存', style: TextStyle(fontSize: 12.5)),
+              ),
+              const SizedBox(width: 10),
+              OutlinedButton.icon(
+                onPressed: _pushBusy ? null : () => _testPush(dsh),
+                icon: const Icon(Icons.send_rounded, size: 16),
+                label: const Text('测试推送', style: TextStyle(fontSize: 12.5)),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 
@@ -582,7 +771,14 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
 
           const SizedBox(height: 16),
 
-          // 3. Connectivity & Network Diagnostics
+          // 3. 离线推送（ntfy）—— 进程被杀/锁屏时的唯一叫醒方式（v1.13）
+          _buildSectionHeader('离线推送 (ntfy)', Icons.notifications_active_rounded, context.c.warning),
+          const SizedBox(height: 8),
+          _buildPushSection(context, dsh),
+
+          const SizedBox(height: 16),
+
+          // 4. Connectivity & Network Diagnostics
           _buildSectionHeader('网络与网关诊断 (Connectivity & Diagnostics)', Icons.network_check_rounded, context.c.success),
           const SizedBox(height: 8),
           Container(

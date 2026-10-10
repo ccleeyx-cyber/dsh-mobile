@@ -7,6 +7,7 @@ import 'models/server_config.dart';
 import 'services/dsh_service.dart';
 import 'services/draft_store.dart';
 import 'services/notification_service.dart';
+import 'services/platform_services.dart';
 import 'services/storage_service.dart';
 import 'theme/app_colors.dart';
 import 'views/config_page.dart';
@@ -58,12 +59,21 @@ void main() async {
     if (payload.startsWith('session:')) {
       final parts = payload.split(':');
       if (parts.length >= 3) {
-        pendingNotificationSessionId = parts.sublist(2).join(':');
+        requestOpenSession(parts.sublist(2).join(':'));
+        return;
       }
     }
     // MainShell 处于运行态时立即触发一次消费（后台点击）。
     pendingNotificationSink?.call();
   };
+
+  // 深链接 `dshmobile://open?session=…`：ntfy 离线推送点开后直达会话。
+  // 与本地通知合流到同一条消费路径 —— 对用户来说两者都是"点一下打开那一轮"。
+  DeepLinkReceiver.onOpenSession = requestOpenSession;
+  unawaited(DeepLinkReceiver.attach());
+  unawaited(DeepLinkReceiver.consumePending().then((sessionId) {
+    if (sessionId != null) requestOpenSession(sessionId);
+  }));
 
   // 冷启动点通知（进程被杀后由通知拉起）在 Android 上不会走
   // onDidReceiveNotificationResponse —— payload 只能从
@@ -85,11 +95,21 @@ void main() async {
   );
 }
 
-/// 待跳转的会话 id（来自点按的通知）。消费后置 null。
+/// 待跳转的会话 id（来自点按的通知或深链接）。消费后置 null。
 String? pendingNotificationSessionId;
 
 /// MainShell 注册的"有新跳转"触发器（后台点击通知时，App 已在前台运行）。
 void Function()? pendingNotificationSink;
+
+/// 请求打开某个会话。通知点按与深链接共用这一条路径。
+///
+/// 两条来源的时序不同（通知回调可能早于第一帧、深链接可能晚于 MainShell 挂载），
+/// 所以统一"存下 + 通知 sink"，由 MainShell 决定是立刻消费还是挂载时消费。
+void requestOpenSession(String sessionId) {
+  if (sessionId.isEmpty) return;
+  pendingNotificationSessionId = sessionId;
+  pendingNotificationSink?.call();
+}
 
 /// 全局 navigator key —— 通知跳转需要无 BuildContext 的导航出口。
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();

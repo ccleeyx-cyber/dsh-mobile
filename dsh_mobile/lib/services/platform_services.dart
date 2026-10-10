@@ -32,8 +32,13 @@ class ShareReceiver {
       if (raw is Map) {
         final text = raw['text']?.toString();
         final imagePath = raw['imagePath']?.toString();
+        final imageName = raw['imageName']?.toString();
         if ((text != null && text.isNotEmpty) || (imagePath != null && imagePath.isNotEmpty)) {
-          return SharedContent(text: text ?? '', imagePath: imagePath ?? '');
+          return SharedContent(
+            text: text ?? '',
+            imagePath: imagePath ?? '',
+            imageName: imageName ?? '',
+          );
         }
       }
     } catch (_) {
@@ -43,8 +48,62 @@ class ShareReceiver {
   }
 }
 
+/// 深链接：`dshmobile://open?session=<id>`（离线推送点开后直达会话）。
+///
+/// 两个方向都要接：
+///  * 冷启动时 Intent 已经在 Activity 里，Dart 起来后主动取一次；
+///  * 运行中再点推送 → 原生 `openSession` 反向回调进来。
+class DeepLinkReceiver {
+  static const MethodChannel _ch = MethodChannel('dsh_mobile/deeplink');
+
+  /// 原生推来的会话 id（运行中收到深链接时）。
+  static void Function(String sessionId)? onOpenSession;
+
+  static Future<void> attach() async {
+    _ch.setMethodCallHandler((call) async {
+      if (call.method == 'openSession') {
+        final raw = call.arguments;
+        final sessionId = raw is Map ? raw['sessionId']?.toString() : null;
+        if (sessionId != null && sessionId.isNotEmpty) {
+          onOpenSession?.call(sessionId);
+        }
+      }
+      return null;
+    });
+  }
+
+  /// 冷启动遗留的会话 id，取走即清。null 表示这次启动不是被深链接拉起的。
+  static Future<String?> consumePending() async {
+    try {
+      final raw = await _ch.invokeMethod<dynamic>('consumePending');
+      final sessionId = raw?.toString();
+      if (sessionId != null && sessionId.isNotEmpty) return sessionId;
+    } catch (_) {}
+    return null;
+  }
+}
+
+/// 把字节交给系统应用打开（交付物下载后用）。
+class FileOpener {
+  static const MethodChannel _ch = MethodChannel('dsh_mobile/file');
+
+  /// 返回是否真的拉起了某个应用。失败时调用方应提示"已下载但没有应用能打开"。
+  static Future<bool> openBytes(String name, List<int> bytes) async {
+    try {
+      return await _ch.invokeMethod<bool>('openBytes', {
+            'name': name,
+            'bytes': Uint8List.fromList(bytes),
+          }) ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
 class SharedContent {
   final String text;
   final String imagePath;
-  const SharedContent({required this.text, required this.imagePath});
+  final String imageName;
+  const SharedContent({required this.text, required this.imagePath, this.imageName = ''});
 }

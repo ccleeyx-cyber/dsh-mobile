@@ -49,7 +49,13 @@ const DEFAULT_CONFIG = {
   port: 3088,
   npsHost: 'n.cnm.asia',
   npsPort: 3088,
-  useHttps: false
+  useHttps: false,
+  // ntfy 离线推送（v1.14）。默认关闭：推送会把事件摘要发往第三方服务，
+  // 必须由用户显式打开并填 topic。
+  ntfyEnabled: false,
+  ntfyUrl: '',
+  ntfyTopic: '',
+  ntfyToken: ''
 };
 
 export function loadConfig() {
@@ -73,7 +79,11 @@ export function loadConfig() {
       port: Number(raw.port) || DEFAULT_CONFIG.port,
       npsHost: (raw.npsHost && String(raw.npsHost).trim()) || DEFAULT_CONFIG.npsHost,
       npsPort: Number(raw.npsPort) || DEFAULT_CONFIG.npsPort,
-      useHttps: Boolean(raw.useHttps)
+      useHttps: Boolean(raw.useHttps),
+      ntfyEnabled: raw.ntfyEnabled === true,
+      ntfyUrl: typeof raw.ntfyUrl === 'string' ? raw.ntfyUrl.trim() : '',
+      ntfyTopic: typeof raw.ntfyTopic === 'string' ? raw.ntfyTopic.trim() : '',
+      ntfyToken: typeof raw.ntfyToken === 'string' ? raw.ntfyToken.trim() : ''
     };
   } catch {
     return { ...DEFAULT_CONFIG, token: generateToken() };
@@ -93,6 +103,12 @@ export function saveConfig(patch = {}) {
   if (patch.npsHost !== undefined) updated.npsHost = String(patch.npsHost).trim() || DEFAULT_CONFIG.npsHost;
   if (patch.npsPort !== undefined) updated.npsPort = Number(patch.npsPort) || DEFAULT_CONFIG.npsPort;
   if (patch.useHttps !== undefined) updated.useHttps = Boolean(patch.useHttps);
+  // 推送配置（v1.14）。空字符串是合法值 —— 用户清空地址/topic 就等于关掉这条
+  // 通道，不能像 token 那样回退到默认值。
+  if (patch.ntfyEnabled !== undefined) updated.ntfyEnabled = patch.ntfyEnabled === true;
+  if (patch.ntfyUrl !== undefined) updated.ntfyUrl = String(patch.ntfyUrl || '').trim();
+  if (patch.ntfyTopic !== undefined) updated.ntfyTopic = String(patch.ntfyTopic || '').trim();
+  if (patch.ntfyToken !== undefined) updated.ntfyToken = String(patch.ntfyToken || '').trim();
 
   fs.writeFileSync(configFile(), JSON.stringify(updated, null, 2), 'utf8');
   return updated;

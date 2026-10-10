@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/dsh_service.dart';
@@ -7,6 +9,7 @@ import 'workspaces_view.dart';
 import 'security_permissions_view.dart';
 import 'custom_settings_view.dart';
 import 'config_page.dart';
+import 'task_center_view.dart';
 import '../theme/app_colors.dart';
 
 class MainShell extends StatefulWidget {
@@ -78,8 +81,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       dsh.fetchWorkspaces();
       dsh.fetchApprovals();
     } else if (index == 2) {
-      dsh.fetchApprovals();
+      // 任务页：交付物/变更/定时/作业/用量一次拉齐（v1.13）。
+      unawaited(dsh.refreshTaskCenter());
     } else if (index == 3) {
+      dsh.fetchApprovals();
+    } else if (index == 4) {
       dsh.fetchSettings();
     }
   }
@@ -133,6 +139,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     // 完全看不到任何提示（用户实测："提问没显示、也没通知"）。
     final waitingCount = context.select<DshService, int>(
       (d) => d.pendingApprovals.length + d.pendingQuestions.length,
+    );
+    // 任务页徽标：排队消息 + 活着的后台作业 —— 这两样都是"你不在看的时候
+    // 也在继续跑"的东西，值得一个数字。
+    final queueBadge = context.select<DshService, int>(
+      (d) => d.queueItems.length + d.jobs.where((j) => j.isLive).length,
     );
     final isTokenInvalid = context.select<DshService, bool>((d) => d.isTokenInvalid);
 
@@ -202,7 +213,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               children: [
                 ChatView(
                   onOpenWorkspaces: () => _setIndex(1),
-                  onOpenSecurity: () => _setIndex(2),
+                  onOpenSecurity: () => _setIndex(3),
                 ),
                 WorkspacesView(
                   onSwitchToChat: () => _setIndex(0),
@@ -210,6 +221,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   // 否则本页的 3 秒轮询会在用户处于其它 tab 时继续跑。
                   active: _currentIndex == 1,
                 ),
+                // 任务页（v1.13）：交付物 / 变更 diff / 定时任务 / 后台作业 / 用量。
+                TaskCenterView(onOpenChat: () => _setIndex(0)),
                 SecurityPermissionsView(onOpenChat: () => _setIndex(0)),
                 const CustomSettingsView(),
               ],
@@ -259,6 +272,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   icon: _buildNavBadge(const Icon(Icons.folder_outlined), pendingCount),
                   selectedIcon: _buildNavBadge(const Icon(Icons.folder_rounded), pendingCount),
                   label: '工作区',
+                ),
+                NavigationDestination(
+                  icon: _buildNavBadge(const Icon(Icons.dashboard_customize_outlined), queueBadge),
+                  selectedIcon: _buildNavBadge(const Icon(Icons.dashboard_customize_rounded), queueBadge),
+                  label: '任务',
                 ),
                 NavigationDestination(
                   icon: _buildNavBadge(const Icon(Icons.security_outlined), pendingCount),

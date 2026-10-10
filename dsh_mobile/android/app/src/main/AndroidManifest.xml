@@ -67,7 +67,28 @@
                 <category android:name="android.intent.category.DEFAULT"/>
                 <data android:mimeType="image/*"/>
             </intent-filter>
+
+            <!-- 深链接：离线推送（ntfy）点开后直达对应会话。
+                 没有这个 filter，用户点开推送只会落到浏览器，等于白推。 -->
+            <intent-filter android:label="打开 DSH 会话">
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="dshmobile"/>
+            </intent-filter>
         </activity>
+
+        <!-- 交付物/文件的外发通道。Android 7+ 禁止直接传 file://，
+             必须由 FileProvider 授权缓存目录里的文件。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <!-- 后台保活前台服务：进程被系统回收后由系统重建（START_STICKY），
              否则 WebSocket 随进程一起消失，后台推送就永远不会发生。

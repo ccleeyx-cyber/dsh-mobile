@@ -62,6 +62,22 @@ class StorageService {
 
   static final Random _rng = Random.secure();
 
+  /// 运行中发消息的投递方式：'queue'（排队）或 'steer'（插话）。
+  ///
+  /// 存在本地而不是网关：这是**这台手机的**输入习惯，同一账号的另一台设备
+  /// 不该被它改掉。默认排队 —— 排队永远不会打断正在跑的任务。
+  static const String _keyDeliveryMode = 'dsh_delivery_mode';
+
+  static Future<String> loadDeliveryMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_keyDeliveryMode) == 'steer' ? 'steer' : 'queue';
+  }
+
+  static Future<void> saveDeliveryMode(String mode) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_keyDeliveryMode, mode == 'steer' ? 'steer' : 'queue');
+  }
+
   /// Guarantees uniqueness **by construction**, not by luck.
   ///
   /// The earlier form was `'gw-' + microsecondsSinceEpoch + '-' + nextInt(0xFFFFFF)`.

@@ -315,21 +315,38 @@ class _ConfigPageState extends State<ConfigPage> {
           ),
           Align(
             alignment: Alignment.centerLeft,
-            child: TextButton.icon(
-              onPressed: _saveAsNewProfile,
-              icon: const Icon(Icons.add, size: 16),
-              label: const Text('把当前填写内容另存为新网关', style: TextStyle(fontSize: 12.5)),
-              style: TextButton.styleFrom(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                visualDensity: VisualDensity.compact,
-              ),
+            child: Wrap(
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 4,
+              children: [
+                // 一键切换：设为活动网关并立刻连接。多网关用户的主要动作。
+                TextButton.icon(
+                  onPressed: selected == null ? null : _switchAndConnect,
+                  icon: const Icon(Icons.bolt_rounded, size: 16),
+                  label: const Text('切换并连接', style: TextStyle(fontSize: 12.5)),
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: _saveAsNewProfile,
+                  icon: const Icon(Icons.add, size: 16),
+                  label: const Text('把当前填写内容另存为新网关', style: TextStyle(fontSize: 12.5)),
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ),
+              ],
             ),
           ),
           if (selected != null)
             Padding(
               padding: const EdgeInsets.only(left: 10, bottom: 6),
               child: Text(
-                '切换只填入下方表单；点「保存并进入聊天」才会连接并记住。',
+                '「切换并连接」设为活动网关并立即连接；下拉切换只填入表单，'
+                '点「保存并进入聊天」才会记住表单里的改动。',
                 style: TextStyle(fontSize: 11, color: context.c.textTertiary),
               ),
             ),
@@ -360,6 +377,38 @@ class _ConfigPageState extends State<ConfigPage> {
         backgroundColor: ok ? Colors.green : Colors.red,
       ),
     );
+  }
+
+  /// 一键切换并连接选中的网关。
+  ///
+  /// 之前 `setActiveProfile` 从来没有被调用过：切换下拉框只填表单，用户还得
+  /// 再找「保存并进入聊天」才真的连上，而重度的多机用法（家里/公司两台）
+  /// 每次换机要多点两下。这里把"设为活动 + 连接 + 进入对话"合成一个动作，
+  /// 且**不覆盖**该网关已保存的字段 —— 切换不该顺手把表单里的临时编辑写回去。
+  Future<void> _switchAndConnect() async {
+    final id = _activeProfileId;
+    if (id == null) return;
+
+    final cfg = await StorageService.setActiveProfile(id);
+    if (!mounted) return;
+    if (cfg == null) {
+      _toast('该网关已不存在，请重新保存');
+      return;
+    }
+
+    final dshService = Provider.of<DshService>(context, listen: false);
+    dshService.clearAuthError();
+    await dshService.connect(cfg);
+    if (!mounted) return;
+
+    _toast('已切换到「${cfg.displayName}」');
+    if (Navigator.of(context).canPop()) {
+      Navigator.of(context).pop();
+    } else {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const MainShell()),
+      );
+    }
   }
 
   void _saveAndConnect() async {
