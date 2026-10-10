@@ -198,6 +198,25 @@ async function connectClient() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Re-subscribe and return the NEW `question_subscribed` reply.
+ *
+ * ⚠️ 不能用 `waitFor(m => m.type === 'question_subscribed')`：它先扫**历史帧**，
+ * 于是会命中订阅时那一条（`pending` 还是空的），断言就永远看不到新状态。
+ * 这里按"条数增加了"来区分，只有新到的那条才算数。
+ */
+async function resubscribe(c, timeoutMs = 5000) {
+  const before = c.frames.filter((m) => m.type === 'question_subscribed').length;
+  c.send({ type: 'subscribe_questions' });
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const subs = c.frames.filter((m) => m.type === 'question_subscribed');
+    if (subs.length > before) return subs[subs.length - 1];
+    await sleep(50);
+  }
+  throw new Error('resubscribe: 没有收到新的 question_subscribed');
+}
+
+/**
  * Write a projection-cache file into the throwaway DSH_HOME.
  *
  * The gateway reads per-session rows (turnBoundary / sessionListMetadata) from
@@ -444,6 +463,60 @@ describe('user-questions：领取与作答', () => {
 
     await silent.close();
     await subscriber.close();
+  });
+
+  it('别的会话的取消帧不得清掉本会话仍活着的提问（现网事故）', async () => {
+    const c = await connectClient();
+    await c.subscribe();
+
+    // 会话 A 的提问正在等回答。
+    pushToEngine(questionFrame(QUESTION, { id: 'evt-alive', agent: 'session-A' }));
+    await c.waitFor((m) => m.type === 'question_request' && m.eventId === 'evt-alive');
+
+    // 会话 B 的取消帧抵达（引擎的取消帧不带我们在找的那个 eventId）。
+    pushToEngine(itemFrame('gw-events-stream', {
+      type: 'cancel',
+      event: 'turn/cancel',
+      agent: 'session-B',
+      data: { sessionId: 'session-B' }
+    }));
+    await sleep(300);
+
+    // 会话 A 的提问必须还在 —— 早先的实现是无条件全清，于是手机上卡片消失、
+    // 重连 replay 也空了，而电脑端（直接读引擎状态）仍然显示着那个选择项。
+    const sub = await resubscribe(c);
+    assert.equal(sub.pending.some((p) => p.eventId === 'evt-alive'), true,
+      '跨会话的取消不得牵连别的会话的提问');
+
+    // 仍能作答。
+    c.send({ type: 'question_answer', eventId: 'evt-alive', answer: { answers: [{ id: 'q1', selected: ['继续'] }] } });
+    const ack = await c.waitFor((m) => m.type === 'question_ack' && m.eventId === 'evt-alive');
+    assert.equal(ack.ok, true);
+
+    await c.close();
+  });
+
+  it('本会话自己的取消帧要释放该会话的提问', async () => {
+    const c = await connectClient();
+    await c.subscribe();
+
+    pushToEngine(questionFrame(QUESTION, { id: 'evt-cancel-me', agent: 'session-C' }));
+    await c.waitFor((m) => m.type === 'question_request' && m.eventId === 'evt-cancel-me');
+
+    pushToEngine(itemFrame('gw-events-stream', {
+      type: 'cancel',
+      event: 'turn/cancel',
+      agent: 'session-C',
+      data: { sessionId: 'session-C' }
+    }));
+    const invalidated = await c.waitFor((m) => m.type === 'questions_invalidated');
+    assert.equal(invalidated.reason, 'engine-cancel');
+
+    const sub = await resubscribe(c);
+    assert.equal(sub.pending.some((p) => p.eventId === 'evt-cancel-me'), false,
+      '本会话取消后不该再提供该提问');
+
+    await c.close();
   });
 
   it('订阅者断开后提问不释放，重连的手机能从 replay 里拿到（v1.11.4 起）', async () => {

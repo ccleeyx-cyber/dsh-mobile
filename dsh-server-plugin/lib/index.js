@@ -1582,16 +1582,35 @@ export function apply(ctx, config = {}, internals = {}) {
         if (forwardSessionEvent(val, null)) return;
 
         // A cancelled turn invalidates whatever it was waiting on.
-    if (val.type === 'cancel' || val.event === 'approval/cancel' || val.event === 'turn/cancel') {
-      const cancelEventId = val.eventId || val.id;
-      if (cancelEventId) relinquishQuestion(cancelEventId, 'engine-cancel');
-      // A cancel frame carries no event id for the question it invalidates, so
-      // a turn-level cancel has to clear whatever is still outstanding.
-      for (const q of [...pendingQuestions.values()]) {
-        relinquishQuestion(q.eventId, 'engine-cancel');
-      }
-      sendToSubscribers({ type: 'questions_invalidated', reason: 'engine-cancel' }, questionSubscribers);
-    }
+        //
+        // ⚠️ 必须**按会话（或按 eventId）**清，不能像早先那样把 pendingQuestions
+        // 全清。实测过一次现网事故：A 会话的取消帧抵达后，B 会话那条仍然活着的
+        // 提问被一起清掉 —— 手机上的卡片随之消失、重连 replay 也空了，而电脑端
+        // （直接读引擎状态）**仍然显示着那个选择项**。用户看到的就是
+        // "通知来了、点进去什么都没有，电脑上却在等他回答"。
+        if (val.type === 'cancel' || val.event === 'approval/cancel' || val.event === 'turn/cancel') {
+          const cancelEventId = val.eventId || val.id;
+          const cancelSession = val.agent || val.agentId || val.sessionId ||
+            val.data?.sessionId || val.request?.sessionId || null;
+          let dropped = 0;
+          if (cancelEventId && pendingQuestions.has(cancelEventId)) {
+            relinquishQuestion(cancelEventId, 'engine-cancel');
+            dropped++;
+          } else if (cancelSession) {
+            for (const q of [...pendingQuestions.values()]) {
+              if (sessionIdMatchesSafe(q.sessionId, cancelSession)) {
+                relinquishQuestion(q.eventId, 'engine-cancel');
+                dropped++;
+              }
+            }
+          }
+          // 既没有匹配的 eventId、也没有会话信息时**什么都不清**：引擎的取消帧
+          // 不带我们在找的那个 id 是常态，宁可由 TTL 与"作答时被引擎拒绝"来收尾，
+          // 也不能拿一个看不见的误删去换——误删之后用户连重试的入口都没有了。
+          if (dropped > 0) {
+            sendToSubscribers({ type: 'questions_invalidated', reason: 'engine-cancel' }, questionSubscribers);
+          }
+        }
 
     if (val.type === 'cancel' || val.event === 'approval/cancel') {
           const eventId = val.eventId || val.id;

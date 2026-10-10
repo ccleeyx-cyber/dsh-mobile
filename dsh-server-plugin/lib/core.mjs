@@ -39,7 +39,7 @@ export function configurePersistence({ verifyToken: vt, findDeviceByToken: fdt }
 }
 
 
-export const BRIDGE_VERSION = '1.3.0';
+export const BRIDGE_VERSION = '1.3.1';
 export const MAX_BODY_SIZE = 2 * 1024 * 1024; // 2MB defensive payload limit (F4.1)
 export const HEARTBEAT_INTERVAL_MS = 30000;
 
@@ -1309,3 +1309,4 @@ export function renameSession({ home = dshHome(), sessionId, title }) {
 }
 
 export { fs, path, url };
+
