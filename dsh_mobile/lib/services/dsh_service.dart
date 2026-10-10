@@ -1673,8 +1673,24 @@ class DshService extends ChangeNotifier {
       ).timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return;
 
+      // 网关对"审批不存在(404)/回传引擎失败(502)"也回 HTTP 200（历史遗留，
+      // body 里才有 ok:false）。只看状态码会把失败当成功：卡片被删、用户以为
+      // 批过了，而引擎还在审批门前挂着。这里必须读 body 的 ok。
       if (res.statusCode == 200) {
-        _pendingApprovals.removeWhere((a) => a.eventId == req.eventId || a.id == req.id);
+        var ok = true;
+        var errMsg = '';
+        try {
+          final data = jsonDecode(utf8.decode(res.bodyBytes));
+          ok = data['ok'] != false;
+          errMsg = data['error']?.toString() ?? '';
+        } catch (_) {}
+        if (ok) {
+          _pendingApprovals.removeWhere((a) => a.eventId == req.eventId || a.id == req.id);
+          _lastError = '';
+        } else {
+          // 失败保留卡片（网关同样保留了队列条目），用户还有重试入口。
+          _lastError = errMsg.isNotEmpty ? '审批未生效: $errMsg' : '审批未生效，请重试';
+        }
         notifyListeners();
       }
     } catch (e) {

@@ -130,6 +130,32 @@ class NotificationService {
 
   bool get permissionGranted => _granted;
 
+  /// 冷启动补偿：检查 App 是否由「点按通知」拉起，并派发其 payload。
+  ///
+  /// 为什么需要它：Android 上冷启动（进程被杀后点通知）时，
+  /// flutter_local_notifications 的 onDidReceiveNotificationResponse **不会**触发
+  /// —— 插件原生的 onAttachedToActivity 只处理前台通知 action，普通通知的
+  /// launch intent 必须通过 getNotificationAppLaunchDetails() 主动查询。
+  /// 不查的话 payload 直接丢失：App 打开、停在旧会话，用户"点进去没有操作选项"
+  /// 正是这条链路断掉的表现（此前 notification_service 顶部注释声称 MainActivity
+  /// 处理了 launch intent —— 那段处理并不存在）。
+  ///
+  /// 必须在 [init] 成功（插件就绪）之后调用，且只调用一次（启动期）。
+  Future<void> consumeLaunchNotification() async {
+    if (!_pluginReady) return;
+    try {
+      final details = await _plugin.getNotificationAppLaunchDetails();
+      final resp = details?.notificationResponse;
+      if (details?.didNotificationLaunchApp == true &&
+          resp?.payload != null &&
+          resp!.payload!.isNotEmpty) {
+        onSelectNotification?.call(resp.payload!);
+      }
+    } catch (e) {
+      debugPrint('[NotificationService] 消费冷启动通知失败: $e');
+    }
+  }
+
   /// 拉起前台服务，让进程在后台存活、连接不断。
   ///
   /// Android 12+ 对后台启动前台服务有限制，可能返回 false。此时**不要静默

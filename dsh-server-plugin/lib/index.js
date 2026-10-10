@@ -2665,7 +2665,10 @@ export function apply(ctx, config = {}, internals = {}) {
           return;
         }
         const resOutcome = await handleApprovalRespond(eventId, outcome, reason);
-        sendJson(200, resOutcome);
+        // 按结果回真实状态码（404 已过期 / 502 回传引擎失败），不再恒 200。
+        // 旧客户端只看 200 就删卡片，等于把失败谎报成成功；App 侧新代码
+        // 同时读状态码与 body.ok，两边任一都能感知失败。
+        sendJson(resOutcome.ok === false ? (resOutcome.code || 502) : 200, resOutcome);
         return;
       }
 

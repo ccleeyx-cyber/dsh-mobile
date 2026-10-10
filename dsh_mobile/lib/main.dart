@@ -65,6 +65,15 @@ void main() async {
     pendingNotificationSink?.call();
   };
 
+  // 冷启动点通知（进程被杀后由通知拉起）在 Android 上不会走
+  // onDidReceiveNotificationResponse —— payload 只能从
+  // getNotificationAppLaunchDetails() 里取。不补这一步，跳转会话的
+  // session id 直接丢失，用户"点进去没有操作选项"。
+  // 等 init() 完成（插件就绪）后再查，避免在未初始化的插件上抛异常。
+  unawaited(NotificationService.instance.init().then((_) {
+    return NotificationService.instance.consumeLaunchNotification();
+  }));
+
   runApp(
     MultiProvider(
       providers: [

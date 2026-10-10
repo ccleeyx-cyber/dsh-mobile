@@ -1742,7 +1742,12 @@ class _ChatViewState extends State<ChatView> {
                       backgroundColor: context.c.surface.withOpacity(0.8),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                     ),
-                    onPressed: activeApprovals.isNotEmpty ? _scrollToBottom : widget.onOpenSecurity,
+                    // 审批属于其他会话时，直接跳到那个会话去处理 —— 此前是
+                    // 跳去安全策略页，而安全页 v1.11.4 起只留摘要、其"去处理"
+                    // 又跳回当前会话，形成谁也到不了审批卡片的死循环。
+                    onPressed: activeApprovals.isNotEmpty
+                        ? _scrollToBottom
+                        : () => _jumpToApprovalSession(dsh),
                     icon: Icon(
                       activeApprovals.isNotEmpty ? Icons.arrow_downward_rounded : Icons.shield_rounded,
                       size: 14,
@@ -1941,6 +1946,21 @@ class _ChatViewState extends State<ChatView> {
         ],
       ),
     );
+  }
+
+  /// 跳到"正在等你授权"的那个会话。
+  ///
+  /// 与提问的 _jumpToQuestionSession 对称：审批同样是"agent 停下来等你"，
+  /// 卡片渲染在**它所属会话**的对话流末尾。之前 banner 把用户送进安全策略页
+  /// 的死循环（安全页只剩摘要、"去处理"又跳回当前会话），这里补上真正的出口。
+  Future<void> _jumpToApprovalSession(DshService dsh) async {
+    final cur = dsh.currentSession;
+    final target = dsh.pendingApprovals.firstWhere(
+      (a) => cur == null || !cur.matchesSessionId(a.sessionId),
+      orElse: () => dsh.pendingApprovals.first,
+    );
+    HapticFeedback.selectionClick();
+    await dsh.openSessionById(target.sessionId);
   }
 
   /// 不属于当前会话的待答提问数量。
