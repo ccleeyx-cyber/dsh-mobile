@@ -242,6 +242,74 @@ void main() {
 
     dsh.disconnect();
   });
+
+  test('回前台重订阅能拿回 pending 重放（后台半死连接的回归）', () async {
+    allowRealNetwork();
+    final dsh = DshService();
+    unawaited(dsh.connect(ServerConfig(
+      host: '127.0.0.1',
+      port: port,
+      token: 'test-token',
+    )));
+
+    final subscribed = await waitFor(
+      () => parsed().any((m) => m['type'] == 'subscribe_questions'),
+    );
+    expect(subscribed, isTrue, reason: '前置条件：必须先订阅');
+    // 服务器先回一个 pong，喂饱看门狗 —— 让 handleAppResumed 判定连接健康，
+    // 走"补订阅"分支而不是重连分支。两条路径都要能拿回提问，这里测的是
+    // 更难的那条：连接看着活着（Resumed 只补订阅）。
+    sockets.first.add('pong');
+
+    // 网关挂着的 pending（App 在后台期间错过实时帧的那条）。
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    final countBefore = parsed()
+        .where((m) => m['type'] == 'subscribe_questions')
+        .length;
+
+    dsh.handleAppResumed();
+    final resub = await waitFor(
+      () => parsed().where((m) => m['type'] == 'subscribe_questions').length > countBefore,
+    );
+    expect(
+      resub,
+      isTrue,
+      reason: 'handleAppResumed 在连接健康时必须补发一次 subscribe_questions '
+          '（幂等，网关会重放 pending）—— 否则后台期间错过的提问永远拿不回来。',
+    );
+
+    // 模拟网关对这次补订阅回放 pending。
+    sockets.first.add(jsonEncode({
+      'type': 'question_subscribed',
+      'ok': true,
+      'pending': [
+        {
+          'eventId': 'evt-replay',
+          'sessionId': 's1',
+          'questions': [
+            {
+              'id': 'q1',
+              'question': '后台期间错过的提问？',
+              'options': [
+                {'label': '继续'},
+              ],
+            }
+          ],
+        }
+      ],
+    }));
+
+    final shown = await waitFor(
+      () => dsh.pendingQuestions.any((p) => p.eventId == 'evt-replay'),
+    );
+    expect(
+      shown,
+      isTrue,
+      reason: '补订阅换回的 pending 重放必须被留存渲染。',
+    );
+
+    dsh.disconnect();
+  });
 }
 
 /// selectSession 内部有真实的网络调用（REST 历史拉取），测试服务器对它们

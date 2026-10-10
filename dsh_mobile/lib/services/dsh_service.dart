@@ -34,6 +34,15 @@ class DshService extends ChangeNotifier {
   WebSocketChannel? _channel;
   Timer? _heartbeatTimer;
   Timer? _sessionPollTimer;
+
+  /// Pong 看门狗：上次收到任何服务器帧（含 pong）的时间。
+  ///
+  /// 手机进后台后，系统/运营商 NAT 会把 WS 静默掐断 —— 写 ping 进死 socket
+  /// **不报错**（数据进本地缓冲就返回），onError/onDone 都不触发，App 一直
+  /// 以为"connected"。网关把提问帧发给死 socket，手机永远收不到 —— 这正是
+  /// 「前台能收到、后台回来收不到」的根因。看门狗周期性检查：心跳已发出但
+  /// 迟迟没有回帧，就主动判定连接半死并触发重连。
+  DateTime? _lastServerFrameAt;
   ConnectionStatus _status = ConnectionStatus.disconnected;
   String _lastError = '';
   ServerConfig? _currentConfig;
@@ -888,6 +897,19 @@ class DshService extends ChangeNotifier {
   void _subscribeToQuestions() {
     _questionsSubscribed = false;
     _sendWsJson({'type': 'subscribe_questions'});
+  }
+
+  /// 回前台时的补强：再要一次 pending 重放。
+  ///
+  /// 网关对重复 subscribe 是幂等的（重新加集合 + 回放 pending），所以多发
+  /// 一次没有副作用；而它恰好覆盖两个残余风险：
+  /// 1. 连接活着但 App 在后台期间错过了实时帧（恰好没走到重连路径）；
+  /// 2. 通知点击进来的瞬间连接还在重建中，subscribe 恰逢其时地晚到。
+  /// 不做这层，这两种情况都要等下一次提问才暴露。
+  void resubscribeQuestions() {
+    if (_status == ConnectionStatus.connected) {
+      _subscribeToQuestions();
+    }
   }
 
   /// 返回是否真的发出去了。
@@ -2072,6 +2094,8 @@ class DshService extends ChangeNotifier {
 
   // Incoming WebSocket Message Processing
   void _handleRawMessage(dynamic raw) {
+    // 任何服务器帧都喂看门狗 —— pong、系统帧、数据帧都算"连接活着"的证据。
+    _lastServerFrameAt = DateTime.now();
     if (raw is! String) return;
     if (raw == 'pong') return;
 
@@ -2537,12 +2561,24 @@ class DshService extends ChangeNotifier {
   // Heartbeat
   void _startHeartbeat() {
     _stopHeartbeat();
+    _lastServerFrameAt = DateTime.now();
     _heartbeatTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
       if (_isDisposed) {
         timer.cancel();
         return;
       }
       if (_status == ConnectionStatus.connected) {
+        // 看门狗：超过 45s（3 个心跳周期）没收到任何服务器帧，判定为半死
+        // 连接 —— 写 ping 不报错不代表 socket 还活着（见 _lastServerFrameAt
+        // 的注释）。立即重建连接，而不是等到用户发现"又收不到了"。
+        final last = _lastServerFrameAt;
+        if (last != null && DateTime.now().difference(last).inSeconds > 45) {
+          debugPrint('[DshService] 看门狗：45s 无服务器帧，判定半死连接，强制重连');
+          _status = ConnectionStatus.disconnected;
+          notifyListeners();
+          _scheduleReconnect(immediate: true);
+          return;
+        }
         try {
           _channel?.sink.add('ping');
         } catch (_) {}
@@ -2721,6 +2757,19 @@ class DshService extends ChangeNotifier {
       _scheduleReconnect(immediate: true);
     } else {
       debugPrint('[DshService] Resumed while connected: checking socket liveness');
+      // 后台期间 socket 可能已被系统/NAT 静默掐断，而本地写 ping 不报错、
+      // onError/onDone 也不触发（半死连接）。判据用看门狗时钟：距离最近一次
+      // **真正收到服务器帧**太久（>40s，即后台期间没收到过心跳 pong），就
+      // 不能信任这条连接 —— 直接重建，重连后会重新订阅提问并重放 pending。
+      final last = _lastServerFrameAt;
+      final stale = last == null || DateTime.now().difference(last).inSeconds > 40;
+      if (stale) {
+        debugPrint('[DshService] 后台期间无服务器帧，判定连接半死，立即重建');
+        _status = ConnectionStatus.disconnected;
+        notifyListeners();
+        _scheduleReconnect(immediate: true);
+        return;
+      }
       try {
         _channel?.sink.add('ping');
       } catch (_) {
@@ -2729,6 +2778,7 @@ class DshService extends ChangeNotifier {
       }
       fetchApprovals();
       fetchWorkspaces();
+      resubscribeQuestions(); // 幂等补强：拿一次 pending 重放
       if (_currentSession != null) {
         _resyncActiveSession(_currentSession!.sessionId);
       }
