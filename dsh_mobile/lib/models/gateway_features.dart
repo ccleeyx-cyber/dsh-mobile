@@ -125,12 +125,16 @@ class TurnEndInfo {
   final bool failed;
   final int time;
 
+  /// 这是第几轮（引擎的 turn 号），用于判定"是不是最新那一轮"。
+  final int? turn;
+
   const TurnEndInfo({
     required this.kind,
     this.text = '',
     this.code = '',
     this.failed = false,
     this.time = 0,
+    this.turn,
   });
 
   static TurnEndInfo? fromJson(dynamic raw) {
@@ -143,6 +147,7 @@ class TurnEndInfo {
       code: raw['code']?.toString() ?? '',
       failed: raw['failed'] == true || raw['failed'] == 'true',
       time: raw['time'] is int ? raw['time'] as int : 0,
+      turn: raw['turn'] is int ? raw['turn'] as int : null,
     );
   }
 }

@@ -16,6 +16,7 @@ import '../models/permission_config.dart';
 import '../models/user_question.dart';
 import '../models/pending_attachment.dart';
 import 'draft_store.dart';
+import 'storage_service.dart';
 import 'notification_service.dart';
 import '../models/audit_log.dart';
 import '../models/persona.dart';
@@ -101,6 +102,10 @@ class DshService extends ChangeNotifier {
   /// 引擎的 turn/end.reason 里，若只弹一瞬、或只发一条后台通知，用户回到会话
   /// 时只会看到一条没有解释、停在半途的回答。
   TurnEndInfo? _lastTurnFailure;
+
+  /// 用户已关闭失败横幅的会话（规范化 id），持久化到 SharedPreferences。
+  final Set<String> _dismissedFailureSessions = {};
+  bool _dismissedFailuresLoaded = false;
   int _reasoningBudget = 8000;
   double _temperature = 0.7;
   bool _isLoadingHistory = false;
@@ -291,11 +296,34 @@ class DshService extends ChangeNotifier {
   /// 当前会话最近一次回合的失败说明；无失败时为 null。
   TurnEndInfo? get lastTurnFailure => _lastTurnFailure;
 
-  /// 用户已知悉该失败（横幅上的关闭按钮）。
+  /// 用户已知悉该失败（横幅上的关闭按钮）：记进持久化的抑制表，重启后也不再弹，
+  /// 直到该会话有新的一轮结束（那时旧失败已经过时，账就该清了）。
   void dismissTurnFailure() {
+    final sid = _currentSession?.sessionId;
+    if (sid != null) {
+      _dismissedFailureSessions.add(_failureKey(sid));
+      unawaited(StorageService.saveDismissedTurnFailures(_dismissedFailureSessions.toList()));
+    }
     if (_lastTurnFailure == null) return;
     _lastTurnFailure = null;
     notifyListeners();
+  }
+
+  String _failureKey(String sessionId) =>
+      sessionId.replaceAll('session-', '').toLowerCase();
+
+  /// 唯一设置失败横幅的入口：被抑制过的会话不再重复弹同一条。
+  void _applyTurnFailure(TurnEndInfo? info) {
+    final sid = _currentSession?.sessionId;
+    if (info == null || !info.failed) {
+      _lastTurnFailure = null;
+      return;
+    }
+    if (sid != null && _dismissedFailureSessions.contains(_failureKey(sid))) {
+      _lastTurnFailure = null;
+      return;
+    }
+    _lastTurnFailure = info;
   }
 
   List<AgentPersona> get personas => _personas;
@@ -444,6 +472,19 @@ class DshService extends ChangeNotifier {
   // Connect
   Future<void> connect(ServerConfig config) async {
     _currentConfig = config;
+    // 加载"已关闭失败横幅"的账本（一次）。放在 connect 而不是构造里：构造是同步
+    // 的，而 SharedPreferences 是异步的；connect 是每条使用路径的必经入口。
+    if (!_dismissedFailuresLoaded) {
+      _dismissedFailuresLoaded = true;
+      try {
+        final saved = await StorageService.loadDismissedTurnFailures();
+        _dismissedFailureSessions
+          ..clear()
+          ..addAll(saved);
+      } catch (e) {
+        debugPrint('[DshService] 加载失败横幅抑制表失败: $e');
+      }
+    }
     _isExplicitlyDisconnected = false;
     _isTokenInvalid = false;
     _reconnectTimer?.cancel();
@@ -899,8 +940,7 @@ class DshService extends ChangeNotifier {
         final isRunning = sessionData?['isRunning'] == true;
         final sModel = sessionData?['model'] as String?;
         // 最近一次回合是否以失败结束 —— 手机后连上来也能看到原因。
-        final turnInfo = TurnEndInfo.fromJson(sessionData?['lastTurn']);
-        _lastTurnFailure = (turnInfo != null && turnInfo.failed) ? turnInfo : null;
+        _applyTurnFailure(TurnEndInfo.fromJson(sessionData?['lastTurn']));
         if (sModel != null && sModel.isNotEmpty) {
           _currentSessionModel = sModel;
         } else if (session.model.isNotEmpty) {
@@ -2135,13 +2175,13 @@ class DshService extends ChangeNotifier {
             _messages.last.isStreaming = false;
           }
           if (turnEnded) {
-            _lastTurnFailure = TurnEndInfo(
+            _applyTurnFailure(TurnEndInfo(
               kind: 'error',
               text: errStr,
               code: code,
               failed: true,
               time: DateTime.now().millisecondsSinceEpoch,
-            );
+            ));
           }
           // 失败即终结：把"运行中"相关的所有状态一并收干净，否则转圈会一直转下去
           // （这是用户报的"报错了还一直显示运行中"）。
@@ -2429,12 +2469,20 @@ class DshService extends ChangeNotifier {
         // 失败说明 —— 结束原因只有网关读得到，手机不能靠猜。
         final endReason = json['reason']?.toString();
         if (endReason == 'error' || endReason == 'interrupted' || endReason == 'blocked') {
-          _lastTurnFailure = TurnEndInfo(
+          _applyTurnFailure(TurnEndInfo(
             kind: endReason!,
             text: json['message']?.toString() ?? '',
             failed: true,
             time: DateTime.now().millisecondsSinceEpoch,
-          );
+          ));
+        } else if (endReason != null) {
+          // 新一轮正常结束：上一轮的失败已经过时。横幅与"已关闭"抑制账一起清掉，
+          // 否则那条旧账会让以后真正的新失败也弹不出来。
+          _lastTurnFailure = null;
+          final sid = _currentSession?.sessionId;
+          if (sid != null && _dismissedFailureSessions.remove(_failureKey(sid))) {
+            unawaited(StorageService.saveDismissedTurnFailures(_dismissedFailureSessions.toList()));
+          }
         }
         _sessionPollTimer?.cancel();
         _sessionPollTimer = null;

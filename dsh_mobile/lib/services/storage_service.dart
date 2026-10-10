@@ -39,6 +39,27 @@ class StorageService {
     await prefs.setString(_keyThemeMode, mode);
   }
 
+  /// 已被用户关掉"本轮以错误结束"横幅的会话 id 集合（v1.11.3）。
+  ///
+  /// 为什么要持久化：横幅读的是历史里的 lastTurn，只要那一轮仍是最后一轮，
+  /// 每次打开会话都会重新判定为失败 —— 用户关掉之后重启 App 又弹一遍，就是
+  /// "每次都弹过期信息"。关掉即记账，直到该会话有新的一轮结束才清账。
+  static const String _keyDismissedFailures = 'dsh_dismissed_turn_failures';
+  static const int _maxDismissedFailures = 100;
+
+  static Future<List<String>> loadDismissedTurnFailures() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getStringList(_keyDismissedFailures) ?? const [];
+  }
+
+  static Future<void> saveDismissedTurnFailures(List<String> sessionIds) async {
+    final prefs = await SharedPreferences.getInstance();
+    final capped = sessionIds.length > _maxDismissedFailures
+        ? sessionIds.sublist(sessionIds.length - _maxDismissedFailures)
+        : sessionIds;
+    await prefs.setStringList(_keyDismissedFailures, capped);
+  }
+
   static final Random _rng = Random.secure();
 
   /// Guarantees uniqueness **by construction**, not by luck.

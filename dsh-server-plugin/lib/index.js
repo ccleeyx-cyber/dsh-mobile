@@ -807,15 +807,29 @@ export function apply(ctx, config = {}, internals = {}) {
       // 会话历史一起送到手机上，表现为"打开会话永远在转圈"。
       reconcileFollowerWithProjection(follower, rows);
       isRunning = (follower && follower.isRunning) || isRecentlyPrompted || isOpenTurnActive;
-      lastSeq = rows.turnBoundary?.val?.lastStepBoundary?.seq ?? 
-                rows.sessionListMetadata?.val?.lastSeq ?? 
-                rows.titleInput?.val?.lastSeq ?? 50000;
+      // ⚠️ 分页上界必须是**投影水位线**（所有行 seq 的最大值），不能用
+      // lastStepBoundary.seq：turn/end 永远排在最后一个 step 边界之后，用它当
+      // 上界会把**最新那轮**的 turn/end 排除在外，于是 lastTurn 退回读到上一轮
+      // 的结束原因 —— 手机上就表现为"一直弹出之前那条过期报错"。
+      lastSeq = Math.max(
+        ...Object.values(rows).map((r) => Number(r?.seq) || 0),
+        Number(rows.turnBoundary?.val?.lastStepBoundary?.seq) || 0,
+        Number(rows.sessionListMetadata?.val?.lastSeq) || 0,
+        Number(rows.titleInput?.val?.lastSeq) || 0,
+        0
+      ) || 50000;
     }
 
     // 最近一次回合是怎么结束的。错误只存在于 turn/end.reason 里，手机后连上来
     // （或错误发生在手机不在场时）必须也能看到它，否则"报错了但手机没显示"
     // 就永远修不掉。
     let lastTurn = null;
+    // 引擎认定的"最后一个已闭合回合"号，用来判定我们从分页里读到的那条
+    // turn/end 到底是不是最新的（见下面的 mismatch 丢弃）。
+    const engineLastClosedTurn = (() => {
+      const v = cacheData?.record?.rows?.turnBoundary?.val?.lastTurn;
+      return typeof v === 'number' ? v : null;
+    })();
 
     // 1. 调用 DSH 原生 RPC session/page 获取真实历史事件流
     try {
@@ -917,6 +931,7 @@ export function apply(ctx, config = {}, internals = {}) {
               text: end.text,
               code: end.code || '',
               failed: isFailedTurnEnd(ev.data?.reason),
+              turn: typeof ev.data?.turn === 'number' ? ev.data.turn : null,
               time: ev.time || Date.now()
             };
           }
@@ -924,6 +939,21 @@ export function apply(ctx, config = {}, internals = {}) {
       }
     } catch (rpcErr) {
       logger.warn('[getSessionHistory] RPC session/page error:', rpcErr?.message || rpcErr);
+    }
+
+    // 丢弃"过期"的 turn/end：如果我们从分页里读到的那条不是引擎认定的最后一个
+    // 已闭合回合，就说明它不是最新的一轮（分页边界/投影刷新的任一处滞后都会
+    // 造成这种错位）。宁可这一条不报，也不能把上一轮的失败当成"本轮"反复弹给
+    // 用户 —— 那正是"每次打开都弹之前那条过期信息"的直接成因。
+    if (lastTurn && engineLastClosedTurn != null && lastTurn.turn != null
+        && lastTurn.turn !== engineLastClosedTurn) {
+      audit('session/last-turn-stale-dropped', {
+        sessionId,
+        readTurn: lastTurn.turn,
+        engineLastClosedTurn,
+        kind: lastTurn.kind
+      });
+      lastTurn = null;
     }
 
     // 2. 兜底解析：若 RPC 无结果但存在 titleInput，填充首轮用户输入

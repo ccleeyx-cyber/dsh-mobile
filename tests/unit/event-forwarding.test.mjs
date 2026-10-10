@@ -72,6 +72,15 @@ const BASE = `http://127.0.0.1:${MOBILE_PORT}`;
 const rpcCalls = [];
 let engineWs = null;
 
+/**
+ * Controlled `session/page` fixture. The fake engine FILTERS these by the
+ * `throughSeq` the gateway asks for — exactly like the real paginator — so a
+ * wrong upper bound genuinely loses records and the test can prove it. The
+ * throughSeqs the gateway requested are recorded for assertions.
+ */
+let pageRecords = [];
+const pageThroughSeqs = [];
+
 function startFakeEngine() {
   const srv = http.createServer((req, res) => {
     let body = '';
@@ -81,6 +90,13 @@ function startFakeEngine() {
       try { parsed = JSON.parse(body); } catch { /* ignore */ }
       rpcCalls.push({ method: parsed?.method ?? req.url, payload: parsed?.payload ?? null, url: req.url });
       res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (parsed?.method === 'session/page') {
+        const throughSeq = parsed?.payload?.args?.request?.throughSeq;
+        pageThroughSeqs.push(throughSeq);
+        const records = pageRecords.filter((r) => (r.event?.seq ?? 0) <= (throughSeq ?? 0));
+        res.end(JSON.stringify({ result: { ok: true, value: { records } } }));
+        return;
+      }
       // Shape the RPC caller requires: {result:{ok:true,value:...}}.
       res.end(JSON.stringify({ result: { ok: true, value: {} } }));
     });
@@ -180,6 +196,23 @@ async function connectClient() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Write a projection-cache file into the throwaway DSH_HOME.
+ *
+ * The gateway reads per-session rows (turnBoundary / sessionListMetadata) from
+ * here to decide `isRunning`, the `session/page` upper bound, and whether the
+ * turn/end it read is the newest one — so these tests need real rows, not stubs.
+ */
+function writeProjCache(sessionId, rows) {
+  const dir = path.join(TMP_HOME, 'storages', 'session_projcache', 'sessions');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, `${sessionId}.json`),
+    JSON.stringify({ record: { rows, identity: { createdAt: Date.now() } } }, null, 2),
+    'utf8'
+  );
+}
 
 // -------------------------------------------------------------- setup ---
 
@@ -677,5 +710,60 @@ describe('回合结束时手机必须能停下来并看到原因', () => {
     assert.equal(body.data.isRunning, false,
       '回合已结束，迟到的 chunk 不得让网关继续报"运行中"（否则手机永远转圈）');
     await c.close();
+  });
+
+  /* ---------------------------------------------------------------- *
+   * 分页上界与 lastTurn
+   *
+   * turn/end 永远排在最后一个 step 边界之后（实测 turnBoundary.seq = 4239，
+   * lastStepBoundary.seq = 4237）。早先拿 lastStepBoundary.seq 当 session/page
+   * 的 throughSeq，就把**最新那轮**的 turn/end 挡在页外，lastTurn 于是退回读到
+   * 上一轮的结束原因 —— 用户看到的就是"换模型跑成功了，界面还在弹昨天那条报错"。
+   * ---------------------------------------------------------------- */
+  it('分页上界必须覆盖最新 turn/end，否则会一直弹上一轮的旧错误', async () => {
+    const sid = 'session-stale-turn';
+    // 投影：水位线 200，最后一个 step 边界 190，引擎认定最后闭合回合 = 6。
+    writeProjCache(sid, {
+      turnBoundary: { seq: 200, val: { openTurnStartSeq: null, lastStepBoundary: { kind: 'end', seq: 190 }, lastTurn: 6 } },
+      sessionListMetadata: { seq: 200, val: { lastPromptAt: Date.now(), blank: false } }
+    });
+    pageRecords = [
+      { event: { type: 'turn/end', seq: 185, data: { turn: 5, reason: { kind: 'error', error: { message: 'rate limit', code: 'RATE_LIMIT' } } } } },
+      { event: { type: 'assistant/message', seq: 192, data: { message: { content: [{ type: 'text', text: '换模型后已完成' }] } } } },
+      { event: { type: 'turn/end', seq: 195, data: { turn: 6, reason: { kind: 'completed' } } } }
+    ];
+    pageThroughSeqs.length = 0;
+
+    const res = await fetch(`${BASE}/api/mobile/sessions/${sid}`, {
+      headers: { Authorization: `Bearer ${TOKEN}` }
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+
+    // 上界必须抬到投影水位线（200），否则 seq 192/195 会被自己过滤掉。
+    assert.ok(pageThroughSeqs.at(-1) >= 195,
+      `session/page 的 throughSeq 必须覆盖最新 turn/end，实际=${pageThroughSeqs.at(-1)}`);
+    assert.equal(body.data.lastTurn?.kind, 'completed',
+      '最新一轮是 completed，不得把上一轮的 error 当成"本轮"');
+    assert.equal(body.data.lastTurn?.failed, false);
+  });
+
+  it('分页里读到的 turn/end 不是引擎认定的最后一轮时，宁可不报也不报旧账', async () => {
+    const sid = 'session-stale-turn2';
+    writeProjCache(sid, {
+      turnBoundary: { seq: 300, val: { openTurnStartSeq: null, lastStepBoundary: { kind: 'end', seq: 290 }, lastTurn: 9 } },
+      sessionListMetadata: { seq: 300, val: { lastPromptAt: Date.now(), blank: false } }
+    });
+    // 投影说最后闭合回合是 9，但页里只有第 8 轮的结束记录（模拟投影/分页错位）。
+    pageRecords = [
+      { event: { type: 'turn/end', seq: 280, data: { turn: 8, reason: { kind: 'error', error: { message: '旧错误', code: 'OLD' } } } } }
+    ];
+
+    const res = await fetch(`${BASE}/api/mobile/sessions/${sid}`, {
+      headers: { Authorization: `Bearer ${TOKEN}` }
+    });
+    const body = await res.json();
+    assert.equal(body.data.lastTurn, null,
+      '对不上引擎认定的最后一轮时，必须丢弃而不是把旧错误当成最新');
   });
 });
