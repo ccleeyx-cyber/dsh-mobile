@@ -18,6 +18,14 @@ class SecurityPermissionsView extends StatefulWidget {
 }
 
 class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
+  /// 审计日志当前展开渲染的条数。
+  ///
+  /// 审计可达 100 条，此前全部塞进一个 shrinkWrap 的内层 ListView ——
+  /// shrinkWrap 没有懒加载，100 个 tile 一次性布局，页面滚动时每帧都
+  /// 全量重算，实测整 App 掉帧。这里改为"先渲 20 条 + 点按追加"，
+  /// 数据仍在服务端内存里，展开只是本地切片，无额外请求。
+  int _auditLimit = 20;
+
   @override
   void initState() {
     super.initState();
@@ -282,15 +290,36 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                        child: Text('暂无历史审计记录', style: TextStyle(color: context.c.textTertiary, fontSize: 13)),
                     ),
                   )
-                : ListView.separated(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    itemCount: auditLogs.length,
-                    separatorBuilder: (context, index) => Divider(color: context.c.border, height: 12),
-                    itemBuilder: (context, index) {
-                      final item = auditLogs[index];
-                      return _buildAuditLogTile(item);
-                    },
+                // 只渲染前 _auditLimit 条（默认 20），其余点「加载更多」追加。
+                // shrinkWrap 的 ListView 没有懒加载 —— 100 条全量布局是
+                // 整页掉帧的直接原因。
+                : Column(
+                    children: [
+                      // 手写分隔（原来由 ListView.separated 提供）：take 切片
+                      // 后用 index 判断是否最后一条，避免尾部多余分隔线。
+                      for (var i = 0; i < auditLogs.length && i < _auditLimit; i++) ...[
+                        _buildAuditLogTile(auditLogs[i]),
+                        if (i != _auditLimit - 1 && i != auditLogs.length - 1)
+                          Divider(color: context.c.border, height: 12),
+                      ],
+                      if (auditLogs.length > _auditLimit)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: TextButton(
+                            onPressed: () => setState(() => _auditLimit += 30),
+                            style: TextButton.styleFrom(
+                              foregroundColor: context.c.accent,
+                              minimumSize: Size.zero,
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            child: Text(
+                              '显示更多（还有 ${auditLogs.length - _auditLimit} 条）',
+                              style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+                            ),
+                          ),
+                        ),
+                    ],
                   ),
           ),
         ],
@@ -774,3 +803,4 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
     );
   }
 }
+

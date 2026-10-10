@@ -92,6 +92,10 @@ class _ChatViewState extends State<ChatView> {
   Timer? _holdTick;
   /// 松手后的收尾保护：stop() 之后 onFinal 可能还会到，用来把最终文本补进输入框。
   bool _holdAwaitingFinal = false;
+  /// 录音态兜底超时：语音服务挂死（listen 超时、平台不回调）时 _holdPhase
+  /// 会卡在 recording，手势层吞掉一切点击 —— 表现为"输入框点不动"。
+  /// 30s 强制回 idle；正常说话远短于这个上限，到点即视为异常。
+  Timer? _holdWatchdog;
 
   // ---- 附件 (v1.10.0) ----
   /// 已挂载、等待随下一条消息发出去的附件。
@@ -205,6 +209,7 @@ class _ChatViewState extends State<ChatView> {
     _inputFocusNode.removeListener(_onInputFocusChange);
     _scrollController.removeListener(_onScroll);
     _holdTick?.cancel();
+    _holdWatchdog?.cancel();
     // 正在录音时被销毁（切会话/返回）：必须主动取消识别，否则麦克风会被一直
     // 占着，下一次识别会以"被其他应用占用"失败。
     if (_holdPhase != _HoldTalkPhase.idle) {
@@ -1347,9 +1352,14 @@ class _ChatViewState extends State<ChatView> {
         (dsh.isSending && (currentSession?.matchesSessionId(dsh.currentSession?.sessionId) ?? false));
     final activeApprovals = dsh.pendingApprovals.where((a) {
       if (currentSessionId == null) return false;
+      // 会话归属不明的审批（网关侧 sessionId 解析失败落了 'default'）不进
+      // 对话流 —— 原来的 `|| a.sessionId == 'default'` 把它塞进**每一个**
+      // 会话里，同一张审批卡满屏重复。这类审批统一由安全页的计数摘要
+      // 承接（那里按总数显示，且 banner 有"跳到所属会话"出口）。
+      if (a.sessionId.isEmpty || a.sessionId == 'default') return false;
       final cleanCurrent = currentSessionId.replaceFirst('session-', '');
       final cleanReq = a.sessionId.replaceFirst('session-', '');
-      return a.sessionId == currentSessionId || cleanReq == cleanCurrent || a.sessionId == 'default';
+      return a.sessionId == currentSessionId || cleanReq == cleanCurrent;
     }).toList();
 
     // Keyboard height transitions
@@ -2491,6 +2501,14 @@ class _ChatViewState extends State<ChatView> {
     _holdTick = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted && _holdPhase == _HoldTalkPhase.recording) setState(() {});
     });
+    // 兜底看门狗：语音服务挂死时 _endHoldTalk（依赖松手）可能永远不来，
+    // 也可能来了但 stop() 挂在平台回调上。30s 后强制收尾，把输入框还回去。
+    _holdWatchdog?.cancel();
+    _holdWatchdog = Timer(const Duration(seconds: 30), () {
+      if (!mounted || _holdPhase != _HoldTalkPhase.recording) return;
+      _cancelHoldTalk();
+      if (mounted) _toast('录音异常结束，已恢复输入框');
+    });
 
     final ok = await VoiceInputService.instance.start(
       onPartial: (text, _) {
@@ -2535,6 +2553,7 @@ class _ChatViewState extends State<ChatView> {
   Future<void> _endHoldTalk(DshService dsh) async {
     if (_holdPhase != _HoldTalkPhase.recording) return;
     _holdTick?.cancel();
+    _holdWatchdog?.cancel();
     _holdAwaitingFinal = true;
     await VoiceInputService.instance.stop();
     if (!mounted) return;
@@ -2560,6 +2579,8 @@ class _ChatViewState extends State<ChatView> {
   void _cancelHoldTalk() {
     if (_holdPhase != _HoldTalkPhase.recording) return;
     _holdTick?.cancel();
+    _holdWatchdog?.cancel();
+    _holdAwaitingFinal = false;
     VoiceInputService.instance.cancel();
     if (!mounted) return;
     setState(() {
@@ -2707,9 +2728,22 @@ class _ChatViewState extends State<ChatView> {
                                 // 中途改动 GestureDetector 的识别器集合会牵动识别器
                                 // 生命周期，这里一律保持非空、在内部判状态。
                                 onTap: () {
-                                  if (_holdPhase != _HoldTalkPhase.recording) {
-                                    _inputFocusNode.requestFocus();
+                                  if (_holdPhase == _HoldTalkPhase.recording) {
+                                    // 录音态下点按 = 自救出口。语音服务偶发挂死
+                                    //（listen 超时/平台不回调）时 _holdPhase 会被
+                                    // 卡在 recording，手势层吞掉一切点击且不再放行
+                                    // —— 用户表现为"输入框点不动、键盘弹不出来"。
+                                    // 点按直接放弃这次录音，把输入框还回去。
+                                    _cancelHoldTalk();
+                                    _toast('已取消录音');
+                                    return;
                                   }
+                                  // requestFocus 只拿焦点，不保证唤起输入法：
+                                  // 指针被这层 opaque 手势层吃掉时，EditableText
+                                  // 自己的 tap→IME 请求不会发生。显式补一次
+                                  // requestImeFocus，让键盘一定弹出来。
+                                  _inputFocusNode.requestFocus();
+                                  FocusScope.of(context).requestFocus(_inputFocusNode);
                                 },
                                 onLongPressStart: (_) => _beginHoldTalk(dsh),
                                 onLongPressEnd: (_) => _endHoldTalk(dsh),

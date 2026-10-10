@@ -3005,7 +3005,16 @@ export function apply(ctx, config = {}, internals = {}) {
             ws.send(JSON.stringify({ type: 'approval_ack', eventId, outcome: res.outcome, ok: res.ok }));
           }
         }
-      } catch (_) {}
+      } catch (err) {
+        // 一条畸形帧或处理错误绝不能拖垮整个网关，但也不能无声无息 ——
+        // 旧实现 catch(_){} 让"手机发了什么导致逻辑炸了"在线上无迹可循。
+        // 记 warn（原始帧截断到 200 字符，防止超大 payload 刷屏），不回错误帧
+        //（客户端未必在等 ack，写了反而制造新的异常路径）。
+        try {
+          logger.warn('[dsh-mobile-bridge] WS 消息处理失败: %s | frame: %s',
+            err?.message ?? err, String(raw).slice(0, 200));
+        } catch (_) {}
+      }
     });
 
     ws.on('close', () => {
