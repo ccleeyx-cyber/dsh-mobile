@@ -1573,6 +1573,11 @@ class _ChatViewState extends State<ChatView> {
     final dsh = Provider.of<DshService>(context);
     final currentSession = dsh.currentSession;
     final currentWs = dsh.currentWorkspace;
+    // 顶栏第二行显示的工作区名。取自**当前会话反查**的归属，而不是 currentWs ——
+    // 从搜索结果/通知按 id 打开的会话可能不属于任何已加载工作区，那样会显示一个
+    // 相邻工作区的名字（不同工作区可以有同名会话，用户无从察觉）。查不到就是 null，
+    // 这一行整行不渲染。
+    final workspaceTitle = dsh.workspaceOfCurrentSession?.title;
     final sessionId = currentSession?.sessionId ?? 'default';
     final policy = dsh.getSessionPermission(sessionId);
     final currentSessionId = currentSession?.sessionId;
@@ -1713,7 +1718,21 @@ class _ChatViewState extends State<ChatView> {
           onTapSection: (section) => _openSessionInfo(dsh, section: section),
         ),
         titleSpacing: 12,
-        title: Row(
+        // 会话标题 + 它所属的工作区（两行）。
+        //
+        // 为什么需要工作区这一行：不同工作区可以有**同名会话**，而从通知/深链接/
+        // 搜索结果跳进来时（`openSessionById`），界面上原本完全看不出这是哪个工作区
+        // 的会话。放在顶栏标题的第二行而不是状态条里 —— 状态条回答的是"现在在干
+        // 什么"（产出/改动/上下文），工作区回答的是"这个会话在哪"，混在一起会把
+        // "点某一段展开对应信息"的语义弄浑。
+        //
+        // 工作区判定不出来时**整行隐藏**（见 `workspaceOfCurrentSession`）：
+        // 那一行宁可没有，也不能显示一个可能是"隔壁工作区"的名字。
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
               children: [
                 // 当前权限状态色点。它原本是顶栏那个盾牌按钮的一部分；盾牌移进
                 // 「更多」菜单后，用这个 7px 的点保住「当前是什么权限」的一眼信息，
@@ -1758,6 +1777,27 @@ class _ChatViewState extends State<ChatView> {
                 ],
               ],
             ),
+            if (workspaceTitle != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 1.5),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.folder_outlined, size: 10.5, color: context.c.textTertiary),
+                    const SizedBox(width: 3),
+                    Flexible(
+                      child: Text(
+                        workspaceTitle,
+                        style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
         // 顶栏只保留 3 个高频按钮（新建 / 查找 / 更多）。
         //
         // 原先有 5 个：权限、新建、主题、查找、更多。再叠加两行标题（句柄选择 +

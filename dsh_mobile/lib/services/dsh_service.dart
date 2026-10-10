@@ -331,6 +331,26 @@ class DshService extends ChangeNotifier {
 
   Workspace? get currentWorkspace => _currentWorkspace;
   SessionMeta? get currentSession => _currentSession;
+
+  /// 当前会话**实际所属**的工作区；判定不出来时为 null。
+  ///
+  /// 刻意不用 [currentWorkspace] 顶替：`SessionMeta` 身上没有 workspaceId，归属
+  /// 只能按 `Workspace.sessions` 的成员关系反查。而 `openSessionById()`（搜索命中、
+  /// 通知/深链接跳转）会在找不到所属工作区时构造一个最小 SessionMeta 直接进 ——
+  /// 那种情况下把"上次选中的工作区"的名字显示在顶栏，就是**主动误导**：不同工作区
+  /// 完全可以有同名会话，用户没有任何办法察觉自己看错了。返回 null 让 UI 隐藏这一
+  /// 行，比给一个可能是错的答案好。
+  Workspace? get workspaceOfCurrentSession {
+    final sid = _currentSession?.sessionId;
+    if (sid == null || sid.isEmpty) return null;
+    for (final ws in _workspaces) {
+      for (final s in ws.sessions) {
+        if (s.matchesSessionId(sid)) return ws;
+      }
+    }
+    return null;
+  }
+
   List<ChatMessage> get messages => _messages;
   List<ApprovalRequest> get pendingApprovals => _pendingApprovals;
   DshSettings? get settings => _settings;

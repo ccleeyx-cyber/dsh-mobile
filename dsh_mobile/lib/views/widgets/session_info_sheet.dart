@@ -285,12 +285,10 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         ));
         children.add(const SizedBox(height: 6));
         children.add(Text(
-          // Thousand separators here too: these were the only raw integers left
-          // in the panel, so the window rendered as a bare `1000000` right under
-          // a properly grouped `会话累计` — inconsistent, and easy to misread as
-          // "you just computed it against 1M".
-          '上下文已用 ${_group(stats.pressureTokens!)} / ${_group(stats.contextWindow!)}'
-          '${stats.projectedTokens != null ? ' · 下一轮预计 ${_group(stats.projectedTokens!)}' : ''}',
+          // 千分位/M 都作用到这一行：它以前是整块面板里唯一剩下的裸整数，窗口直接
+          // 显示成 `1000000`，而正确的读法就是 `1M`（用户点名要求的口径）。
+          '上下文已用 ${_compact(stats.pressureTokens!)} / ${_compact(stats.contextWindow!)}'
+          '${stats.projectedTokens != null ? ' · 下一轮预计 ${_compact(stats.projectedTokens!)}' : ''}',
           style: TextStyle(fontSize: 11.5, color: context.c.textSecondary),
         ));
       }
@@ -303,12 +301,12 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       // 而缓存读是同一段上下文被反复重读，会把数字吹大一个量级（用户实测
       // 11.08M 输入 + 0.34M 输出 + 193.46M 缓存读），显示成 205M 完全不是消耗。
       final consumed = stats.consumedTokens;
-      children.add(_metricRow('会话累计消耗', consumed == null ? '—' : _group(consumed)));
+      children.add(_metricRow('会话累计消耗', consumed == null ? '—' : _compact(consumed)));
       if (stats.hasCacheReuse) {
         children.add(Padding(
           padding: const EdgeInsets.only(top: 2),
-          child: _hint('另有缓存复用 ${_group(stats.cacheReadTokens ?? 0)}'
-              '${(stats.cacheWriteTokens ?? 0) > 0 ? ' + 写入 ${_group(stats.cacheWriteTokens!)}' : ''}'
+          child: _hint('另有缓存复用 ${_compact(stats.cacheReadTokens ?? 0)}'
+              '${(stats.cacheWriteTokens ?? 0) > 0 ? ' + 写入 ${_compact(stats.cacheWriteTokens!)}' : ''}'
               '（重复读取的上下文，不计入上面的消耗）。'),
         ));
       }
@@ -366,7 +364,7 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
     return _section(title: '用量与上下文', icon: Icons.data_usage_rounded, children: children);
   }
 
-  String _formatTurnBurn(int? burn) => burn == null ? '—' : _group(burn);
+  String _formatTurnBurn(int? burn) => burn == null ? '—' : _compact(burn);
 
   /// 千分位。自己写四行而不是引 intl：这个包里没有这个依赖，也不值得为它加。
   static String _group(int value) {
@@ -377,6 +375,22 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       out.write(digits[i]);
     }
     return value < 0 ? '-$out' : out.toString();
+  }
+
+  /// token 量级的显示单位：**一百万写作 `1M`**（用户明确指定的口径）。
+  ///
+  /// 用 M 而不是继续摊开长数字，是因为这一屏要回答的只有"离上限还有多远、这轮
+  /// 贵不贵"——`1000000` 与 `1M` 是同一件事，但后者一眼可读。
+  ///
+  /// 阈值刻意只放在 1e6：小于一百万的量级继续给精确值 + 千分位。把 12,345 写成
+  /// `0.0M` 纯粹是丢信息，而"30 万 / 90 万"这类差别用千分位反而更好读。
+  static String _compact(int value) {
+    if (value.abs() < 1000000) return _group(value);
+    final millions = value / 1000000;
+    var text = millions.toStringAsFixed(1);
+    // `1.0M` → `1M`：整兆不必带那个 .0。
+    if (text.endsWith('.0')) text = text.substring(0, text.length - 2);
+    return '${text}M';
   }
 
   // --------------------------------------------------------- 交付物 ----

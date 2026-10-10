@@ -447,10 +447,44 @@ void main() {
         ),
       );
 
-      expect(find.text('11,422,551'), findsOneWidget, reason: '消耗 = 11,080,549 + 342,002');
-      expect(find.text('204,881,889'), findsNothing, reason: '把缓存读算进去会凭空报出 2 亿');
-      expect(find.textContaining('缓存复用 193,459,338'), findsOneWidget);
+      expect(find.text('11.4M'), findsOneWidget, reason: '消耗 = 11,080,549 + 342,002 → 11.4M');
+      expect(find.text('204.9M'), findsNothing, reason: '把缓存读算进去会凭空报出 200M 量级');
+      expect(find.textContaining('缓存复用 193.5M'), findsOneWidget);
       expect(find.textContaining('不计入上面的消耗'), findsOneWidget);
+    });
+
+    testWidgets('一百万写成 1M（用户指定的量级口径）', (tester) async {
+      await pumpSheet(
+        tester,
+        const SessionInfoSheet(
+          stats: SessionStats(
+            source: 'live',
+            uncachedInputTokens: 1000000,
+            outputTokens: 0,
+            pressureTokens: 325000,
+            contextWindow: 1000000,
+          ),
+        ),
+      );
+      // 窗口 1000000 必须写成 1M，而不是把七个 0 摊在屏幕上。
+      expect(find.textContaining('/ 1M'), findsOneWidget);
+      expect(find.text('1M'), findsOneWidget, reason: '消耗 1,000,000 → 1M，不是 1.0M');
+      expect(find.text('1.0M'), findsNothing);
+      // 不到一百万的量级保留精确值。
+      expect(find.textContaining('上下文已用 325,000'), findsOneWidget);
+    });
+
+    testWidgets('不到一百万的数字不写 M（12,345 不能变成 0.0M）', (tester) async {
+      await pumpSheet(
+        tester,
+        const SessionInfoSheet(
+          stats: SessionStats(source: 'live', uncachedInputTokens: 12000, outputTokens: 400),
+          turnBurnTokens: 12345,
+        ),
+      );
+      expect(find.text('12,345'), findsOneWidget);
+      expect(find.text('12,400'), findsOneWidget);
+      expect(find.text('0.0M'), findsNothing);
     });
 
     testWidgets('分桶取不到时显示「—」，绝不用 totalTokens 冒充消耗', (tester) async {
@@ -613,6 +647,61 @@ void main() {
       await tester.pump();
       return dsh;
     }
+
+    // ------------------------------------------------- 顶栏：工作区归属 ----
+    //
+    // 需求原话："我在会话界面想要看到这个会话是属于哪个工作区的"。不同工作区
+    // 可以有同名会话，而从通知/深链接/搜索结果跳进来时，界面上原本完全看不出
+    // 这是哪个工作区的会话。
+
+    Workspace ws(String id, String title, List<String> sessionIds) => Workspace(
+          workspaceId: id,
+          title: title,
+          path: 'E:\\workspace\\$title',
+          sessions: [
+            for (final s in sessionIds) SessionMeta(sessionId: s, title: '会话 $s'),
+          ],
+        );
+
+    testWidgets('顶栏第二行显示会话所属工作区', (tester) async {
+      final dsh = await chatWithSession(tester);
+      dsh.debugSetWorkspaces([
+        ws('w1', '个人', ['session-a']),
+        ws('w2', 'GZ', ['session-z']),
+      ]);
+      await tester.pump();
+
+      expect(find.text('个人'), findsOneWidget);
+      expect(find.text('GZ'), findsNothing, reason: '不能把别的工作区的名字显示出来');
+      await teardown(tester);
+    });
+
+    testWidgets('会话归属判定不出来时不显示任何工作区名（宁可没有，也不能显示错的）', (tester) async {
+      final dsh = await chatWithSession(tester);
+      // 从搜索结果/通知按 id 打开的会话可能不在任何已加载的工作区里。此时把
+      // "上次选中的工作区"顶上去就是主动误导：不同工作区可以有同名会话，
+      // 用户没有任何办法察觉自己看错了。
+      dsh.debugSetWorkspaces([ws('w1', '个人', ['session-z'])]);
+      await tester.pump();
+
+      expect(find.text('个人'), findsNothing);
+      expect(find.byIcon(Icons.folder_outlined), findsNothing);
+      await teardown(tester);
+    });
+
+    testWidgets('切到另一个工作区的会话后，副标题跟着变', (tester) async {
+      final dsh = await chatWithSession(tester);
+      dsh.debugSetWorkspaces([ws('w1', '个人', ['session-a'])]);
+      await tester.pump();
+      expect(find.text('个人'), findsOneWidget);
+
+      dsh.debugSetCurrentSession(SessionMeta(sessionId: 'session-z', title: '另一个会话'));
+      dsh.debugSetWorkspaces([ws('w2', 'SZ', ['session-z'])]);
+      await tester.pump();
+      expect(find.text('SZ'), findsOneWidget);
+      expect(find.text('个人'), findsNothing, reason: '旧工作区名不得残留');
+      await teardown(tester);
+    });
 
     testWidgets('状态条挂在 AppBar 下方，显示上下文与产出，不是一条空白带', (tester) async {
       final dsh = await chatWithSession(tester);
