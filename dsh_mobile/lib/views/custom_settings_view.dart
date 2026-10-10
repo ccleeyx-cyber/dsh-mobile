@@ -14,6 +14,17 @@ import '../main.dart';
 class CustomSettingsView extends StatefulWidget {
   const CustomSettingsView({super.key});
 
+  /// Stable handles for the ntfy block, so the interface tests can assert on it
+  /// without depending on copy that is expected to keep changing.
+  @visibleForTesting
+  static const pushRequirementNoteKey = Key('push-requirement-note');
+  @visibleForTesting
+  static const pushUrlFieldKey = Key('push-url-field');
+  @visibleForTesting
+  static const pushTopicFieldKey = Key('push-topic-field');
+  @visibleForTesting
+  static const pushTokenFieldKey = Key('push-token-field');
+
   @override
   State<CustomSettingsView> createState() => _CustomSettingsViewState();
 }
@@ -265,6 +276,62 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     );
   }
 
+  /// 「另一半在手机上」：网关只是**发布方**，没有订阅方就什么都不会响。
+  ///
+  /// ntfy 是发布/订阅模型。这一屏填的地址与 topic 只决定"往哪儿发"，收到与否
+  /// 取决于手机上是否有一个客户端**订阅了同一个 topic**。缺了后半句，配置项
+  /// 看起来完全正常、测试推送也能成功，用户却"一直收不到"——这正是之前被
+  /// 反馈为"推送只是看起来配好了"的原因。所以这句话必须挨着输入框写出来，
+  /// 而不是折叠在别处的说明里。
+  Widget _buildPushRequirementNote(BuildContext context) {
+    final lines = <String>[
+      '① 在应用商店安装一个 ntfy 客户端（官方开源 App，Android/iOS 都有）。',
+      '② 在客户端里订阅与下面完全相同的一个 topic（一个字都不能差）。',
+      '③ 没装客户端，或 topic 对不上 → 手机不会有任何提示。',
+      '④ 提醒只在 App 不在线（进程被杀/断网/锁屏）时经 ntfy 发送；'
+          'App 活着时由它自己弹本地通知，不会重复推两条。',
+    ];
+    return Container(
+      key: CustomSettingsView.pushRequirementNoteKey,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: context.c.warning.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: context.c.warning.withOpacity(0.35)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.smartphone_rounded, size: 15, color: context.c.warning),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  '还需要在手机上装一个 ntfy 客户端并订阅同一 topic',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: context.c.textPrimary,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          for (final line in lines)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 3),
+              child: Text(
+                line,
+                style: TextStyle(fontSize: 11, color: context.c.textSecondary, height: 1.4),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   /// 离线推送配置卡。
   ///
   /// 为什么需要它：App 的本地通知只在**进程活着**时才有意义；Android 杀掉进程
@@ -315,8 +382,11 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
             '事件摘要会经该服务中转，请只在接受这一点时开启。',
             style: TextStyle(fontSize: 11.5, color: context.c.textSecondary, height: 1.35),
           ),
+          const SizedBox(height: 10),
+          _buildPushRequirementNote(context),
           const SizedBox(height: 12),
           TextField(
+            key: CustomSettingsView.pushUrlFieldKey,
             controller: _ntfyUrlController,
             onChanged: (_) => _ntfyDirty = true,
             decoration: const InputDecoration(
@@ -329,6 +399,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           ),
           const SizedBox(height: 10),
           TextField(
+            key: CustomSettingsView.pushTopicFieldKey,
             controller: _ntfyTopicController,
             onChanged: (_) => _ntfyDirty = true,
             decoration: const InputDecoration(
@@ -341,6 +412,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           ),
           const SizedBox(height: 10),
           TextField(
+            key: CustomSettingsView.pushTokenFieldKey,
             controller: _ntfyTokenController,
             onChanged: (_) => _ntfyDirty = true,
             obscureText: true,
@@ -668,7 +740,12 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text('深度思考预算 (Reasoning Budget)', style: TextStyle(color: context.c.textPrimary, fontSize: 13, fontWeight: FontWeight.w500)),
+                    // Expanded：左侧标签很长（"深度思考预算 (Reasoning Budget)"），
+                    // spaceBetween 下两个裸 Text 会一起溢出（实测手机宽 97px）。
+                    Expanded(
+                      child: Text('深度思考预算 (Reasoning Budget)', style: TextStyle(color: context.c.textPrimary, fontSize: 13, fontWeight: FontWeight.w500)),
+                    ),
+                    const SizedBox(width: 8),
                     Text(
                       dsh.reasoningBudget == 0 ? '关闭思考' : '${dsh.reasoningBudget ~/ 1000}k Tokens',
                       style: TextStyle(color: context.c.accent, fontSize: 13, fontWeight: FontWeight.bold),
@@ -1058,9 +1135,14 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
       children: [
         Icon(icon, size: 20, color: color),
         const SizedBox(width: 8),
-        Text(
-          title,
-          style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+        // Expanded: 标题里有"大语言模型与思考引擎 (LLM & Reasoning)"这种长串，
+        // 手机宽度下裸 Text 会把这一行撑爆（实测 420 逻辑宽溢出 67px，屏幕上
+        // 是黄黑斜纹）。给它剩余宽度让它换行，而不是被裁掉。
+        Expanded(
+          child: Text(
+            title,
+            style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+          ),
         ),
       ],
     );

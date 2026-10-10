@@ -27,12 +27,17 @@ import {
 import { installRpc, RPC_CHANNEL, ENDPOINTS } from './rpc.mjs';
 import {
   handleFeatureRoute,
-  pushForEvent,
   buildNtfyRequest,
+  deliverNtfy,
+  describeNtfyTarget,
+  redactNtfyDetail,
   parsePorcelain,
   parseNumstat,
   combineChanges,
-  parseUnifiedDiff
+  parseUnifiedDiff,
+  collectSessionRecords,
+  projectionCacheFileNames,
+  claimsMobileFeatureRoute
 } from './features.mjs';
 import {
   BRIDGE_VERSION,
@@ -239,20 +244,41 @@ export function apply(ctx, config = {}, internals = {}) {
    * 会话**；任何失败都如实回错，不假装成功。
    * ------------------------------------------------------------------ */
 
+  /**
+   * One session's projection-cache record, or null.
+   *
+   * ⚠️ The cache filename is NOT always the bare session id. Measured on this
+   * install (2026-10-10): 2133 of 2468 files are named `session-<uuid>.json`
+   * and only 335 are named `<uuid>.json`. The previous implementation stripped
+   * the `session-` prefix and then read `${clean}.json` unconditionally, so it
+   * missed 86.4% of sessions — which is why `readSessionCwd()` returned null
+   * for almost everything (and `/api/mobile/workspace/changes` answered
+   * `no-workspace`, while relative deliverable paths resolved against the dsh
+   * web process's own working directory instead of the session's).
+   *
+   * Both spellings are tried, bare first so the existing behaviour is kept for
+   * the sessions where it already worked.
+   */
+  function readProjectionRecord(sessionId) {
+    const names = projectionCacheFileNames(sessionId);
+    if (names.length === 0) return null;
+    const dir = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions');
+    for (const name of names) {
+      const record = projCacheReader.readJson(path.join(dir, name));
+      if (record) return record;
+    }
+    return null;
+  }
+
   /** Decoded projection-cache rows for one session (no engine round trip). */
   function readProjectionRows(sessionId) {
-    const clean = String(sessionId || '').replace(/^session-/, '');
-    const file = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions', `${clean}.json`);
-    const record = projCacheReader.readJson(file);
+    const record = readProjectionRecord(sessionId);
     return record?.record?.rows ?? null;
   }
 
   /** Session working directory from the projection cache, when recorded. */
   function readSessionCwd(sessionId) {
-    const clean = String(sessionId || '').replace(/^session-/, '');
-    const file = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions', `${clean}.json`);
-    const record = projCacheReader.readJson(file);
-    const cwd = record?.record?.identity?.cwd;
+    const cwd = readProjectionRecord(sessionId)?.record?.identity?.cwd;
     return typeof cwd === 'string' && cwd ? cwd : null;
   }
 
@@ -278,24 +304,30 @@ export function apply(ctx, config = {}, internals = {}) {
   /**
    * Session records plus working directory, for deliverable discovery.
    *
-   * One bounded page is enough: `present` declarations are rare and the page
-   * carries the newest events, which is exactly the window a phone cares about.
+   * ⚠️ The request shape matters more than it looks. `session/page`'s
+   * `throughSeq` is a REQUIRED wire field (see `collectSessionRecords` in
+   * features.mjs for the full evidence trail). The previous version sent only
+   * `{ address, maxMessages: 200 }`, which the engine rejected with
+   * `gateway/input-invalid` before it ever opened the session; the catch below
+   * turned that into `{ records: [] }` and the deliverable list was therefore
+   * empty for every session, forever. Verified end-to-end against the live
+   * gateway: a session holding a real `deliverables/presented` event still
+   * answered `{"deliverables":[]}`.
    */
   async function readSessionRecords(sessionId) {
     const cwd = readSessionCwd(sessionId);
     try {
-      const page = await callDshRpc('session/page', {
-        args: {
-          request: {
-            address: { kind: 'session', sessionId: toFullSessionId(sessionId) },
-            maxMessages: 200
-          }
-        }
+      const { records, pages, truncated } = await collectSessionRecords({
+        callDshRpc,
+        sessionId: toFullSessionId(sessionId)
       });
-      return { records: Array.isArray(page?.records) ? page.records : [], cwd };
+      if (truncated) {
+        logger.warn('[dsh-mobile-bridge] 交付物扫描未走完全部历史 %s（%d 页）', sessionId, pages);
+      }
+      return { records, cwd, truncated };
     } catch (err) {
       logger.warn('[dsh-mobile-bridge] session/page 失败（交付物扫描）%s: %s', sessionId, err?.message || err);
-      return { records: [], cwd };
+      return { records: [], cwd, truncated: false };
     }
   }
 
@@ -347,7 +379,16 @@ export function apply(ctx, config = {}, internals = {}) {
     return { available: true, cwd, files };
   }
 
-  /** Stream one file to the client with a download disposition. */
+  /**
+   * Stream one file to the client with a download disposition.
+   *
+   * Returns true once the bytes are on the wire, false when nothing could be
+   * sent (missing path, not a regular file, or a read error). On false this
+   * writes NOTHING — deliberately: a partially-written 200 would be worse than
+   * an error the client can see. The caller owns the error response; a caller
+   * that ignores the return value leaves the socket open with no answer (the
+   * phone then waits out its full request timeout).
+   */
   function sendFile(absPath, displayName) {
     return new Promise((resolve) => {
       let stat;
@@ -442,62 +483,16 @@ export function apply(ctx, config = {}, internals = {}) {
   }
 
   /**
-   * Send one ntfy push. Fire-and-forget by design: a phone notification must
-   * never fail (or delay) the approval/question path it reports on.
+   * Real ntfy transport: one bounded POST, no retries.
+   *
+   * Injected into `deliverNtfy` so the delivery decision (dedupe, audit) stays
+   * testable without a network. Resolves `{ ok, status, reason }` and never
+   * rejects — a push must not fail the approval or turn it reports on.
    */
-  function pushNtfy(kind, detail = {}) {
-    let cfg;
-    try {
-      cfg = loadConfig();
-    } catch {
-      return;
-    }
-    if (cfg.ntfyEnabled !== true) return;
-    const message = pushForEvent(kind, detail);
-    if (!message) return;
-    const click = detail.clickUrl
-      ? { ...message, click: detail.clickUrl }
-      : message;
-    const request = buildNtfyRequest(cfg, click);
-    if (!request) return;
-
-    try {
-      const target = new globalThis.URL(request.url);
-      const transport = target.protocol === 'https:' ? https : http;
-      const body = JSON.stringify(request.body);
-      const req = transport.request({
-        hostname: target.hostname,
-        port: target.port || (target.protocol === 'https:' ? 443 : 80),
-        path: `${target.pathname}${target.search}`,
-        method: 'POST',
-        headers: { ...request.headers, 'Content-Length': Buffer.byteLength(body) },
-        timeout: 5000
-      }, (res) => {
-        res.resume();
-        if (res.statusCode >= 400) {
-          logger.warn('[dsh-mobile-bridge] ntfy 推送被拒: HTTP %s', res.statusCode);
-        }
-      });
-      req.on('error', (err) => logger.warn('[dsh-mobile-bridge] ntfy 推送失败: %s', err?.message || err));
-      req.on('timeout', () => { try { req.destroy(); } catch (_) {} });
-      req.end(body);
-    } catch (err) {
-      logger.warn('[dsh-mobile-bridge] ntfy 推送异常: %s', err?.message || err);
-    }
-  }
-
-  /** Send a test push; returns whether ntfy accepted it. */
-  function pushTest() {
+  function sendNtfyOverHttp(request) {
     return new Promise((resolve) => {
-      const cfg = loadConfig();
-      if (cfg.ntfyEnabled !== true) { resolve(false); return; }
-      const request = buildNtfyRequest(cfg, {
-        title: 'DSH 推送测试',
-        body: '配置已生效：审批/提问/任务完成会推到这里',
-        priority: 3,
-        tags: ['bell']
-      });
-      if (!request) { resolve(false); return; }
+      let settled = false;
+      const done = (value) => { if (!settled) { settled = true; resolve(value); } };
       try {
         const target = new globalThis.URL(request.url);
         const transport = target.protocol === 'https:' ? https : http;
@@ -511,15 +506,79 @@ export function apply(ctx, config = {}, internals = {}) {
           timeout: 5000
         }, (res) => {
           res.resume();
-          resolve(res.statusCode < 400);
+          const status = res.statusCode ?? 0;
+          done(status >= 200 && status < 300
+            ? { ok: true, status }
+            : { ok: false, status, reason: `ntfy 返回 HTTP ${status}` });
         });
-        req.on('error', () => resolve(false));
-        req.on('timeout', () => { try { req.destroy(); } catch (_) {} resolve(false); });
+        req.on('error', (err) => done({ ok: false, status: null, reason: err?.message || 'request-error' }));
+        req.on('timeout', () => {
+          try { req.destroy(); } catch (_) {}
+          done({ ok: false, status: null, reason: 'timeout' });
+        });
         req.end(body);
-      } catch {
-        resolve(false);
+      } catch (err) {
+        done({ ok: false, status: null, reason: err?.message || 'request-error' });
       }
     });
+  }
+
+  /**
+   * ntfy fallback for one event. Fire-and-forget: the caller must not be delayed
+   * or failed by a push.
+   *
+   * ⚠️ Deliberately NOT unconditional. The same approval/question/turn-end is
+   * also broadcast to every mobile socket, and a live App raises its own local
+   * notification for it — pushing as well gave the user two notifications for
+   * one event. `deliverNtfy` only sends when no socket can actually receive
+   * (see `countDeliverableClients`), and records WHY in the audit ring either
+   * way so "I got no push" is diagnosable.
+   */
+  function pushNtfy(kind, detail = {}) {
+    void deliverNtfy({
+      kind,
+      detail,
+      config: (() => { try { return loadConfig(); } catch { return {}; } })(),
+      clients: connectedClients,
+      send: sendNtfyOverHttp,
+      audit,
+      logger
+    }).catch((err) => logger.warn('[dsh-mobile-bridge] ntfy 推送异常: %s', err?.message || err));
+  }
+
+  /**
+   * Send a test push; returns whether ntfy accepted it.
+   *
+   * Deliberately bypasses the app-connected dedupe: the user pressed the button
+   * and needs to see whether the channel works end to end, including while the
+   * App is in the foreground. It still goes through the same transport and the
+   * same redacted audit entry, so a failed test is diagnosable.
+   */
+  async function pushTest() {
+    let cfg = {};
+    try { cfg = loadConfig(); } catch { /* reported below */ }
+    if (cfg.ntfyEnabled !== true) {
+      audit('ntfy/test', { outcome: 'skipped', reason: 'disabled', ...describeNtfyTarget(cfg) });
+      return false;
+    }
+    const request = buildNtfyRequest(cfg, {
+      title: 'DSH 推送测试',
+      body: '配置已生效：审批/提问/任务完成会推到这里',
+      priority: 3,
+      tags: ['bell']
+    });
+    if (!request) {
+      audit('ntfy/test', { outcome: 'skipped', reason: 'unconfigured', ...describeNtfyTarget(cfg) });
+      return false;
+    }
+    const res = await sendNtfyOverHttp(request);
+    audit('ntfy/test', {
+      outcome: res.ok ? 'sent' : 'failed',
+      status: typeof res.status === 'number' ? res.status : null,
+      reason: res.ok ? '' : redactNtfyDetail(res.reason || 'rejected', cfg),
+      ...describeNtfyTarget(cfg)
+    });
+    return res.ok === true;
   }
 
 
@@ -2734,7 +2793,50 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
 
-      if (pathname.startsWith('/api/mobile/sessions/') && req.method === 'GET') {
+      // ---- v1.14 能力路由（队列/定时/作业/交付物/diff/用量/推送）----
+      //
+      // ⚠️ 必须排在下面的 startsWith('/api/mobile/sessions/') 通配路由之前。
+      //
+      // 这个通配分支把 `/api/mobile/sessions/<任意字符串>` 的剩余部分当成
+      // sessionId 交给 getSessionHistory()，所以任何注册在该前缀下的 GET 功能
+      // 路由都会被它吞掉，而且**吞得不报错**：`GET /api/mobile/sessions/queue`
+      // 会返回一份名为 "queue" 的空历史（measured：`{"ok":true,"code":0,
+      // "data":{"sessionId":"queue","messages":[]}}`），App 拿不到 `queue` 字段
+      // 就当成空数组，于是队列永远显示"没有排队消息"——看起来像正常状态。
+      //
+      // 上面 `sessions/search` 的注释记过同一个坑（当时是"搜索永远返回空"），
+      // 只修了那一条。这里改用**排序**而不是再补一个排除项：功能路由整体前置，
+      // 以后往 /api/mobile/sessions/ 下加 GET 路由不会再重蹈覆辙。
+      // handleFeatureRoute 未命中时返回 false，落到下面的既有路由与 404。
+      if (await handleFeatureRoute({
+        pathname,
+        req,
+        res,
+        parsedUrl,
+        jsonBody,
+        auth,
+        sendJson,
+        sendFile,
+        callDshRpc,
+        readStreamOnce,
+        readProjections,
+        readProjectionRows,
+        readSessionRecords,
+        readWorkspaceChanges,
+        readConfig: loadConfig,
+        writeConfig: saveConfig,
+        pushTest,
+        audit,
+        logger
+      })) {
+        return;
+      }
+
+      // The second half of the guard: even if someone moves the feature dispatch
+      // back below this branch, a claimed feature route can no longer be stolen
+      // by the wildcard (see `claimsMobileFeatureRoute` in features.mjs).
+      if (pathname.startsWith('/api/mobile/sessions/') && req.method === 'GET'
+          && !claimsMobileFeatureRoute(req.method, pathname)) {
         const sessionId = pathname.replace('/api/mobile/sessions/', '').trim();
         const history = await getSessionHistory(sessionId);
         sendJson(200, { ok: true, code: 0, data: history });
@@ -3151,33 +3253,9 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
 
-      // ---- v1.14 能力路由（队列/定时/作业/交付物/diff/用量/推送）----
-      //
-      // 一个入口集中处理，纯逻辑留在 lib/features.mjs 里（可脱离引擎单测）。
-      // 未命中的请求原样返回 false，落到下面的既有路由与 404。
-      if (await handleFeatureRoute({
-        pathname,
-        req,
-        res,
-        parsedUrl,
-        jsonBody,
-        auth,
-        sendJson,
-        sendFile,
-        callDshRpc,
-        readStreamOnce,
-        readProjections,
-        readProjectionRows,
-        readSessionRecords,
-        readWorkspaceChanges,
-        readConfig: loadConfig,
-        writeConfig: saveConfig,
-        pushTest,
-        audit,
-        logger
-      })) {
-        return;
-      }
+      // ---- v1.14 能力路由已在上面的通配路由**之前**处理 ----
+      // （见 `/api/mobile/sessions/queue` 旁注：通配分支会静默吞掉该前缀下的
+      //  GET 功能路由。这里保留位置说明，避免将来有人把它挪回来。）
 
       // ---- 会话归档 / 取消归档 ----
       if (pathname === '/api/mobile/sessions/archive' && req.method === 'POST') {

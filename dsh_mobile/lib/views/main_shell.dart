@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/dsh_service.dart';
@@ -9,7 +7,6 @@ import 'workspaces_view.dart';
 import 'security_permissions_view.dart';
 import 'custom_settings_view.dart';
 import 'config_page.dart';
-import 'task_center_view.dart';
 import '../theme/app_colors.dart';
 
 class MainShell extends StatefulWidget {
@@ -81,11 +78,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       dsh.fetchWorkspaces();
       dsh.fetchApprovals();
     } else if (index == 2) {
-      // 任务页：交付物/变更/定时/作业/用量一次拉齐（v1.13）。
-      unawaited(dsh.refreshTaskCenter());
-    } else if (index == 3) {
       dsh.fetchApprovals();
-    } else if (index == 4) {
+    } else if (index == 3) {
       dsh.fetchSettings();
     }
   }
@@ -140,11 +134,13 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final waitingCount = context.select<DshService, int>(
       (d) => d.pendingApprovals.length + d.pendingQuestions.length,
     );
-    // 任务页徽标：排队消息 + 活着的后台作业 —— 这两样都是"你不在看的时候
-    // 也在继续跑"的东西，值得一个数字。
-    final queueBadge = context.select<DshService, int>(
-      (d) => d.queueItems.length + d.jobs.where((j) => j.isLive).length,
-    );
+    // 这里**曾经**有一个"任务" tab 的角标：排队消息 + 活着的后台作业。
+    // 它删掉的原因是它从设计上就不可能对：`jobs` 只有"任务页被打开"这一条写入
+    // 路径（而 index 只有面板打开才拉），所以没进过页面时它恒为 0，进过一次之后
+    // 又永远停在那一刻 —— 两个方向都是错的。删除后：
+    //   * 排队消息的信号由会话的输入框（dock）与状态条承载：队列是**单会话**的，
+    //     放在 tab 上反而误导（"这是哪个会话的队列？"）；
+    //   * 作业状态只出现在当前会话的状态条与信息面板里。
     final isTokenInvalid = context.select<DshService, bool>((d) => d.isTokenInvalid);
 
     // 键盘弹出时隐藏底部导航栏 —— 这是修一个真实的布局缺陷，不是装饰性调整。
@@ -162,9 +158,15 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
     // 侧滑返回拦截：MainShell 是 home 路由，没有可 pop 的上一级 —— 系统
     // 预测性返回手势会直接退出 App。用户预期是"回到工作区"（聊天 App 的
-    // 常规动线），所以非工作区 tab 时侧滑 = 切到工作区（index 1）；
-    // 已经在工作区（或权限/设置页）时才放行为真正的退出。
-    final canExit = _currentIndex == 1 || _currentIndex == 2 || _currentIndex == 3;
+    // 常规动线），所以**除对话页之外**的 tab 侧滑 = 切到工作区（index 1）；
+    // 已经在别的 tab（工作区/安全策略/设置）时才放行为真正的退出。
+    //
+    // 这里顺带改了旧代码与它自己的注释不一致的地方：旧条件是
+    // `index == 1 || index == 2 || index == 3`（工作区/任务/安全策略），把**设置页**
+    // 排除在外，于是从设置页侧滑会跳到工作区而不是退出 —— 与注释描述的意图相反。
+    // 「任务」tab 删掉后索引变成 0 对话 / 1 工作区 / 2 安全策略 / 3 设置，
+    // 直接表达成"不在对话页就可以退出"。
+    final canExit = _currentIndex != 0;
 
     return PopScope(
       canPop: canExit,
@@ -213,7 +215,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               children: [
                 ChatView(
                   onOpenWorkspaces: () => _setIndex(1),
-                  onOpenSecurity: () => _setIndex(3),
+                  onOpenSecurity: () => _setIndex(2),
                 ),
                 WorkspacesView(
                   onSwitchToChat: () => _setIndex(0),
@@ -221,8 +223,6 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   // 否则本页的 3 秒轮询会在用户处于其它 tab 时继续跑。
                   active: _currentIndex == 1,
                 ),
-                // 任务页（v1.13）：交付物 / 变更 diff / 定时任务 / 后台作业 / 用量。
-                TaskCenterView(onOpenChat: () => _setIndex(0)),
                 SecurityPermissionsView(onOpenChat: () => _setIndex(0)),
                 const CustomSettingsView(),
               ],
@@ -272,11 +272,6 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   icon: _buildNavBadge(const Icon(Icons.folder_outlined), pendingCount),
                   selectedIcon: _buildNavBadge(const Icon(Icons.folder_rounded), pendingCount),
                   label: '工作区',
-                ),
-                NavigationDestination(
-                  icon: _buildNavBadge(const Icon(Icons.dashboard_customize_outlined), queueBadge),
-                  selectedIcon: _buildNavBadge(const Icon(Icons.dashboard_customize_rounded), queueBadge),
-                  label: '任务',
                 ),
                 NavigationDestination(
                   icon: _buildNavBadge(const Icon(Icons.security_outlined), pendingCount),

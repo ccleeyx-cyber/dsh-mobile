@@ -145,6 +145,150 @@ export function resolveDeliverable(deliverables, requested) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 2b. Session event-log paging (the deliverable scan's data source)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Candidate projection-cache filenames for one session id, in lookup order.
+ *
+ * ⚠️ The cache filename is NOT always the bare session id. Measured on this
+ * install (2026-10-10): 2133 of 2468 files are named `session-<uuid>.json` and
+ * only 335 are named `<uuid>.json`. The previous lookup stripped the `session-`
+ * prefix and read `${clean}.json` unconditionally, so it reached only 13.6% of
+ * sessions — `readSessionCwd()` returned null for the other 86.4%, which made
+ * relative deliverable paths resolve against the dsh web process's own working
+ * directory and made `/api/mobile/workspace/changes` answer `no-workspace` for
+ * sessions that do have a workspace.
+ *
+ * @param sessionId - session id with or without the `session-` prefix.
+ * @returns the filenames to try, or an empty list for a blank id.
+ */
+export function projectionCacheFileNames(sessionId) {
+  const raw = typeof sessionId === 'string' ? sessionId.trim() : '';
+  if (!raw) return [];
+  const clean = raw.replace(/^session-/, '');
+  if (!clean) return [];
+  return [`${clean}.json`, `session-${clean}.json`];
+}
+
+/**
+ * Parse the cursor out of the engine's "past cursor" rejection.
+ *
+ * ⚠️ This exists because `session/page` has NO other way to learn a session's
+ * current cursor. Verified against the live engine (2026-10-10, dsh web
+ * 16:03:54 / bridge 1.14.0):
+ *
+ *   - `SessionPageRequest.throughSeq` is a REQUIRED wire field
+ *     (`typert.host.js`: `'throughSeq': z.number().readonly()`, where
+ *     `maxMessages` is the `...optional()` one). Omitting it is rejected by
+ *     boundary validation with `gateway/input-invalid`, before the engine ever
+ *     looks at the session.
+ *   - `session/projections` does not expose a cursor (22 projection rows, none
+ *     of them `turnBoundary`), and `SessionSummary` from `session/list` has no
+ *     sequence field either.
+ *   - `throughSeq: -1` is accepted but answers an EMPTY page: the engine maps it
+ *     to `end = min(throughSeq + 1, …) = 0`, so nothing is sliced.
+ *   - Asking for a page past the end answers, in 221 bytes,
+ *     `gateway/bad-request: session page through seq N is past cursor C`,
+ *     where C is exactly the cursor a correct request needs (verified equal to
+ *     the projection cache's `rows.turnBoundary.seq` on every session tried).
+ *
+ * So the probe is the authoritative cursor source; a changed message shape
+ * degrades to "no cursor", which yields no records rather than a wrong page.
+ *
+ * @param message - an engine error message.
+ * @returns the cursor, or null when the message is not a past-cursor rejection.
+ */
+export function parseCursorFromPastSeqError(message) {
+  if (typeof message !== 'string') return null;
+  const m = /past cursor (\d+)/.exec(message);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
+
+/** Messages per page. Only `user/message`/`assistant/message` count toward it. */
+export const SESSION_PAGE_MESSAGES = 500;
+
+/**
+ * How many pages the deliverable scan will walk back through.
+ *
+ * `maxMessages` is a MESSAGE budget, not an event budget: measured on a real
+ * 4378-event session, `maxMessages: 200` returned 1418 records but covered only
+ * seq [2961..4378], and it silently dropped 2 of that session's 8
+ * `deliverables/presented` events. Raising `maxMessages` is the wrong axis —
+ * the same session cost 3.9 MB at 200 and 11.2 MB at full depth. Walking
+ * backwards in bounded pages keeps the common case tiny (86% of real sessions
+ * have cursor <= 500, i.e. one small page) while still reaching old
+ * declarations in long ones.
+ */
+export const SESSION_MAX_PAGES = 8;
+
+/**
+ * Read a session's event log, newest page first, walking backwards.
+ *
+ * Returns records in ascending sequence order (what `extractDeliverables`
+ * expects) plus an honest `truncated` flag when the page budget ran out before
+ * history was exhausted — never a silent partial answer.
+ *
+ * @param deps - `{ callDshRpc, sessionId, maxPages?, messagesPerPage? }`.
+ * @returns `{ records, cursor, pages, truncated }`; `records` is empty when the
+ *   session has no readable cursor (unknown/not-found session).
+ */
+export async function collectSessionRecords({ callDshRpc, sessionId, maxPages = SESSION_MAX_PAGES, messagesPerPage = SESSION_PAGE_MESSAGES }) {
+  if (typeof callDshRpc !== 'function' || !sessionId) return { records: [], cursor: null, pages: 0, truncated: false };
+  const address = { kind: 'session', sessionId };
+
+  // 1. Authoritative cursor. A past-cursor rejection IS the answer.
+  let cursor = null;
+  try {
+    await callDshRpc('session/page', { args: { request: { address, throughSeq: Number.MAX_SAFE_INTEGER, maxMessages: 1 } } });
+  } catch (err) {
+    cursor = parseCursorFromPastSeqError(err?.message);
+  }
+  if (cursor === null) return { records: [], cursor: null, pages: 0, truncated: false };
+
+  // 2. Walk backwards. `beforeSeq` moves the window's old end; `throughSeq`
+  //    stays pinned at the cursor so the schema stays satisfied.
+  const bySeq = new Map();
+  let before;
+  let pages = 0;
+  let truncated = false;
+  while (pages < maxPages) {
+    const request = { address, throughSeq: cursor, maxMessages: messagesPerPage };
+    if (before !== undefined) request.beforeSeq = before;
+    let page;
+    try {
+      page = await callDshRpc('session/page', { args: { request } });
+    } catch {
+      // A failed page must not discard the pages already in hand: the newest
+      // declarations are the ones the phone wants, and we have them. Report the
+      // partial answer instead of throwing the whole scan away.
+      truncated = true;
+      break;
+    }
+    const records = Array.isArray(page?.records) ? page.records : [];
+    if (records.length === 0) break;
+    pages += 1;
+    for (const record of records) {
+      const seq = record?.event?.seq;
+      if (typeof seq === 'number') bySeq.set(seq, record);
+      else bySeq.set(`p${pages}:${bySeq.size}`, record);
+    }
+    const firstSeq = records[0]?.event?.seq;
+    if (typeof firstSeq !== 'number' || firstSeq <= 0) break;
+    if (page?.hasMore === false) break;
+    before = firstSeq;
+    if (pages >= maxPages) truncated = true;
+  }
+
+  const records = [...bySeq.entries()]
+    .sort((a, b) => (typeof a[0] === 'number' && typeof b[0] === 'number' ? a[0] - b[0] : 0))
+    .map(([, record]) => record);
+  return { records, cursor, pages, truncated };
+}
+
+/* ------------------------------------------------------------------ *
  * 3. Workspace changes (what the agent edited)
  * ------------------------------------------------------------------ */
 
@@ -474,8 +618,250 @@ export function pushForEvent(kind, detail = {}) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 6b. ntfy delivery: dedupe, attribution, redaction
+ * ------------------------------------------------------------------ */
+
+/**
+ * `WebSocket.OPEN`. Passed in rather than imported so this module stays free of
+ * a transport dependency and can be unit-tested with plain objects.
+ */
+export const WS_OPEN = 1;
+
+/**
+ * Count the mobile sockets a frame can actually reach right now.
+ *
+ * Two conditions, both taken from state the gateway already maintains:
+ *
+ *   * `readyState === OPEN` — the same predicate `broadcastToMobileClients`
+ *     uses to decide it can deliver a frame. Anything else cannot receive.
+ *   * `isAlive !== false` — the heartbeat flag (`wss.on('connection')` sets it
+ *     true; `ws.on('pong')` and every inbound message set it true again). The
+ *     30-second sweep sets it false and pings, then TERMINATES any socket still
+ *     false on the next sweep, so `false` means "a full ping interval went by
+ *     with no pong".
+ *
+ * ⚠️ The trade-off is deliberate. Treating a socket whose pong is still in
+ * flight (false for one RTT, milliseconds) as dead costs a duplicate
+ * notification — annoying. Treating a socket that is OPEN but whose peer is
+ * gone as alive costs a MISSED notification — the user is never told anything.
+ * So the sweep flag is honoured, and the millisecond window is accepted.
+ *
+ * @param clients - iterable of sockets.
+ * @param openReadyState - the OPEN constant for the transport in use.
+ */
+export function countDeliverableClients(clients, openReadyState = WS_OPEN) {
+  if (!clients || typeof clients[Symbol.iterator] !== 'function') return 0;
+  let live = 0;
+  for (const ws of clients) {
+    if (!ws || ws.readyState !== openReadyState) continue;
+    if (ws.isAlive === false) continue;
+    live += 1;
+  }
+  return live;
+}
+
+/**
+ * Whether this event must be delivered over ntfy.
+ *
+ * The App shows its own local notification for exactly these events (approval /
+ * question / turn end) while its socket is up, so pushing as well would hand the
+ * user two notifications for one event. ntfy is the FALLBACK for "no socket":
+ * process killed, phone asleep, radio gone.
+ *
+ * @param config - bridge config; `ntfyEnabled` must be strictly true.
+ * @param clients - iterable of mobile sockets.
+ */
+export function shouldPushNtfy(config, clients, openReadyState = WS_OPEN) {
+  if (config?.ntfyEnabled !== true) return false;
+  return countDeliverableClients(clients, openReadyState) === 0;
+}
+
+/**
+ * Redacted description of the configured ntfy target, for the audit trail.
+ *
+ * The host is useful ("is this going to ntfy.sh or to my own server?") and is
+ * not a secret. The TOPIC is the shared secret of the channel — anyone who
+ * knows it can subscribe — and the token is a credential. Neither may reach the
+ * audit buffer, which is served to any authenticated client. So only the host
+ * and the topic's LENGTH are recorded.
+ */
+export function describeNtfyTarget(config) {
+  const base = typeof config?.ntfyUrl === 'string' ? config.ntfyUrl.trim() : '';
+  let host = '';
+  if (base) {
+    try { host = new URL(base).host; } catch { host = ''; }
+  }
+  const topic = typeof config?.ntfyTopic === 'string' ? config.ntfyTopic.trim() : '';
+  return { host, topicLength: topic.length };
+}
+
+/**
+ * Strip the channel secret out of any text bound for the audit trail.
+ *
+ * A transport error message is normally host-only ("getaddrinfo ENOTFOUND
+ * host"), but it is produced by a library we do not control and the URL it was
+ * talking to contains the topic. Substituting both secrets covers the case where
+ * one of them is echoed back verbatim, and the length cap stops a pathological
+ * message from bloating the 200-entry audit ring.
+ */
+export function redactNtfyDetail(text, config) {
+  let out = typeof text === 'string' ? text : String(text ?? '');
+  const secrets = [
+    typeof config?.ntfyToken === 'string' ? config.ntfyToken.trim() : '',
+    typeof config?.ntfyTopic === 'string' ? config.ntfyTopic.trim() : ''
+  ];
+  for (const secret of secrets) {
+    if (secret) out = out.split(secret).join('[redacted]');
+  }
+  return out.slice(0, 160);
+}
+
+/**
+ * Deliver one ntfy push through an injected transport, and record the outcome.
+ *
+ * Split out of `lib/index.js` so every decision — dedupe, retry-free failure
+ * handling, and what reaches the audit log — is testable without a network or a
+ * real WebSocket. Never rejects: a push must not fail the approval or turn it
+ * reports on.
+ *
+ * Audit outcomes, so "I got no notification" is answerable from the audit ring:
+ *   * `skipped` + `reason: 'disabled'`      — the switch is off
+ *   * `skipped` + `reason: 'app-connected'` — a socket is up; the App notifies
+ *   * `skipped` + `reason: 'not-pushable'`  — the event kind is not push-worthy
+ *   * `skipped` + `reason: 'unconfigured'`  — no URL or no topic
+ *   * `sent`    + `status`
+ *   * `failed`  + `status` / `reason`
+ *
+ * @param deps - `{ kind, detail, config, clients, openReadyState, send, audit,
+ *   logger }`. `send(request)` resolves `{ ok, status, reason }`.
+ * @returns `{ outcome, status?, reason? }`.
+ */
+export async function deliverNtfy({
+  kind,
+  detail = {},
+  config,
+  clients = [],
+  openReadyState = WS_OPEN,
+  send,
+  audit,
+  logger
+} = {}) {
+  const target = describeNtfyTarget(config);
+  const liveClients = countDeliverableClients(clients, openReadyState);
+
+  const record = (outcome, extra = {}) => {
+    const payload = {
+      kind: kind ?? '',
+      outcome,
+      liveClients,
+      host: target.host,
+      topicLength: target.topicLength,
+      ...extra
+    };
+    try { audit?.('ntfy/push', payload); } catch { /* the audit sink is best effort */ }
+    return payload;
+  };
+
+  if (config?.ntfyEnabled !== true) {
+    record('skipped', { reason: 'disabled' });
+    return { outcome: 'skipped', reason: 'disabled' };
+  }
+  if (liveClients > 0) {
+    // The App is alive and will raise its own local notification for this event.
+    record('skipped', { reason: 'app-connected' });
+    return { outcome: 'skipped', reason: 'app-connected' };
+  }
+
+  const message = pushForEvent(kind, detail);
+  if (!message) {
+    record('skipped', { reason: 'not-pushable' });
+    return { outcome: 'skipped', reason: 'not-pushable' };
+  }
+  const withClick = detail.clickUrl ? { ...message, click: detail.clickUrl } : message;
+  const request = buildNtfyRequest(config, withClick);
+  if (!request) {
+    record('skipped', { reason: 'unconfigured' });
+    return { outcome: 'skipped', reason: 'unconfigured' };
+  }
+  if (typeof send !== 'function') {
+    record('failed', { reason: 'no-transport' });
+    return { outcome: 'failed', reason: 'no-transport' };
+  }
+
+  try {
+    const res = await send(request);
+    if (res?.ok) {
+      const status = typeof res.status === 'number' ? res.status : null;
+      record('sent', { status });
+      logger?.info?.('[dsh-mobile-bridge] ntfy 推送已送达: HTTP %s', status);
+      return { outcome: 'sent', status };
+    }
+    const status = typeof res?.status === 'number' ? res.status : null;
+    const reason = redactNtfyDetail(res?.reason || 'rejected', config);
+    record('failed', { status, reason });
+    logger?.warn?.('[dsh-mobile-bridge] ntfy 推送失败: HTTP %s %s', status, reason);
+    return { outcome: 'failed', status, reason };
+  } catch (err) {
+    const reason = redactNtfyDetail(err?.message || 'transport-error', config);
+    record('failed', { status: null, reason });
+    logger?.warn?.('[dsh-mobile-bridge] ntfy 推送异常: %s', reason);
+    return { outcome: 'failed', status: null, reason };
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * Route handling
  * ------------------------------------------------------------------ */
+
+/**
+ * Every method+path this module claims, as `[method, pathname]` pairs.
+ *
+ * ⚠️ This list exists so the legacy `/api/mobile/sessions/*` GET wildcard in
+ * `lib/index.js` can refuse to handle these paths. That wildcard treats
+ * everything after `/api/mobile/sessions/` as a session id and hands it to
+ * `getSessionHistory()`, so it swallows any GET feature route registered under
+ * that prefix — silently. Measured on the live instance before the fix:
+ *
+ *   GET /api/mobile/sessions/queue?sessionId=session-03ba0334…
+ *   -> {"ok":true,"code":0,"data":{"sessionId":"queue","isRunning":false,
+ *       "messages":[]}}          ← a fake session literally named "queue"
+ *
+ * `sessions/search` had already been bitten by the same trap (it returned an
+ * empty history forever) and was patched with a single exclusion. The dispatch
+ * is now ordered before the wildcard AND the wildcard carries this guard, so a
+ * future addition under `/api/mobile/sessions/` cannot silently regress.
+ * `tests/unit/features.test.mjs` cross-checks this list against
+ * `handleFeatureRoute`'s real behaviour, so the two cannot drift apart.
+ */
+export const FEATURE_ROUTES = [
+  ['GET', '/api/mobile/sessions/queue'],
+  ['POST', '/api/mobile/sessions/queue'],
+  ['GET', '/api/mobile/schedules'],
+  ['POST', '/api/mobile/schedules/delete'],
+  ['GET', '/api/mobile/jobs'],
+  ['POST', '/api/mobile/jobs/kill'],
+  ['GET', '/api/mobile/deliverables'],
+  ['GET', '/api/mobile/deliverables/download'],
+  ['GET', '/api/mobile/workspace/changes'],
+  ['GET', '/api/mobile/workspace/diff'],
+  ['GET', '/api/mobile/session/stats'],
+  ['GET', '/api/mobile/push/config'],
+  ['POST', '/api/mobile/push/config'],
+  ['POST', '/api/mobile/push/test']
+];
+
+/**
+ * True when a request belongs to this module rather than to session history.
+ *
+ * @param method - HTTP method.
+ * @param pathname - request pathname (query string already stripped).
+ */
+export function claimsMobileFeatureRoute(method, pathname) {
+  if (typeof pathname !== 'string' || pathname.length === 0) return false;
+  const m = typeof method === 'string' ? method.toUpperCase() : '';
+  if (!m) return false;
+  return FEATURE_ROUTES.some(([rm, rp]) => rm === m && rp === pathname);
+}
 
 /**
  * Handle one of the new `/api/mobile/*` feature routes.
@@ -590,9 +976,9 @@ export async function handleFeatureRoute(deps) {
   if (pathname === '/api/mobile/deliverables' && req.method === 'GET') {
     const sessionId = String(deps.parsedUrl.query?.sessionId || '').trim();
     if (!sessionId) { sendJson(400, { ok: false, error: 'sessionId is required' }); return true; }
-    const { records, cwd } = await readSessionRecords(sessionId);
+    const { records, cwd, truncated } = await readSessionRecords(sessionId);
     const deliverables = extractDeliverables(records, cwd);
-    sendJson(200, { ok: true, code: 0, deliverables });
+    sendJson(200, { ok: true, code: 0, deliverables, truncated: truncated === true });
     return true;
   }
 
@@ -607,7 +993,20 @@ export async function handleFeatureRoute(deps) {
       sendJson(403, { ok: false, code: 403, error: '该文件不在本会话的交付物清单中' });
       return true;
     }
-    await deps.sendFile(row.path, row.display);
+    // `sendFile` answers false when the declared file is gone or unreadable. It
+    // deliberately writes nothing in that case, so the route MUST answer here —
+    // otherwise the socket is left open with no response and the phone's
+    // 60-second `http.get` timeout is the only thing that ends it (that is what
+    // "点不开" looked like: a long spinner and then a generic timeout toast).
+    const sent = await deps.sendFile(row.path, row.display);
+    if (sent === false) {
+      sendJson(404, {
+        ok: false,
+        code: 404,
+        error: '交付物文件在宿主上已不存在或不可读',
+        path: row.path
+      });
+    }
     return true;
   }
 

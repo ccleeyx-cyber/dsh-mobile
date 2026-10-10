@@ -9,6 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
 
 import {
   selectQueueRows,
@@ -24,8 +25,19 @@ import {
   normalizeSchedule,
   buildNtfyRequest,
   pushForEvent,
+  countDeliverableClients,
+  shouldPushNtfy,
+  describeNtfyTarget,
+  redactNtfyDetail,
+  deliverNtfy,
+  collectSessionRecords,
+  parseCursorFromPastSeqError,
+  projectionCacheFileNames,
+  claimsMobileFeatureRoute,
+  FEATURE_ROUTES,
   handleFeatureRoute
 } from '../../dsh-server-plugin/lib/features.mjs';
+import { createAuditSink } from '../../dsh-server-plugin/lib/core.mjs';
 
 /* ------------------------------------------------------------------ *
  * queue
@@ -274,6 +286,183 @@ test('pushForEvent: only human-blocking and completion events push', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * ntfy: dedupe, attribution, redaction
+ * ------------------------------------------------------------------ */
+
+const OPEN = 1; // WebSocket.OPEN
+const liveSocket = () => ({ readyState: OPEN, isAlive: true });
+
+function makePushDeps(overrides = {}) {
+  const calls = { audit: [], warns: [], sent: [], infos: [] };
+  return {
+    calls,
+    deps: {
+      kind: 'turn-end',
+      detail: { sessionId: 'session-1', summary: '本轮已结束' },
+      config: { ntfyEnabled: true, ntfyUrl: 'https://ntfy.example.com', ntfyTopic: 'TOPIC-SECRET', ntfyToken: 'tk_TOKEN_SECRET' },
+      clients: [],
+      openReadyState: OPEN,
+      // Stub transport: NO network is ever touched.
+      send: async (request) => { calls.sent.push(request); return overrides.sendResult ?? { ok: true, status: 200 }; },
+      audit: (action, payload) => calls.audit.push({ action, payload }),
+      logger: {
+        warn: (...a) => calls.warns.push(a.join(' ')),
+        info: (...a) => calls.infos.push(a.join(' '))
+      },
+      ...overrides.deps
+    }
+  };
+}
+
+test('countDeliverableClients: only OPEN sockets the heartbeat has not written off', () => {
+  assert.equal(countDeliverableClients([]), 0);
+  assert.equal(countDeliverableClients(null), 0);
+  assert.equal(countDeliverableClients(undefined), 0);
+  assert.equal(countDeliverableClients([liveSocket()]), 1);
+  // Not OPEN: cannot receive (CONNECTING=0, CLOSING=2, CLOSED=3).
+  assert.equal(countDeliverableClients([{ readyState: 0, isAlive: true }]), 0);
+  assert.equal(countDeliverableClients([{ readyState: 2, isAlive: true }]), 0);
+  assert.equal(countDeliverableClients([{ readyState: 3, isAlive: true }]), 0);
+  // The 30s sweep declared it dead (a full ping interval with no pong).
+  assert.equal(countDeliverableClients([{ readyState: OPEN, isAlive: false }]), 0);
+  // `isAlive === undefined` is a socket that has not been swept yet — count it.
+  assert.equal(countDeliverableClients([{ readyState: OPEN }]), 1);
+  assert.equal(countDeliverableClients([liveSocket(), { readyState: 3 }, { readyState: OPEN, isAlive: false }]), 1);
+});
+
+test('shouldPushNtfy: the switch must be strictly on, and a live App wins', () => {
+  assert.equal(shouldPushNtfy({ ntfyEnabled: true }, []), true, 'no client -> push');
+  assert.equal(shouldPushNtfy({ ntfyEnabled: true }, [liveSocket()]), false, 'App alive -> the App notifies locally');
+  assert.equal(shouldPushNtfy({ ntfyEnabled: true }, [{ readyState: 3 }]), true, 'socket gone -> push');
+  assert.equal(shouldPushNtfy({ ntfyEnabled: true }, [{ readyState: OPEN, isAlive: false }]), true, 'heartbeat-dead -> push');
+  assert.equal(shouldPushNtfy({ ntfyEnabled: false }, []), false);
+  // Only a real boolean true enables pushing: a stray string must not.
+  assert.equal(shouldPushNtfy({ ntfyEnabled: 'true' }, []), false);
+  assert.equal(shouldPushNtfy({}, []), false);
+  assert.equal(shouldPushNtfy(null, []), false);
+});
+
+test('deliverNtfy: a live App suppresses the push and the audit says why', async () => {
+  const { deps, calls } = makePushDeps({ deps: { clients: [liveSocket()] } });
+  const out = await deliverNtfy(deps);
+  assert.equal(out.outcome, 'skipped');
+  assert.equal(out.reason, 'app-connected');
+  assert.equal(calls.sent.length, 0, 'no push may go out while the App can receive');
+  assert.equal(calls.audit.length, 1);
+  assert.equal(calls.audit[0].action, 'ntfy/push');
+  assert.equal(calls.audit[0].payload.outcome, 'skipped');
+  assert.equal(calls.audit[0].payload.reason, 'app-connected');
+  assert.equal(calls.audit[0].payload.liveClients, 1);
+});
+
+test('deliverNtfy: with no live App the push goes out and the status is recorded', async () => {
+  const { deps, calls } = makePushDeps();
+  const out = await deliverNtfy(deps);
+  assert.equal(out.outcome, 'sent');
+  assert.equal(out.status, 200);
+  assert.equal(calls.sent.length, 1, 'exactly one push');
+  assert.equal(calls.audit[0].payload.outcome, 'sent');
+  assert.equal(calls.audit[0].payload.status, 200);
+  // The URL carries the topic because that is what ntfy requires — the point is
+  // that it never reaches the audit ring or the log.
+  assert.match(calls.sent[0].url, /TOPIC-SECRET/);
+});
+
+test('deliverNtfy: a rejected push is audited with its status, never swallowed', async () => {
+  const { deps, calls } = makePushDeps({ sendResult: { ok: false, status: 403, reason: 'ntfy 返回 HTTP 403' } });
+  const out = await deliverNtfy(deps);
+  assert.equal(out.outcome, 'failed');
+  assert.equal(out.status, 403);
+  assert.equal(calls.audit[0].payload.outcome, 'failed');
+  assert.equal(calls.audit[0].payload.status, 403);
+  assert.equal(calls.audit[0].payload.reason, 'ntfy 返回 HTTP 403');
+  assert.equal(calls.warns.length, 1, 'the failure is also on the warn channel');
+});
+
+test('deliverNtfy: a transport exception is audited, not thrown at the caller', async () => {
+  const { deps, calls } = makePushDeps({ deps: { send: async () => { throw new Error('getaddrinfo ENOTFOUND ntfy.example.com'); } } });
+  const out = await deliverNtfy(deps);
+  assert.equal(out.outcome, 'failed');
+  assert.equal(out.status, null);
+  assert.match(out.reason, /ENOTFOUND/);
+  assert.equal(calls.audit[0].payload.outcome, 'failed');
+  assert.equal(calls.audit[0].payload.reason, 'getaddrinfo ENOTFOUND ntfy.example.com');
+});
+
+test('deliverNtfy: never logs the token or the topic (any outcome)', async () => {
+  const cases = [
+    { name: 'sent', deps: {} },
+    { name: 'rejected', deps: { sendResult: { ok: false, status: 500, reason: 'topic TOPIC-SECRET rejected' } } },
+    { name: 'throw-with-secrets', deps: { deps: { send: async () => { throw new Error('POST https://ntfy.example.com/TOPIC-SECRET failed with tk_TOKEN_SECRET'); } } } },
+    { name: 'app-connected', deps: { deps: { clients: [liveSocket()] } } },
+    { name: 'disabled', deps: { deps: { config: { ntfyEnabled: false, ntfyUrl: 'https://ntfy.example.com', ntfyTopic: 'TOPIC-SECRET', ntfyToken: 'tk_TOKEN_SECRET' } } } }
+  ];
+  for (const c of cases) {
+    const { deps, calls } = makePushDeps(c.deps);
+    await deliverNtfy(deps);
+    const blob = JSON.stringify(calls.audit) + JSON.stringify(calls.warns) + JSON.stringify(calls.infos);
+    assert.ok(!blob.includes('TOPIC-SECRET'), `${c.name}: the topic must never be recorded`);
+    assert.ok(!blob.includes('tk_TOKEN_SECRET'), `${c.name}: the token must never be recorded`);
+    // What IS recorded: the host (diagnosable, not secret).
+    assert.equal(calls.audit[0].payload.host, 'ntfy.example.com', `${c.name}: the host is recorded`);
+  }
+});
+
+test('deliverNtfy: disabled / not-pushable / unconfigured are distinguishable', async () => {
+  const off = makePushDeps({ deps: { config: { ntfyEnabled: false } } });
+  assert.equal((await deliverNtfy(off.deps)).reason, 'disabled');
+
+  const noop = makePushDeps({ deps: { kind: 'delta' } });
+  assert.equal((await deliverNtfy(noop.deps)).reason, 'not-pushable');
+  assert.equal(noop.calls.sent.length, 0);
+
+  const bare = makePushDeps({ deps: { config: { ntfyEnabled: true } } });
+  assert.equal((await deliverNtfy(bare.deps)).reason, 'unconfigured');
+  assert.equal(bare.calls.sent.length, 0);
+
+  // Every skip is still audited: "I got no push" must be answerable.
+  for (const h of [off, noop, bare]) assert.equal(h.calls.audit[0].payload.outcome, 'skipped');
+});
+
+test('describeNtfyTarget / redactNtfyDetail: expose the host, bury the secrets', () => {
+  const cfg = { ntfyEnabled: true, ntfyUrl: 'https://ntfy.example.com/', ntfyTopic: 'SECRET-TOPIC', ntfyToken: 'SECRET-TOKEN' };
+  assert.deepEqual(describeNtfyTarget(cfg), { host: 'ntfy.example.com', topicLength: 12 });
+  assert.deepEqual(describeNtfyTarget({}), { host: '', topicLength: 0 });
+  assert.deepEqual(describeNtfyTarget(null), { host: '', topicLength: 0 });
+  assert.deepEqual(describeNtfyTarget({ ntfyUrl: 'not a url', ntfyTopic: 'ab' }), { host: '', topicLength: 2 });
+
+  assert.equal(redactNtfyDetail('GET https://h/SECRET-TOPIC 401', cfg), 'GET https://h/[redacted] 401');
+  assert.equal(redactNtfyDetail('token=SECRET-TOKEN', cfg), 'token=[redacted]');
+  assert.equal(redactNtfyDetail('plain failure', cfg), 'plain failure');
+  assert.equal(redactNtfyDetail(undefined, cfg), '');
+  assert.equal(redactNtfyDetail('x'.repeat(500), cfg).length, 160, 'the audit ring is bounded');
+});
+
+test('the REAL audit sink can be served to a client without leaking the channel', async () => {
+  // The audit buffer is readable through an authenticated route, so "we passed a
+  // safe payload" is not enough — the sink's own normalization (it derives
+  // `command` from `reason` and falls back to JSON.stringify) must not resurrect
+  // a secret either. This drives the payload through the actual sink.
+  const sink = createAuditSink({ size: 50 });
+  const cfg = { ntfyEnabled: true, ntfyUrl: 'https://ntfy.example.com', ntfyTopic: 'SECRET-TOPIC', ntfyToken: 'SECRET-TOKEN' };
+  const scenarios = [
+    {},
+    { sendResult: { ok: false, status: 429, reason: 'rate limited on SECRET-TOPIC' } },
+    { deps: { send: async () => { throw new Error('connect to https://ntfy.example.com/SECRET-TOPIC with SECRET-TOKEN'); } } },
+    { deps: { clients: [liveSocket()] } }
+  ];
+  for (const s of scenarios) {
+    const { deps } = makePushDeps({ ...s, deps: { ...(s.deps ?? {}), config: cfg } });
+    await deliverNtfy({ ...deps, audit: (action, payload) => sink.record(action, payload) });
+  }
+  const readable = JSON.stringify(sink.read(50));
+  assert.ok(readable.includes('ntfy/push'), 'the entries are actually there');
+  assert.ok(!readable.includes('SECRET-TOPIC'), 'no entry may carry the topic');
+  assert.ok(!readable.includes('SECRET-TOKEN'), 'no entry may carry the token');
+  assert.ok(readable.includes('ntfy.example.com'), 'the host stays, so failures are attributable');
+});
+
+/* ------------------------------------------------------------------ *
  * route table
  * ------------------------------------------------------------------ */
 
@@ -383,6 +572,195 @@ test('route: deliverable download streams a declared file', async () => {
   await handleFeatureRoute(deps);
   assert.equal(calls.files.length, 1);
   assert.equal(calls.files[0].name, 'out/ok.docx');
+});
+
+/* ------------------------------------------------------------------ *
+ * deliverable scan data source (the "点不开" root cause)
+ * ------------------------------------------------------------------ */
+
+// The engine's real rejection text, captured from the live instance
+// (dsh web 16:03:54, 2026-10-10). `session/page` cannot report a session's
+// cursor any other way — see parseCursorFromPastSeqError's docblock.
+const REAL_PAST_CURSOR = 'session page through seq 9007199254740991 is past cursor 4431';
+
+test('parseCursorFromPastSeqError: reads the engine cursor, refuses anything else', () => {
+  assert.equal(parseCursorFromPastSeqError(REAL_PAST_CURSOR), 4431);
+  assert.equal(parseCursorFromPastSeqError('session page through seq 5 is past cursor 0'), 0);
+  assert.equal(parseCursorFromPastSeqError('session "session-x" not found'), null);
+  assert.equal(parseCursorFromPastSeqError('typert gateway: session/page: wire field "request" failed boundary validation'), null);
+  assert.equal(parseCursorFromPastSeqError(undefined), null);
+  assert.equal(parseCursorFromPastSeqError('past cursor -3'), null);
+});
+
+test('collectSessionRecords: every page carries the REQUIRED throughSeq', async () => {
+  // Regression: the scan used to send {address, maxMessages} and the engine
+  // answered `gateway/input-invalid`, which was swallowed into `records: []`.
+  // The deliverable list was therefore empty for every session, forever.
+  const sent = [];
+  const callDshRpc = async (method, payload) => {
+    sent.push({ method, request: payload.args.request });
+    if (payload.args.request.throughSeq === Number.MAX_SAFE_INTEGER) {
+      throw new Error(REAL_PAST_CURSOR); // the cursor probe
+    }
+    return { records: [{ event: { type: 'user/message', seq: 0 } }], hasMore: false };
+  };
+  const out = await collectSessionRecords({ callDshRpc, sessionId: 'session-x' });
+  assert.equal(sent.length, 2, 'one cursor probe plus one page');
+  for (const call of sent) {
+    assert.equal(call.method, 'session/page');
+    assert.equal(typeof call.request.throughSeq, 'number', 'throughSeq is a required wire field');
+    assert.ok(call.request.address && call.request.address.kind === 'session');
+  }
+  assert.equal(out.cursor, 4431);
+  assert.equal(out.records.length, 1);
+  assert.equal(out.truncated, false);
+});
+
+test('collectSessionRecords: walks backwards with beforeSeq and never truncates silently', async () => {
+  const pages = [
+    { records: [{ event: { type: 'user/message', seq: 300 } }, { event: { type: 'deliverables/presented', seq: 310 } }], hasMore: true },
+    { records: [{ event: { type: 'user/message', seq: 100 } }, { event: { type: 'user/message', seq: 150 } }], hasMore: true },
+    { records: [{ event: { type: 'user/message', seq: 0 } }], hasMore: false }
+  ];
+  const requests = [];
+  let n = 0;
+  const callDshRpc = async (method, payload) => {
+    const request = payload.args.request;
+    if (request.throughSeq === Number.MAX_SAFE_INTEGER) throw new Error(REAL_PAST_CURSOR);
+    requests.push(request);
+    return pages[n++] ?? { records: [], hasMore: false };
+  };
+  const out = await collectSessionRecords({ callDshRpc, sessionId: 'session-x' });
+  assert.equal(requests.length, 3);
+  assert.equal(requests[0].beforeSeq, undefined, 'the first page starts at the cursor');
+  assert.equal(requests[1].beforeSeq, 300, 'the next window starts at the previous page start');
+  assert.equal(requests[2].beforeSeq, 100);
+  for (const r of requests) assert.equal(r.throughSeq, 4431, 'throughSeq stays pinned at the cursor');
+  // ascending, deduplicated, and the deliverable survives
+  assert.deepEqual(out.records.map((r) => r.event.seq), [0, 100, 150, 300, 310]);
+  assert.equal(out.truncated, false);
+});
+
+test('collectSessionRecords: page budget exhaustion is reported, not hidden', async () => {
+  const callDshRpc = async (method, payload) => {
+    const request = payload.args.request;
+    if (request.throughSeq === Number.MAX_SAFE_INTEGER) throw new Error(REAL_PAST_CURSOR);
+    return { records: [{ event: { type: 'user/message', seq: (request.beforeSeq ?? 1000) - 10 } }], hasMore: true };
+  };
+  const out = await collectSessionRecords({ callDshRpc, sessionId: 'session-x', maxPages: 2, messagesPerPage: 10 });
+  assert.equal(out.pages, 2);
+  assert.equal(out.truncated, true, 'a partial answer must say so');
+});
+
+test('collectSessionRecords: an unknown session yields no records, not an exception', async () => {
+  const callDshRpc = async () => { throw new Error('session "session-x" not found'); };
+  const out = await collectSessionRecords({ callDshRpc, sessionId: 'session-x' });
+  assert.deepEqual(out, { records: [], cursor: null, pages: 0, truncated: false });
+});
+
+test('projectionCacheFileNames: reaches BOTH cache filename spellings', () => {
+  // Regression: 2133/2468 real cache files are `session-<uuid>.json`; the old
+  // single-candidate lookup reached 13.6% of them, so cwd was null for 86.4%.
+  assert.deepEqual(projectionCacheFileNames('session-03ba0334-462f-4838-beac-783599a96e08'), [
+    '03ba0334-462f-4838-beac-783599a96e08.json',
+    'session-03ba0334-462f-4838-beac-783599a96e08.json'
+  ]);
+  // An already-bare id must still produce the prefixed candidate.
+  assert.deepEqual(projectionCacheFileNames('03ba0334-462f-4838-beac-783599a96e08'), [
+    '03ba0334-462f-4838-beac-783599a96e08.json',
+    'session-03ba0334-462f-4838-beac-783599a96e08.json'
+  ]);
+  assert.deepEqual(projectionCacheFileNames(''), []);
+  assert.deepEqual(projectionCacheFileNames('session-'), []);
+  assert.deepEqual(projectionCacheFileNames(null), []);
+});
+
+test('route: deliverable download 404s instead of leaving the socket unanswered', async () => {
+  // `sendFile` writes nothing when the file is gone; the route must answer or
+  // the phone sits in its full 60s `http.get` timeout (what "点不开" looked like).
+  const { deps, calls } = makeHarness({
+    sessionRecords: { records: [{ event: { type: 'deliverables/presented', seq: 1, data: { files: [{ path: 'out/gone.docx' }] } } }], cwd: '/w' }
+  });
+  deps.pathname = '/api/mobile/deliverables/download';
+  deps.parsedUrl = { query: { sessionId: 's', path: path.resolve('/w/out/gone.docx') } };
+  deps.sendFile = async () => false; // file removed from the host
+  await handleFeatureRoute(deps);
+  assert.equal(calls.sent.length, 1, 'exactly one response');
+  assert.equal(calls.sent[0].status, 404);
+  assert.equal(calls.sent[0].body.code, 404);
+});
+
+test('route: deliverables reports the scan truncation flag', async () => {
+  const { deps, calls } = makeHarness({
+    sessionRecords: {
+      records: [{ event: { type: 'deliverables/presented', seq: 9, data: { files: [{ path: 'out/a.docx' }] } } }],
+      cwd: '/w',
+      truncated: true
+    }
+  });
+  deps.pathname = '/api/mobile/deliverables';
+  deps.parsedUrl = { query: { sessionId: 's' } };
+  await handleFeatureRoute(deps);
+  assert.equal(calls.sent[0].status, 200);
+  assert.equal(calls.sent[0].body.deliverables.length, 1);
+  assert.equal(calls.sent[0].body.truncated, true);
+});
+
+/* ------------------------------------------------------------------ *
+ * dispatch order: the sessions/* GET wildcard must not steal a feature route
+ * ------------------------------------------------------------------ */
+
+// The wildcard branch in index.js turns everything after `/api/mobile/sessions/`
+// into a session id. Measured on the live (pre-fix) gateway:
+//   GET /api/mobile/sessions/queue?sessionId=… ->
+//   {"ok":true,"code":0,"data":{"sessionId":"queue","messages":[]}}
+// i.e. a fake session literally named "queue", and the queue feature route
+// unreachable in production. These tests are the guard for that class.
+
+test('claimsMobileFeatureRoute: knows every route handleFeatureRoute really claims', async () => {
+  // Cross-check the exported list against real behaviour, so list and handler
+  // can never drift: every claimed pair must be handled, and nothing else.
+  for (const [method, pathname] of FEATURE_ROUTES) {
+    const { deps } = makeHarness({ sessionRecords: { records: [], cwd: '/w' } });
+    deps.pathname = pathname;
+    deps.req = { method };
+    deps.parsedUrl = { query: { sessionId: 'session-1', path: '/w/a' } };
+    assert.equal(await handleFeatureRoute(deps), true, `${method} ${pathname} must be claimed`);
+  }
+});
+
+test('claimsMobileFeatureRoute: a real session id still belongs to history', () => {
+  // The wildcard must keep working: these must NOT be claimed by the feature layer.
+  for (const id of ['session-03ba0334-462f-4838-beac-783599a96e08', '03ba0334-462f-4838-beac-783599a96e08']) {
+    assert.equal(claimsMobileFeatureRoute('GET', `/api/mobile/sessions/${id}`), false);
+  }
+  assert.equal(claimsMobileFeatureRoute('GET', '/api/mobile/sessions/queue'), true);
+  assert.equal(claimsMobileFeatureRoute('POST', '/api/mobile/sessions/queue'), true);
+  // Method-sensitive: no POST route may be claimed as a GET or vice versa.
+  assert.equal(claimsMobileFeatureRoute('POST', '/api/mobile/sessions/search'), false);
+  assert.equal(claimsMobileFeatureRoute('GET', '/api/mobile/sessions/archive'), false);
+  assert.equal(claimsMobileFeatureRoute(undefined, '/api/mobile/sessions/queue'), false);
+  assert.equal(claimsMobileFeatureRoute('GET', ''), false);
+});
+
+test('index.js: the feature dispatch precedes the sessions/* GET wildcard', () => {
+  // Regression lock for the ordering bug. On the pre-fix file the dispatch sat
+  // ~420 lines BELOW the wildcard, so /api/mobile/sessions/queue was swallowed
+  // by getSessionHistory('queue'). A source-level assertion is the only way to
+  // pin the ORDER of two branches inside an unexported request handler without
+  // binding a port and dialling the live engine.
+  const source = readFileSync(new URL('../../dsh-server-plugin/lib/index.js', import.meta.url), 'utf8');
+  const dispatchAt = source.indexOf('if (await handleFeatureRoute({');
+  const wildcardAt = source.indexOf("pathname.startsWith('/api/mobile/sessions/')");
+  assert.ok(dispatchAt > 0, 'the feature dispatch must exist');
+  assert.ok(wildcardAt > 0, 'the sessions/* GET wildcard must exist');
+  assert.ok(
+    dispatchAt < wildcardAt,
+    `handleFeatureRoute must run before the sessions/* wildcard (dispatch@${dispatchAt}, wildcard@${wildcardAt})`
+  );
+  // …and the wildcard must additionally refuse claimed feature routes.
+  const wildcardBlock = source.slice(wildcardAt, wildcardAt + 300);
+  assert.match(wildcardBlock, /!claimsMobileFeatureRoute\(/, 'the wildcard must carry the feature-route guard');
 });
 
 test('route: diff refuses a path outside the change list', async () => {

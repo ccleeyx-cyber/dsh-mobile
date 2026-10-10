@@ -36,12 +36,17 @@ class DeliverableItem {
   final int? turn;
   final int? seq;
 
+  /// 声明时刻（epoch 毫秒）。网关 `extractDeliverables` 一直在回传 `time`，
+  /// 只是模型没接 —— 它在"这条产出是什么时候给的"上比 `seq` 更可读。
+  final int? time;
+
   const DeliverableItem({
     required this.path,
     required this.display,
     required this.description,
     this.turn,
     this.seq,
+    this.time,
   });
 
   factory DeliverableItem.fromJson(Map<String, dynamic> json) => DeliverableItem(
@@ -50,6 +55,7 @@ class DeliverableItem {
         description: json['description']?.toString() ?? '',
         turn: _int(json['turn']),
         seq: _int(json['seq']),
+        time: _int(json['time']),
       );
 
   String get fileName {
@@ -63,6 +69,54 @@ class DeliverableItem {
     final i = name.lastIndexOf('.');
     return i >= 0 && i < name.length - 1 ? name.substring(i + 1).toLowerCase() : '';
   }
+}
+
+/// 一轮里声明过的交付物。
+///
+/// 网关的 `extractDeliverables` 按 `seq` **倒序**返回（最新声明的排最前），
+/// 这里只分组、不重排组内顺序 —— 组内顺序就是网关给的顺序。
+class DeliverableGroup {
+  /// 轮号；`null` 表示网关没回传轮号（老记录，或事件里缺 turn）。
+  final int? turn;
+  final List<DeliverableItem> items;
+
+  const DeliverableGroup({required this.turn, required this.items});
+
+  /// 这一组的轮次标签，未知时为 null（界面据此降级文案，而不是编一个轮号）。
+  String? get turnLabel => turn == null ? null : '第 $turn 轮';
+}
+
+/// 按轮次分组，**轮号大的在前**；没有轮号的记录自成一组建在最后。
+///
+/// 为什么需要分组而不是只排序：一个长会话可能声明过几十个文件，而手机上一次
+/// 只看得下 5~8 行。用户 99% 要的是"刚给我的那批"，所以"按轮分组 + 默认只
+/// 展开最新一轮"是交付物列表的基本形态，不是可选的排序优化。
+List<DeliverableGroup> groupDeliverablesByTurn(List<DeliverableItem> rows) {
+  final numbered = <int, List<DeliverableItem>>{};
+  final unnumbered = <DeliverableItem>[];
+  for (final row in rows) {
+    final turn = row.turn;
+    if (turn == null) {
+      unnumbered.add(row);
+    } else {
+      numbered.putIfAbsent(turn, () => <DeliverableItem>[]).add(row);
+    }
+  }
+  final turns = numbered.keys.toList()..sort((a, b) => b.compareTo(a));
+  return <DeliverableGroup>[
+    for (final turn in turns) DeliverableGroup(turn: turn, items: numbered[turn]!),
+    if (unnumbered.isNotEmpty) DeliverableGroup(turn: null, items: unnumbered),
+  ];
+}
+
+/// 最新一轮的交付物（流内「本轮产出」卡片用）；没有记录时是空列表。
+///
+/// 若所有记录都没有轮号，返回的是**整份清单**（它已经按 seq 倒序，即"最近声明
+/// 的在前"），因为此时"哪一轮"无从判断 —— 卡片会把标题降级成「最近交付」，
+/// 而不是假装这些都属于同一轮。
+List<DeliverableItem> latestDeliverableTurn(List<DeliverableItem> rows) {
+  final groups = groupDeliverablesByTurn(rows);
+  return groups.isEmpty ? const <DeliverableItem>[] : groups.first.items;
 }
 
 /// One changed file in the session's workspace.
@@ -279,6 +333,30 @@ class SessionStats {
     final window = contextWindow;
     if (used == null || window == null || window <= 0) return null;
     return (used / window).clamp(0.0, 1.0);
+  }
+
+  /// 数值来自引擎的实时投影（会话此刻在内存里）。
+  bool get isLive => source == 'live';
+
+  /// 数值来自投影缓存快照：会话当前不在内存中，这**不是**实时值。
+  ///
+  /// 必须与 [isLive] 区分渲染 —— 把几小时前的快照当实时值展示，会让用户
+  /// 据此做出错误的"还能不能继续"判断。
+  bool get isSnapshot => source == 'cache';
+
+  /// 本轮消耗 = 两次「实时」总 token 读数之差。
+  ///
+  /// 返回 `null` 的一切情形都必须由调用方渲染成「—」：基线未知、当前读数未知、
+  /// 或当前读数不是实时值（`cache` 快照可能是很久以前的）。**绝不允许回落成
+  /// 0** —— 0 在用户眼里是"这轮免费"，而真相是"不知道"，这是两件事。
+  ///
+  /// `tokenUsage` 是单调累计的会话投影，所以"两次读数之差"确实等于这段时间
+  /// 里跑掉的量；调用方在每个 `done` 更新基线即可得到"这一轮"。
+  static int? turnDelta({int? baseline, SessionStats? now}) {
+    if (baseline == null || now == null || !now.isLive) return null;
+    final total = now.totalTokens;
+    if (total == null || total < baseline) return null;
+    return total - baseline;
   }
 }
 

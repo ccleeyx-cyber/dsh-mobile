@@ -37,11 +37,46 @@ ignored: ["**/node_modules", "**/.*", "cache", "data"]
 | 0001 安全与崩溃修复 | **已应用并生效** —— 你在 2026-10-08 重启了 dsh web，`core.mjs` 与 `index.js` 均为打过补丁的版本 |
 | 0002 归档筛选 | **已应用并生效** —— 同一次重启加载；实测 `?archived=only` 正确回显 `archivedMode`，三态 `archivedCount` 恒为 1338 |
 | 0003 事件转发（提问 / TODO / 附件 + 背压） | **已应用并生效** —— 2026-10-10 12:00 那次重启加载（网关版本当时为 1.3.1） |
-| 0004 重度远程能力（v1.14.0，见下节） | **已写进 `lib/`，尚未生效** —— 需要你下一次重启 dsh web |
+| 0004 重度远程能力（bridge 1.14.0） | **已应用并生效** —— 2026-10-10 16:03:54 那次重启加载（实测四个新路由返回 `400 sessionId is required`、伪造路由返回 `404`，证明已注册） |
+| 0005 修复 0004 的致命缺陷 + ntfy 闭环（见下节） | ⚠️ **已写进 `lib/`，尚未生效** —— **需要你重启一次 dsh web**（本轮全部网关改动合并在这一步） |
 
 补丁生成过程中活文件一个字节都没被改过（0001 生成时 SHA256 前后一致：`index.js=CB1C57D0…`、`core.mjs=3D74A56E…`）。
 
 ---
+
+## 0005-gateway-fix-broken-features（需重启一次 dsh web）
+
+0004 上线后发现它有几处**致命缺陷**，使得"交付物 / 队列 / 变更"在真机上要么永远是空的、要么根本不可达。本补丁全部修掉；改动仍集中在 `features.mjs` 与 `index.js`，另有 `tests/unit/features.test.mjs` 新增回归锁。
+
+### 根因与修法
+
+| 编号 | 缺陷 | 后果 | 修法 |
+|---|---|---|---|
+| RC-1 | `session/page` 漏了引擎 wire 模式里**强制必填**的 `throughSeq`（`typert.host.js:630` 无 `.optional()`，而 `maxMessages` 有） | 请求被 `gateway/input-invalid` 拒，异常被 `catch` 吞成 `records: []` ⇒ **任何会话的交付物清单恒为空**（用户"点不开"的直接成因） | 补齐参数；改为按 cursor 向后分页扫描 |
+| RC-2 | 投影缓存文件名判定只覆盖 13.6% 的会话（2468 个文件里 2133 个叫 `session-<uuid>.json`，旧码剥前缀后查 `<uuid>.json`） | `cwd` 对 86.4% 会话为 `null` ⇒ 相对路径被解析到 dsh web 进程自己的工作目录；`workspace/changes` 对真实工作区回 `no-workspace` | 两种拼写都试 |
+| RC-3 | `sendFile` 在文件不存在时**一个字节都不写** | socket 悬空 ⇒ App 侧 `http.get(...).timeout(60s)` 转圈 60 秒后弹泛化超时 | 检查返回值，失败回 `404 + path` |
+| RC-4 | `maxMessages` 是**消息**预算且从旧端截断 | 8 条交付物事件的会话只看到 6 条；加大它既贵又不完整（200 条已 3.9MB） | 改用 cursor 分页，`truncated` 如实上报 |
+| RC-5 | `/api/mobile/sessions/*` 的 GET 通配分支比功能分发**早 421 行**，且无排除 | `GET /api/mobile/sessions/queue` 被当成"名为 queue 的会话历史"⇒ **队列功能生产上不可达**，而 App 把缺字段当空数组，显示成"没有排队消息"（看起来像正常状态） | 分发整体前置 + 通配加守卫；全文件只有这一处通配分支且仅匹配 GET，已逐条实测确认无反向遮蔽 |
+
+### ntfy 闭环补齐
+
+- **去重**：`shouldPushNtfy()` 依据网关现成状态（`readyState === OPEN` + `isAlive !== false`，即 30s 心跳扫描的判定）决定是否下发。**App 在线时不发 ntfy**（它自己会弹本地通知），消除"两条通知"。取舍：ping 在途被误判为 dead 的代价是**多弹一次**；把已消失的 peer 当 alive 的代价是**漏通知** —— 取前者。
+- **可归因**：每次推送写 `ntfy/push` 审计（`{kind, outcome, liveClients, host, topicLength, status?, reason?}`），`skipped` 分 `disabled`/`app-connected`/`not-pushable`/`unconfigured`，因此"我没收到推送"可区分开关没开 / App 在线被抑制 / topic 未配 / ntfy 拒绝。`pushTest()` 写 `ntfy/test` 且**刻意绕过去重**（手动测试必须真发）。
+- **不泄密**：`describeNtfyTarget()` 只出 `host` + topic 长度；`redactNtfyDetail()` 把 token/topic 明文替换为 `[redacted]` 并截断 160 字符。有一条**过真实 `createAuditSink`** 的用例断言审计落盘后不含 token/topic。
+- App 侧设置页新增须知卡：必须自备 ntfy 客户端并订阅**完全相同**的 topic，且"只在 App 不在线时才发"。
+
+### 重启后的验收（最快三条）
+
+```bash
+TOKEN=<~/.dsh/mobile-bridge/config.json 里的 token>
+# 1. 队列路由不再被通配吞掉：必须返回 queue 键，且不再出现 data.sessionId
+curl -s -H "x-dsh-token: $TOKEN" "http://127.0.0.1:3088/api/mobile/sessions/queue?sessionId=session-<uuid>"
+# 2. 交付物清单不再是空数组（会话 b014a73e 有一条真实交付物）
+curl -s -H "x-dsh-token: $TOKEN" "http://127.0.0.1:3088/api/mobile/deliverables?sessionId=session-b014a73e-90d9-4160-a084-d6dea8cbe435"
+# 3. 推送可归因：App 在线时应见 skipped/app-connected，App 离线时应见 sent/200
+tail -5 ~/.dsh/mobile-bridge/audit.log
+```
+
 
 ## 0004-gateway-heavy-remote-capabilities（bridge 1.14.0）
 

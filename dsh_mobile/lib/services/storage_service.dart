@@ -62,21 +62,12 @@ class StorageService {
 
   static final Random _rng = Random.secure();
 
-  /// 运行中发消息的投递方式：'queue'（排队）或 'steer'（插话）。
-  ///
-  /// 存在本地而不是网关：这是**这台手机的**输入习惯，同一账号的另一台设备
-  /// 不该被它改掉。默认排队 —— 排队永远不会打断正在跑的任务。
-  static const String _keyDeliveryMode = 'dsh_delivery_mode';
-
-  static Future<String> loadDeliveryMode() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_keyDeliveryMode) == 'steer' ? 'steer' : 'queue';
-  }
-
-  static Future<void> saveDeliveryMode(String mode) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_keyDeliveryMode, mode == 'steer' ? 'steer' : 'queue');
-  }
+  // v1.14 删除了「运行中投递方式」的持久化（原 `dsh_delivery_mode` 键）。
+  //
+  // 它当初是"记住这台手机习惯排队还是插话"，但一个能被记住的开关会让"默认"
+  // 在下次变成插话 —— 用户不会记得它停在哪一格，一次没注意就插了正在跑的活。
+  // 现在运行中发送恒为排队（`mode:'queue'`），插话只能靠在队列条目上再确认一次。
+  // 落盘的旧值不再被读取，因此不做迁移清理（写清理代码是净增代码、无收益）。
 
   /// Guarantees uniqueness **by construction**, not by luck.
   ///

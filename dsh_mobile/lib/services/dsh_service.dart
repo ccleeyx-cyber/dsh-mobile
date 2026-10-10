@@ -16,6 +16,7 @@ import '../models/permission_config.dart';
 import '../models/user_question.dart';
 import '../models/pending_attachment.dart';
 import 'draft_store.dart';
+import 'platform_services.dart';
 import 'storage_service.dart';
 import 'notification_service.dart';
 import '../models/audit_log.dart';
@@ -29,6 +30,27 @@ enum ConnectionStatus {
   connecting,
   connected,
   error,
+}
+
+/// 一条队列动作（edit / remove / steer）的结局。
+///
+/// 为什么不是 `bool`：失败有两种含义完全不同的情况，而它们的**用户可见后果相反**：
+///
+///   * [alreadyGone] —— 那条消息已被引擎领走（正常时序，比如你点「立即插话」的
+///     同时这一轮刚好结束）。必须静默收敛，报错会把"本来就该发生的事"说成故障。
+///   * [failed] —— 真的失败了（网络/权限/参数）。必须留着条目并说明原因。
+///
+/// 把两者压成一个 `false` 会让界面无论如何都要报一条红错，或者无论如何都不报
+/// —— 两种都是错的。
+enum QueueActionOutcome {
+  /// 动作被服务端接受并已生效。
+  applied,
+
+  /// 目标条目已不在队列里（被引擎领取或被别处删掉），无需报错。
+  alreadyGone,
+
+  /// 真正的失败：条目应保持在队列里，界面要给出原因。
+  failed,
 }
 
 class DshService extends ChangeNotifier {
@@ -607,7 +629,6 @@ class DshService extends ChangeNotifier {
       await fetchAuditLogs();
       await fetchPersonas();
       await fetchSnippets();
-      await loadDeliveryMode();
       await fetchPushConfig();
       await measurePing();
     } catch (e) {
@@ -723,8 +744,9 @@ class DshService extends ChangeNotifier {
 
   /// 测试用：直接设定"当前会话"，不联网。
   ///
-  /// 任务页/排队面板都只在**有当前会话**时才渲染内容（没有会话时给的是
-  /// "先去打开一个会话"的指引），所以没有这个缝就测不到它们真正要测的东西。
+  /// 会话内的信息视图（状态条 / 信息面板 / 排队 dock）都只在**有当前会话**时
+  /// 才渲染内容（没有会话时给的是"先去打开一个会话"的指引），所以没有这个缝
+  /// 就测不到它们真正要测的东西。
   @visibleForTesting
   void debugSetCurrentSession(SessionMeta session) {
     _currentSession = session;
@@ -980,6 +1002,9 @@ class DshService extends ChangeNotifier {
     _isSending = false; // Reset sending state immediately
     _isLoadingHistory = true;
     _lastError = '';
+    // 上一个会话的读数（交付物/变更/作业/用量）必须清掉：不清的话新会话的状态条
+    // 会拿旧会话的上下文压力与作业数当自己的（这比"多打几个请求"严重得多）。
+    _resetSessionInsights();
     notifyListeners();
 
     // Notify server to follow this session for real-time streaming
@@ -1048,8 +1073,15 @@ class DshService extends ChangeNotifier {
       if (currentSeq == _sessionLoadSeq) {
         _isLoadingHistory = false;
         notifyListeners();
-        // 排队消息属于会话：切过去就要看到它在等什么（v1.13）。
-        unawaited(fetchQueue());
+        // 会话洞察三档加载（v1.14）。
+        //
+        // 第一档立刻发：`stats` + `queue` 都是本地投影读，决定状态条首帧有没有
+        // 上下文压力和队列内容。
+        unawaited(fetchSessionOverview());
+        // 第二档紧接一次：交付物（一次 MUX RPC）→ 变更（一个 git 子进程）。
+        // 两个都决定状态条上的数字，但比第一档贵，所以不参与首帧；里面每一环
+        // 都带会话守卫，会话切走就停。
+        unawaited(fetchSessionSecondary());
       }
     }
   }
@@ -1067,6 +1099,8 @@ class DshService extends ChangeNotifier {
 
     // Immediately empty out messages as requested: "点击新增会话之后应该是出现一个空的会话"
     _messages = [];
+    // 新会话没有任何读数：清掉上一个会话的（同 selectSession）。
+    _resetSessionInsights();
 
     final targetWsId = workspaceId ?? _currentWorkspace?.workspaceId;
     if (targetWsId != null) {
@@ -2115,56 +2149,180 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  // ---------------------------------------------------------------- 任务中心 --
+  // ------------------------------------------------------------ 会话洞察 --
   //
-  // 一个会话"正在等什么/改了什么/产出什么/烧了多少"的只读视图（v1.13）。
-  // 所有读取都允许失败并保留上一次结果：手机在地铁里断网时，页面显示的是
+  // 一个会话"正在等什么/改了什么/产出什么/烧了多少"的只读视图。
+  // 所有读取都允许失败并保留上一次结果：手机在地铁里断网时，界面显示的是
   // 上一次的真值 + 一个错误提示，而不是一片空白。
+  //
+  // 三条贯穿这一块的不变量（改这里之前先读，它们都被测试钉住了）：
+  //
+  // 1. **未知 ≠ 零。** 每个"数量"都是可空的，`null` 表示读不到/还没拉过，
+  //    界面据此**隐藏整段**。绝不回落成 0 —— `改动 0` 与 `改动 读不到` 在
+  //    用户眼里是"工作区干净"与"我不知道"两件完全不同的事。
+  // 2. **切会话必须丢弃在途响应。** 每个 fetch 都带 `_sessionLoadSeq` 守卫；
+  //    没有它，快速切 A→B 会把 A 的交付物显示在 B 的会话里，用户会被指向
+  //    错的下载项。
+  // 3. **换会话必须清空上一个会话的读数。** [_resetSessionInsights] 负责这件事：
+  //    否则新会话的状态条会显示旧会话的上下文压力/作业数。
 
   List<QueueItem> _queueItems = [];
   String _queueError = '';
   bool _queueLoading = false;
+
+  /// 队列可见性三态（v1.14）。**必须区分"读不到"和"确实是空"**：
+  ///
+  ///   * `null`  —— 还没查过（冷启动）。界面不渲染队列区，避免首帧闪一条空壳。
+  ///   * `true`  —— 服务端给了 `queue` 字段，哪怕是空数组；这才代表"确实没有排队消息"。
+  ///   * `false` —— 读不到（HTTP 失败 / 响应体里没有 `queue`）。
+  ///
+  /// 为什么要三态：生产上 `GET /api/mobile/sessions/queue` 曾被通配路由当成
+  /// `getSessionHistory("queue")` 吞掉，响应里根本没有 `queue` 字段。旧代码
+  /// `data['queue'] as List? ?? []` 把它静默当成空队列，于是"路由坏了"和"真的没排队"
+  /// 在界面上完全一样 —— 修好路由之前和之后无法分辨，用户看到的是一个永远空的队列。
+  bool? _queueKnown;
+
+  /// 后台作业是否只是"读不到"（网关 `degraded: 'jobs-unavailable'`）。
+  ///
+  /// 与队列同一个形态的问题：把"读不到"渲染成"没有作业"。这里只负责把标记
+  /// 暴露出来（信息面板由 T3 消费），不去猜网关为什么降级。
+  String _jobsDegraded = '';
+
   List<DeliverableItem> _deliverables = [];
+
+  /// 交付物清单的可见性三态，与 [queueKnown] 同一套语义：
+  /// `null` 还没拉过（状态条隐藏"产出"段）/ `true` 拉到了（含空清单，此时
+  /// `产出 0` 是**真值**，要显示）/ `false` 读不到（隐藏，不装作 0 个）。
+  bool? _deliverablesKnown;
+
+  /// 本会话收到过多少次 `deliverables` 事件。
+  ///
+  /// 与"清单里有几项"刻意分开：消息流里的「本轮产出」卡片必须是**事件**的产物
+  /// （"刚刚交付了"），而进会话时补拉到的旧产出属于**状态**（归状态条与信息面板）。
+  /// 只看清单有没有内容，会把好几轮以前的产出渲染到消息流尾部冒充"刚刚交付"。
+  int _deliverableEvents = 0;
+
   List<WorkspaceChange> _workspaceChanges = [];
   String _workspaceChangesReason = '';
   bool _workspaceChangesAvailable = false;
+
+  /// 变更清单的可见性三态（同 [queueKnown] 语义）。
+  bool? _changesKnown;
+
+  /// 本轮结束时要重新取一次变更清单（收到过 `workspace_changes` 帧）。
+  ///
+  /// 事件只置脏、不立刻拉：那个事件在一轮里可能来好几次，而它每次都要起一个
+  /// `git status` 子进程；更要紧的是轮内的 git 状态会随 agent 写文件中途抖动，
+  /// 数字没有意义。统一在 `done` 拉一次，一轮最多一个子进程。
+  bool _changesDirty = false;
+
   List<ScheduleItem> _schedules = [];
   List<JobItem> _jobs = [];
   SessionStats? _sessionStats;
   PushConfig? _pushConfig;
-  String _deliveryMode = 'queue';
+
+  /// 本轮消耗的基线：**回合开始那一刻**的累计 token 读数。
+  int? _statsBaselineTokens;
+
+  /// 是否已经观测到"这个回合开始跑了"——上升沿用，避免一个回合内的多次
+  /// `session_status(isRunning:true)` 反复覆盖基线（那会把基线推进到回合中途，
+  /// 算出来的"本轮消耗"偏小）。
+  bool _turnRunningSeen = false;
+
+  /// 最近一个**已结束**回合的消耗是否已经量到。
+  bool _hasMeasuredTurn = false;
+  int? _measuredTurnTokens;
 
   List<QueueItem> get queueItems => _queueItems;
   String get queueError => _queueError;
   bool get queueLoading => _queueLoading;
+  bool? get queueKnown => _queueKnown;
+  String get jobsDegraded => _jobsDegraded;
   List<DeliverableItem> get deliverables => _deliverables;
+  bool? get deliverablesKnown => _deliverablesKnown;
+
+  /// 本会话收到的 `deliverables` 事件数（见 [_deliverableEvents] 的说明）。
+  int get deliverableEventCount => _deliverableEvents;
+
+  /// 交付物数量：**只有在拉到时才有值**，否则 null（界面隐藏该段）。
+  ///
+  /// 给的是"可显示的值"而不是"拉过没有"：状态条需要的正是这个，写成
+  /// `deliverablesFetched` 那种布尔，调用方还得自己再决定显示什么。
+  int? get deliverableCount => _deliverablesKnown == true ? _deliverables.length : null;
+
   List<WorkspaceChange> get workspaceChanges => _workspaceChanges;
   String get workspaceChangesReason => _workspaceChangesReason;
   bool get workspaceChangesAvailable => _workspaceChangesAvailable;
+
+  /// 变更文件数：拉到了、且可列（git 仓库）时才有值，否则 null（隐藏）。
+  int? get changeCount =>
+      (_changesKnown == true && _workspaceChangesAvailable) ? _workspaceChanges.length : null;
+
+  /// 变更清单确实是"读不到"（而不是"还没拉过"）：非 git 仓库 / 网关报错。
+  ///
+  /// 与"未知"分开的原因：未知时状态条安静地不显示就够了；确实不可用时，
+  /// 信息面板里要**说清为什么**，否则用户会以为工作区是干净的。
+  bool get changesUnavailable => _changesKnown == true && !_workspaceChangesAvailable;
+
   List<ScheduleItem> get schedules => _schedules;
   List<JobItem> get jobs => _jobs;
   SessionStats? get sessionStats => _sessionStats;
   PushConfig? get pushConfig => _pushConfig;
 
-  /// 运行中发消息的投递方式：'queue' 排队 / 'steer' 插话。
-  String get deliveryMode => _deliveryMode;
+  /// 当前基线的累计读数（`null` = 没量到实时值）。
+  int? get statsBaselineTokens => _statsBaselineTokens;
 
-  Future<void> setDeliveryMode(String mode) async {
-    final next = mode == 'steer' ? 'steer' : 'queue';
-    if (next == _deliveryMode) return;
-    _deliveryMode = next;
-    notifyListeners();
-    await StorageService.saveDeliveryMode(next);
+  /// 「本轮消耗」：回合结束（`done`）后由结束时的实时读数与回合开始前的基线
+  /// 相减得到。
+  ///
+  /// **它要么是正数，要么是 null（面板显示「—」），永远不会是 0。** 三个原因：
+  ///
+  /// 1. 回合还没结束（或结束时的读数还没回来）→ 没有真值，显示「—」；
+  /// 2. `tokenUsage` 是单调累计投影，结束时的读数若不是实时值（`cache` 快照，
+  ///    可能是几小时前的），相减出来的不是"这一轮"；
+  /// 3. `total - baseline == 0` 与"没量到"在界面上无法区分，而 0 会被读成
+  ///    "这轮没花钱"——这是面板最不能显示的一个值，所以按未知处理。
+  int? get lastTurnTokens {
+    if (!_hasMeasuredTurn) return null;
+    final burn = _measuredTurnTokens;
+    if (burn == null || burn <= 0) return null;
+    return burn;
   }
 
-  /// 启动时读取上次选择的投递方式。
-  Future<void> loadDeliveryMode() async {
-    _deliveryMode = await StorageService.loadDeliveryMode();
-    notifyListeners();
+  /// 回合开始时记下"开始前"的累计读数。
+  void _captureStatsBaseline() {
+    final stats = _sessionStats;
+    // 只有实时读数才有资格当基线；`cache` 快照可能落后几个小时，拿它相减会
+    // 算出一个凭空捏造的数字。
+    _statsBaselineTokens = (stats != null && stats.isLive) ? stats.totalTokens : null;
+  }
+
+  /// 换会话时清掉上一个会话的全部读数。
+  void _resetSessionInsights() {
+    _deliverables = [];
+    _deliverablesKnown = null;
+    _deliverableEvents = 0;
+    _workspaceChanges = [];
+    _workspaceChangesReason = '';
+    _workspaceChangesAvailable = false;
+    _changesKnown = null;
+    _changesDirty = false;
+    _schedules = [];
+    _jobs = [];
+    _jobsDegraded = '';
+    _sessionStats = null;
+    _statsBaselineTokens = null;
+    _turnRunningSeen = false;
+    _hasMeasuredTurn = false;
+    _measuredTurnTokens = null;
   }
 
   /// 拉取当前会话的排队消息。
+  ///
+  /// 带 [_sessionLoadSeq] 守卫：切换会话后，旧会话的在途响应不得写回 —— 否则
+  /// 用户在新会话里看到的是上一个会话的队列。
   Future<void> fetchQueue() async {
+    final seq = _sessionLoadSeq;
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return;
     _queueLoading = true;
@@ -2173,22 +2331,36 @@ class DshService extends ChangeNotifier {
           .replace(queryParameters: {'sessionId': sessionId});
       final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return;
+      if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        final list = data['queue'] as List<dynamic>? ?? [];
-        _queueItems = list
-            .whereType<Map>()
-            .map((e) => QueueItem.fromJson(Map<String, dynamic>.from(e)))
-            .where((q) => q.id.isNotEmpty)
-            .toList(growable: false);
-        _queueError = '';
+        final raw = data['queue'];
+        if (raw is List) {
+          _queueItems = raw
+              .whereType<Map>()
+              .map((e) => QueueItem.fromJson(Map<String, dynamic>.from(e)))
+              .where((q) => q.id.isNotEmpty)
+              .toList(growable: false);
+          _queueError = '';
+          _queueKnown = true;
+        } else {
+          // 200 但没有 queue 字段：路由/网关形态不对，不是"空队列"。
+          _queueKnown = false;
+          _queueError = '队列状态未知：服务端未返回 queue 字段';
+        }
       } else {
+        _queueKnown = false;
         _queueError = '读取排队消息失败 (HTTP ${res.statusCode})';
       }
     } catch (e) {
       debugPrint('[DshService] fetchQueue error: $e');
-      _queueError = '读取排队消息失败: $e';
+      if (seq == _sessionLoadSeq) {
+        _queueKnown = false;
+        _queueError = '读取排队消息失败: $e';
+      }
     } finally {
+      // 只清"加载中"这个纯装饰性的状态，不守卫：旧请求先返回时让它落下去，
+      // 数据写入本身已经被 seq 守卫挡住，界面上宁可少转一会儿圈。
       _queueLoading = false;
       notifyListeners();
     }
@@ -2196,11 +2368,31 @@ class DshService extends ChangeNotifier {
 
   /// 对一条排队消息执行 edit / remove / steer。
   ///
-  /// 返回是否成功。**失败必须让卡片留着** —— 网关侧失败时条目仍在队列里，
-  /// 本地乐观删除会让用户以为已经撤掉了，而 agent 依然会执行它。
-  Future<bool> queueAction(String itemId, String kind, {String? text}) async {
+  /// **失败收敛（v1.14）**：动作失败后先 [fetchQueue] 对齐服务端真值，再看那条
+  /// 消息还在不在队列里 ——
+  ///
+  ///   * 不在了 → 它已被引擎领走（正常时序），返回 [QueueActionOutcome.alreadyGone]，
+  ///     由界面静默收敛（"这条已经发出去了"），**不报错**；
+  ///   * 还在   → 真的失败（网络/权限/参数），返回 [QueueActionOutcome.failed]。
+  ///
+  /// 之所以不用引擎错误码判定：`session/steer-unavailable` / `session/queue-item-not-found`
+  /// 在网关的 RPC 边界（`core.mjs` 的 `reject`）就被丢掉了，客户端拿不到；
+  /// 禁止用错误文本做字符串匹配。等网关补上错误码透传后，这里可以升级成按码分支
+  /// （行为不变，只是少一次多余的刷新）。
+  Future<QueueActionOutcome> queueAction(String itemId, String kind, {String? text}) async {
+    final injected = _debugQueueActionOutcome;
+    if (injected != null) {
+      // 测试注入：不打网关（见 debugSetQueueActionResult）。记下这一次调用，
+      // 好让"第一次点击不该调它"成为可断言的。
+      _debugLastQueueAction = '$kind:$itemId';
+      return injected;
+    }
+
+    final seq = _sessionLoadSeq;
     final sessionId = _currentSession?.sessionId;
-    if (_currentConfig == null || sessionId == null || itemId.isEmpty) return false;
+    if (_currentConfig == null || sessionId == null || itemId.isEmpty) {
+      return QueueActionOutcome.failed;
+    }
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/queue');
       final res = await _httpClient.post(
@@ -2215,34 +2407,75 @@ class DshService extends ChangeNotifier {
           },
         }),
       ).timeout(const Duration(seconds: 10));
-      if (_checkResponseAuth(res)) return false;
+      if (_checkResponseAuth(res)) return QueueActionOutcome.failed;
       if (res.statusCode == 200) {
         _queueError = '';
         await fetchQueue();
-        return true;
+        return QueueActionOutcome.applied;
       }
       var msg = 'HTTP ${res.statusCode}';
       try {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        if (data['error'] != null) msg = data['error'].toString();
+        // 网关今天给的是字符串；不依赖它永远如此（对象直接 toString 会显示成
+        // `[object Object]`，用户看不懂也排查不了）。
+        final e = data['error'];
+        if (e is String && e.isNotEmpty) {
+          msg = e;
+        } else if (e is Map && e['message'] is String) {
+          msg = e['message'] as String;
+        }
       } catch (_) {}
-      _queueError = '操作失败: $msg';
-      notifyListeners();
-      return false;
+      return _settleFailedQueueAction(seq, itemId, '操作失败: $msg');
     } catch (e) {
       debugPrint('[DshService] queueAction error: $e');
-      _queueError = '操作失败: $e';
-      notifyListeners();
-      return false;
+      return _settleFailedQueueAction(seq, itemId, '操作失败: $e');
     }
   }
 
-  /// 运行中投递一条消息（排队或插话）。返回是否被网关接受。
+  /// 队列动作失败后的收敛判定：先对齐服务端真值，再决定这是不是真的失败。
+  Future<QueueActionOutcome> _settleFailedQueueAction(int seq, String itemId, String fallbackError) async {
+    // 切了会话就别再刷新了：fetchQueue 会去查新会话的队列，与这条动作无关。
+    if (seq == _sessionLoadSeq) {
+      await fetchQueue();
+    }
+    if (seq != _sessionLoadSeq) {
+      // 会话已切换，无法判定这条消息的结局；不污染新会话的错误文案。
+      return QueueActionOutcome.alreadyGone;
+    }
+    final stillQueued = _queueItems.any((q) => q.id == itemId);
+    if (!stillQueued && _queueKnown == true) {
+      // 刷新后它不在队列里 → 已被领走，属正常时序。
+      _queueError = '';
+      return QueueActionOutcome.alreadyGone;
+    }
+    _queueError = fallbackError;
+    notifyListeners();
+    return QueueActionOutcome.failed;
+  }
+
+  /// 运行中投递一条消息。
+  ///
+  /// **恒为排队**（`mode:'queue'`）：等这一轮跑完由引擎自动续发。要立刻插进
+  /// 正在跑的回合，唯一的入口是队列条目上的「立即插话」（走 [queueAction] 的
+  /// `steer`），并且要二次确认 —— 投递方式不再是一个能被记住的开关。
   ///
   /// 与 [sendChatMessage] 分开是刻意的：那条路径会乐观插入"用户气泡 + 助手
-  /// 占位"，而排队/插话的消息属于 inbox 或正在跑的回合，插入的气泡会和引擎
-  /// 回传的真值重复。这里只发、然后以服务端的队列为准刷新界面。
+  /// 占位"，而排队消息属于 inbox，插入的气泡会和引擎回传的真值重复。这里只发、
+  /// 然后以服务端的队列为准刷新界面。
   Future<bool> deliverWhileRunning(String text, {List<PendingAttachment> attachments = const []}) async {
+    final injected = _debugDeliverResult;
+    if (injected != null) {
+      // 测试注入：不打网关（见 debugSetDeliverResult）。成功时按需补一条队列行，
+      // 等价于"投递成功 → fetchQueue 后队列里多了一条"。
+      if (injected && _debugDeliverAppendsRow != null) {
+        _queueItems = [..._queueItems, _debugDeliverAppendsRow!];
+        _queueKnown = true;
+        notifyListeners();
+      }
+      return injected;
+    }
+
+    final seq = _sessionLoadSeq;
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return false;
     if (text.trim().isEmpty && attachments.isEmpty) return false;
@@ -2256,14 +2489,17 @@ class DshService extends ChangeNotifier {
           'sessionId': sessionId,
           'text': text,
           'model': currentModel,
-          'mode': _deliveryMode,
+          // 恒排队：运行中发出去的消息等本轮结束后自动发送。
+          'mode': 'queue',
           if (attachments.isNotEmpty)
             'attachments': attachments.map((a) => a.toWirePart()).toList(),
         }),
       ).timeout(const Duration(seconds: 20));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
-        await fetchQueue();
+        // 会话已切换：这条消息确实发出去了（返回 true 让调用方保留回执），
+        // 但队列真值属于上一个会话，不能拿它刷新新会话的队列面板。
+        if (seq == _sessionLoadSeq) await fetchQueue();
         return true;
       }
       _lastError = '发送失败 (HTTP ${res.statusCode})';
@@ -2280,56 +2516,121 @@ class DshService extends ChangeNotifier {
   /// 供下载类请求复用鉴权头（交付物下载走同一个令牌，不额外暴露任何东西）。
   Map<String, String> get authHeadersForDownload => _authHeaders;
 
-  // ---- 测试注入点（任务中心）----
+  // ---- 测试注入点（会话洞察）----
   //
   // 这些字段只有 HTTP 一条写入路径，而单测里打真实网关会污染用户数据
   //（历史上正是这么累积出 1270 条空会话的）。所以给 UI 测试一个纯内存的
   // 注入口，让"页面渲染了什么"可以被钉住，而不必联网。
   @visibleForTesting
-  void debugSetQueue(List<QueueItem> rows, {bool loading = false, String error = ''}) {
+  void debugSetQueue(List<QueueItem> rows, {bool loading = false, String error = '', bool? known}) {
     _queueItems = rows;
     _queueLoading = loading;
     _queueError = error;
+    // 未显式指定时按"有错误=读不到"推断，好让既有用例的语义不变
+    // （`debugSetQueue([])` = 确实为空；`debugSetQueue([], error: …)` = 读不到）。
+    _queueKnown = known ?? error.isEmpty;
     notifyListeners();
   }
 
-  @visibleForTesting
-  void debugSetDeliveryMode(String mode) {
-    _deliveryMode = mode == 'steer' ? 'steer' : 'queue';
-    notifyListeners();
-  }
-
-  /// 摆布"当前会话在跑"这个状态（输入栏据此在发送/停止之间切换）。
+  /// 摆布"当前会话在跑"这个状态（输入栏据此显示停止键）。
   @visibleForTesting
   void debugSetRunning(bool running) {
     _isSending = running;
     notifyListeners();
   }
 
+  // ---- 运行中投递的测试注入口（v1.14）----
+  //
+  // 为什么必须有：`deliverWhileRunning` 与 `queueAction` 是仅有的两条"运行中
+  // 投递"写路径，它们只有 HTTP 一个出口。要在 widget 测试里钉住"默认排队 / 二次
+  // 确认才插话 / 失败回滚"这些交互，就得让它们可被摆布 —— 否则测试必然打真实网关、
+  // 往用户的会话里塞消息（历史上正是这么累积出 1270 条空会话的）。
+  // 置回 null 即恢复真实 HTTP 路径。
+
+  bool? _debugDeliverResult;
+  QueueItem? _debugDeliverAppendsRow;
+  QueueActionOutcome? _debugQueueActionOutcome;
+  String _debugLastQueueAction = '';
+
+  /// 摆布 [deliverWhileRunning] 的返回值。`null` = 走真实请求。
+  ///
+  /// [appendsRow] 用来模拟"投递成功后重新拉队列，队列里多了一条" —— 没有它，
+  /// 回执条上的「撤回」就没有可撤的目标，那条交互等于测不到。
+  @visibleForTesting
+  void debugSetDeliverResult(bool? ok, {QueueItem? appendsRow}) {
+    _debugDeliverResult = ok;
+    _debugDeliverAppendsRow = appendsRow;
+    notifyListeners();
+  }
+
+  /// 摆布 [queueAction] 的返回值。`null` = 走真实请求。
+  @visibleForTesting
+  void debugSetQueueActionResult(QueueActionOutcome? outcome) {
+    _debugQueueActionOutcome = outcome;
+    notifyListeners();
+  }
+
+  /// 最后一次 [queueAction] 的 `kind:itemId`（空串 = 从未被调用）。
+  ///
+  /// 让"第一次点击只进入待确认态、不打网关"这类断言可以真正被验证，而不是
+  /// 靠"没看到 toast"间接推断。
+  @visibleForTesting
+  String get debugLastQueueAction => _debugLastQueueAction;
+
   @visibleForTesting
   void debugSetTaskCenter({
     List<DeliverableItem>? deliverables,
+    bool? deliverablesKnown,
+    int? deliverableEvents,
     List<WorkspaceChange>? changes,
+    bool? changesKnown,
     bool changesAvailable = false,
     String changesReason = '',
     List<ScheduleItem>? schedules,
     List<JobItem>? jobs,
+    String jobsDegraded = '',
     SessionStats? stats,
+    int? statsBaselineTokens,
+    int? measuredTurnTokens,
     PushConfig? push,
   }) {
-    if (deliverables != null) _deliverables = deliverables;
-    if (changes != null) _workspaceChanges = changes;
+    if (deliverables != null) {
+      _deliverables = deliverables;
+      // 给了清单就默认"读到了"（这是绝大多数用例的意思），要测"读不到"显式传
+      // deliverablesKnown: false / 只传 deliverablesKnown: null。
+      _deliverablesKnown = deliverablesKnown ?? true;
+    } else if (deliverablesKnown != null) {
+      _deliverablesKnown = deliverablesKnown;
+    }
+    if (deliverableEvents != null) _deliverableEvents = deliverableEvents;
+    if (changes != null) {
+      _workspaceChanges = changes;
+      _changesKnown = changesKnown ?? true;
+    } else if (changesKnown != null) {
+      _changesKnown = changesKnown;
+    }
     _workspaceChangesAvailable = changesAvailable;
     _workspaceChangesReason = changesReason;
     if (schedules != null) _schedules = schedules;
-    if (jobs != null) _jobs = jobs;
+    if (jobs != null) {
+      _jobs = jobs;
+      _jobsDegraded = jobsDegraded;
+    }
     if (stats != null) _sessionStats = stats;
+    if (statsBaselineTokens != null) _statsBaselineTokens = statsBaselineTokens;
+    if (measuredTurnTokens != null) {
+      _measuredTurnTokens = measuredTurnTokens;
+      _hasMeasuredTurn = true;
+    }
     if (push != null) _pushConfig = push;
     notifyListeners();
   }
 
   /// 交付物清单（Agent 用 present 声明的文件）。
+  ///
+  /// 带 [_sessionLoadSeq] 守卫：切会话后旧会话的响应不得写回。
   Future<void> fetchDeliverables() async {
+    final seq = _sessionLoadSeq;
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return;
     try {
@@ -2337,18 +2638,32 @@ class DshService extends ChangeNotifier {
           .replace(queryParameters: {'sessionId': sessionId});
       final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return;
+      if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        final list = data['deliverables'] as List<dynamic>? ?? [];
-        _deliverables = list
-            .whereType<Map>()
-            .map((e) => DeliverableItem.fromJson(Map<String, dynamic>.from(e)))
-            .where((d) => d.path.isNotEmpty)
-            .toList(growable: false);
+        final raw = data['deliverables'];
+        if (raw is List) {
+          _deliverables = raw
+              .whereType<Map>()
+              .map((e) => DeliverableItem.fromJson(Map<String, dynamic>.from(e)))
+              .where((d) => d.path.isNotEmpty)
+              .toList(growable: false);
+          _deliverablesKnown = true;
+        } else {
+          // 200 但没有这个字段：网关形态不对，不是"没有交付物"。
+          _deliverablesKnown = false;
+        }
+        notifyListeners();
+      } else {
+        _deliverablesKnown = false;
         notifyListeners();
       }
     } catch (e) {
       debugPrint('[DshService] fetchDeliverables error: $e');
+      if (seq == _sessionLoadSeq) {
+        _deliverablesKnown = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -2363,7 +2678,14 @@ class DshService extends ChangeNotifier {
   }
 
   /// 本次任务改动的文件（git 工作树）。
+  ///
+  /// ⚠️ 这**不是**"本轮改了哪些文件"：`git status` 给的是工作区的**累计**真值，
+  /// 没有轮次归属（引擎自己的 `workspace/changes` 事件只带轮号、快照留在 Host
+  /// 侧不可回放）。所以变更只能按"当前状态"展示，不能拆到每轮消息后面。
+  ///
+  /// 带 [_sessionLoadSeq] 守卫。
   Future<void> fetchWorkspaceChanges() async {
+    final seq = _sessionLoadSeq;
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return;
     try {
@@ -2371,20 +2693,32 @@ class DshService extends ChangeNotifier {
           .replace(queryParameters: {'sessionId': sessionId});
       final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
       if (_checkResponseAuth(res)) return;
+      if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        final list = data['files'] as List<dynamic>? ?? [];
-        _workspaceChanges = list
-            .whereType<Map>()
-            .map((e) => WorkspaceChange.fromJson(Map<String, dynamic>.from(e)))
-            .where((c) => c.path.isNotEmpty)
-            .toList(growable: false);
+        final raw = data['files'];
+        _workspaceChanges = raw is List
+            ? raw
+                .whereType<Map>()
+                .map((e) => WorkspaceChange.fromJson(Map<String, dynamic>.from(e)))
+                .where((c) => c.path.isNotEmpty)
+                .toList(growable: false)
+            : const <WorkspaceChange>[];
         _workspaceChangesAvailable = data['available'] == true;
         _workspaceChangesReason = data['reason']?.toString() ?? '';
+        // 只有真拿到 `files` 才算"读过"：否则"读不到"会被当成"工作区干净"。
+        _changesKnown = raw is List;
+        notifyListeners();
+      } else {
+        _changesKnown = false;
         notifyListeners();
       }
     } catch (e) {
       debugPrint('[DshService] fetchWorkspaceChanges error: $e');
+      if (seq == _sessionLoadSeq) {
+        _changesKnown = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -2411,8 +2745,9 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  /// 当前会话的定时任务。
+  /// 当前会话的定时任务。带 [_sessionLoadSeq] 守卫。
   Future<void> fetchSchedules() async {
+    final seq = _sessionLoadSeq;
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return;
     try {
@@ -2420,6 +2755,7 @@ class DshService extends ChangeNotifier {
           .replace(queryParameters: {'sessionId': sessionId});
       final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return;
+      if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final list = data['schedules'] as List<dynamic>? ?? [];
@@ -2457,7 +2793,13 @@ class DshService extends ChangeNotifier {
   }
 
   /// 会话可见的后台作业。
+  ///
+  /// 网关在取不到作业流时会回 `degraded: 'jobs-unavailable'`（`features.mjs` 的
+  /// jobs 路由读不到 `job/list` 帧时的降级）。旧代码只看 `jobs` 字段，于是"读不到"
+  /// 和"没有后台作业"在界面上完全一样 —— 用户会以为真没作业在跑。这里把标记
+  /// 原样暴露出去，由信息面板决定怎么说明。
   Future<void> fetchJobs() async {
+    final seq = _sessionLoadSeq;
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return;
     try {
@@ -2465,6 +2807,7 @@ class DshService extends ChangeNotifier {
           .replace(queryParameters: {'sessionId': sessionId});
       final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 12));
       if (_checkResponseAuth(res)) return;
+      if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final list = data['jobs'] as List<dynamic>? ?? [];
@@ -2473,6 +2816,7 @@ class DshService extends ChangeNotifier {
             .map((e) => JobItem.fromJson(Map<String, dynamic>.from(e)))
             .where((j) => j.id.isNotEmpty)
             .toList(growable: false);
+        _jobsDegraded = data['degraded']?.toString() ?? '';
         notifyListeners();
       }
     } catch (e) {
@@ -2502,8 +2846,17 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  /// 用量 / 上下文压力 / goal。
-  Future<void> fetchSessionStats() async {
+  /// 用量 / 上下文压力 / goal。带 [_sessionLoadSeq] 守卫。
+  ///
+  /// [endOfTurn] 为 true 表示这是 `done` 之后为了量"本轮消耗"补的一次读：
+  /// 拿到实时值后记下 `本轮 = 新值 − 回合开始前的基线`，并把基线**推进**到新值。
+  ///
+  /// 为什么基线不能在 `done` 那一帧就地设置：`done` 时手里还是**回合开始前**的
+  /// 读数，拿它做基线再相减就是 `total - total = 0` —— 而 0 是面板最不能显示的
+  /// 值（用户读成"这轮没花钱"）。所以基线只在**回合开始的上升沿**记，`done` 之后
+  /// 再取一次终值来相减，量到的结果存进 [_measuredTurnTokens]。
+  Future<void> fetchSessionStats({bool endOfTurn = false}) async {
+    final seq = _sessionLoadSeq;
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return;
     try {
@@ -2511,11 +2864,21 @@ class DshService extends ChangeNotifier {
           .replace(queryParameters: {'sessionId': sessionId});
       final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return;
+      if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final stats = data['stats'];
         if (stats is Map) {
-          _sessionStats = SessionStats.fromJson(Map<String, dynamic>.from(stats));
+          final parsed = SessionStats.fromJson(Map<String, dynamic>.from(stats));
+          _sessionStats = parsed;
+          if (endOfTurn) {
+            _measuredTurnTokens = SessionStats.turnDelta(baseline: _statsBaselineTokens, now: parsed);
+            _hasMeasuredTurn = true;
+            // 基线推进到本回合终值：下一次相减只覆盖下一个回合。
+            if (parsed.isLive && parsed.totalTokens != null) {
+              _statsBaselineTokens = parsed.totalTokens;
+            }
+          }
           notifyListeners();
         }
       }
@@ -2524,16 +2887,64 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  /// 一次拉齐任务中心的全部数据（页面进入 / 下拉刷新）。
-  Future<void> refreshTaskCenter() async {
-    await Future.wait([
-      fetchDeliverables(),
-      fetchWorkspaceChanges(),
-      fetchSchedules(),
-      fetchJobs(),
-      fetchSessionStats(),
-      fetchQueue(),
-    ]);
+  // ---- 会话洞察的三档加载 ----
+  //
+  // 分档的依据是**每一条请求的真实成本**（按服务端实现读出来的，不是猜的）：
+  //
+  //   本地投影读（不跨进程）          `session/stats`、`sessions/queue`
+  //   一次 MUX RPC                    `deliverables`（session/page 200 条）、`schedules`
+  //   一个 git 子进程                 `workspace/changes`
+  //   流 RPC + 等首帧 + 5s 超时       `jobs`
+  //
+  // 旧实现是"进任务页就 `Future.wait` 全部六个"，等于把最贵的两个放在最频繁的
+  // 动作上。现在：进会话拉便宜的，紧接补状态条要的两个，最贵的两个只在用户
+  // 真的打开面板时才拉。**全程零 Timer**。
+
+  /// 第一档：进会话立即。两个都是本地投影读。
+  Future<void> fetchSessionOverview() async {
+    await Future.wait([fetchSessionStats(), fetchQueue()]);
+  }
+
+  /// 第二档：进会话后紧接一次、可取消（会话切走就不继续为旧会话跑 git）。
+  ///
+  /// 这两个决定状态条上的 `产出 N` / `改动 N`，必须在进会话后不久就正确 ——
+  /// 否则用户又得跳出去看。但它们比第一档贵，所以不参与首帧。
+  Future<void> fetchSessionSecondary() async {
+    final seq = _sessionLoadSeq;
+    await fetchDeliverables();
+    if (seq != _sessionLoadSeq) return;
+    await fetchWorkspaceChanges();
+  }
+
+  /// 第三档：**只在信息面板打开时**拉（面板的 `onRefresh` 也用它）。
+  Future<void> fetchSessionExtras() async {
+    await Future.wait([fetchJobs(), fetchSchedules()]);
+  }
+
+  /// 下载交付物并交给系统应用打开。
+  ///
+  /// 返回空串表示成功，否则是给用户看的失败说明 —— 由卡片/面板**内联**显示，
+  /// 不用会自己消失的 SnackBar。
+  ///
+  /// 走原生通道而不是"写入 App 私有目录再给个路径"：Android 上文件要被外部应用
+  /// 打开必须过 FileProvider，而缓存目录只有原生侧知道。字节在这里读齐（带鉴权头），
+  /// 原生只负责落盘 + 拉起 Intent。
+  ///
+  /// `item.path` 必须是 REST 返回的**绝对路径**：下载路由按绝对路径做精确成员
+  /// 判定，用 WS 帧里的相对路径会被判 403。
+  Future<String> openDeliverable(DeliverableItem item) async {
+    final uri = deliverableUrl(item);
+    if (uri == null) return '当前没有可用的网关配置';
+    try {
+      final res = await _httpClient.get(uri, headers: _authHeaders).timeout(const Duration(seconds: 60));
+      if (res.statusCode != 200) return '下载失败 (HTTP ${res.statusCode})';
+      final ok = await FileOpener.openBytes(item.fileName, res.bodyBytes);
+      if (!ok) return '已下载，但没有应用能打开 ${item.fileName}';
+      return '';
+    } catch (e) {
+      debugPrint('[DshService] openDeliverable error: $e');
+      return '下载失败: $e';
+    }
   }
 
   // ---- 离线推送（ntfy）配置 ----
@@ -2695,6 +3106,7 @@ class DshService extends ChangeNotifier {
             _isCanceling = false;
             _sessionPollTimer?.cancel();
             _sessionPollTimer = null;
+            _turnRunningSeen = false;
             if (_messages.isNotEmpty && _messages.last.isAssistant) {
               _messages.last.isStreaming = false;
               for (final t in _messages.last.tools) {
@@ -2704,6 +3116,16 @@ class DshService extends ChangeNotifier {
           } else {
             if (_activeTurnSeq > _cancelledTurnSeq && !_isCanceling) {
               _isSending = true;
+            }
+            // 回合开始的**上升沿**：记下"开始前"的累计读数，作为本轮消耗的基线。
+            //
+            // 必须做上升沿判断：一个回合里 `session_status(isRunning:true)` 会被
+            // 广播多次（每一步都可能重发），每次都覆盖基线会把基线推进到回合中途，
+            // 算出来的"本轮消耗"偏小。也绝不在这里取"终止值"——那个值要等 `done`
+            // 之后由 fetchSessionStats(endOfTurn: true) 去取。
+            if (!_turnRunningSeen) {
+              _turnRunningSeen = true;
+              _captureStatsBaseline();
             }
           }
           changed = true;
@@ -3016,7 +3438,7 @@ class DshService extends ChangeNotifier {
         return;
       }
 
-      // 10.5 交付物与工作区变更（v1.13）：网关只推一个信号，数据按需拉。
+      // 10.5 交付物与工作区变更：网关只推一个信号，数据按需拉。
       //
       // 交付物里可能有几十 MB 的文件，绝不可能内联进 WS 帧；变更清单要跑 git，
       // 也不该由每次事件触发。所以事件只负责说"变了"，真正的读取走 REST。
@@ -3024,9 +3446,19 @@ class DshService extends ChangeNotifier {
         final sId = json['sessionId']?.toString() ?? '';
         if (_currentSession == null || !_currentSession!.matchesSessionId(sId)) return;
         if (type == 'deliverables') {
+          // 交付物必须**立刻**拉：用户此刻正等着文件，"产出 N" 和流内卡片都要它。
+          // 同时记一次事件 —— 流内卡片只认这个计数，不认"清单非空"。
+          _deliverableEvents++;
+          notifyListeners();
           unawaited(fetchDeliverables());
         } else {
-          unawaited(fetchWorkspaceChanges());
+          // 变更只置脏，统一在 `done` 拉一次。
+          //
+          // 两个理由：① 这个事件在一轮里可能来好几次，而每次都要起一个 git
+          // 子进程；② 更要紧的是轮内的 git 状态会随 agent 写文件中途抖动，
+          // 此刻的数字没有意义。一轮一次，且发生在轮末 —— 正是"本次变更"有意义
+          // 的时刻。
+          _changesDirty = true;
         }
         return;
       }
@@ -3082,10 +3514,22 @@ class DshService extends ChangeNotifier {
         _isSending = false;
         _isCanceling = false;
         _streamRevision++;
+        // 回合结束了：本轮的基线使命结束（`_turnRunningSeen` 复位，等下一个回合
+        // 的上升沿重新记基线）。
+        _turnRunningSeen = false;
         notifyListeners();
         fetchWorkspaces();
-        // 一轮结束会领取（claim）队首消息：队列真值变了，刷新它（v1.13）。
+        // 一轮结束会领取（claim）队首消息：队列真值变了，刷新它。
         unawaited(fetchQueue());
+        // 本轮消耗要在**轮末**量：这里补一次 stats 的实时读，拿它与回合开始前的
+        // 基线相减，结果存进 lastTurnTokens。不能在 done 这一帧就地设基线 ——
+        // 那会算出 0（见 fetchSessionStats 的注释）。
+        unawaited(fetchSessionStats(endOfTurn: true));
+        // 本轮改过工作区的话，轮末补一次变更清单（一轮最多一个 git 子进程）。
+        if (_changesDirty) {
+          _changesDirty = false;
+          unawaited(fetchWorkspaceChanges());
+        }
         return;
       }
 

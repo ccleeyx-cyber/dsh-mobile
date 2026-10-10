@@ -19,6 +19,9 @@ import 'widgets/question_card.dart';
 import 'widgets/attachment_tile.dart';
 import 'widgets/message_search.dart';
 import 'widgets/message_search_panel.dart';
+import 'widgets/session_status_strip.dart';
+import 'widgets/session_info_sheet.dart';
+import 'widgets/turn_output_card.dart';
 import 'config_page.dart';
 import '../theme/app_colors.dart';
 import '../main.dart';
@@ -38,6 +41,39 @@ enum _HoldTalkPhase {
 
   /// 已识别、等确认：文本在输入框里（可改），下方是「重录 / 发送」。
   confirm,
+}
+
+/// 输入卡片上方那条提示上附带的动作。
+///
+/// 只有"安全方向"的动作才在这里：撤回刚排进去的那条（一次点击即撤，不需要
+/// 二次确认 —— 撤回是往回收，多余的一次确认只会让人撤回不掉）、以及失败后重试。
+enum _NoticeAction {
+  none,
+
+  /// 「撤回」：把刚排队的那一条从队列里删掉。需要该提示的 `undoItemId`。
+  undoQueue,
+
+  /// 「重试」：正文已经被放回输入框，重试即再发一次。
+  retrySend,
+}
+
+/// 输入卡片上方的一条提示（v1.14）。
+///
+/// 排队回执 / 插话结果 / 失败回滚说明共用这一处：它们表达的永远是同一件事
+/// ——"刚才那次投递发生了什么"，同一时刻只可能有一件。放在输入卡片**顶部**
+/// 而不是 SnackBar：失败时用户写的内容还在输入框里，提示必须和它挨着。
+class _ComposerNotice {
+  final String text;
+  final bool ok;
+  final _NoticeAction action;
+  final String? undoItemId;
+
+  const _ComposerNotice({
+    required this.text,
+    this.ok = true,
+    this.action = _NoticeAction.none,
+    this.undoItemId,
+  });
 }
 
 class ChatView extends StatefulWidget {
@@ -62,6 +98,33 @@ class _ChatViewState extends State<ChatView> {
   bool _showScrollToBottom = false;
   int _lastMessageCount = 0;
   bool _wasLoadingHistory = false;
+
+  // ---- 会话洞察（v1.14）：状态条 / 信息面板 / 本轮产出卡片 ----
+
+  /// 队列 dock 是否已被用户就地展开（超过 3 条时才用得上）。
+  bool _queueExpanded = false;
+
+  /// 已经为哪些会话"看过"交付物（会话 id → 当时的交付物数量）。
+  ///
+  /// 状态条上的"产出"在有新东西且用户还没打开面板时用强调色。只放内存、
+  /// 不落盘：重开 App 后再强调一次无害，而落盘会引入一个需要清理的持久状态。
+  final Map<String, int> _deliverablesAck = {};
+
+  /// 上一次观察到的"交付物事件"计数。用它判断"**刚刚**交付了"——
+  /// 进会话时补拉到的旧产出不算刚刚（那属于状态，去信息面板看）。
+  int _lastSeenDeliverableEvents = 0;
+
+  /// 「本轮产出」卡片锚定的消息索引：事件到达那一刻最后一条消息的位置。
+  /// -1 = 没有可显示的卡片。
+  int _outputCardAnchorIndex = -1;
+
+  /// 正在下载的交付物路径（内联转圈）与失败说明（内联红字，不用 SnackBar）。
+  ///
+  /// 用 `ValueNotifier` 而不是普通字段：同一个"正在下载的是哪一个"要同时驱动
+  /// 消息流里的卡片和**信息面板那一层模态**（模态是另一棵子树，不会跟着
+  /// ChatView 的 setState 重建）。
+  String? _deliverableError;
+  final ValueNotifier<String?> _deliverableBusy = ValueNotifier<String?>(null);
 
   // ---- 会话内查找 (v1.4.2) ----
   final TextEditingController _searchController = TextEditingController();
@@ -108,11 +171,77 @@ class _ChatViewState extends State<ChatView> {
   /// 一个递增计数在单个页面生命周期内就足够唯一。
   String _nextAttachmentId() => 'att-${++_attachSeq}';
 
+  // ---- 运行中投递（v1.14）----
+  //
+  // 语义：**会话进行中发消息 = 默认排队**，由引擎在这一轮跑完后自动发送；
+  // 要立刻插进正在跑的回合，唯一的入口是队列条目上的「立即插话」，并且要
+  // **再点一次**确认。投递方式不再是能被记住的开关 —— 一个能被记住的开关
+  // 会让"默认"在下次变成插话（用户不会记得它停在哪一格）。
+
+  /// 输入卡片上方那一条提示（排队回执 / 插话结果 / 失败说明）。
+  ///
+  /// 与 `_toast` 分开：`_toast` 走 SnackBar，会被下一条 toast 顶掉且 2 秒消失，
+  /// 而"你刚写的一大段话没发出去"这种事必须留在原地让用户看见。
+  late final ValueNotifier<_ComposerNotice?> _notice = ValueNotifier(null);
+  Timer? _noticeTimer;
+
+  /// 已武装（等第二次点击确认）的队列条目 id。非空 = 该行按钮显示「确认插话？」。
+  String? _armedSteerItemId;
+  Timer? _steerArmTimer;
+
+  /// 「立即插话」的第二次点击等待时长。
+  ///
+  /// 2.5 秒：够完成"看一眼按钮变了、再点一次"的确认动作，又短到不会一直挂着
+  /// 一个危险状态。超时自动还原，不产生任何副作用。
+  static const Duration _steerConfirmWindow = Duration(milliseconds: 2500);
+
+  void _showNotice(
+    String text, {
+    bool ok = true,
+    _NoticeAction action = _NoticeAction.none,
+    String? undoItemId,
+    Duration duration = const Duration(seconds: 5),
+  }) {
+    _noticeTimer?.cancel();
+    _notice.value = _ComposerNotice(
+      text: text,
+      ok: ok,
+      action: action,
+      undoItemId: undoItemId,
+    );
+    _noticeTimer = Timer(duration, () {
+      if (mounted) _notice.value = null;
+    });
+  }
+
+  void _clearNotice() {
+    _noticeTimer?.cancel();
+    _noticeTimer = null;
+    _notice.value = null;
+  }
+
+  /// 退出"待确认插话"状态（超时、点了别处、或已真正执行）。
+  void _disarmSteer() {
+    _steerArmTimer?.cancel();
+    _steerArmTimer = null;
+    if (_armedSteerItemId != null) {
+      setState(() => _armedSteerItemId = null);
+    }
+  }
+
   /// 测试用：直接挂一个附件，绕开原生选择器（单测里调不起来）。
   @visibleForTesting
   void debugAddPendingAttachment(PendingAttachment attachment) {
     setState(() => _pendingAttachments.add(attachment));
   }
+
+  /// 测试用：读取输入卡片上方那条提示的文案（没有提示时为 null）。
+  @visibleForTesting
+  String? get debugNoticeText => _notice.value?.text;
+
+  /// 测试用：当前处于"待确认插话"的条目 id。
+  @visibleForTesting
+  String? get debugArmedSteerItemId => _armedSteerItemId;
 
   void _toggleSearch() {
     setState(() {
@@ -249,6 +378,10 @@ class _ChatViewState extends State<ChatView> {
     _scrollController.removeListener(_onScroll);
     _holdTick?.cancel();
     _holdWatchdog?.cancel();
+    _noticeTimer?.cancel();
+    _steerArmTimer?.cancel();
+    _notice.dispose();
+    _deliverableBusy.dispose();
     // 正在录音时被销毁（切会话/返回）：必须主动取消识别，否则麦克风会被一直
     // 占着，下一次识别会以"被其他应用占用"失败。
     if (_holdPhase != _HoldTalkPhase.idle) {
@@ -397,9 +530,12 @@ class _ChatViewState extends State<ChatView> {
     setState(() => _pendingAttachments.clear());
 
     if (dsh.isSessionRunning) {
-      // agent 正在跑：这条消息按用户选的模式投递（排队/插话），**不**插入本地
-      // 乐观气泡 —— 队列与回合真值都以服务端为准，插一份本地副本只会在引擎
-      // 回传后变成两条。
+      // agent 正在跑：这条消息**排队**（等本轮结束后由引擎自动续发），且**不**
+      // 插入本地乐观气泡 —— 队列与回合真值都以服务端为准，插一份本地副本只会
+      // 在引擎回传后变成两条。
+      //
+      // 要立刻插进正在跑的回合，入口只有队列条目上的「立即插话」，那里要再点
+      // 一次确认。这里没有第二含义（v1.14 删掉了"排队/插话"开关）。
       unawaited(_deliverWhileRunning(dsh, text, outgoing));
     } else {
       dsh.sendChatMessage(text, attachments: outgoing);
@@ -407,20 +543,33 @@ class _ChatViewState extends State<ChatView> {
     _scrollToBottom();
   }
 
-  /// 运行中投递：失败必须把内容还回来。
+  /// 运行中投递（恒为排队）：失败必须把内容还回来。
   ///
   /// 输入框已经清空了（乐观清空是为了让连续发送手感正常），所以失败时要把
   /// 正文和附件放回输入框，否则用户写的东西直接消失。
+  ///
+  /// 成功/失败都用输入卡片上方的**原地提示条**而不是 `_toast`：失败时提示
+  /// 必须和"还回来的正文"待在一起，而 SnackBar 会被下一条 toast 顶掉、2 秒后
+  /// 消失 —— 用户可能完全没看见就丢了内容。
   Future<void> _deliverWhileRunning(
     DshService dsh,
     String text,
     List<PendingAttachment> attachments,
   ) async {
-    final mode = dsh.deliveryMode;
+    // 队列快照：用它算出"这次调用新增的那一条"，撤回才有准确目标。
+    final before = dsh.queueItems.map((q) => q.id).toSet();
     final ok = await dsh.deliverWhileRunning(text, attachments: attachments);
     if (!mounted) return;
     if (ok) {
-      _toast(mode == 'steer' ? '已插话发送' : '已加入队列');
+      // 新增的那一条就是刚落进队列的这条消息。取不到（比如它已被瞬间领取、
+      // 或队列暂时读不到）就不显示「撤回」—— 宁可不给这个按钮，也不能让用户
+      // 撤回掉另一条别人的消息。
+      final added = dsh.queueItems.where((q) => !before.contains(q.id)).toList();
+      _showNotice(
+        '已排队 · 本轮结束后自动发送',
+        action: added.isEmpty ? _NoticeAction.none : _NoticeAction.undoQueue,
+        undoItemId: added.isEmpty ? null : added.last.id,
+      );
       _scrollToBottom();
       return;
     }
@@ -429,7 +578,7 @@ class _ChatViewState extends State<ChatView> {
     setState(() => _pendingAttachments
       ..clear()
       ..addAll(attachments));
-    _toast('发送失败，内容已还回输入框');
+    _showNotice('排队失败，内容已放回输入框', ok: false, action: _NoticeAction.retrySend);
   }
 
   /// 选取并挂载附件（§4.2）。
@@ -1466,13 +1615,32 @@ class _ChatViewState extends State<ChatView> {
     _lastStreamContentLength = currentContentLen;
 
     if (currentSessionId != _lastSessionId) {
+      final previousSessionId = _lastSessionId;
       _lastSessionId = currentSessionId;
       _lastMessageCount = dsh.messages.length;
       _lastStreamRevision = dsh.streamRevision;
       _userScrolledUp = false;
-      // 切会话时换草稿（v1.4.2）。先把当前输入框里的字存进它所属的会话，再读
-      // 新会话的 —— 顺序反了就会把上一个会话的字写进新会话。
-      dsh.updateDraft(_inputController.text);
+      // 会话级的界面状态跟着切：队列展开态、产出卡片锚点、失败提示。
+      _queueExpanded = false;
+      _outputCardAnchorIndex = -1;
+      _lastSeenDeliverableEvents = dsh.deliverableEventCount;
+      _deliverableBusy.value = null;
+      _deliverableError = null;
+      // 切会话时换草稿（v1.4.2）。
+      //
+      // ⚠️ 两个坑，改动前都真实存在（v1.14 修）：
+      //
+      // 1) **不能**在这里调 `dsh.updateDraft(...)`。它的键是"当前会话"，而此刻
+      //    `_currentSession` 已经是**新**会话了 —— 等于把旧会话的正文写进新会话的
+      //    草稿槽。后果是：切回旧会话时输入框被它自己的旧草稿（往往是空的）覆盖，
+      //    用户刚打的字凭空消失；而那半句话则悄悄出现在新会话的输入框里。
+      //    所以这里按**上一个会话的 id** 显式写回它自己的槽位。
+      // 2) **首次进入不能写**。`_lastSessionId` 从 null 变成首个会话时，输入框
+      //    必然是空的，写进去等于把这个会话已存的草稿用空串清掉（`DraftStore.write`
+      //    收到空串就是删除）。
+      if (previousSessionId != null && previousSessionId != currentSessionId) {
+        dsh.drafts.write(previousSessionId, _inputController.text);
+      }
       final restored = dsh.currentDraft;
       _inputController.text = restored;
       _inputController.selection = TextSelection.collapsed(offset: restored.length);
@@ -1496,15 +1664,53 @@ class _ChatViewState extends State<ChatView> {
     }
     _wasLoadingHistory = dsh.isLoadingHistory;
 
+    // 「本轮产出」卡片（v1.14）：**由事件驱动**，不是由"清单里有东西"驱动。
+    //
+    // 差别是实质性的：进会话时补拉到的旧交付物属于**状态**（它该出现在状态条的
+    // "产出 N"和信息面板里），若把这份清单直接渲染到消息流尾部，它会冒充"刚刚
+    // 交付"，而它可能来自好几轮以前。所以锚点在**收到 deliverables 事件**那一刻
+    // 才设置；随后 REST 结果回来就把卡片渲染出来。
+    //
+    // 位置放在会话切换判断**之后**：否则"切会话"与"事件到达"落在同一帧时，
+    // 会话切换块会把刚设好的锚点清掉 —— 顺序反过来的话就是一帧的随机性。
+    final deliverableEvents = dsh.deliverableEventCount;
+    if (deliverableEvents != _lastSeenDeliverableEvents) {
+      _lastSeenDeliverableEvents = deliverableEvents;
+      _outputCardAnchorIndex = dsh.messages.isEmpty ? -1 : dsh.messages.length - 1;
+    }
+    // 卡片只在"那条 assistant 消息仍然是最后一条"时显示：用户一旦发出下一条
+    // 消息（乐观插入用户气泡），锚点就对不上，卡片自动消失 —— 那时它已经不是
+    // "刚刚发生的事"，常驻记录在信息面板里。
+    final showTurnOutput = _outputCardAnchorIndex >= 0 &&
+        dsh.messages.isNotEmpty &&
+        dsh.messages.length - 1 == _outputCardAnchorIndex &&
+        dsh.deliverables.isNotEmpty &&
+        !isStreaming;
+
     return Scaffold(
       backgroundColor: context.c.surfaceMuted,
       appBar: AppBar(
         backgroundColor: context.c.surface,
         elevation: 0,
         scrolledUnderElevation: 0,
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(1),
-          child: Container(color: context.c.border, height: 1),
+        // 顶部那两行（1px 分隔线）整体换成会话状态条（v1.14）。
+        //
+        // 它自己实现 `PreferredSizeWidget`，所以高度由它内部算：有内容 34dp、
+        // 什么都不显示时只留那条 1px 分隔线 —— 不需要这里手工算高度，也就不会
+        // 出现"顶部留了一条空白带"这种布局残留。
+        //
+        // 为什么状态放**顶部**而不是输入框上方：键盘弹起时输入框上方那块空间被
+        // 压到最紧，而这里不参与压缩，打字时"执行中 / 产出 / 上下文"依然可读。
+        bottom: SessionStatusStrip(
+          isRunning: isSessionRunning,
+          deliverableCount: dsh.deliverableCount,
+          deliverablesUnread: _deliverablesUnread(dsh),
+          changeCount: dsh.changeCount,
+          changesUnavailable: dsh.changesUnavailable,
+          contextFraction: dsh.sessionStats?.contextFraction,
+          contextIsSnapshot: dsh.sessionStats?.isSnapshot ?? false,
+          liveJobCount: _liveJobCount(dsh),
+          onTapSection: (section) => _openSessionInfo(dsh, section: section),
         ),
         titleSpacing: 12,
         title: Row(
@@ -1925,7 +2131,7 @@ class _ChatViewState extends State<ChatView> {
                             physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                             keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
                             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                            itemCount: dsh.messages.length + activeApprovals.length,
+                            itemCount: dsh.messages.length + activeApprovals.length + (showTurnOutput ? 1 : 0),
                             itemBuilder: (context, index) {
                               // 1. Messages first (historical and streaming assistant response)
                               if (index < dsh.messages.length) {
@@ -1959,13 +2165,25 @@ class _ChatViewState extends State<ChatView> {
 
                               // 2. Pending approvals appended at the end of active chat stream
                               final approvalIndex = index - dsh.messages.length;
-                              final req = activeApprovals[approvalIndex];
-                              return Padding(
-                                padding: const EdgeInsets.only(top: 8, bottom: 12),
-                                child: ApprovalCard(
-                                  request: req,
-                                  onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
-                                ),
+                              if (approvalIndex < activeApprovals.length) {
+                                final req = activeApprovals[approvalIndex];
+                                return Padding(
+                                  padding: const EdgeInsets.only(top: 8, bottom: 12),
+                                  child: ApprovalCard(
+                                    request: req,
+                                    onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
+                                  ),
+                                );
+                              }
+
+                              // 3. 「本轮产出」卡片：事件进流那一半 —— 交付物出现在
+                              // 交付它的那一轮之后（见 build 里锚点的说明）。
+                              return TurnOutputCard(
+                                deliverables: dsh.deliverables,
+                                busyPath: _deliverableBusy.value,
+                                errorText: _deliverableError,
+                                onOpen: (item) => _openDeliverable(dsh, item),
+                                onShowAll: () => _openSessionInfo(dsh, section: SessionInsightSection.deliverables),
                               );
                             },
                           ),
@@ -2709,6 +2927,137 @@ class _ChatViewState extends State<ChatView> {
   ///
   /// 操作行的顺序按使用频率从右往左递减：发送最右（拇指最容易够到），
   /// 然后语音、模型、添加。
+  /// 会话洞察的会话键（去掉 `session-` 前缀，读写两侧用同一个形态）。
+  String _ackKey(DshService dsh) {
+    final sid = dsh.currentSession?.sessionId ?? '';
+    return sid.replaceFirst('session-', '');
+  }
+
+  /// 有"还没被看过"的新产出 → 状态条那一段用强调色。
+  ///
+  /// 未知（`deliverableCount == null`，还没拉到）不算未读：不能因为"不知道"
+  /// 就把用户的注意力吸走。
+  bool _deliverablesUnread(DshService dsh) {
+    final total = dsh.deliverableCount;
+    if (total == null || total == 0) return false;
+    final acked = _deliverablesAck[_ackKey(dsh)];
+    return acked == null || total > acked;
+  }
+
+  /// 还在跑的后台作业数。
+  ///
+  /// 网关降级（读不到作业列表）时返回 null —— 状态条据此**隐藏**这一段，而不是
+  /// 显示"0 个作业"（那会被读成"没有作业在跑"）。
+  int? _liveJobCount(DshService dsh) {
+    if (dsh.jobsDegraded.isNotEmpty) return null;
+    return dsh.jobs.where((j) => j.isLive).length;
+  }
+
+  /// 上下文压力告警（**只在跨过阈值时**才占空间）。
+  ///
+  /// 触发条件里带 `isLive`：投影缓存快照可能落后几个小时，拿它去催用户
+  /// "该新开会话了"是在用旧数据催一个不可逆的决定。
+  Widget _buildContextPressureRow(DshService dsh) {
+    final stats = dsh.sessionStats;
+    final fraction = stats?.contextFraction;
+    if (stats == null || !stats.isLive || fraction == null) return const SizedBox.shrink();
+    if (fraction < SessionStatusStrip.pressureCriticalThreshold) return const SizedBox.shrink();
+
+    final pct = (fraction * 100).round();
+    return Container(
+      key: const ValueKey('context-pressure-row'),
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.fromLTRB(8, 4, 4, 4),
+      decoration: BoxDecoration(
+        color: context.c.dangerSurface,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: context.c.dangerBorder),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.warning_amber_rounded, size: 15, color: context.c.danger),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              '上下文已用 $pct%，继续下去可能被截断',
+              style: TextStyle(fontSize: 11.5, color: context.c.danger),
+            ),
+          ),
+          TextButton(
+            onPressed: () => dsh.createNewSession(),
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            child: Text('新开会话', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: context.c.danger)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 打开会话信息面板：状态条的任意一段、卡片的"查看全部"、以及输入框上方的
+  /// 上下文告警都走这里。
+  ///
+  /// 打开时先发一次第三档加载（`jobs` + `schedules` —— 全链路最贵的两个请求，
+  /// 只在用户明确要看的时候拉）；面板自己也会在首帧后调一次 `onRefresh`，
+  /// 所以这里不重复发，只负责把"看过产出"这件事记下来。
+  Future<void> _openSessionInfo(DshService dsh, {SessionInsightSection section = SessionInsightSection.usage}) async {
+    _deliverablesAck[_ackKey(dsh)] = dsh.deliverableCount ?? 0;
+    if (mounted) setState(() {});
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: context.c.surface,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      // 面板里的数据是**会话域**的，随时可能被事件刷新（例如作业列表刚拉回来），
+      // 所以让它在自己的路由里订阅一次 DshService —— 否则弹层会冻结在打开那一刻
+      // 的快照上，懒加载的结果永远看不见。
+      builder: (_) => Consumer<DshService>(
+        builder: (_, d, __) => ValueListenableBuilder<String?>(
+          valueListenable: _deliverableBusy,
+          builder: (_, busyPath, __) => SessionInfoSheet(
+            stats: d.sessionStats,
+            turnBurnTokens: d.lastTurnTokens,
+            deliverables: d.deliverables,
+            changes: d.workspaceChanges,
+            changesAvailable: d.workspaceChangesAvailable,
+            changesReason: d.workspaceChangesReason,
+            jobs: d.jobs,
+            jobsUnavailable: d.jobsDegraded.isNotEmpty,
+            schedules: d.schedules,
+            busyDeliverablePath: busyPath,
+            initialSection: section,
+            onOpenDeliverable: (item) => _openDeliverable(d, item),
+            onLoadDiff: d.fetchDiff,
+            onKillJob: (job) => d.killJob(job.id),
+            onDeleteSchedule: (s) => d.deleteSchedule(s.id),
+            onRefresh: d.fetchSessionExtras,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 下载交付物并交给系统打开；失败说明**内联**在卡片/面板里。
+  ///
+  /// `item.path` 必须是 REST 返回的绝对路径（下载路由按绝对路径做成员判定）。
+  Future<void> _openDeliverable(DshService dsh, DeliverableItem item) async {
+    if (_deliverableBusy.value != null) return; // 防重复点
+    setState(() {
+      _deliverableError = null;
+      _deliverableBusy.value = item.path;
+    });
+    final err = await dsh.openDeliverable(item);
+    if (!mounted) return;
+    setState(() {
+      _deliverableBusy.value = null;
+      _deliverableError = err.isEmpty ? null : err;
+    });
+  }
+
   Widget _buildInputBar(DshService dsh) {
     return Container(
       // 测试用来量输入栏的实际位置：键盘弹出后它的底边必须紧贴键盘顶边，
@@ -2731,6 +3080,18 @@ class _ChatViewState extends State<ChatView> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // 上下文告警（v1.14）：**只在跨过阈值时**出现。
+              //
+              // 输入框上方是"我要行动"的位置，而"上下文快满了"正是一个必须当场
+              // 做的决策（继续会被截断 / 该新开会话）。平时一行都不占 —— 常驻在
+              // 这里的信息会被键盘弹起时的压缩挤掉，也会挤掉真正要打字的空间。
+              _buildContextPressureRow(dsh),
+              // 运行中说明（v1.14）：把"你发的消息会排队"讲在**打字之前**。
+              // 放在提示条/队列面板之上 —— 它描述的是"这个输入框现在是什么含义"。
+              _buildRunningHint(dsh),
+              // 上一条排队消息的回执（可撤回）。放在队列面板之上：它讲的是
+              // "刚刚那一下发生了什么"，而队列讲的是"现在攒了些什么"。
+              _buildNotice(dsh),
               // 排队消息（v1.13）：agent 正在跑时你发出去的话先在这里等。
               // 放在输入卡片**内部**最上方：它是"这条队列属于这个输入框"，
               // 而不是另一块独立面板。
@@ -2866,22 +3227,40 @@ class _ChatViewState extends State<ChatView> {
                 // 确认态：识别结果已经在输入框里（可直接改字），这里给两个动作。
                 _buildHoldConfirmRow(dsh)
               else if (_holdPhase == _HoldTalkPhase.idle)
-                Row(
-                  children: [
-                    _buildComposerIcon(
-                      icon: Icons.add_rounded,
-                      tooltip: '添加图片或文件',
-                      highlighted: _pendingAttachments.isNotEmpty,
-                      onTap: () => _showAttachSheet(dsh),
-                    ),
-                    const Spacer(),
-                    _buildDeliveryModeChip(dsh),
-                    _buildModelPill(dsh),
-                    const SizedBox(width: 2),
-                    _buildMicButton(dsh),
-                    const SizedBox(width: 4),
-                    _buildSendButton(dsh),
-                  ],
+                LayoutBuilder(
+                  builder: (context, box) {
+                    // 这一行的横向空间永远是紧的：在 360dp 宽的手机上，固定宽度
+                    // 的模型胶囊会把整行顶出去（实测 317 > 316，溢出 1px）。
+                    // 所以胶囊的可读宽度按**剩余空间**算，而不是钉死一个常量。
+                    //
+                    // 预留：停止键 36（不显示时 0）+ 附件键 36 + 麦克风 44 +
+                    // 发送键 44 + 三处间隔 6 + 胶囊自身装饰（内边距/图标/箭头）
+                    // 47 + 4 的安全余量。
+                    final stopWidth = (dsh.isSending || dsh.isCanceling) ? 36.0 : 0.0;
+                    final reserved = 36.0 + 44.0 + 44.0 + 6.0 + 47.0 + 4.0;
+                    final textCap = (box.maxWidth - stopWidth - reserved).clamp(40.0, 104.0);
+                    return Row(
+                      children: [
+                        // 停止键固定在**最左**（v1.14）：它曾经和发送键抢同一个位置，
+                        // 于是"输入框被清空"（切会话、重录、草稿恢复）会在用户毫无输入
+                        // 动作的情况下把发送键变成停止键 —— 手一抖就取消掉自己正在跑的
+                        // 回合。位置分开之后，任何状态变化都不会改变任何按钮的含义。
+                        _buildStopButton(dsh),
+                        _buildComposerIcon(
+                          icon: Icons.add_rounded,
+                          tooltip: '添加图片或文件',
+                          highlighted: _pendingAttachments.isNotEmpty,
+                          onTap: () => _showAttachSheet(dsh),
+                        ),
+                        const Spacer(),
+                        _buildModelPill(dsh, maxTextWidth: textCap),
+                        const SizedBox(width: 2),
+                        _buildMicButton(dsh),
+                        const SizedBox(width: 4),
+                        _buildSendButton(dsh),
+                      ],
+                    );
+                  },
                 ),
             ],
           ),
@@ -3011,16 +3390,122 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
-  /// 排队消息面板（v1.13）。
+  /// 运行中说明（v1.14）：把"这条消息的含义变了"讲在用户打字**之前**。
   ///
-  /// 只读 + 三个动作（编辑 / 删除 / 插话），全部以服务端为准：每次动作后
-  /// 重新拉队列，绝不本地乐观删除 —— 网关失败时条目仍在队列里等待执行，
-  /// 界面上却把它抹掉，用户会以为已经撤回了。
+  /// 为什么必须有：上一版靠一枚"排队/插话"开关表达这件事，而开关只在回合跑起来
+  /// 之后才出现 —— 用户打字时看不到它，按发送时也未必看它，于是"这一条到底会排队
+  /// 还是插话"完全靠记忆。这里改成一句常驻说明：含义是不变的（永远排队），
+  /// 所以可以一直讲同一句话。
+  Widget _buildRunningHint(DshService dsh) {
+    if (!dsh.isSessionRunning) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6, left: 2, right: 2),
+      child: Row(
+        children: [
+          Icon(Icons.info_outline_rounded, size: 12, color: context.c.textTertiary),
+          const SizedBox(width: 5),
+          Expanded(
+            child: Text(
+              '本轮执行中 · 你发的消息会在本轮结束后自动发送',
+              style: TextStyle(fontSize: 11, color: context.c.textTertiary),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 输入卡片上方的原地提示条（v1.14）：排队回执 / 插话结果 / 失败回滚说明。
+  ///
+  /// 与 `_toast` 的分工：`_toast` 用 SnackBar，适合"知道了"这类说完就算的消息；
+  /// 这条提示承载的是"你刚写的东西去哪了"，必须留在原地、可撤回、可重试。
+  Widget _buildNotice(DshService dsh) {
+    return ValueListenableBuilder<_ComposerNotice?>(
+      valueListenable: _notice,
+      builder: (context, notice, _) {
+        if (notice == null) return const SizedBox.shrink();
+        final tone = notice.ok ? context.c.textSecondary : context.c.danger;
+        return Container(
+          key: const ValueKey('chat-notice'),
+          margin: const EdgeInsets.only(bottom: 6),
+          padding: const EdgeInsets.fromLTRB(8, 4, 4, 4),
+          decoration: BoxDecoration(
+            color: notice.ok ? context.c.surface : context.c.dangerSurface,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: notice.ok ? context.c.border : context.c.danger),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                notice.ok ? Icons.check_circle_outline_rounded : Icons.error_outline_rounded,
+                size: 14,
+                color: tone,
+              ),
+              const SizedBox(width: 5),
+              Expanded(
+                child: Text(
+                  notice.text,
+                  style: TextStyle(fontSize: 11.5, color: notice.ok ? context.c.textSecondary : context.c.danger),
+                ),
+              ),
+              if (notice.action != _NoticeAction.none)
+                _queueTextButton(
+                  key: const ValueKey('chat-notice-action'),
+                  label: notice.action == _NoticeAction.undoQueue ? '撤回' : '重试',
+                  onTap: () => _onNoticeAction(dsh, notice),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _onNoticeAction(DshService dsh, _ComposerNotice notice) {
+    switch (notice.action) {
+      case _NoticeAction.undoQueue:
+        final id = notice.undoItemId;
+        _clearNotice();
+        if (id != null) unawaited(_removeQueued(dsh, id, appliedText: '已撤回'));
+        break;
+      case _NoticeAction.retrySend:
+        _clearNotice();
+        _sendMessage(dsh);
+        break;
+      case _NoticeAction.none:
+        break;
+    }
+  }
+
+  /// 排队消息面板（v1.13；v1.14 改交互）。
+  ///
+  /// 两个动作（编辑 / 删除）+ 插话入口，全部以服务端为准：每次动作后重新拉队列，
+  /// 绝不本地乐观删除 —— 网关失败时条目仍在队列里等待执行，界面上却把它抹掉，
+  /// 用户会以为已经撤回了。
+  ///
+  /// 「立即插话」的位置是这一版的关键：它**只在队列条目上**，不在发送前。发送前
+  /// 要提供插话就只能靠一枚提前预设的开关（因为按下之前没有别的办法表达"我要插话"），
+  /// 而那正是"用户忘了开关停在哪"的根源。消息先排队、用户看见它排在队列里、
+  /// 再决定要不要让它插进去 —— 这是唯一顺序。
   Widget _buildQueueDock(DshService dsh) {
     final rows = dsh.queueItems;
-    if (rows.isEmpty && dsh.queueError.isEmpty) return const SizedBox.shrink();
+    // 队列可见性三态：读不到（已知失败）也要渲染，否则"路由坏了"会被静默当成
+    // "没有排队消息"（生产上真的发生过：GET queue 被通配路由吞掉）。
+    final unknown = dsh.queueKnown == false;
+    if (rows.isEmpty && dsh.queueError.isEmpty && !unknown) return const SizedBox.shrink();
+
+    final header = rows.isEmpty
+        ? (unknown ? '队列状态未知' : '排队消息')
+        : '${rows.length} 条排队中 · 本轮结束后自动发送';
+
+    // 展开态的上限：输入卡片是这条 Column 里唯一 Expanded（消息列表）的兄弟，
+    // 且**自身高度无上限** —— 20 条排队 × 约 66px 会直接把输入卡片顶出屏幕
+    // （RenderFlex 溢出）。所以就地展开必须限高 + 内部自己滚。
+    const double collapsedMax = 3 * 66.0;
+    const double expandedMax = 220;
 
     return Container(
+      key: const ValueKey('queue-dock'),
       margin: const EdgeInsets.only(bottom: 6),
       padding: const EdgeInsets.fromLTRB(8, 6, 6, 6),
       decoration: BoxDecoration(
@@ -3035,11 +3520,12 @@ class _ChatViewState extends State<ChatView> {
             children: [
               Icon(Icons.queue_rounded, size: 14, color: context.c.textSecondary),
               const SizedBox(width: 5),
-              Text(
-                rows.isEmpty ? '排队消息' : '${rows.length} 条排队消息',
-                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: context.c.textSecondary),
+              Expanded(
+                child: Text(
+                  header,
+                  style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: context.c.textSecondary),
+                ),
               ),
-              const Spacer(),
               if (dsh.queueLoading)
                 SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.6, color: context.c.textTertiary)),
             ],
@@ -3049,41 +3535,38 @@ class _ChatViewState extends State<ChatView> {
               padding: const EdgeInsets.only(top: 4),
               child: Text(dsh.queueError, style: TextStyle(fontSize: 11, color: context.c.danger)),
             ),
-          // 最多列 3 条：队列可能有十几条，全画出来会把输入框挤出屏幕 ——
-          // 而输入框才是这一块的主角。剩下的去「任务」页看。
-          for (final row in rows.take(3))
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Row(
+          // 折叠时最多列 3 条：队列可能有十几条，全画出来会把输入框挤出屏幕 ——
+          // 而输入框才是这一块的主角。
+          //
+          // 溢出不再跳转到别的页面（那个页面已经删除）：**点一下就地把这个面板
+          // 展开**，仍然限高（220）+ 内部滚动，所以既看得到全部，又不会把输入框
+          // 顶出屏幕。
+          ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: _queueExpanded ? expandedMax : collapsedMax),
+            child: SingleChildScrollView(
+              child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Expanded(
-                    child: Text(
-                      row.label,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 12.5, color: context.c.textPrimary),
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  _queueIconButton(Icons.edit_outlined, '编辑', () => _editQueueRow(dsh, row)),
-                  _queueIconButton(Icons.close_rounded, '删除', () => _removeQueueRow(dsh, row)),
-                  _queueIconButton(
-                    Icons.bolt_rounded,
-                    '立即插话',
-                    // 插话只有在 agent 跑着的时候才有意义；不跑时按钮置灰，
-                    // 而不是点了之后由引擎回一个 steer-unavailable。
-                    dsh.isSessionRunning ? () => _steerQueueRow(dsh, row) : null,
-                  ),
+                  for (final row in (_queueExpanded ? rows : rows.take(3))) _buildQueueRow(dsh, row),
                 ],
               ),
             ),
+          ),
           if (rows.length > 3)
-            Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Text(
-                '还有 ${rows.length - 3} 条（在「任务」页查看全部）',
-                style: TextStyle(fontSize: 11, color: context.c.textTertiary),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton(
+                key: const ValueKey('queue-dock-toggle'),
+                onPressed: () => setState(() => _queueExpanded = !_queueExpanded),
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: Text(
+                  _queueExpanded ? '收起' : '还有 ${rows.length - 3} 条 · 展开全部',
+                  style: TextStyle(fontSize: 11, color: context.c.accent),
+                ),
               ),
             ),
         ],
@@ -3091,39 +3574,187 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
-  Widget _queueIconButton(IconData icon, String tooltip, VoidCallback? onTap) {
+  Widget _buildQueueRow(DshService dsh, QueueItem row) {
+    final armed = _armedSteerItemId == row.id;
+    return Padding(
+      key: ValueKey('queue-row-${row.id}'),
+      padding: const EdgeInsets.only(top: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Text(
+                  row.label,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 12.5, color: context.c.textPrimary),
+                ),
+              ),
+              const SizedBox(width: 8),
+              // 触摸区 36×36（旧版是 16px 图标 + 4px padding = 24px，与紧邻的
+              // 「删除」中心距只有 28px，误触会直接改掉正在跑的任务上下文）。
+              _queueIconButton(Icons.edit_outlined, '编辑', () => _editQueueRow(dsh, row), key: ValueKey('queue-edit-${row.id}')),
+              const SizedBox(width: 4),
+              _queueIconButton(Icons.close_rounded, '删除', () => _removeQueueRow(dsh, row), key: ValueKey('queue-remove-${row.id}')),
+            ],
+          ),
+          const SizedBox(height: 2),
+          if (dsh.isSessionRunning)
+            Row(
+              children: [
+                _queueTextButton(
+                  key: ValueKey('queue-steer-${row.id}'),
+                  label: armed ? '确认插话？' : '立即插话',
+                  // 第一次点击只"武装"，第二次才真的插进正在跑的回合。这条路径
+                  // 会改变 agent 当前的执行上下文，一次误触的代价是一整轮跑偏。
+                  onTap: () => _steerQueueRow(dsh, row),
+                  tone: armed ? context.c.warning : context.c.accent,
+                  filled: armed,
+                ),
+                if (armed) ...[
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      // 引擎的 steer 是插进**最近的步骤**（agent.steer），不会取消
+                      // 这一轮 —— 文案必须与真实语义一致，否则用户会以为任务要重跑。
+                      '会插进当前步骤，本轮不会重来',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 10.5, color: context.c.warning),
+                    ),
+                  ),
+                ],
+              ],
+            )
+          else
+            // 不可用时**给原因**，而不是一个点了没反应的死按钮。
+            Text(
+              '仅本轮运行中可插话发送',
+              style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _queueIconButton(IconData icon, String tooltip, VoidCallback? onTap, {Key? key}) {
     return Tooltip(
       message: tooltip,
       child: InkWell(
+        key: key,
         onTap: onTap,
         borderRadius: BorderRadius.circular(6),
-        child: Padding(
-          padding: const EdgeInsets.all(4),
-          child: Icon(
-            icon,
-            size: 16,
-            color: onTap == null ? context.c.textTertiary : context.c.textSecondary,
+        child: SizedBox(
+          width: 36,
+          height: 36,
+          child: Center(
+            child: Icon(
+              icon,
+              size: 17,
+              color: onTap == null ? context.c.textTertiary : context.c.textSecondary,
+            ),
           ),
         ),
       ),
     );
   }
 
-  Future<void> _removeQueueRow(DshService dsh, QueueItem row) async {
-    HapticFeedback.selectionClick();
-    final ok = await dsh.queueAction(row.id, 'remove');
-    if (!mounted) return;
-    if (!ok) _toast(dsh.queueError.isEmpty ? '删除失败' : dsh.queueError);
+  /// 队列条目上的文字按钮（v1.14）。
+  ///
+  /// 用文字而不是图标：⚡ 这种图标没有语义，而且同一个图标在发送键上已经被用过
+  /// 一次（两个含义）；文字按钮的触摸区天然达标，也不用靠 Tooltip 解释自己。
+  Widget _queueTextButton({
+    required String label,
+    required VoidCallback onTap,
+    Color? tone,
+    bool filled = false,
+    Key? key,
+  }) {
+    final color = tone ?? context.c.accent;
+    return InkWell(
+      key: key,
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+        decoration: BoxDecoration(
+          color: filled ? color : Colors.transparent,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: color.withOpacity(filled ? 1.0 : 0.5)),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            color: filled ? Colors.white : color,
+          ),
+        ),
+      ),
+    );
   }
 
-  Future<void> _steerQueueRow(DshService dsh, QueueItem row) async {
-    HapticFeedback.mediumImpact();
-    final ok = await dsh.queueAction(row.id, 'steer');
+  /// 队列动作结束后的统一收敛。
+  ///
+  /// [QueueActionOutcome.alreadyGone] 必须**静默收敛**：那条消息已经被引擎领走，
+  /// 是正常时序（比如你点「立即插话」的同时这一轮刚好结束），报红错等于把本来
+  /// 就该发生的事说成故障。
+  void _settleQueueAction(
+    DshService dsh,
+    QueueActionOutcome outcome, {
+    required String appliedText,
+    required String failedText,
+  }) {
+    switch (outcome) {
+      case QueueActionOutcome.applied:
+        _showNotice(appliedText, duration: const Duration(seconds: 2));
+        break;
+      case QueueActionOutcome.alreadyGone:
+        _showNotice('这条已经发出去了', duration: const Duration(seconds: 2));
+        break;
+      case QueueActionOutcome.failed:
+        _showNotice(dsh.queueError.isEmpty ? failedText : dsh.queueError, ok: false);
+        break;
+    }
+  }
+
+  Future<void> _removeQueueRow(DshService dsh, QueueItem row) async {
+    HapticFeedback.selectionClick();
+    await _removeQueued(dsh, row.id, appliedText: '已删除');
+  }
+
+  /// 按 id 删除一条排队消息（删除按钮与回执条的「撤回」共用）。
+  Future<void> _removeQueued(DshService dsh, String itemId, {required String appliedText}) async {
+    final outcome = await dsh.queueAction(itemId, 'remove');
     if (!mounted) return;
-    _toast(ok ? '已插话发送' : (dsh.queueError.isEmpty ? '插话失败' : dsh.queueError));
+    _settleQueueAction(dsh, outcome, appliedText: appliedText, failedText: '删除失败');
+  }
+
+  /// 「立即插话」：第一次点击只进入待确认态，第二次才真的插话。
+  Future<void> _steerQueueRow(DshService dsh, QueueItem row) async {
+    if (_armedSteerItemId != row.id) {
+      HapticFeedback.selectionClick();
+      _steerArmTimer?.cancel();
+      setState(() => _armedSteerItemId = row.id);
+      _steerArmTimer = Timer(_steerConfirmWindow, () {
+        _steerArmTimer = null;
+        if (!mounted) return;
+        if (_armedSteerItemId == row.id) setState(() => _armedSteerItemId = null);
+      });
+      return;
+    }
+    _disarmSteer();
+    HapticFeedback.mediumImpact();
+    final outcome = await dsh.queueAction(row.id, 'steer');
+    if (!mounted) return;
+    _settleQueueAction(dsh, outcome, appliedText: '已插话发送', failedText: '插话失败');
   }
 
   Future<void> _editQueueRow(DshService dsh, QueueItem row) async {
+    _disarmSteer();
     final controller = TextEditingController(text: row.text);
     final next = await showDialog<String>(
       context: context,
@@ -3151,9 +3782,9 @@ class _ChatViewState extends State<ChatView> {
       _toast('内容不能为空');
       return;
     }
-    final ok = await dsh.queueAction(row.id, 'edit', text: next);
+    final outcome = await dsh.queueAction(row.id, 'edit', text: next);
     if (!mounted) return;
-    if (!ok) _toast(dsh.queueError.isEmpty ? '保存失败' : dsh.queueError);
+    _settleQueueAction(dsh, outcome, appliedText: '已保存', failedText: '保存失败');
   }
 
   /// 操作行里的图标按钮。
@@ -3191,7 +3822,10 @@ class _ChatViewState extends State<ChatView> {
   /// 从顶栏移到这里：它是"这条消息要发给谁"的设定，和输入内容属于同一个决策
   /// 单元，放在手边更顺手，也省掉顶栏一整行。顶栏那个胶囊随之去掉 —— 同一件事
   /// 不该在两处各显示一份。
-  Widget _buildModelPill(DshService dsh) {
+  ///
+  /// [maxTextWidth] 由操作行按剩余空间算出来（见 `_buildInputBar`）：手机上横向
+  /// 空间不足时先压缩模型名，而不是把整行顶出屏幕。
+  Widget _buildModelPill(DshService dsh, {double maxTextWidth = 104}) {
     final name = dsh.currentModel.replaceFirst('cn:', '');
     return InkWell(
       onTap: () => _showModelSwitchSheet(context, dsh),
@@ -3204,7 +3838,7 @@ class _ChatViewState extends State<ChatView> {
             Icon(Icons.smart_toy_outlined, size: 14, color: context.c.textSecondary),
             const SizedBox(width: 5),
             ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 104),
+              constraints: BoxConstraints(maxWidth: maxTextWidth),
               child: Text(
                 name,
                 style: TextStyle(fontSize: 12, color: context.c.textSecondary),
@@ -3219,122 +3853,120 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
+  /// 停止键（v1.14 起与发送键**彻底分家**）。
+  ///
+  /// 只在本机**正在跑**这一轮时出现，并且固定在操作行最左端 —— 它曾经和发送键
+  /// 抢同一个位置（空输入框 = 停止、有内容 = 发送），后果是：任何"输入框被清空"
+  /// 的路径（切会话恢复草稿、重录、恢复草稿）都会在用户毫无输入动作的情况下
+  /// 把发送键变成停止键，手一抖就取消掉自己正在跑的回合，还丢掉一整轮进度。
+  /// 位置分开之后，任何状态变化都不会改变任何按钮的含义。
+  ///
+  /// 判据必须是 `isSending`（本机发起），**不是** `isSessionRunning`：会话可能是
+  /// 电脑端发起、手机只是旁观，那时给一个停止键等于让手机去停别人的活。
+  Widget _buildStopButton(DshService dsh) {
+    if (dsh.isCanceling) {
+      return const SizedBox(
+        width: 36,
+        height: 36,
+        child: Center(
+          child: SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    if (!dsh.isSending) return const SizedBox.shrink();
+    return Tooltip(
+      message: '停止本轮',
+      child: InkWell(
+        key: const ValueKey('chat-stop-button'),
+        onTap: () {
+          HapticFeedback.mediumImpact();
+          dsh.cancelActiveTurn();
+        },
+        borderRadius: BorderRadius.circular(18),
+        child: Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            color: context.c.dangerSurface,
+            shape: BoxShape.circle,
+            border: Border.all(color: context.c.danger),
+          ),
+          child: Icon(Icons.stop_rounded, color: context.c.danger, size: 18),
+        ),
+      ),
+    );
+  }
+
   /// 发送键。
   ///
   /// * 没有可发的内容时**置灰且不可点** —— 上一版无论有没有文字都是亮着的，
   ///   点下去没反应，用户会以为卡住了。
-  /// * 运行中且输入框为空时是停止键：这时用户最想要的是"停下来"。
-  /// * 运行中且**有内容**时是发送键（按排队/插话投递）—— 两个意图不必抢
-  ///   同一个按钮：清空输入框就能停。
+  /// * 运行中它**还是发送键**（含义变成"排队"），不再变成停止键；角标上的数字
+  ///   是"已经排了几条"。含义的改变由输入框上方的常驻说明讲清楚，不靠按钮变脸。
   ///
   /// ⚠️ 整个判断必须包在 ValueListenableBuilder 里。最初把 `hasDraft` 写在
   /// 函数开头，而调用它的输入栏只在 DshService 通知时才重建 —— 用户敲字只
-  /// 触发 ValueListenableBuilder 这一小块重建，于是"敲了字按钮还是停止键"，
-  /// 点了就等于取消自己的回合。这个 bug 由 widget 测试抓到。
+  /// 触发 ValueListenableBuilder 这一小块重建，于是"敲了字按钮还是置灰"。
   Widget _buildSendButton(DshService dsh) {
     return ValueListenableBuilder<TextEditingValue>(
       valueListenable: _inputController,
       builder: (context, value, _) {
         final canSend = value.text.trim().isNotEmpty || _pendingAttachments.isNotEmpty;
-        if ((dsh.isSending || dsh.isCanceling) && !canSend) {
-          return SizedBox(
-            width: 44,
-            height: 44,
-            child: dsh.isCanceling
-                ? Padding(
-                    padding: const EdgeInsets.all(10),
-                    child: CircularProgressIndicator(strokeWidth: 2, color: context.c.danger),
-                  )
-                : InkWell(
-                    onTap: () {
-                      HapticFeedback.mediumImpact();
-                      dsh.cancelActiveTurn();
-                    },
-                    borderRadius: BorderRadius.circular(22),
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: context.c.dangerSurface,
-                        shape: BoxShape.circle,
-                        border: Border.all(color: context.c.danger),
-                      ),
-                      child: Icon(Icons.stop_rounded, color: context.c.danger, size: 20),
-                    ),
-                  ),
-          );
-        }
-
-        // 运行中且有内容 → 发送键按排队/插话投递（和 Web 端一致：空框才是停止键）。
-        // 图标换成 ⚡ 表示"这句话是在插话"，让用户一眼看出不是在开新回合。
-        final steering = dsh.isSessionRunning && canSend && dsh.deliveryMode == 'steer';
+        final queued = dsh.isSessionRunning ? dsh.queueItems.length : 0;
         return SizedBox(
           width: 44,
           height: 44,
-          child: InkWell(
-            onTap: canSend ? () => _sendMessage(dsh) : null,
-            borderRadius: BorderRadius.circular(22),
-            child: Container(
-              decoration: BoxDecoration(
-                color: canSend
-                    ? (steering ? context.c.warning : context.c.accent)
-                    : context.c.border,
-                shape: BoxShape.circle,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Positioned.fill(
+                child: InkWell(
+                  key: const ValueKey('chat-send-button'),
+                  onTap: canSend ? () => _sendMessage(dsh) : null,
+                  borderRadius: BorderRadius.circular(22),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: canSend ? context.c.accent : context.c.border,
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(
+                      Icons.arrow_upward_rounded,
+                      size: 22,
+                      color: canSend ? Colors.white : context.c.textTertiary,
+                    ),
+                  ),
+                ),
               ),
-              child: Icon(
-                steering ? Icons.bolt_rounded : Icons.arrow_upward_rounded,
-                size: 22,
-                color: canSend ? Colors.white : context.c.textTertiary,
-              ),
-            ),
+              // 队列数角标：运行中按发送 = 排队，用户需要知道已经攒了几条。
+              // 刻意不用 ⚡ 之类的另一套图标 —— 同一个位置换图标会让人以为
+              // "发送键变成了别的东西"，而这正是上一版的问题。
+              if (queued > 0)
+                Positioned(
+                  right: 0,
+                  top: 0,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                    constraints: const BoxConstraints(minWidth: 15),
+                    decoration: BoxDecoration(
+                      color: context.c.warning,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: context.c.surface, width: 1.5),
+                    ),
+                    child: Text(
+                      '$queued',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 9.5, fontWeight: FontWeight.bold, color: Colors.white),
+                    ),
+                  ),
+                ),
+            ],
           ),
         );
       },
-    );
-  }
-
-  /// 运行中的投递方式切换（排队 / 插话）。
-  ///
-  /// 只在会话跑着的时候出现：空闲时这枚开关没有任何作用，摆在输入框旁边只会
-  /// 让人琢磨它到底影响什么。
-  Widget _buildDeliveryModeChip(DshService dsh) {
-    if (!dsh.isSessionRunning) return const SizedBox.shrink();
-    final steer = dsh.deliveryMode == 'steer';
-    return Tooltip(
-      message: steer ? '插话：打断当前回合立刻看这句话' : '排队：等这一轮跑完再执行',
-      child: InkWell(
-        onTap: () {
-          HapticFeedback.selectionClick();
-          dsh.setDeliveryMode(steer ? 'queue' : 'steer');
-        },
-        borderRadius: BorderRadius.circular(8),
-        child: Container(
-          margin: const EdgeInsets.only(right: 6),
-          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
-          decoration: BoxDecoration(
-            color: steer ? context.c.warning.withOpacity(0.12) : context.c.surface,
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: steer ? context.c.warning : context.c.border),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                steer ? Icons.bolt_rounded : Icons.queue_rounded,
-                size: 13,
-                color: steer ? context.c.warning : context.c.textSecondary,
-              ),
-              const SizedBox(width: 4),
-              Text(
-                steer ? '插话' : '排队',
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontWeight: FontWeight.w600,
-                  color: steer ? context.c.warning : context.c.textSecondary,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
     );
   }
 }
