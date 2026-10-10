@@ -69,6 +69,21 @@ void main() {
       await teardown(tester);
     });
 
+    testWidgets('队列很长时输入栏里只列 3 条，其余提示去任务页', (tester) async {
+      final dsh = await pump(tester, const ChatView());
+      dsh.debugSetQueue([
+        for (var i = 1; i <= 5; i++) QueueItem(id: 'm$i', text: '排队第 $i 条', attachments: 0),
+      ]);
+      await tester.pump();
+
+      expect(find.text('5 条排队消息'), findsOneWidget);
+      expect(find.text('排队第 1 条'), findsOneWidget);
+      expect(find.text('排队第 3 条'), findsOneWidget);
+      expect(find.text('排队第 4 条'), findsNothing, reason: '第 4 条起不该出现在输入栏里');
+      expect(find.textContaining('还有 2 条'), findsOneWidget);
+      await teardown(tester);
+    });
+
     testWidgets('会话没在跑时「插话」按钮置灰', (tester) async {
       final dsh = await pump(tester, const ChatView());
       dsh.debugSetQueue([const QueueItem(id: 'm1', text: '待发送', attachments: 0)]);

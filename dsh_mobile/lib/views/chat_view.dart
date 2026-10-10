@@ -3049,7 +3049,9 @@ class _ChatViewState extends State<ChatView> {
               padding: const EdgeInsets.only(top: 4),
               child: Text(dsh.queueError, style: TextStyle(fontSize: 11, color: context.c.danger)),
             ),
-          for (final row in rows)
+          // 最多列 3 条：队列可能有十几条，全画出来会把输入框挤出屏幕 ——
+          // 而输入框才是这一块的主角。剩下的去「任务」页看。
+          for (final row in rows.take(3))
             Padding(
               padding: const EdgeInsets.only(top: 6),
               child: Row(
@@ -3074,6 +3076,14 @@ class _ChatViewState extends State<ChatView> {
                     dsh.isSessionRunning ? () => _steerQueueRow(dsh, row) : null,
                   ),
                 ],
+              ),
+            ),
+          if (rows.length > 3)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                '还有 ${rows.length - 3} 条（在「任务」页查看全部）',
+                style: TextStyle(fontSize: 11, color: context.c.textTertiary),
               ),
             ),
         ],
