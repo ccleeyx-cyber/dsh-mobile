@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/rendering.dart';
@@ -23,6 +25,18 @@ import '../services/voice_input_service.dart';
 import '../services/platform_services.dart';
 import '../models/pending_attachment.dart';
 import '../services/attachment_picker.dart';
+
+/// 长按说话的三个状态（v1.12.0）。
+enum _HoldTalkPhase {
+  /// 平时：点按打字，长按开始说话。
+  idle,
+
+  /// 正在录音：整块输入区换成"正在聆听"，松手结束。
+  recording,
+
+  /// 已识别、等确认：文本在输入框里（可改），下方是「重录 / 发送」。
+  confirm,
+}
 
 class ChatView extends StatefulWidget {
   final VoidCallback? onOpenWorkspaces;
@@ -63,6 +77,21 @@ class _ChatViewState extends State<ChatView> {
   // null = 尚未探测；探测结果决定按钮是可用还是禁用。
   bool? _voiceSupported;
   bool _voiceListening = false;
+
+  // ---- 长按说话 (v1.12.0) ----
+  //
+  // 交互：**长按输入框**开始说话 → **松开**停止并把识别文本填进输入框 →
+  // 出现「重录 / 发送」两个按钮等你确认。**点按输入框**仍是原来的打字。
+  // 为什么要有"确认"这一步：语音识别在嘈杂环境/口音下会出错，直接发出去的
+  // 代价是 agent 立刻按错误指令动手（可能是删除或部署）。多一次确认，
+  // 用户有机会看一眼、改一下。
+  _HoldTalkPhase _holdPhase = _HoldTalkPhase.idle;
+  /// 识别中的当前文本（累积的，整段替换 —— 见 VoiceInputService.start 的注释）。
+  String _holdText = '';
+  DateTime? _holdStartedAt;
+  Timer? _holdTick;
+  /// 松手后的收尾保护：stop() 之后 onFinal 可能还会到，用来把最终文本补进输入框。
+  bool _holdAwaitingFinal = false;
 
   // ---- 附件 (v1.10.0) ----
   /// 已挂载、等待随下一条消息发出去的附件。
@@ -175,6 +204,12 @@ class _ChatViewState extends State<ChatView> {
   void dispose() {
     _inputFocusNode.removeListener(_onInputFocusChange);
     _scrollController.removeListener(_onScroll);
+    _holdTick?.cancel();
+    // 正在录音时被销毁（切会话/返回）：必须主动取消识别，否则麦克风会被一直
+    // 占着，下一次识别会以"被其他应用占用"失败。
+    if (_holdPhase != _HoldTalkPhase.idle) {
+      VoiceInputService.instance.cancel();
+    }
     _inputFocusNode.dispose();
     _inputController.dispose();
     _searchController.dispose();
@@ -2417,6 +2452,121 @@ class _ChatViewState extends State<ChatView> {
     dsh.updateDraft(text);
   }
 
+  // ---------------------------------------------------------- 长按说话 --
+  //
+  // 长按生效的**唯一**条件：输入框为空（见下方 builder 里的 holdEnabled）。
+  // 一旦有文字，长按必须还给系统原本的"选中/粘贴"——抢走它会让编辑长文本
+  // 变得很难用。已有文字时想继续用语音，右边的麦克风按钮（点按）仍然在。
+
+  Future<void> _beginHoldTalk(DshService dsh) async {
+    if (_holdPhase != _HoldTalkPhase.idle) return;
+    HapticFeedback.mediumImpact();
+    setState(() {
+      _holdPhase = _HoldTalkPhase.recording;
+      _holdText = '';
+      _holdStartedAt = DateTime.now();
+    });
+    // 录音时长显示：1 秒一跳就够了，别用逐帧动画去拖主线程。
+    _holdTick?.cancel();
+    _holdTick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted && _holdPhase == _HoldTalkPhase.recording) setState(() {});
+    });
+
+    final ok = await VoiceInputService.instance.start(
+      onPartial: (text, _) {
+        if (!mounted) return;
+        setState(() {
+          _holdText = text;
+          _holdAwaitingFinal = false;
+        });
+      },
+      onFinal: (text) {
+        if (!mounted) return;
+        setState(() {
+          _holdText = text;
+          // 松手后才到的 final：把它补进输入框（前提是用户没改过内容）。
+          if (_holdAwaitingFinal && _inputController.text == _holdText) {
+            _inputController.text = text;
+          }
+          _holdAwaitingFinal = false;
+        });
+      },
+      onError: (msg) {
+        if (!mounted) return;
+        _holdTick?.cancel();
+        setState(() {
+          _holdPhase = _HoldTalkPhase.idle;
+          _holdText = '';
+        });
+        _toast(msg);
+      },
+    );
+    if (!mounted) return;
+    if (!ok) {
+      // 启动失败的原因已由 onError 说明；这里只负责收状态。
+      _holdTick?.cancel();
+      setState(() => _holdPhase = _HoldTalkPhase.idle);
+      return;
+    }
+    setState(() => _voiceSupported = true);
+  }
+
+  /// 松手：停止识别，转录本进输入框，进入"重录 / 发送"确认态。
+  Future<void> _endHoldTalk(DshService dsh) async {
+    if (_holdPhase != _HoldTalkPhase.recording) return;
+    _holdTick?.cancel();
+    _holdAwaitingFinal = true;
+    await VoiceInputService.instance.stop();
+    if (!mounted) return;
+
+    final text = _holdText.trim();
+    if (text.isEmpty) {
+      setState(() {
+        _holdPhase = _HoldTalkPhase.idle;
+        _holdText = '';
+      });
+      _toast('没有听清，再长按说一次');
+      return;
+    }
+    setState(() {
+      _holdPhase = _HoldTalkPhase.confirm;
+      _inputController.text = text;
+      _inputController.selection = TextSelection.collapsed(offset: text.length);
+    });
+    dsh.updateDraft(text);
+  }
+
+  /// 手势被系统打断（来电、手势冲突等）：直接放弃这次录音。
+  void _cancelHoldTalk() {
+    if (_holdPhase != _HoldTalkPhase.recording) return;
+    _holdTick?.cancel();
+    VoiceInputService.instance.cancel();
+    if (!mounted) return;
+    setState(() {
+      _holdPhase = _HoldTalkPhase.idle;
+      _holdText = '';
+    });
+  }
+
+  /// 「重录」：清掉这次结果，立刻重新开始说话（不用再长按一次）。
+  Future<void> _redoHoldTalk(DshService dsh) async {
+    _inputController.clear();
+    dsh.updateDraft('');
+    setState(() {
+      _holdPhase = _HoldTalkPhase.idle;
+      _holdText = '';
+    });
+    await _beginHoldTalk(dsh);
+  }
+
+  /// 「发送」：把识别到的文本按正常消息发出去。
+  Future<void> _sendHoldTalk(DshService dsh) async {
+    final text = _inputController.text;
+    setState(() => _holdPhase = _HoldTalkPhase.idle);
+    if (text.trim().isEmpty) return;
+    _sendMessage(dsh); // 返回 void，别 await
+  }
+
   void _toast(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).clearSnackBars();
@@ -2467,41 +2617,226 @@ class _ChatViewState extends State<ChatView> {
               // 提示词模板（v1.11.0）：点一下把模板文字接进输入框。
               // 没有模板时不占任何空间。
               if (dsh.snippets.isNotEmpty) _buildSnippetChips(dsh),
-              TextField(
-                controller: _inputController,
-                focusNode: _inputFocusNode,
-                style: TextStyle(color: context.c.textPrimary, fontSize: 14.5),
-                maxLines: 5,
-                minLines: 1,
-                decoration: InputDecoration(
-                  hintText: '发送指令或提问...',
-                  hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 13.5),
-                  border: InputBorder.none,
-                  isDense: true,
-                  contentPadding: const EdgeInsets.fromLTRB(6, 4, 6, 8),
+
+              // 录音态的"正在聆听"面板由手势层内部渲染（见下方注释 2）——
+              // 这里**不能**把整块换成别的 widget，否则承载长按识别器的那一层
+              // 会被销毁、松手事件永远不来。
+              //
+              // ⚠️ 两个坑，都踩过，别退回去：
+              //
+              // 1) 为什么是"盖一层"而不是给 TextField 套 GestureDetector：
+                //    EditableText **内部**也有一个长按识别器（选词 + 弹工具条），
+                //    在手势竞技场里它比外层先注册、会赢 —— 实测长按有时能录音、
+                //    有时毫无反应，关掉 enableInteractiveSelection 也压不住。
+                //    盖一层不透明的层，指针根本到不了下面的 EditableText。
+                //
+                // 2) 为什么录音态**不换掉这一层**、只换它的内容：
+                //    长按开始后如果把承载识别器的 widget 从树上摘掉，识别器会被
+                //    一起销毁 —— `onLongPressEnd` 永远不会触发，于是松手之后
+                //    一直卡在"正在聆听"（这条在真机上同样会发生）。
+                //    所以这一层在整个手势期间必须保持存活；三个回调也**始终非空**
+                //    （在回调内部判状态），中途把回调置 null 同样会销毁识别器。
+                //
+                // 为什么不妨碍打字：系统文字输入走 EditableText 的 text input
+                // connection，不经过命中测试；而且一旦有内容这一层立刻消失，
+                // 光标/选择/长按选词全部恢复原样。
+                //
+                // 用 ValueListenableBuilder 只重建这一小块：可见性依赖输入内容，
+                // 用 setState 会每敲一个字重建整个 ChatView（含消息列表）。
+                ValueListenableBuilder<TextEditingValue>(
+                  valueListenable: _inputController,
+                  builder: (context, value, _) {
+                    final empty = value.text.isEmpty;
+                    final recording = _holdPhase == _HoldTalkPhase.recording;
+                    // 空框时覆盖，直到松手进入确认态（那时要让用户能改字/点按钮）。
+                    final showGestureLayer = (empty || recording) &&
+                        _holdPhase != _HoldTalkPhase.confirm;
+                    // 录音面板比输入框高（麦克风圆点 + 两行文字）。Stack 的高度由
+                    // 第一个孩子决定，所以录音时要显式给足空间，否则面板会被压在
+                    // 输入框那一行的高度里、报 RenderFlex overflow。
+                    // SizedBox 始终存在（只在高度上变），保证树的形状稳定 ——
+                    // 形状一变就可能重建承载长按识别器的元素，松手就收不到了。
+                    return SizedBox(
+                      height: recording ? 54 : null,
+                      child: Stack(
+                        children: [
+                          TextField(
+                            key: const ValueKey('chat-input-field'),
+                            controller: _inputController,
+                            focusNode: _inputFocusNode,
+                            style: TextStyle(color: context.c.textPrimary, fontSize: 14.5),
+                            maxLines: 5,
+                            minLines: 1,
+                            decoration: const InputDecoration(
+                              // 空框的提示由手势层负责（它才是那段交互的说明），
+                              // 这里留空，避免两层文案叠在一起。
+                              hintText: '',
+                              border: InputBorder.none,
+                              isDense: true,
+                              contentPadding: EdgeInsets.fromLTRB(6, 4, 6, 8),
+                            ),
+                            onChanged: (v) => dsh.updateDraft(v),
+                            onSubmitted: (_) => _sendMessage(dsh),
+                          ),
+                          if (showGestureLayer)
+                            Positioned.fill(
+                              child: GestureDetector(
+                                key: const ValueKey('chat-hold-layer'),
+                                behavior: HitTestBehavior.opaque,
+                                // 录音中不接受点按。**注意不要让这个回调变 null**：
+                                // 中途改动 GestureDetector 的识别器集合会牵动识别器
+                                // 生命周期，这里一律保持非空、在内部判状态。
+                                onTap: () {
+                                  if (_holdPhase != _HoldTalkPhase.recording) {
+                                    _inputFocusNode.requestFocus();
+                                  }
+                                },
+                                onLongPressStart: (_) => _beginHoldTalk(dsh),
+                                onLongPressEnd: (_) => _endHoldTalk(dsh),
+                                onLongPressCancel: () => _cancelHoldTalk(),
+                                child: recording
+                                    ? _buildHoldRecordingPanel()
+                                    // 指令只在还没聚焦时显示：已经点了、键盘都弹出来了，
+                                    // 再挂着"点按打字"是多余的噪音。用 ListenableBuilder
+                                    // 只听焦点，避免为这点变化重建整个页面。
+                                    : ListenableBuilder(
+                                        listenable: _inputFocusNode,
+                                        builder: (context, _) {
+                                          if (_inputFocusNode.hasFocus) {
+                                            return const SizedBox.shrink();
+                                          }
+                                          return Align(
+                                            alignment: Alignment.centerLeft,
+                                            child: Padding(
+                                              padding: const EdgeInsets.fromLTRB(6, 4, 6, 8),
+                                              child: Text(
+                                                '点按打字，长按说话',
+                                                style: TextStyle(color: context.c.textTertiary, fontSize: 13.5),
+                                              ),
+                                            ),
+                                          );
+                                        },
+                                      ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    );
+                  },
                 ),
-                onChanged: (v) => dsh.updateDraft(v),
-                onSubmitted: (_) => _sendMessage(dsh),
-              ),
-              Row(
-                children: [
-                  _buildComposerIcon(
-                    icon: Icons.add_rounded,
-                    tooltip: '添加图片或文件',
-                    highlighted: _pendingAttachments.isNotEmpty,
-                    onTap: () => _showAttachSheet(dsh),
-                  ),
-                  const Spacer(),
-                  _buildModelPill(dsh),
-                  const SizedBox(width: 2),
-                  _buildMicButton(dsh),
-                  const SizedBox(width: 4),
-                  _buildSendButton(dsh),
-                ],
-              ),
+
+              if (_holdPhase == _HoldTalkPhase.confirm)
+                // 确认态：识别结果已经在输入框里（可直接改字），这里给两个动作。
+                _buildHoldConfirmRow(dsh)
+              else if (_holdPhase == _HoldTalkPhase.idle)
+                Row(
+                  children: [
+                    _buildComposerIcon(
+                      icon: Icons.add_rounded,
+                      tooltip: '添加图片或文件',
+                      highlighted: _pendingAttachments.isNotEmpty,
+                      onTap: () => _showAttachSheet(dsh),
+                    ),
+                    const Spacer(),
+                    _buildModelPill(dsh),
+                    const SizedBox(width: 2),
+                    _buildMicButton(dsh),
+                    const SizedBox(width: 4),
+                    _buildSendButton(dsh),
+                  ],
+                ),
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// 录音中的面板：麦克风 + 已说的内容 + 时长，并明确写"松开结束"。
+  ///
+  /// 交互提示必须写出来：长按说话是"看不见的手势"，没有文案用户不会知道
+  /// 什么时候可以松手、松手会发生什么。
+  Widget _buildHoldRecordingPanel() {
+    final elapsed = _holdStartedAt == null
+        ? 0
+        : DateTime.now().difference(_holdStartedAt!).inSeconds;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(6, 6, 6, 8),
+      child: Row(
+        children: [
+          Container(
+            width: 30,
+            height: 30,
+            decoration: BoxDecoration(
+              color: context.c.dangerSurface,
+              shape: BoxShape.circle,
+              border: Border.all(color: context.c.danger.withOpacity(0.5)),
+            ),
+            child: Icon(Icons.mic_rounded, size: 17, color: context.c.danger),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _holdText.isEmpty ? '正在聆听…' : _holdText,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: _holdText.isEmpty ? context.c.textSecondary : context.c.textPrimary,
+                    fontSize: 14,
+                    height: 1.3,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '松开结束 · ${elapsed}s',
+                  style: TextStyle(color: context.c.textTertiary, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 松手后的确认行：重录 / 发送。
+  Widget _buildHoldConfirmRow(DshService dsh) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 2),
+      child: Row(
+        children: [
+          Expanded(
+            child: OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                foregroundColor: context.c.textSecondary,
+                side: BorderSide(color: context.c.border),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
+                padding: const EdgeInsets.symmetric(vertical: 10),
+              ),
+              onPressed: () => _redoHoldTalk(dsh),
+              icon: const Icon(Icons.refresh_rounded, size: 17),
+              label: const Text('重录', style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600)),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: context.c.accent,
+                foregroundColor: Colors.white,
+                elevation: 0,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
+                padding: const EdgeInsets.symmetric(vertical: 10),
+              ),
+              onPressed: () => _sendHoldTalk(dsh),
+              icon: const Icon(Icons.arrow_upward_rounded, size: 17),
+              label: const Text('发送', style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.bold)),
+            ),
+          ),
+        ],
       ),
     );
   }

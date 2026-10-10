@@ -226,6 +226,16 @@ class VoiceInputService {
     void Function(String message)? onError,
     String localeId = defaultLocaleId,
   }) async {
+    // 测试钩子：假识别模式。不碰任何平台通道，直接把脚本里的中间结果回放出来，
+    // 最终结果留到 stop() 时交付（与 speech_to_text 的时序一致）。
+    if (_fakePartials != null) {
+      _listening = true;
+      _fakeOnFinal = onFinal;
+      for (final p in _fakePartials!) {
+        onPartial(p, 1.0);
+      }
+      return true;
+    }
     if (!_available && !await init()) {
       onError?.call(await unavailableReason());
       return false;
@@ -386,6 +396,15 @@ class VoiceInputService {
 
   /// 停止识别并保留已识别内容。
   Future<void> stop() async {
+    // 测试钩子：假识别模式下"停止"才交付最终结果（模拟平台的行为）。
+    if (_fakePartials != null) {
+      _listening = false;
+      final t = _fakeFinal;
+      final cb = _fakeOnFinal;
+      _fakeOnFinal = null;
+      if (t.isNotEmpty) cb?.call(t);
+      return;
+    }
     if (!_listening) return;
     try {
       await _speech.stop();
@@ -397,6 +416,11 @@ class VoiceInputService {
 
   /// 取消识别并丢弃结果。
   Future<void> cancel() async {
+    if (_fakePartials != null) {
+      _listening = false;
+      _fakeOnFinal = null;
+      return;
+    }
     try {
       await _speech.cancel();
     } catch (_) {}
@@ -439,4 +463,30 @@ class VoiceInputService {
 
   @visibleForTesting
   bool debugGetListening() => _listening;
+
+  /// 测试钩子：假识别状态（null = 关闭）。
+  ///
+  /// 为什么需要它：真正的识别要过平台通道，widget 测试里拿不到任何结果，
+  /// 于是"长按说话 → 松开 → 确认 → 发送"这条链路只能靠它走通。
+  /// 只在测试显式设置后生效，生产路径完全不受影响。
+  List<String>? _fakePartials;
+  String _fakeFinal = '';
+  void Function(String)? _fakeOnFinal;
+
+  /// [partials] 会在 start() 时按顺序作为中间结果回放；
+  /// [finalText] 会在 stop() 时作为最终结果交付（模拟平台时序）。
+  @visibleForTesting
+  void debugSetFakeRecognition({List<String> partials = const [], String finalText = ''}) {
+    _fakePartials = List<String>.from(partials);
+    _fakeFinal = finalText;
+    _fakeOnFinal = null;
+    _listening = false;
+  }
+
+  @visibleForTesting
+  void debugClearFakeRecognition() {
+    _fakePartials = null;
+    _fakeFinal = '';
+    _fakeOnFinal = null;
+  }
 }
