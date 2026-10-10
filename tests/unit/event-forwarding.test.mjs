@@ -446,30 +446,41 @@ describe('user-questions：领取与作答', () => {
     await subscriber.close();
   });
 
-  it('最后一个持有者断开后该问题不再被提供', async () => {
+  it('订阅者断开后提问不释放，重连的手机能从 replay 里拿到（v1.11.4 起）', async () => {
     const a = await connectClient();
     await a.subscribe();
     const b = await connectClient();
     await b.subscribe();
 
-    pushToEngine(questionFrame(QUESTION, { id: 'evt-orphan' }));
-    await a.waitFor((m) => m.type === 'question_request' && m.eventId === 'evt-orphan');
-    await b.waitFor((m) => m.type === 'question_request' && m.eventId === 'evt-orphan');
+    pushToEngine(questionFrame(QUESTION, { id: 'evt-survive' }));
+    await a.waitFor((m) => m.type === 'question_request' && m.eventId === 'evt-survive');
+    await b.waitFor((m) => m.type === 'question_request' && m.eventId === 'evt-survive');
 
-    // 一台断开：另一台仍持有，问题必须还在（多手机修复的核心行为）。
+    // 一台断开：另一台仍持有，绝不能广播失效。
     await a.close();
     await sleep(300);
     assert.equal(b.frames.filter((m) => m.type === 'questions_invalidated').length, 0,
       '还有别的手机持有该提问时，不应广播失效');
 
-    // 最后一个持有者也断开：问题应被释放，晚来的手机不得再看到它。
+    // 最后一台也断开 —— 提问**依然保留**：手机断线太常见（锁屏/切后台/切网），
+    // 而提问正是 agent 停在那里等人的时刻。实测过：下发后 1 秒手机断开、条目被
+    // 释放，用户重连回来 replay 是空的，手机上既没卡片也没通知。
     await b.close();
     await sleep(300);
 
-    // A phone connecting now must not be shown a prompt that is no longer live.
     const c = await connectClient();
     const sub = await c.subscribe();
-    assert.equal(sub.pending.some((p) => p.eventId === 'evt-orphan'), false);
+    assert.equal(sub.pending.some((p) => p.eventId === 'evt-survive'), true,
+      '重连的手机必须还能看到这条仍在等回答的提问');
+
+    // 仍然能正常作答（条目没被释放，引擎侧请求就还有救）。
+    c.send({
+      type: 'question_answer',
+      eventId: 'evt-survive',
+      answer: { answers: [{ id: 'q1', selected: ['继续'] }] }
+    });
+    const ack = await c.waitFor((m) => m.type === 'question_ack' && m.eventId === 'evt-survive');
+    assert.equal(ack.ok, true, '断开重连后作答必须仍然成功');
 
     await c.close();
   });

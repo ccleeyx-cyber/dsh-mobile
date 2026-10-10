@@ -5,11 +5,13 @@ import '../models/audit_log.dart';
 import '../models/approval_preset.dart';
 import '../models/permission_config.dart';
 import '../services/dsh_service.dart';
-import '../widgets/approval_card.dart';
 import '../theme/app_colors.dart';
 
 class SecurityPermissionsView extends StatefulWidget {
-  const SecurityPermissionsView({super.key});
+  /// 「去处理」跳回对话页 —— 审批与提问都必须在对话流里完成。
+  final VoidCallback? onOpenChat;
+
+  const SecurityPermissionsView({super.key, this.onOpenChat});
 
   @override
   State<SecurityPermissionsView> createState() => _SecurityPermissionsViewState();
@@ -40,7 +42,6 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
   Widget build(BuildContext context) {
     final dsh = Provider.of<DshService>(context);
     final permissions = dsh.permissions;
-    final pendingApprovals = dsh.pendingApprovals;
     final auditLogs = dsh.auditLogs;
 
     return Scaffold(
@@ -57,9 +58,18 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
           children: [
             Icon(Icons.security_rounded, color: context.c.accent),
             const SizedBox(width: 8),
-            Text(
-              '权限与安全中心',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '安全策略',
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+                ),
+                Text(
+                  '引擎的工具执行策略与审计（非安卓系统权限）',
+                  style: TextStyle(fontSize: 10.5, color: context.c.textSecondary),
+                ),
+              ],
             ),
           ],
         ),
@@ -78,57 +88,13 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
       body: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         children: [
-          // 1. Pending Approvals Section
-          _buildSectionHeader('待处理权限审批 (Pending Approvals)', Icons.pending_actions_rounded, context.c.warning),
-          const SizedBox(height: 8),
-          if (pendingApprovals.isEmpty)
-            Container(
-              padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
-              decoration: BoxDecoration(
-                color: context.c.surface,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: context.c.success.withOpacity(0.3)),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.02),
-                    blurRadius: 4,
-                    offset: const Offset(0, 1),
-                  ),
-                ],
-              ),
-              child: Row(
-                children: [
-                  Icon(Icons.verified_user_rounded, color: context.c.success, size: 28),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '安全状态良好',
-                          style: TextStyle(color: context.c.textPrimary, fontSize: 15, fontWeight: FontWeight.bold),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          '所有后台操作已就绪，当前无阻塞性工具审批请求。',
-                          style: TextStyle(color: context.c.textSecondary, fontSize: 12),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            )
-          else
-            ...pendingApprovals.map((req) {
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: ApprovalCard(
-                  request: req,
-                  onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
-                ),
-              );
-            }),
+          // 1. 待审批状态 —— 只做摘要，不再重复渲染审批卡片（v1.11.4）
+          //
+          // 审批卡片是"某事停下来等一个人点一下"，它的正确位置是**对话流里**：
+          // 用户看得见是哪个会话、什么工具、为什么。此前这里也渲染一份完全相同的
+          // ApprovalCard 列表，于是同一个待审批在两处出现，用户不知道点哪边才对。
+          // 这里只保留计数与一个跳转入口。
+          _buildPendingSummary(context, dsh),
 
           const SizedBox(height: 24),
 
@@ -590,6 +556,72 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
         ),
         duration: const Duration(seconds: 3),
         behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  /// 待处理摘要：审批与提问的计数 + 一键回对话页处理。
+  ///
+  /// 两者都放进同一块：它们在语义上是同一件事（agent 停下来等人），
+  /// 而且都必须在对话流里完成（那里能看到是哪个会话、什么工具/问题）。
+  Widget _buildPendingSummary(BuildContext context, DshService dsh) {
+    final approvals = dsh.pendingApprovals.length;
+    // 提问只统计当前会话之外的那些也无妨：这里是总量视图，点过去会看到全部。
+    final questions = dsh.pendingQuestions.length;
+    final total = approvals + questions;
+    final idle = total == 0;
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 14, 12, 14),
+      decoration: BoxDecoration(
+        color: idle ? context.c.surface : context.c.warningSurface,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: idle ? context.c.success.withOpacity(0.3) : context.c.warningBorder),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            idle ? Icons.verified_user_rounded : Icons.pending_actions_rounded,
+            color: idle ? context.c.success : context.c.warning,
+            size: 26,
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  idle ? '当前无阻塞项' : '$total 项在等你处理',
+                  style: TextStyle(
+                    color: context.c.textPrimary,
+                    fontSize: 14.5,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  idle
+                      ? '没有工具调用或提问正在等待你。'
+                      : [
+                          if (approvals > 0) '$approvals 个工具授权',
+                          if (questions > 0) '$questions 个提问',
+                        ].join(' · ') + '（在对话页处理）',
+                  style: TextStyle(color: context.c.textSecondary, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          if (!idle)
+            TextButton(
+              onPressed: () => widget.onOpenChat?.call(),
+              style: TextButton.styleFrom(
+                foregroundColor: context.c.warning,
+                minimumSize: Size.zero,
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              ),
+              child: const Text('去处理', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
+            ),
+        ],
       ),
     );
   }

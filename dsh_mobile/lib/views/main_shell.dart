@@ -128,6 +128,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     // CustomSettingsView），而这些子页自己本来就在监听 DshService，于是同一份
     // 数据被重复构建两遍。context.select 只在被选中的值变化时才重建。
     final pendingCount = context.select<DshService, int>((d) => d.pendingApprovals.length);
+    // 对话页的徽标要**连提问一起算**：提问同样是"agent 停下来等你"，
+    // 而且此前它只在当前会话的输入框上方出现 —— 你在别的会话/别的 tab 时
+    // 完全看不到任何提示（用户实测："提问没显示、也没通知"）。
+    final waitingCount = context.select<DshService, int>(
+      (d) => d.pendingApprovals.length + d.pendingQuestions.length,
+    );
     final isTokenInvalid = context.select<DshService, bool>((d) => d.isTokenInvalid);
 
     // 键盘弹出时隐藏底部导航栏 —— 这是修一个真实的布局缺陷，不是装饰性调整。
@@ -204,7 +210,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   // 否则本页的 3 秒轮询会在用户处于其它 tab 时继续跑。
                   active: _currentIndex == 1,
                 ),
-                const SecurityPermissionsView(),
+                SecurityPermissionsView(onOpenChat: () => _setIndex(0)),
                 const CustomSettingsView(),
               ],
             ),
@@ -244,9 +250,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               selectedIndex: _currentIndex,
               onDestinationSelected: _setIndex,
               destinations: [
-                const NavigationDestination(
-                  icon: Icon(Icons.chat_bubble_outline_rounded),
-                  selectedIcon: Icon(Icons.chat_bubble_rounded),
+                NavigationDestination(
+                  icon: _buildNavBadge(const Icon(Icons.chat_bubble_outline_rounded), waitingCount),
+                  selectedIcon: _buildNavBadge(const Icon(Icons.chat_bubble_rounded), waitingCount),
                   label: '对话',
                 ),
                 NavigationDestination(
@@ -257,7 +263,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 NavigationDestination(
                   icon: _buildNavBadge(const Icon(Icons.security_outlined), pendingCount),
                   selectedIcon: _buildNavBadge(const Icon(Icons.security_rounded), pendingCount),
-                  label: '权限安全',
+                  label: '安全策略',
                 ),
                 const NavigationDestination(
                   icon: Icon(Icons.tune_rounded),

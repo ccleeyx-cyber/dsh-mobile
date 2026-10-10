@@ -186,6 +186,21 @@ class DshService extends ChangeNotifier {
   /// 屏幕前、正在等结果"的场景。
   bool get shouldNotify => notifications.permissionGranted && !_isAppForeground;
 
+  /// 是否需要为**某个会话的提问**发通知。
+  ///
+  /// 比 [shouldNotify] 宽一档：提问是"agent 已经停下来等人"，而它只在**当前
+  /// 会话**的输入框上方渲染 —— 你在别的会话或别的 tab 时，即使 App 在前台，
+  /// 屏幕上也没有任何提示。实测就是如此：提问到了网关，用户却既没看到卡片、
+  /// 也没收到通知，只能以为任务还在跑。所以"不在眼前"也要提醒。
+  bool shouldNotifyForSession(String? sessionId) {
+    if (!notifications.permissionGranted) return false;
+    if (!_isAppForeground) return true;
+    final cur = _currentSession;
+    if (cur == null) return true;
+    if (sessionId == null || sessionId.isEmpty) return true;
+    return !cur.matchesSessionId(sessionId);
+  }
+
   /// 通知链路是否**真的**可用。
   ///
   /// 与 [shouldNotify] 的区别：那个只问"该不该发"，这个问"发了能不能到"。
@@ -2324,7 +2339,9 @@ class DshService extends ChangeNotifier {
           _pendingQuestions.add(q);
           notifyListeners();
           // 同待授权：提问让 agent 挂起，必须能打断。
-          if (shouldNotify) {
+          // 用 shouldNotifyForSession：提问不在当前会话/不在眼前时，前台也要提醒
+          // （它只在当前会话的输入框上方渲染，别处完全没有提示）。
+          if (shouldNotifyForSession(q.sessionId)) {
             notifications.show(
               title: 'Agent 在等你回答',
               // 取第一道题的问题文本；有多道题时不逐条罗列 —— 通知栏放不下，

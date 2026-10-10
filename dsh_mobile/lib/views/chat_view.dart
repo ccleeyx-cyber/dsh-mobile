@@ -571,6 +571,40 @@ class _ChatViewState extends State<ChatView> {
                           elevation: 0,
                         ),
                         onPressed: () async {
+                          // 危险档（完全信任）二次确认：与安全页的危险预设保持
+                          // 一致。它会让本会话的工具调用**全部免审批**，而这在
+                          // 聊天流里只是一次点击的距离 —— 值得多问一句。
+                          if (selectedPolicy == 'danger-full-access') {
+                            final confirmed = await showDialog<bool>(
+                              context: context,
+                              builder: (ctx) => AlertDialog(
+                                backgroundColor: context.c.surface,
+                                title: Row(
+                                  children: [
+                                    Icon(Icons.warning_amber_rounded, color: context.c.danger, size: 22),
+                                    const SizedBox(width: 8),
+                                    Text('确认开启完全信任？', style: TextStyle(color: context.c.textPrimary, fontSize: 16, fontWeight: FontWeight.bold)),
+                                  ],
+                                ),
+                                content: Text(
+                                  '本会话后续的工具调用将不再逐条请求你的授权，包括删除文件、执行脚本等写操作。\n\n只在无人值守、且你清楚后果时使用。',
+                                  style: TextStyle(color: context.c.textSecondary, fontSize: 13, height: 1.5),
+                                ),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () => Navigator.pop(ctx, false),
+                                    child: Text('取消', style: TextStyle(color: context.c.textSecondary)),
+                                  ),
+                                  FilledButton(
+                                    style: FilledButton.styleFrom(backgroundColor: context.c.danger),
+                                    onPressed: () => Navigator.pop(ctx, true),
+                                    child: const Text('仍要开启', style: TextStyle(fontWeight: FontWeight.bold)),
+                                  ),
+                                ],
+                              ),
+                            );
+                            if (confirmed != true || !context.mounted) return;
+                          }
                           final currentSessions = Map<String, String>.from(dsh.permissions.sessionPolicies);
                           currentSessions[sessionId] = selectedPolicy;
                           final updatedPerms = dsh.permissions.copyWith(
@@ -1584,6 +1618,44 @@ class _ChatViewState extends State<ChatView> {
               ),
             ),
 
+          // 其他会话的提问横幅（v1.11.4）。
+          //
+          // 提问卡片只渲染**当前会话**的（否则会把别的会话的问题挂到你面前）。
+          // 但那带来一个死角：agent 在会话 B 停下来等你回答，而你在会话 A 或
+          // 别的 tab —— 屏幕上什么都没有，也没有通知，你会以为它一直在跑
+          // （用户实测到的"提问没显示、也没通知"就是这个死角）。
+          // 这里补上一条可点击的提示，把"别处有人在等你"说出来。
+          if (otherSessionQuestionCount(dsh) > 0)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(
+                color: context.c.warningBadgeSurface,
+                border: Border(bottom: BorderSide(color: context.c.warning, width: 1)),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.help_outline_rounded, size: 16, color: context.c.warning),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '其他会话有 ${otherSessionQuestionCount(dsh)} 个提问在等你回答',
+                      style: TextStyle(color: context.c.warning, fontSize: 12.5, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  TextButton.icon(
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                      backgroundColor: context.c.surface.withOpacity(0.8),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                    ),
+                    onPressed: () => _jumpToQuestionSession(dsh),
+                    icon: Icon(Icons.arrow_forward_rounded, size: 14, color: context.c.warning),
+                    label: Text('去回答', style: TextStyle(color: context.c.warning, fontWeight: FontWeight.bold, fontSize: 12)),
+                  ),
+                ],
+              ),
+            ),
+
           // Pending Tool Approvals Banner
           if (dsh.pendingApprovals.isNotEmpty)
             Container(
@@ -1834,6 +1906,24 @@ class _ChatViewState extends State<ChatView> {
         ],
       ),
     );
+  }
+
+  /// 不属于当前会话的待答提问数量。
+  int otherSessionQuestionCount(DshService dsh) {
+    final cur = dsh.currentSession;
+    if (cur == null) return dsh.pendingQuestions.length;
+    return dsh.pendingQuestions.where((q) => !cur.matchesSessionId(q.sessionId)).length;
+  }
+
+  /// 跳到"正在等你回答"的那个会话。
+  Future<void> _jumpToQuestionSession(DshService dsh) async {
+    final cur = dsh.currentSession;
+    final target = dsh.pendingQuestions.firstWhere(
+      (q) => cur == null || !cur.matchesSessionId(q.sessionId),
+      orElse: () => dsh.pendingQuestions.first,
+    );
+    HapticFeedback.selectionClick();
+    await dsh.openSessionById(target.sessionId);
   }
 
   /// 上一轮失败横幅：把"这轮为什么断了"直接说清楚，并给一键"重试"的入口。

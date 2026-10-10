@@ -301,6 +301,9 @@ export function apply(ctx, config = {}, internals = {}) {
   /** Upload rate buckets: device id / ip → { windowStart, count }. */
   const uploadBuckets = new Map();
 
+  /** 每会话最近一次"丢弃过期 lastTurn"的审计时间（节流，见 getSessionHistory）。 */
+  const staleTurnAuditAt = new Map();
+
   const sessionFollowers = new Map();
   const pendingApprovals = new Map();
   let approvalCounter = 1;
@@ -824,11 +827,15 @@ export function apply(ctx, config = {}, internals = {}) {
     // （或错误发生在手机不在场时）必须也能看到它，否则"报错了但手机没显示"
     // 就永远修不掉。
     let lastTurn = null;
-    // 引擎认定的"最后一个已闭合回合"号，用来判定我们从分页里读到的那条
-    // turn/end 到底是不是最新的（见下面的 mismatch 丢弃）。
+    // 引擎认定的"最后一个**已闭合**回合"号。
+    //
+    // ⚠️ 回合打开时 turnBoundary.lastTurn 是**当前正在跑的那个回合号**（实测：
+    // 本会话运行中 lastTurn=7，最后闭合的其实是 6）。不减这 1，就会在运行中的
+    // 回合里把上一轮**真实**的失败判成"对不上"而丢弃 —— 那等于把报错横幅关掉。
     const engineLastClosedTurn = (() => {
-      const v = cacheData?.record?.rows?.turnBoundary?.val?.lastTurn;
-      return typeof v === 'number' ? v : null;
+      const tbVal = cacheData?.record?.rows?.turnBoundary?.val;
+      if (!tbVal || typeof tbVal.lastTurn !== 'number') return null;
+      return tbVal.openTurnStartSeq != null ? tbVal.lastTurn - 1 : tbVal.lastTurn;
     })();
 
     // 1. 调用 DSH 原生 RPC session/page 获取真实历史事件流
@@ -947,12 +954,22 @@ export function apply(ctx, config = {}, internals = {}) {
     // 用户 —— 那正是"每次打开都弹之前那条过期信息"的直接成因。
     if (lastTurn && engineLastClosedTurn != null && lastTurn.turn != null
         && lastTurn.turn !== engineLastClosedTurn) {
-      audit('session/last-turn-stale-dropped', {
-        sessionId,
-        readTurn: lastTurn.turn,
-        engineLastClosedTurn,
-        kind: lastTurn.kind
-      });
+      // 只对"丢掉的是一条失败"记审计，且同一会话 60 秒最多一条。
+      // 无条件记会怎样：手机每 2.5 秒轮询一次会话，一次一条 —— 200 条的审计
+      // 环形缓冲会在几分钟内被这种无意义的重复刷爆，把真正的排查线索挤出去
+      // （实测把 10:58 的提问记录冲掉了，那次排查因此丢了现场）。
+      if (lastTurn.failed) {
+        const lastAudit = staleTurnAuditAt.get(sessionId) || 0;
+        if (Date.now() - lastAudit > 60000) {
+          staleTurnAuditAt.set(sessionId, Date.now());
+          audit('session/last-turn-stale-dropped', {
+            sessionId,
+            readTurn: lastTurn.turn,
+            engineLastClosedTurn,
+            kind: lastTurn.kind
+          });
+        }
+      }
       lastTurn = null;
     }
 
@@ -1154,22 +1171,16 @@ export function apply(ctx, config = {}, internals = {}) {
    * tell the agent the human replied with nothing — a different and false
    * statement. Leaving the request unanswered is what lets the engine's
    * waterfall fall through to the Web UI answerer, which is the honest outcome
-   * when the phone is gone.
+   * when nobody claims it.
    *
-   * When `fromWs` is provided (a specific subscriber disconnected), the entry
-   * is only relinquished if no OTHER live subscriber was also offered it; the
-   * remaining phones keep their cards and can still answer. Only when the last
-   * holder goes away does the prompt fall back to the Web UI.
+   * Called on: engine cancel, upstream link loss, TTL expiry. Deliberately NOT
+   * called when a subscriber simply disconnects — phones drop their socket all
+   * the time (lock screen, backgrounding, Wi-Fi↔LTE), and the agent is blocked
+   * waiting on a human exactly then. See the ws close handler.
    */
-  function relinquishQuestion(eventId, why, fromWs = null) {
+  function relinquishQuestion(eventId, why) {
     const pending = pendingQuestions.get(eventId);
     if (!pending) return false;
-    if (fromWs) {
-      pending.offeredTo?.delete(fromWs);
-      const stillOffered = [...(pending.offeredTo || [])].some((ws) =>
-        questionSubscribers.has(ws) && ws.readyState === WebSocket.OPEN);
-      if (stillOffered) return false; // another phone still holds it
-    }
     pendingQuestions.delete(eventId);
     audit('question/relinquished', { eventId, sessionId: pending.sessionId, why });
     return true;
@@ -2961,10 +2972,9 @@ export function apply(ctx, config = {}, internals = {}) {
         } else if (msg.type === 'unsubscribe_questions') {
           questionSubscribers.delete(ws);
           ws.wantsQuestions = false;
-          // Give up only what THIS phone can no longer answer; other holders
-          // keep their cards.
-          for (const q of [...pendingQuestions.values()]) {
-            relinquishQuestion(q.eventId, 'subscriber-unsubscribe', ws);
+          // 与断线同一策略：只是这台设备不再接收，条目留着（见下面 close 的注释）。
+          for (const q of pendingQuestions.values()) {
+            q.offeredTo?.delete(ws);
           }
         } else if (msg.type === 'approval_response') {
           const eventId = msg.eventId || msg.approvalId || msg.id;
@@ -2977,21 +2987,24 @@ export function apply(ctx, config = {}, internals = {}) {
     });
 
     ws.on('close', () => {
-      // A phone that vanished must stop being offered questions it will never
-      // answer. With multiple phones subscribed, only the prompts THIS phone
-      // held go away — the others keep theirs and can still answer. Only when
-      // the last holder disconnects does the prompt fall back to the Web UI.
+      // 手机上少一次"提问没到"的机会。
+      //
+      // 旧行为：订阅者一断开就把该提问从待办里删掉。但手机断线极常见（锁屏、
+      // 切后台、Wi-Fi↔4G 切换），而提问恰恰是"agent 停在那里等人"的时刻 ——
+      // 实测就发生过：提问下发后 1 秒手机 socket 断开，条目被释放，用户 reconnect
+      // 回来时 replay 是空的，手机上既没有卡片也没有通知（10:58 那次）。
+      //
+      // 现在只把这台 socket 从 offeredTo 里摘掉，条目留着：重连的手机在
+      // subscribe 时会拿到 pending replay，仍然能作答。真正的收尾交给 TTL
+      // （30 分钟）、引擎取消、或已作答。
+      //
+      // 代价必须讲清楚：如果电脑端（Web UI）抢先答了，条目会滞留到 TTL，
+      // 手机此后作答会被引擎以 unknown-question 拒掉 —— 客户端已把这种情况
+      // 显示为"该提问已过期（可能已被其它设备回答）"并收走卡片。用"偶尔一张
+      // 过期卡片"换"提问根本不到手机上"，这个取舍是划算的。
       if (questionSubscribers.has(ws)) {
-        const dropped = [];
-        for (const q of [...pendingQuestions.values()]) {
-          if (relinquishQuestion(q.eventId, 'subscriber-disconnect', ws)) dropped.push(q.eventId);
-        }
-        for (const eventId of dropped) {
-          sendToSubscribers({
-            type: 'questions_invalidated',
-            eventId,
-            reason: 'subscriber-disconnect'
-          }, questionSubscribers);
+        for (const q of pendingQuestions.values()) {
+          q.offeredTo?.delete(ws);
         }
       }
       questionSubscribers.delete(ws);
