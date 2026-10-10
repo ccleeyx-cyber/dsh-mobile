@@ -8,7 +8,14 @@
  * `lib/index.js` stays the single owner of the HTTP surface, the engine RPC
  * caller and the upstream MUX; this file must not import either of them, so a
  * unit test can exercise every decision here without a live DSH.
+ *
+ * The one exception is `sendFile`: it imports it directly (rather than taking it
+ * from `deps`) because a route test must exercise the *real* byte writer. When
+ * it was injectable, the test harness supplied a two-argument stub that needed
+ * no response object, so it happily passed while the real function threw
+ * `ReferenceError: res is not defined` on every download.
  */
+import { sendFile } from './send-file.mjs';
 
 import path from 'node:path';
 
@@ -873,7 +880,7 @@ export function claimsMobileFeatureRoute(method, pathname) {
  */
 export async function handleFeatureRoute(deps) {
   const {
-    pathname, req, jsonBody, sendJson, callDshRpc, readStreamOnce,
+    pathname, req, res, jsonBody, sendJson, callDshRpc, readStreamOnce,
     readProjections, readSessionRecords, readConfig, writeConfig, audit, logger
   } = deps;
 
@@ -998,7 +1005,12 @@ export async function handleFeatureRoute(deps) {
     // otherwise the socket is left open with no response and the phone's
     // 60-second `http.get` timeout is the only thing that ends it (that is what
     // "点不开" looked like: a long spinner and then a generic timeout toast).
-    const sent = await deps.sendFile(row.path, row.display);
+    //
+    // `res` is passed explicitly: `sendFile` writes the 200 itself, and it used
+    // to reference `res` as a free variable it could not see, which threw
+    // `ReferenceError: res is not defined` on every download — a 500 for every
+    // deliverable. The signature is (res, absPath, displayName).
+    const sent = await sendFile(res, row.path, row.display);
     if (sent === false) {
       sendJson(404, {
         ok: false,

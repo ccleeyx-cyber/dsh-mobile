@@ -38,11 +38,71 @@ ignored: ["**/node_modules", "**/.*", "cache", "data"]
 | 0002 归档筛选 | **已应用并生效** —— 同一次重启加载；实测 `?archived=only` 正确回显 `archivedMode`，三态 `archivedCount` 恒为 1338 |
 | 0003 事件转发（提问 / TODO / 附件 + 背压） | **已应用并生效** —— 2026-10-10 12:00 那次重启加载（网关版本当时为 1.3.1） |
 | 0004 重度远程能力（bridge 1.14.0） | **已应用并生效** —— 2026-10-10 16:03:54 那次重启加载（实测四个新路由返回 `400 sessionId is required`、伪造路由返回 `404`，证明已注册） |
-| 0005 修复 0004 的致命缺陷 + ntfy 闭环（见下节） | ⚠️ **已写进 `lib/`，尚未生效** —— **需要你重启一次 dsh web**（本轮全部网关改动合并在这一步） |
+| 0005 修复 0004 的致命缺陷 + ntfy 闭环 | **已应用并生效** —— 2026-10-10 17:27:33 那次重启加载（实测 `/deliverables` 返回真实条目、`/sessions/queue` 返回 `queue` 键而不再是被通配吞掉的空历史） |
+| 0006 修复交付物下载 500（见下节） | ⚠️ **已写进 `lib/`，尚未生效** —— **需要你重启一次 dsh web** |
 
 补丁生成过程中活文件一个字节都没被改过（0001 生成时 SHA256 前后一致：`index.js=CB1C57D0…`、`core.mjs=3D74A56E…`）。
 
 ---
+
+## 0006-gateway-fix-deliverable-download（需重启一次 dsh web）
+
+0005 之后用户实测**"产物依然没法看，点击下载也下载不成功"**。在活实例上复现并定位：
+
+```
+GET /api/mobile/deliverables?sessionId=session-b014a73e-…   → 200，条目正确（0005 的修复有效）
+GET /api/mobile/deliverables/download?…                     → 500  {"error":"res is not defined"}
+```
+
+### 根因
+
+`sendFile` 定义在插件工厂里，函数体写 `res.writeHead(...)` / `stream.pipe(res)`，**但 `res` 不是它的参数** —— 它是工厂作用域里并不存在的自由变量。于是**每一次下载都抛 ReferenceError，被外层 catch 变成 500**。交付物清单能列出来，点下载却必然失败。
+
+### 为什么 211 个网关测试 + 391 个 App 测试都没拦住
+
+测试桩里注入的是：
+
+```js
+sendFile: async (p, name) => { calls.files.push({ p, name }); return true; }
+```
+
+**一个两参数、永远返回 true、完全不需要响应对象的假函数**。它和真实实现毫无相似之处，所以路由测试全绿而生产必崩。这与 T4 审计点名的病同一形态：**网关测试只 import 纯函数，从不执行处理器函数体**。
+
+### 修法（不只是修 bug，而是把这个缺陷类别堵死）
+
+1. `sendFile` 抽到 **`lib/send-file.mjs`**，签名改为 `sendFile(res, absPath, displayName)` —— 把 `res` 变成参数，"自由变量"从结构上不可能再出现。`features.mjs` **直接 import 真实实现**（不再从 deps 注入），并显式传 `res`；`index.js` 不再向 deps 传 `sendFile`（消除第二真值来源，正是它当初掩盖了 bug）。
+2. 新增 `tests/unit/send-file.test.mjs`（5 条）：用**真实临时文件 + 假 `res`** 断言 200、`Content-Length` 等于真实字节数、**接收到的字节逐字节相同**、中文文件名正确百分号编码；文件不存在 → 不写任何东西且回 false；目录 → 拒绝；**伪响应对象 → 必须响亮失败**（不得静默成功）。
+3. 改造 `features.test.mjs` 的下载用例：不再数桩调用次数，而是**让真实 `sendFile` 真的把字节写进响应**，并断言 `res.statusCode === 200`、字节数一致、404 分支不留下已提交的 200。
+4. 新增 `.probe/download-e2e.mjs`：在**真实 HTTP server** 上挂真实分发器（假引擎 + 真实文件），跑通"列出 → 下载 → 越权拒绝"三段 —— **这是无需重启就能做的端到端验证**。
+
+### 验证结果（实测，非推断）
+
+```
+# 把 sendFile 临时退回自由变量形态 → 新用例立刻变红
+✖ route: deliverable download writes the real bytes to the response
+ℹ pass 52  fail 1        （恢复后 53/53 通过）
+
+# 真实 socket 端到端
+LIST     status=200 count=1 path=match
+DOWNLOAD status=200 content-length=32 bytes=32
+BYTES    identical=true
+DISPOSITION attachment; filename*=UTF-8''%E9%AA%8C%E6%94%B6%E6%8A%A5%E5%91%8A.docx
+REFUSED  status=403 {"code":403,"error":"该文件不在本会话的交付物清单中"}
+```
+
+网关全量 **217 个测试、10 个文件全绿**。
+
+### 重启后的验收（一步）
+
+```bash
+TOKEN=<~/.dsh/mobile-bridge/config.json 里的 token>
+curl -s -o /tmp/x.docx -w "%{http_code} %{size_download}\n" -H "x-dsh-token: $TOKEN" \
+  "http://127.0.0.1:3088/api/mobile/deliverables/download?sessionId=session-b014a73e-90d9-4160-a084-d6dea8cbe435&path=E%3A%5Cworkspace%5C%E4%B8%AA%E4%BA%BA%5Cdsh_mobile%5CDSH-Mobile-v1.13.0-%E6%96%B0%E5%8A%9F%E8%83%BD%E4%B8%8E%E9%AA%8C%E6%94%B6%E6%B8%85%E5%8D%95.docx"
+# 期望：200 5900   （修复前是 500 30）
+```
+
+---
+
 
 ## 0005-gateway-fix-broken-features（需重启一次 dsh web）
 

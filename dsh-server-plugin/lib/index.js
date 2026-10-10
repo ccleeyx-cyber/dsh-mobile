@@ -25,6 +25,7 @@ import {
   loadPermissions, savePermissions, permissionsFile
 } from './store.mjs';
 import { installRpc, RPC_CHANNEL, ENDPOINTS } from './rpc.mjs';
+import { sendFile } from './send-file.mjs';
 import {
   handleFeatureRoute,
   buildNtfyRequest,
@@ -380,40 +381,14 @@ export function apply(ctx, config = {}, internals = {}) {
   }
 
   /**
-   * Stream one file to the client with a download disposition.
+   * 交付物/文件下载的字节输出见 `./send-file.mjs`。
    *
-   * Returns true once the bytes are on the wire, false when nothing could be
-   * sent (missing path, not a regular file, or a read error). On false this
-   * writes NOTHING — deliberately: a partially-written 200 would be worse than
-   * an error the client can see. The caller owns the error response; a caller
-   * that ignores the return value leaves the socket open with no answer (the
-   * phone then waits out its full request timeout).
+   * 这里**故意不再**内联实现：它曾作为工厂内的局部函数把 `res` 当自由变量用，
+   * 于是每次调用都抛 `ReferenceError: res is not defined`，下载路由对**所有**
+   * 交付物返回 500 —— 这就是用户看到的"点不开 / 下载不成功"。抽成模块后单测
+   * 能 import 真实实现、用假 `res` 驱动它；在此之前测试只注入两参数假桩，
+   * 与真实函数毫无相似之处，所以路由测试全绿而生产必崩。
    */
-  function sendFile(absPath, displayName) {
-    return new Promise((resolve) => {
-      let stat;
-      try {
-        stat = fs.statSync(absPath);
-      } catch {
-        resolve(false);
-        return;
-      }
-      if (!stat.isFile()) {
-        resolve(false);
-        return;
-      }
-      const safeName = encodeURIComponent(path.basename(displayName || absPath));
-      res.writeHead(200, {
-        'Content-Type': 'application/octet-stream',
-        'Content-Length': stat.size,
-        'Content-Disposition': `attachment; filename*=UTF-8''${safeName}`
-      });
-      const stream = fs.createReadStream(absPath);
-      stream.on('error', () => { try { res.destroy(); } catch (_) {} resolve(false); });
-      stream.on('end', () => resolve(true));
-      stream.pipe(res);
-    });
-  }
 
   /**
    * Open a stream Remote on the MUX, take its first `take` items, then cancel.
@@ -2816,7 +2791,11 @@ export function apply(ctx, config = {}, internals = {}) {
         jsonBody,
         auth,
         sendJson,
-        sendFile,
+        // `sendFile` is deliberately NOT passed: features.mjs imports the real
+        // implementation so route tests exercise the actual byte writer. Injecting
+        // it here as well created two sources of truth, and the injectable one was
+        // stubbed as `async (p, name) => true` -- which is how a 500-on-every-
+        // download defect survived a whole release with green tests.
         callDshRpc,
         readStreamOnce,
         readProjections,

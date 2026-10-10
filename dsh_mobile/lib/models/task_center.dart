@@ -327,6 +327,26 @@ class SessionStats {
 
   bool get hasUsage => totalTokens != null;
 
+  /// Tokens this session actually consumed: uncached input + output.
+  ///
+  /// Deliberately **not** [totalTokens], which also adds the cache buckets. On a
+  /// live session the cache-read bucket is the same context re-read every turn,
+  /// so it dwarfs everything else (measured on the user's own session: 11.08M
+  /// input + 0.34M output + 193.46M cache read). Showing that sum as
+  /// "consumption" claimed 205M tokens had been burned when they had not, and
+  /// the user reasonably read the figure as nonsense. Cache traffic is reported
+  /// on its own line and is not part of what was consumed.
+  ///
+  /// null when neither core number is known, so the UI shows "—" rather than
+  /// inventing a zero.
+  int? get consumedTokens {
+    if (uncachedInputTokens == null && outputTokens == null) return null;
+    return (uncachedInputTokens ?? 0) + (outputTokens ?? 0);
+  }
+
+  /// True when the provider reported cache reuse worth mentioning.
+  bool get hasCacheReuse => (cacheReadTokens ?? 0) > 0 || (cacheWriteTokens ?? 0) > 0;
+
   /// Context occupancy as a 0..1 fraction, or null when either side is unknown.
   double? get contextFraction {
     final used = pressureTokens;

@@ -285,8 +285,12 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         ));
         children.add(const SizedBox(height: 6));
         children.add(Text(
-          '上下文已用 ${stats.pressureTokens} / ${stats.contextWindow}'
-          '${stats.projectedTokens != null ? ' · 下一轮预计 ${stats.projectedTokens}' : ''}',
+          // Thousand separators here too: these were the only raw integers left
+          // in the panel, so the window rendered as a bare `1000000` right under
+          // a properly grouped `会话累计` — inconsistent, and easy to misread as
+          // "you just computed it against 1M".
+          '上下文已用 ${_group(stats.pressureTokens!)} / ${_group(stats.contextWindow!)}'
+          '${stats.projectedTokens != null ? ' · 下一轮预计 ${_group(stats.projectedTokens!)}' : ''}',
           style: TextStyle(fontSize: 11.5, color: context.c.textSecondary),
         ));
       }
@@ -295,7 +299,19 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       // 常驻噪声（缓存读/写、未缓存输入、输出四格）已经砍掉——它们对手机上唯一
       // 的三个决策（继续 / 新开会话 / 放弃）没有可行动价值。这里只留三行。
       children.add(_metricRow('本轮消耗', _formatTurnBurn(widget.turnBurnTokens)));
-      children.add(_metricRow('会话累计', stats.totalTokens == null ? '—' : _group(stats.totalTokens!)));
+      // 「消耗」= 未缓存输入 + 输出。**不能**用 totalTokens：它还包含缓存读，
+      // 而缓存读是同一段上下文被反复重读，会把数字吹大一个量级（用户实测
+      // 11.08M 输入 + 0.34M 输出 + 193.46M 缓存读），显示成 205M 完全不是消耗。
+      final consumed = stats.consumedTokens;
+      children.add(_metricRow('会话累计消耗', consumed == null ? '—' : _group(consumed)));
+      if (stats.hasCacheReuse) {
+        children.add(Padding(
+          padding: const EdgeInsets.only(top: 2),
+          child: _hint('另有缓存复用 ${_group(stats.cacheReadTokens ?? 0)}'
+              '${(stats.cacheWriteTokens ?? 0) > 0 ? ' + 写入 ${_group(stats.cacheWriteTokens!)}' : ''}'
+              '（重复读取的上下文，不计入上面的消耗）。'),
+        ));
+      }
       if (widget.turnBurnTokens == null) {
         children.add(Padding(
           padding: const EdgeInsets.only(top: 2),

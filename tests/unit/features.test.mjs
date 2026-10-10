@@ -9,7 +9,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 import { readFileSync } from 'node:fs';
+import { PassThrough } from 'node:stream';
 
 import {
   selectQueueRows,
@@ -466,16 +469,42 @@ test('the REAL audit sink can be served to a client without leaking the channel'
  * route table
  * ------------------------------------------------------------------ */
 
+/**
+ * A response double that is a real Writable, so `stream.pipe(res)` works.
+ *
+ * The download route now calls the **real** `sendFile` (imported by
+ * features.mjs), not an injected stub. That is deliberate: the old harness
+ * supplied `sendFile: async (p, name) => true` — a fake with no response object
+ * — so the route tests stayed green while the real function threw
+ * `ReferenceError: res is not defined` and every download answered 500.
+ */
+function makeFakeRes() {
+  const res = new PassThrough();
+  const chunks = [];
+  res.on('data', (c) => chunks.push(c));
+  res.statusCode = null;
+  res.headers = null;
+  res.bytes = () => Buffer.concat(chunks);
+  res.writeHead = function writeHead(status, headers) {
+    this.statusCode = status;
+    this.headers = headers;
+    return this;
+  };
+  return res;
+}
+
 function makeHarness(overrides = {}) {
   const calls = { sent: [], rpc: [], audits: [], streams: [], files: [] };
   const deps = {
     pathname: '',
     req: { method: 'GET' },
+    res: makeFakeRes(),
     parsedUrl: { query: {} },
     jsonBody: {},
     auth: { device: { id: 'test', role: 'readwrite' } },
     sendJson: (status, body) => calls.sent.push({ status, body }),
-    sendFile: async (p, name) => { calls.files.push({ p, name }); return true; },
+    // No `sendFile` key on purpose: features.mjs imports the real one so that a
+    // route test can never pass against a fake that does not resemble it.
     callDshRpc: async (method, payload) => { calls.rpc.push({ method, payload }); return overrides.rpcResult ?? {}; },
     readStreamOnce: async (endpoint, args, opts) => { calls.streams.push({ endpoint, args, opts }); return overrides.streamResult ?? null; },
     readProjections: async () => overrides.projections ?? null,
@@ -559,19 +588,56 @@ test('route: deliverable download refuses anything not presented', async () => {
   deps.pathname = '/api/mobile/deliverables/download';
   deps.parsedUrl = { query: { sessionId: 's', path: '/etc/shadow' } };
   await handleFeatureRoute(deps);
-  assert.equal(calls.files.length, 0, 'no file may be streamed');
+  // Assert on the response itself, not on a stubbed call count: the property
+  // that matters is that no bytes and no 200 ever reach the client.
+  assert.equal(deps.res.statusCode, null, 'no file may be streamed');
+  assert.equal(deps.res.bytes().length, 0);
   assert.equal(calls.sent[0].status, 403);
 });
 
-test('route: deliverable download streams a declared file', async () => {
-  const { deps, calls } = makeHarness({
-    sessionRecords: { records: [{ event: { type: 'deliverables/presented', seq: 1, data: { files: [{ path: 'out/ok.docx' }] } } }], cwd: '/w' }
+test('route: deliverable download writes the real bytes to the response', async () => {
+  // A real file on disk, so the real sendFile actually streams something. The
+  // previous version of this test only counted calls into an injected stub and
+  // would pass no matter what the real writer did.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deliverable-'));
+  const real = path.join(dir, 'ok.docx');
+  const content = Buffer.from('PK deliverable bytes', 'utf8');
+  fs.writeFileSync(real, content);
+
+  const { deps } = makeHarness({
+    sessionRecords: { records: [{ event: { type: 'deliverables/presented', seq: 1, data: { files: [{ path: real, description: 'x' }] } } }], cwd: dir }
   });
   deps.pathname = '/api/mobile/deliverables/download';
-  deps.parsedUrl = { query: { sessionId: 's', path: path.resolve('/w/out/ok.docx') } };
-  await handleFeatureRoute(deps);
-  assert.equal(calls.files.length, 1);
-  assert.equal(calls.files[0].name, 'out/ok.docx');
+  deps.parsedUrl = { query: { sessionId: 's', path: real } };
+
+  assert.equal(await handleFeatureRoute(deps), true);
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(deps.res.statusCode, 200, 'the download must answer 200');
+  assert.equal(deps.res.headers['Content-Length'], content.length);
+  assert.equal(deps.res.bytes().length, content.length, 'the phone must receive every byte');
+  assert.equal(deps.res.bytes().toString('utf8'), content.toString('utf8'));
+});
+
+test('route: a declared file that vanished answers 404, never a silent hang', async () => {
+  // The file was presented earlier but is gone from the host now. sendFile
+  // writes NOTHING in that case, so the route must answer for it -- otherwise
+  // the socket stays open and the phone waits out its full 60s timeout, which
+  // is exactly what "点不开" looked like before.
+  const gone = path.join(os.tmpdir(), `vanished-${Date.now()}.docx`);
+  const { deps, calls } = makeHarness({
+    sessionRecords: { records: [{ event: { type: 'deliverables/presented', seq: 1, data: { files: [{ path: gone }] } } }], cwd: os.tmpdir() }
+  });
+  deps.pathname = '/api/mobile/deliverables/download';
+  deps.parsedUrl = { query: { sessionId: 's', path: gone } };
+
+  assert.equal(await handleFeatureRoute(deps), true);
+
+  assert.equal(deps.res.statusCode, null, 'no 200 may be committed when nothing was streamed');
+  assert.equal(deps.res.bytes().length, 0, 'nothing may be written to the body');
+  assert.equal(calls.sent.length, 1, 'the route must answer instead of leaving the socket open');
+  assert.equal(calls.sent[0].status, 404);
+  assert.equal(calls.sent[0].body.path, gone, 'the reply names the path so the user can see what moved');
 });
 
 /* ------------------------------------------------------------------ *
@@ -678,16 +744,18 @@ test('projectionCacheFileNames: reaches BOTH cache filename spellings', () => {
 test('route: deliverable download 404s instead of leaving the socket unanswered', async () => {
   // `sendFile` writes nothing when the file is gone; the route must answer or
   // the phone sits in its full 60s `http.get` timeout (what "点不开" looked like).
+  // No stub here on purpose: the real sendFile is what must observe the missing
+  // file and report false.
   const { deps, calls } = makeHarness({
     sessionRecords: { records: [{ event: { type: 'deliverables/presented', seq: 1, data: { files: [{ path: 'out/gone.docx' }] } } }], cwd: '/w' }
   });
   deps.pathname = '/api/mobile/deliverables/download';
   deps.parsedUrl = { query: { sessionId: 's', path: path.resolve('/w/out/gone.docx') } };
-  deps.sendFile = async () => false; // file removed from the host
   await handleFeatureRoute(deps);
   assert.equal(calls.sent.length, 1, 'exactly one response');
   assert.equal(calls.sent[0].status, 404);
   assert.equal(calls.sent[0].body.code, 404);
+  assert.equal(deps.res.statusCode, null, 'nothing may have been streamed');
 });
 
 test('route: deliverables reports the scan truncation flag', async () => {

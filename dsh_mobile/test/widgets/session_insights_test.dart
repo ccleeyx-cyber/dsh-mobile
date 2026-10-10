@@ -399,22 +399,67 @@ void main() {
         const SessionInfoSheet(stats: SessionStats(source: 'live', totalTokens: 1500)),
       );
       expect(find.text('本轮消耗'), findsOneWidget);
-      expect(find.text('—'), findsOneWidget);
+      // 两处未知都显示「—」：本轮消耗（没量到实时读数）与会话累计消耗（该 fixture
+      // 只有 totalTokens、没有分桶，按"未知≠0"的规矩不能拿 totalTokens 冒充）。
+      expect(find.text('—'), findsNWidgets(2));
       expect(find.text('0'), findsNothing, reason: '0 会被读成"这轮没花钱"，而真相是"不知道"');
       expect(find.textContaining('取不到实时读数时显示「—」'), findsOneWidget);
+      expect(find.text('1,500'), findsNothing, reason: 'totalTokens 不是消耗，不得显示');
     });
 
     testWidgets('拿得到实时读数时显示本轮消耗，并做千分位', (tester) async {
       await pumpSheet(
         tester,
         const SessionInfoSheet(
-          stats: SessionStats(source: 'live', totalTokens: 128000, pressureTokens: 64000, contextWindow: 128000),
+          stats: SessionStats(
+            source: 'live',
+            totalTokens: 139500,
+            uncachedInputTokens: 128000,
+            outputTokens: 11500,
+            pressureTokens: 64000,
+            contextWindow: 128000,
+          ),
           turnBurnTokens: 12345,
         ),
       );
       expect(find.text('12,345'), findsOneWidget);
-      expect(find.text('128,000'), findsOneWidget);
-      expect(find.textContaining('上下文已用 64000 / 128000'), findsOneWidget);
+      expect(find.text('139,500'), findsOneWidget, reason: '消耗 = 未缓存输入 + 输出');
+      // 千分位必须同样作用在上下文那一行：以前这里是裸整数 `64000 / 128000`，
+      // 而它上面一行却是分好组的，容易被读成"按 1M 算的"。
+      expect(find.textContaining('上下文已用 64,000 / 128,000'), findsOneWidget);
+    });
+
+    testWidgets('缓存复用不得被算进"消耗"（用户实测 205M 的成因）', (tester) async {
+      // 用户活会话的真实形状：输入 11.08M、输出 0.34M、缓存读 193.46M。
+      // 旧实现把四个桶全加进 totalTokens 并当作"会话累计"显示 ⇒ 界面报出
+      // 2.05 亿 token 的"消耗"，其中 94% 只是同一段上下文被反复重读。
+      await pumpSheet(
+        tester,
+        const SessionInfoSheet(
+          stats: SessionStats(
+            source: 'live',
+            totalTokens: 204881889,
+            uncachedInputTokens: 11080549,
+            outputTokens: 342002,
+            cacheReadTokens: 193459338,
+            cacheWriteTokens: 0,
+          ),
+        ),
+      );
+
+      expect(find.text('11,422,551'), findsOneWidget, reason: '消耗 = 11,080,549 + 342,002');
+      expect(find.text('204,881,889'), findsNothing, reason: '把缓存读算进去会凭空报出 2 亿');
+      expect(find.textContaining('缓存复用 193,459,338'), findsOneWidget);
+      expect(find.textContaining('不计入上面的消耗'), findsOneWidget);
+    });
+
+    testWidgets('分桶取不到时显示「—」，绝不用 totalTokens 冒充消耗', (tester) async {
+      await pumpSheet(
+        tester,
+        const SessionInfoSheet(stats: SessionStats(source: 'live', totalTokens: 128000)),
+      );
+      expect(find.text('会话累计消耗'), findsOneWidget);
+      expect(find.text('128,000'), findsNothing, reason: '只有 totalTokens 时无法得知真实消耗');
     });
 
     testWidgets('缓存快照与实时值给的是两种说明', (tester) async {
