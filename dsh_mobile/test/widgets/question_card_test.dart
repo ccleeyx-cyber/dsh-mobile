@@ -456,4 +456,71 @@ void main() {
       expect(find.byIcon(Icons.error_outline_rounded), findsOneWidget);
     });
   });
+
+  group('QuestionCard 多选项布局（回归：提交按钮被顶出屏幕）', () {
+    /// 用户实测场景：多选题、每个选项带 description，卡片挂在输入框上方的
+    /// 固定区（自身不在可滚动列表里），选项一多提交按钮就被顶出屏幕外。
+    /// 修法是卡片限高 + 题目区内滚 + 提交按钮钉底。这组测试断言的就是
+    /// "无论多少选项，提交按钮永远在视口内可点"。
+    PendingQuestion buildWidePending() {
+      final options = List.generate(
+        12,
+        (i) => {'label': '选项${i + 1}', 'description': '这是第 ${i + 1} 个选项的说明文字，比较长'},
+      );
+      return PendingQuestion.fromJson({
+        'eventId': 'evt-wide',
+        'sessionId': 'session-abc',
+        'questions': [
+          {'id': 'q1', 'question': '请选择所有适用的项？', 'options': options, 'multiSelect': true},
+        ],
+      });
+    }
+
+    Future<void> pumpInFixedArea(WidgetTester tester, PendingQuestion pending) async {
+      // 模拟真实挂载环境：卡片上方有一个撑满剩余空间的占位（相当于消息
+      // 列表），卡片本身在 Column 固定区 —— 即它**不能**靠外层滚动自救。
+      tester.view.physicalSize = const Size(1000, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: Column(
+            children: [
+              const Expanded(child: SizedBox()),
+              SizedBox(
+                width: 1000,
+                child: QuestionCard(
+                  pending: pending,
+                  canAnswer: true,
+                  onSubmit: (_, __) => true,
+                  onDismiss: () {},
+                ),
+              ),
+            ],
+          ),
+        ),
+      ));
+      await tester.pump();
+    }
+
+    testWidgets('选项再多，提交按钮仍在屏幕内且可点击', (tester) async {
+      await pumpInFixedArea(tester, buildWidePending());
+
+      final btn = find.widgetWithText(FilledButton, '提交回答');
+      expect(btn, findsOneWidget);
+      // 按钮中心必须落在视口内 —— 这就是"最下面没法提交"的反向断言。
+      final center = tester.getCenter(btn);
+      expect(center.dy, lessThan(2400), reason: '提交按钮被顶出屏幕（复现了用户报告的 bug）');
+      expect(center.dy, greaterThan(0));
+    });
+
+    testWidgets('超出的选项收进卡片内部滚动区，不撑破限高', (tester) async {
+      await pumpInFixedArea(tester, buildWidePending());
+
+      final cardSize = tester.getSize(find.byType(QuestionCard));
+      // 420 maxHeight + 12 上下 margin = 上限 432。没有限高时这张
+      // 12 选项卡的实际高度远超此值（每个选项两行文字 + 间距）。
+      expect(cardSize.height, lessThan(433), reason: '卡片必须被 maxHeight=420 约束，不能无限撑高');
+    });
+  });
 }

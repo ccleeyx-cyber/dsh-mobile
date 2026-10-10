@@ -925,10 +925,12 @@ class DshService extends ChangeNotifier {
     // 让在途的旧块失效，不该被当成"这一轮已被取消"。
     _activeTurnSeq++;
     _messages = []; // Clear immediately to prevent cross-contamination
-    // 提问是**会话级**的，不是全局的。切会话时丢掉旧提问，否则会把上一个会话的
-    // 输入卡片挂到新会话的输入框上方 —— 用户会对着一个跟自己无关的问题作答。
-    // TODO 与附件表相反：它们按会话分别存着，切过去直接就能显示。
-    _pendingQuestions.clear();
+    // 提问**不跟着清**。这里曾是「点通知进来看不到选项」的真凶：
+    // 提问经 WS 订阅重放/实时帧存在内存里，用户点通知 → openSessionById →
+    // selectSession 把 _pendingQuestions 整个清空 —— 而网关只在 subscribe 时
+    // 重放一次，清了就永远拿不回来（没有 HTTP 查询接口可补拉）。
+    // 防"把别的会话的提问挂到当前会话"的职责本来就在 currentSessionQuestions
+    // 的会话过滤上，这行 clear 既多余又有害。
     _lastQuestionError = null;
     // 失败横幅同样是会话级的：切走就清，等新会话自己的数据回来再决定。
     _lastTurnFailure = null;

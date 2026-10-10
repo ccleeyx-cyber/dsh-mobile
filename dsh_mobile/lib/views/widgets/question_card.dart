@@ -78,6 +78,11 @@ class _QuestionCardState extends State<QuestionCard> {
     final q = widget.pending;
     return Container(
       margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      // 卡片挂在输入框上方的固定区（不在消息 ListView 里），自身不可滚动。
+      // 选项一多（多选题 + 每项带 description）整张卡被顶出屏幕，提交按钮
+      // 根本够不着 —— 用户实测"最下面没法提交"。所以这里必须自己限高，
+      // 让**题目区**滚动，提交按钮钉在卡片底部永远可见。
+      constraints: const BoxConstraints(maxHeight: 420),
       decoration: BoxDecoration(
         color: context.c.questionSurface,
         borderRadius: BorderRadius.circular(12),
@@ -91,6 +96,7 @@ class _QuestionCardState extends State<QuestionCard> {
         ],
       ),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // header
@@ -128,10 +134,21 @@ class _QuestionCardState extends State<QuestionCard> {
           ),
           Divider(color: context.c.questionBorder, height: 1),
 
-          // questions
-          ...q.questions.map(_buildQuestion),
-
-          if (!widget.canAnswer) _buildOfflineNotice(),
+          // questions —— 可滚动区。Flexible 使其在卡片 maxHeight 内收缩，
+          // 而不是把整张卡无限撑高。
+          Flexible(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.only(top: 2, bottom: 4),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ...q.questions.map(_buildQuestion),
+                  if (!widget.canAnswer) _buildOfflineNotice(),
+                ],
+              ),
+            ),
+          ),
 
           // submit
           Padding(

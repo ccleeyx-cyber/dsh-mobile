@@ -191,4 +191,62 @@ void main() {
 
     dsh.disconnect();
   });
+
+  test('切换会话不能把已收到的提问清掉（点通知进来看不到选项的回归）', () async {
+    allowRealNetwork();
+    final dsh = DshService();
+    unawaited(dsh.connect(ServerConfig(
+      host: '127.0.0.1',
+      port: port,
+      token: 'test-token',
+    )));
+
+    final subscribed = await waitFor(
+      () => parsed().any((m) => m['type'] == 'subscribe_questions'),
+    );
+    expect(subscribed, isTrue, reason: '前置条件：必须先订阅');
+
+    // 模拟网关转发一条实时提问。
+    sockets.first.add(jsonEncode({
+      'type': 'question_request',
+      'eventId': 'evt-keep',
+      'sessionId': 'session-target',
+      'questions': [
+        {
+          'id': 'q1',
+          'question': '选哪个？',
+          'options': [
+            {'label': '甲'},
+            {'label': '乙'},
+          ],
+        }
+      ],
+    }));
+
+    final got = await waitFor(() => dsh.pendingQuestions.isNotEmpty);
+    expect(got, isTrue, reason: '前置条件：提问先要收到');
+
+    // 用户点通知 → openSessionById → selectSession。旧代码在这里
+    // _pendingQuestions.clear()，把刚到手的提问整批删掉，而网关只在
+    // subscribe 时重放一次 —— 清了就永远拿不回来，界面上就是
+    // "点进去什么选项都没有"。
+    await dsh.openSessionById('session-target');
+    await testerPump();
+    expect(
+      dsh.pendingQuestions,
+      isNotEmpty,
+      reason: 'selectSession 不得清空 _pendingQuestions —— 提问没有 HTTP 补拉'
+          '接口，清了就永久丢失（用户点通知进来看不到选项的真因）。',
+    );
+    expect(dsh.pendingQuestions.first.eventId, 'evt-keep');
+
+    dsh.disconnect();
+  });
+}
+
+/// selectSession 内部有真实的网络调用（REST 历史拉取），测试服务器对它们
+/// 一律 404，await 返回即可；这里额外让出事件循环一拍，确保清理路径
+/// （如果存在）已经被执行过再断言。
+Future<void> testerPump() async {
+  await Future<void>.delayed(const Duration(milliseconds: 50));
 }
