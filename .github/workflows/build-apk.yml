@@ -116,9 +116,22 @@ jobs:
       - name: Report signing configuration
         # 用 job 级 env 而不是 `${{ secrets.* != '' }}` 表达式 —— GitHub 不接受
         # 在 step 级 env/if 里引用 secrets 上下文。守卫写在脚本里。
+        #
+        # Unsigned (debug-key) builds are a real product defect, not a warning:
+        # Android refuses to install one over an existing app signed with a
+        # different key, so every such release forces the user to uninstall —
+        # which wipes the stored gateway host and token. The old behaviour
+        # (warning, then quietly ship) meant a broken release could go out with
+        # a green checkmark. Fail hard on the release path; a PR from a fork has
+        # no access to secrets at all, so it keeps building unsigned.
         run: |
           if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
-            echo "::warning title=Unsigned release build::ANDROID_KEYSTORE_BASE64 未设置，本次 APK 将用 debug key 签名。它无法覆盖安装旧版本（Android 拒绝不同签名），需要先卸载。设置该 secret 后即可产出可升级的包。"
+            echo "::error title=Unsigned release build::ANDROID_KEYSTORE_BASE64 未设置。"
+            if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              echo "发布路径不允许 debug key 签名：Android 会拒绝覆盖安装，用户必须先卸载（连带丢失网关地址与令牌）。请配置 secrets.ANDROID_KEYSTORE_BASE64 / _PASSWORD / _KEY_PASSWORD / _KEY_ALIAS 后重跑。"
+              exit 1
+            fi
+            echo "非发布路径（PR/分支），本次仅产出不可覆盖安装的调试包，用于验证构建是否通过。"
           else
             echo "ANDROID_KEYSTORE_BASE64 已设置，将产出可覆盖安装的签名包。"
           fi
