@@ -63,7 +63,16 @@ android {
             if (hasReleaseKeystore) {
                 keyAlias = keystoreProperties['keyAlias']
                 keyPassword = keystoreProperties['keyPassword']
-                storeFile = keystoreProperties['storeFile'] ? file(keystoreProperties['storeFile']) : null
+                // storeFile 必须相对 **rootProject**（android/）解析，不能用 file()。
+                //
+                // file() 在本文件里以 android/app/ 为基准，于是 key.properties 里写的
+                // "keystore/release.jks"（CI 按 android/ 写入的位置）被解析成
+                // android/app/keystore/release.jks —— 差一级目录，Gradle 直接报
+                // "Keystore file not found"。这个 bug 此前从未暴露：CI 一直没有
+                // 签名材料，hasReleaseKeystore 恒为 false，走 debug 分支根本读不到
+                // storeFile。签名材料一配好就立刻炸 —— 也就是说「APK 装不上去」这个
+                // 缺陷的修复路径本身是断的。
+                storeFile = rootProject.file(keystoreProperties['storeFile'] ?: "keystore/release.jks")
                 storePassword = keystoreProperties['storePassword']
             }
         }
