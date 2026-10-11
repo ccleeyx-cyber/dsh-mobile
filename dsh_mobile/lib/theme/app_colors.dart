@@ -50,8 +50,13 @@ class AppColors {
   static const Color textSecondaryDark = Color(0xFF9CA3AF);
 
   /// 最低对比度文字（时间戳、占位符、禁用态）。
-  static const Color textTertiary = Color(0xFF9CA3AF);
-  static const Color textTertiaryDark = Color(0xFF6B7280);
+  ///
+  /// 这三档此前是「按视觉轻重分级」而非「按对比度分级」：#9CA3AF 在白底只有约
+  /// 2.8:1，#6B7280 在 #111827 深底约 3.9:1，两者都低于 WCAG AA 对正文的 4.5:1。
+  /// 而这一档恰好用在时间戳、工具卡副文案、输入框占位符上 —— 正是视力最弱的用户
+  /// 最需要看清的位置。现已改为满足 AA：浅底 #4B5563(7.5:1)、深底 #9CA3AF(7.0:1)。
+  static const Color textTertiary = Color(0xFF4B5563);
+  static const Color textTertiaryDark = Color(0xFF9CA3AF);
 
   // ---- 中性：面 ----
   /// 页面底色。

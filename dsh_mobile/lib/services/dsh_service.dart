@@ -779,6 +779,28 @@ class DshService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 测试用：直接设定消息列表，不联网。
+  ///
+  /// 存在的理由是审批卡的位置：那条回归要证明的是「一条超长回复不能把审批卡顶出
+  /// 屏幕」，而复现它必须能凭空造出一条任意长度的助手消息 —— 走真实网关既慢又
+  /// 会留下真实会话。
+  @visibleForTesting
+  void debugSetMessages(List<ChatMessage> messages) {
+    _messages = messages;
+    notifyListeners();
+  }
+
+  /// 测试用：直接设定待授权列表，不联网。
+  ///
+  /// 审批只由 fetchApprovals() 和 WebSocket 帧写入，两者都要真网关。审批卡的
+  /// 布局（是否被长消息顶出屏幕、多张时如何呈现）是不依赖引擎行为的纯布局问题，
+  /// 却只能从这张列表读 —— 没有这个缝就只能靠人眼看。
+  @visibleForTesting
+  void debugSetPendingApprovals(List<ApprovalRequest> approvals) {
+    _pendingApprovals = approvals;
+    notifyListeners();
+  }
+
   /// 测试用：当前是否还会接受流式增量块。
   ///
   /// 单独把这条判断暴露出来，是因为"打开正在执行的会话看不到流式信息"这个 bug

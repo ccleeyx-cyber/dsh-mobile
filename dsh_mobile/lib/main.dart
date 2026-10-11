@@ -10,6 +10,7 @@ import 'services/notification_service.dart';
 import 'services/platform_services.dart';
 import 'services/storage_service.dart';
 import 'theme/app_colors.dart';
+import 'theme/app_spacing.dart';
 import 'views/config_page.dart';
 import 'views/main_shell.dart';
 
@@ -214,7 +215,21 @@ class _MyAppState extends State<MyApp> {
       themeMode: themeMode,
       // 让 ThemeScope 覆盖整棵树：widget 测试可以直接包一层 ThemeScope 来
       // 断言深色取值，不需要 singleton 或 mockito。
-      builder: (context, child) => ThemeScope(isDark: isDark, child: child ?? const SizedBox()),
+      //
+      // textScaler 在这里钳到 1.0~1.3：全局此前完全没有处理过系统字号，
+      // 放到 1.3x 时 10.5pt 的时间戳、11pt 的状态条会在固定高度的行里
+      // 互相压住。钳位不是无视可访问性 —— 1.3x 已覆盖多数低视力用户所需，
+      // 真要更大倍率应该改布局，而不是让控件重叠。见 theme/app_spacing.dart。
+      builder: (context, child) {
+        final mq = MediaQuery.of(context);
+        return ThemeScope(
+          isDark: isDark,
+          child: MediaQuery(
+            data: mq.copyWith(textScaler: AppTextScale.clamp(mq.textScaler)),
+            child: child ?? const SizedBox(),
+          ),
+        );
+      },
       home: _buildHome(),
     );
   }

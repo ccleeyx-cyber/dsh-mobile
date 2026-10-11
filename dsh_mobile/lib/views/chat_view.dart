@@ -9,6 +9,7 @@ import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../models/chat_message.dart';
 import '../models/dsh_settings.dart';
+import '../models/approval_request.dart';
 import '../services/dsh_service.dart';
 import '../widgets/thinking_card.dart';
 import '../widgets/tool_call_card.dart';
@@ -91,6 +92,14 @@ class ChatView extends StatefulWidget {
 }
 
 class _ChatViewState extends State<ChatView> {
+  /// dock（审批卡 / 提问卡 / TODO / 附件）最多占屏幕高度的多少。
+  ///
+  /// 这些卡片会一起涨：多张审批、多个提问、几张附件，再乘上系统字号。超过这个
+  /// 比例就把剩余空间让回消息流和输入栏 —— 输入栏必须始终可见可点，那是唯一
+  /// 能发消息的地方。0.55 是权衡值：够放下最常见的「一张审批 + 一个提问」，
+  /// 又不会把聊天区挤没。
+  static const double _dockMaxHeightFraction = 0.55;
+
   final TextEditingController _inputController = TextEditingController();
   final FocusNode _inputFocusNode = FocusNode();
   final ScrollController _scrollController = ScrollController();
@@ -1583,7 +1592,7 @@ class _ChatViewState extends State<ChatView> {
     final currentSessionId = currentSession?.sessionId;
     final isSessionRunning = (currentSession?.isRunning ?? false) ||
         (dsh.isSending && (currentSession?.matchesSessionId(dsh.currentSession?.sessionId) ?? false));
-    final activeApprovals = dsh.pendingApprovals.where((a) {
+    final activeApprovals = dsh.pendingApprovals.where((ApprovalRequest a) {
       if (currentSessionId == null) return false;
       // 会话归属不明的审批（网关侧 sessionId 解析失败落了 'default'）不进
       // 对话流 —— 原来的 `|| a.sessionId == 'default'` 把它塞进**每一个**
@@ -2171,7 +2180,7 @@ class _ChatViewState extends State<ChatView> {
                             physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                             keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
                             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                            itemCount: dsh.messages.length + activeApprovals.length + (showTurnOutput ? 1 : 0),
+                            itemCount: dsh.messages.length + (showTurnOutput ? 1 : 0),
                             itemBuilder: (context, index) {
                               // 1. Messages first (historical and streaming assistant response)
                               if (index < dsh.messages.length) {
@@ -2203,20 +2212,10 @@ class _ChatViewState extends State<ChatView> {
                                 );
                               }
 
-                              // 2. Pending approvals appended at the end of active chat stream
-                              final approvalIndex = index - dsh.messages.length;
-                              if (approvalIndex < activeApprovals.length) {
-                                final req = activeApprovals[approvalIndex];
-                                return Padding(
-                                  padding: const EdgeInsets.only(top: 8, bottom: 12),
-                                  child: ApprovalCard(
-                                    request: req,
-                                    onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
-                                  ),
-                                );
-                              }
+                              // 审批卡片不再挂在消息流末尾（详见 _buildApprovalBlocks 的注释）。
+                              // 这里只剩消息和本轮产出卡。
 
-                              // 3. 「本轮产出」卡片：事件进流那一半 —— 交付物出现在
+                              // 「本轮产出」卡片：事件进流那一半 —— 交付物出现在
                               // 交付它的那一轮之后（见 build 里锚点的说明）。
                               return TurnOutputCard(
                                 deliverables: dsh.deliverables,
@@ -2277,12 +2276,41 @@ class _ChatViewState extends State<ChatView> {
               onJumpTo: (hit) => _jumpToHit(hit, dsh),
             ),
 
-          // 提问卡片 / TODO 面板 / 图片附件（patch 0003）。
+          // 审批卡片 —— 与提问卡同处输入框上方的固定 dock，不再是消息流里的一项。
           //
-          // 顺序是有意的：提问在最上面，因为它阻塞着 agent 的下一步 —— 用户
-          // 必须先看到并回答它，TODO 和图片都是背景信息。附件紧贴输入框，因为
-          // 它是"这轮对话里出现的图"，不是一条独立消息。
-          ..._buildInteractiveBlocks(dsh),
+          // 放在这里而不是 ListView 尾部：审批是阻塞动作，agent 停下等的就是它。
+          // 作为尾部消息时，任何一条长回复都能把它顶出屏幕（用户得先滚到底才能
+          // 点「允许一次」），而提问卡早就是固定区 + 限高 + 操作栏钉底。两个卡片
+          // 必须一致，否则用户学到的心智模型取决于 Agent 最后说了多长。
+          //
+          // 这一段整体有上限 + 可滚动：dock 是 body Column 里的非 flex 子项，
+          // 高度会跟卡片数量、附件数量、系统字号一起涨。一旦超过剩余高度，整个
+          // body Column 就 OVERFLOWING —— 系统字号 1.3x + 一张审批 + 一个提问 +
+          // 几张附件即可复现（实测 RenderFlex 报错）。
+          //
+          // 这里必须用**显式高度上限**而不是 Flexible：Column 里的 Flexible 会把
+          // 子项按剩余空间撑满，于是输入栏被推上去 182px（实测底边 398 而非
+          // 580）—— 那正是 v1.9.0 修过的"输入框下方一条空白"缺陷。
+          ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.sizeOf(context).height * _dockMaxHeightFraction,
+            ),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ..._buildApprovalBlocks(activeApprovals, dsh),
+
+                  // 提问卡片 / TODO 面板 / 图片附件（patch 0003）。
+                  //
+                  // 顺序是有意的：提问在最上面，因为它阻塞着 agent 的下一步 —— 用户
+                  // 必须先看到并回答它，TODO 和图片都是背景信息。附件紧贴输入框，
+                  // 因为它是"这轮对话里出现的图"，不是一条独立消息。
+                  ..._buildInteractiveBlocks(dsh),
+                ],
+              ),
+            ),
+          ),
 
           // 上一轮失败说明（回合级）。放在输入框正上方：它解释的是"为什么刚才
           // 那一轮断了"，紧挨着用户接下来要输入的地方，且不遮挡历史消息。
@@ -2378,6 +2406,42 @@ class _ChatViewState extends State<ChatView> {
         ],
       ),
     );
+  }
+
+  /// 待授权的工具操作。与 [QuestionCard] 同属「阻塞型」交互，因此同样挂在输入框
+  /// 上方的固定 dock，并同样自己限高、把操作按钮钉在底部。
+  ///
+  /// 一次只展示一张：两个审批同时可点的话，用户很容易批错那一个 —— 而错批的
+  /// 代价是让 agent 执行了一条没打算执行的命令。剩下的折叠成计数行，让用户知道
+  /// 还有几张、可以逐张过。
+  List<Widget> _buildApprovalBlocks(List<ApprovalRequest> approvals, DshService dsh) {
+    if (approvals.isEmpty) return const [];
+    final blocks = <Widget>[];
+    final first = approvals.first;
+    blocks.add(
+      ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 300),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: ApprovalCard(
+            request: first,
+            onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
+          ),
+        ),
+      ),
+    );
+    if (approvals.length > 1) {
+      blocks.add(
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+          child: Text(
+            '还有 ${approvals.length - 1} 个操作等待授权，处理完上面这个后依次显示',
+            style: TextStyle(fontSize: 11, color: context.c.textTertiary),
+          ),
+        ),
+      );
+    }
+    return blocks;
   }
 
   /// 提问 / TODO / 附件三块。抽出来是因为它们共享「只属于当前会话」这条约束，

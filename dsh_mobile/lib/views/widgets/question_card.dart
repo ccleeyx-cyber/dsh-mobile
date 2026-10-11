@@ -159,7 +159,10 @@ class _QuestionCardState extends State<QuestionCard> {
                   child: Text(
                     _allAnswered
                         ? '将把回答发送给 Agent'
-                        : '请回答上面每一道题${q.questions.length > 1 ? '（共 ${q.questions.length} 道）' : ''}',
+                        // 旧文案只说「请回答上面每一道题」，但没告诉用户漏选时
+                        // 怎么办 —— 结果就是按钮一直灰着、看不出出路。直接把
+                        // 出路写出来。
+                        : '每道题都要有答复：选项、或者下面那句话${q.questions.length > 1 ? '（共 ${q.questions.length} 道）' : ''}',
                     style: TextStyle(fontSize: 11, color: context.c.orange),
                   ),
                 ),
@@ -300,9 +303,15 @@ class _QuestionCardState extends State<QuestionCard> {
             style: const TextStyle(fontSize: 12.5),
             decoration: InputDecoration(
               isDense: true,
+              // 逃生口的说法要说清楚，不能只写「可选」：
+              // _allAnswered 要求**每一题**都给出 selected 或 custom，而引擎的
+              // isAnswered 契约同样不接受空答案 —— 所以多选题漏选时，用户唯一
+              // 能走的路就是把这句话填出来（比如「跳过此题，先按你的方案执行」）。
+              // 旧文案写成「可选」让人以为留空也算答了，于是提交按钮永远灰着，
+              // 看起来像卡死。这句话必须写明它同时是「不选任何项」的唯一出口。
               hintText: item.options.isEmpty
                   ? '输入你的回答…'
-                  : '补充说明（可选；也可以只填这里代替选项）',
+                  : '不想选？在这里写一句也算回答（如「跳过此项，先按你的方案执行」）',
               hintStyle: TextStyle(fontSize: 12, color: context.c.textTertiary),
               contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
               border: OutlineInputBorder(

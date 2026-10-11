@@ -56,6 +56,89 @@ void main() {
     await tester.pump();
   }
 
+  group('多选题漏选时仍有出路（v1.14.5 可用性修复）', () {
+    // 回归锁定：_allAnswered 要求每一题都有答复，而引擎的 isAnswered 契约同样
+    // 不接受「空 selected + 空 custom」。于是一道漏选就能让整卡永远提交不了，
+    // 而旧文案只说「请回答上面每一道题」，没告诉用户还能怎么办 —— 表现就是按钮
+    // 一直灰着、像卡死。出路必须是**自定义文本**（它满足引擎契约），且界面要
+    // 明确说出这句话。
+    testWidgets('提交区文案写出路：选项或那句话都行', (tester) async {
+      await pumpCard(tester, pending: buildPending(questions: [
+        {'id': 'q1', 'question': '第一题？', 'options': [
+          {'label': '甲'},
+          {'label': '乙'},
+        ]},
+        {'id': 'q2', 'question': '第二题？', 'options': [
+          {'label': '丙'},
+          {'label': '丁'},
+        ]},
+      ]));
+
+      expect(find.textContaining('每道题都要有答复'), findsOneWidget);
+      expect(find.textContaining('选项、或者下面那句话'), findsOneWidget);
+    });
+
+    testWidgets('选项区提示把自定义框称作「不想选」的出口', (tester) async {
+      await pumpCard(tester, pending: buildPending());
+
+      expect(find.textContaining('不想选？在这里写一句也算回答'), findsOneWidget);
+    });
+
+    testWidgets('只给第二题写自定义文本也能提交（不需要碰任何选项）', (tester) async {
+      Map<String, List<String>>? capturedSelections;
+      Map<String, String>? capturedCustoms;
+      await pumpCard(
+        tester,
+        pending: buildPending(questions: [
+          {'id': 'q1', 'question': '第一题？', 'options': [
+            {'label': '甲'},
+            {'label': '乙'},
+          ]},
+          {'id': 'q2', 'question': '第二题？', 'options': [
+            {'label': '丙'},
+            {'label': '丁'},
+          ]},
+        ]),
+        onSubmit: (sel, cus) {
+          capturedSelections = sel;
+          capturedCustoms = cus;
+          return true;
+        },
+      );
+
+      // 第二题写一句「跳过」，第一题选「甲」
+      await tester.tap(find.text('甲'));
+      await tester.pump();
+      final fields = find.byType(TextField);
+      await tester.enterText(fields.at(1), '跳过此题，先按你的方案执行');
+      await tester.pumpAndSettle();
+
+      final submit = find.widgetWithText(FilledButton, '提交回答');
+      expect(tester.widget<FilledButton>(submit).onPressed, isNotNull,
+          reason: '有选项 + 有自定义文本时提交按钮必须可点');
+
+      await tester.tap(submit);
+      await tester.pump();
+
+      expect(capturedSelections, isNotNull, reason: '提交必须真的发生');
+      expect(capturedSelections!['q1'], ['甲']);
+      // 关键断言：漏选的那道题不是被丢弃，而是带着理由提交 —— 这正是
+      // AskUserQuestionAnswerItem.isAnswered 要求的形状。
+      expect(capturedCustoms!['q2'], '跳过此题，先按你的方案执行');
+      expect(capturedSelections!.containsKey('q2'), isFalse,
+          reason: '没选任何项时不该伪造一个 selected');
+    });
+
+    testWidgets('全部漏选且没写任何东西时，提交按钮仍然是禁用的', (tester) async {
+      // 反向断言：这条修复**没有**把「跳过」变成一个绕过契约的后门。
+      // 引擎会拒收空答案，所以此处必须仍禁用。
+      await pumpCard(tester, pending: buildPending());
+
+      final submit = find.widgetWithText(FilledButton, '提交回答');
+      expect(tester.widget<FilledButton>(submit).onPressed, isNull);
+    });
+  });
+
   group('QuestionCard 渲染', () {
     testWidgets('渲染问题文本与全部选项', (tester) async {
       await pumpCard(tester, pending: buildPending());
@@ -64,8 +147,9 @@ void main() {
       expect(find.text('要继续吗？'), findsOneWidget);
       expect(find.text('继续'), findsOneWidget);
       expect(find.text('停止'), findsOneWidget);
-      // 未答完时按钮禁用，并明确告知还差什么
-      expect(find.text('请回答上面每一道题'), findsOneWidget);
+      // 未答完时按钮禁用，并明确告知还差什么、以及出路在哪
+      // （文案必须包含「每道题都要有答复」—— 漏选时用户唯一的出口是那句自定义文本）
+      expect(find.textContaining('每道题都要有答复'), findsOneWidget);
     });
 
     testWidgets('detail 与 header 都被渲染出来', (tester) async {
@@ -198,7 +282,7 @@ void main() {
       // 再点一次 → 取消
       await tester.tap(find.text('继续'));
       await tester.pump();
-      expect(find.text('请回答上面每一道题'), findsOneWidget);
+      expect(find.textContaining('每道题都要有答复'), findsOneWidget);
     });
 
     testWidgets('单选：点另一个选项会替换，而不是叠加', (tester) async {

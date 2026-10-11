@@ -484,10 +484,20 @@ class _ApprovalCardState extends State<ApprovalCard> {
           ),
 
           // Actions Bar
+          //
+          // Wrap, not Row：两个带文字的按钮并排的最小宽度约 341px，而卡片内宽只有
+          // 341.6px —— 系统字号一放大就溢出（1.3x 时实测报 RenderFlex OVERFLOWING，
+          // 按钮互相压住且点不准）。这是全 App 唯一一处「阻塞型动作按钮」，
+          // 溢出等于用户批不了这个操作。
+          //
+          // 用 Wrap 而不是把标签缩短成「拒绝/允许」：这两个词的中英并列是有意的
+          // （对着引擎日志核对时用得上），不该为了塞进一行而牺牲。
           Padding(
             padding: const EdgeInsets.only(left: 14, right: 14, bottom: 12),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.end,
+            child: Wrap(
+              alignment: WrapAlignment.end,
+              spacing: 12,
+              runSpacing: 8,
               children: [
                 // Reject Button with Sheet on tap and instant reject on long-press
                 Tooltip(
@@ -517,7 +527,7 @@ class _ApprovalCardState extends State<ApprovalCard> {
                     ),
                   ),
                 ),
-                const SizedBox(width: 12),
+                // spacing 由 Wrap 的 spacing 提供，此处不需要 SizedBox
                 // Allow Once Button
                 ElevatedButton.icon(
                   onPressed: () {
