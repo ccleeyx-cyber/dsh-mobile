@@ -471,10 +471,10 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
       return matchWs || matchSession;
     }).toList();
 
-    int totalSessions = 0;
+    // 只统计"需要行动"的那个数字。会话总数不再统计 —— 它原本只用于顶部那枚
+    // 与卡片内容重复的计数 pill（已删除）。
     int totalRunning = 0;
     for (final w in workspaces) {
-      totalSessions += w.sessions.length;
       totalRunning += w.sessions.where((s) => _isSessionRunning(s, dsh)).length;
     }
 
@@ -514,50 +514,45 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
       ),
       body: Column(
         children: [
-          // Fluent CommandBar Stats Row
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-            decoration: BoxDecoration(
-              color: context.c.surface,
-              border: Border(bottom: BorderSide(color: context.c.border)),
-            ),
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: [
-                  _buildHeaderPill(
-                    icon: Icons.folder_rounded,
-                    label: '${workspaces.length} 个挂载项目',
-                    color: context.c.accent,
-                  ),
-                  const SizedBox(width: 8),
-                  _buildHeaderPill(
-                    icon: Icons.chat_bubble_outline_rounded,
-                    label: '$totalSessions 个历史会话',
-                    color: context.c.accent,
-                  ),
-                  if (totalRunning > 0) ...[
-                    const SizedBox(width: 8),
-                    _buildHeaderPill(
-                      icon: Icons.bolt_rounded,
-                      label: '$totalRunning 个任务执行中',
-                      color: context.c.accent,
-                      animate: true,
-                    ),
+          // 顶部只留"需要行动"的信号。
+          //
+          // 原先这里无条件挂着两枚计数 pill（`N 个挂载项目` / `N 个历史会话`），
+          // 于是页头永远是"统计条 + 搜索 + 归档筛选 + 列表"四条平行横带，看起来
+          // 像四块拼起来的（用户的原话："有点割裂"）。
+          //
+          // 那两枚计数还与内容重复：工作区数量在列表里一眼可数，"共 N 个历史对话"
+          // 每张卡片里都写着。真正需要主动提醒的只有下面这两件 —— 有任务在跑、
+          // 有待审批 —— 它们不出现时，这一整条不渲染，页头直接就是搜索。
+          if (totalRunning > 0 || dsh.pendingApprovals.isNotEmpty)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(
+                color: context.c.surface,
+                border: Border(bottom: BorderSide(color: context.c.border)),
+              ),
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    if (totalRunning > 0)
+                      _buildHeaderPill(
+                        icon: Icons.bolt_rounded,
+                        label: '$totalRunning 个任务执行中',
+                        color: context.c.accent,
+                        animate: true,
+                      ),
+                    if (totalRunning > 0 && dsh.pendingApprovals.isNotEmpty) const SizedBox(width: 8),
+                    if (dsh.pendingApprovals.isNotEmpty)
+                      _buildHeaderPill(
+                        icon: Icons.shield_outlined,
+                        label: '${dsh.pendingApprovals.length} 项待审批',
+                        color: context.c.warning,
+                        animate: true,
+                      ),
                   ],
-                  if (dsh.pendingApprovals.isNotEmpty) ...[
-                    const SizedBox(width: 8),
-                    _buildHeaderPill(
-                      icon: Icons.shield_outlined,
-                      label: '${dsh.pendingApprovals.length} 项待审批',
-                      color: context.c.warning,
-                      animate: true,
-                    ),
-                  ],
-                ],
+                ),
               ),
             ),
-          ),
 
           // Search Bar：统一的搜索入口。
           //
@@ -722,6 +717,19 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
         data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
         child: ExpansionTile(
           initiallyExpanded: isCurrent,
+          // 展开**故意不**切换工作区。
+          //
+          // 一开始我把「设为活跃」按钮删掉、改成"展开即选中"，但那是错的：
+          // `selectWorkspace(ws, autoSelectSession: false)` 会走
+          // `_currentSession = null; _messages = []` —— 于是**随手展开一个工作区
+          // 就把你正在看的会话清空了**。展开是个很随意的动作，不该有这种破坏性
+          // 副作用（比原来那个显式按钮还糟）。
+          //
+          // 那"当前工作区"由什么驱动？由你真正做的事驱动：`selectSession()` 里会
+          // `_currentWorkspace = matched`，所以打开哪个工作区里的会话，它就是当前；
+          // 想换一个工作区开新对话，用下面那个「新建对话」按钮即可。两个意图各有
+          // 各的入口，不需要第三条路。
+
           leading: Container(
             width: 34,
             height: 34,
@@ -791,18 +799,15 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   ),
                 ),
               ],
-              if (isCurrent && !hasRunning && pendingCount == 0) ...[
-                const SizedBox(width: 6),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: context.c.accent.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(4),
-                    border: Border.all(color: context.c.accent.withOpacity(0.3)),
-                  ),
-                  child: Text('当前活跃', style: TextStyle(color: context.c.accent, fontSize: 9.5, fontWeight: FontWeight.bold)),
-                ),
-              ],
+              // 这里原先还有一个「当前活跃」徽标。删掉的理由不是"太挤"，而是它
+              // **纯属重复**：这张卡片已经用三重外观表示"当前"了 —— 边框是强调色
+              // 且加粗到 1.5px、左侧图标底色与图标变强调色、标题文字也变强调色。
+              // 再加一个徽标，等于同一件事说四遍。
+              //
+              // 而且它的显示条件原本是 `isCurrent && !hasRunning && pendingCount == 0`：
+              // **一个工作区里有会话在跑或有待审批时，它的"当前活跃"徽标反而消失**
+              // （被那两个徽标挤掉）—— 最该被认出来的那个丢了自己的标签。状态应该
+              // 靠外观表达，不该和"需要立刻行动"的信号抢位置。
             ],
           ),
           subtitle: Column(
@@ -847,27 +852,14 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           ),
           children: [
             // Workspace Action Bar
+            //
+            // 「设为活跃」已删除：展开这张卡片就会成为当前工作区（见上面的
+            // onExpansionChanged），一个动作不需要两个入口，也不该用一条独立的
+            // 按钮条去表达"我是当前"。
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
               child: Row(
                 children: [
-                  if (!isCurrent)
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: context.c.accent,
-                          side: BorderSide(color: context.c.accent),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                          padding: const EdgeInsets.symmetric(vertical: 6),
-                        ),
-                        icon: const Icon(Icons.play_arrow_rounded, size: 16),
-                        label: const Text('设为活跃', style: TextStyle(fontSize: 12)),
-                        onPressed: () {
-                          dsh.selectWorkspace(ws);
-                        },
-                      ),
-                    ),
-                  if (!isCurrent) const SizedBox(width: 8),
                   Expanded(
                     child: ElevatedButton.icon(
                       style: ElevatedButton.styleFrom(
