@@ -174,7 +174,10 @@ export function projectionCacheFileNames(sessionId) {
   const raw = typeof sessionId === 'string' ? sessionId.trim() : '';
   if (!raw) return [];
   const clean = raw.replace(/^session-/, '');
-  if (!clean) return [];
+  // [fix 2026-10-11] Path-traversal gate: these names are joined under the
+  // projcache dir by every caller. Keep the same charset rule core.mjs's
+  // assertSessionId enforces (and which deleteSession applies).
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(clean)) return [];
   return [`${clean}.json`, `session-${clean}.json`];
 }
 

@@ -1126,7 +1126,7 @@ class _ChatViewState extends State<ChatView> {
                                   shrinkWrap: true,
                                   separatorBuilder: (_, __) => const SizedBox(height: 6),
                                   itemCount: filtered.length,
-                                  itemBuilder: (context, index) {
+                                  itemBuilder: (itemCtx, index) {
                                     final m = filtered[index];
                       final isSelected = m.id == activeModel || (m.id.replaceFirst('cn:', '') == activeModel.replaceFirst('cn:', ''));
                       return InkWell(
@@ -1135,24 +1135,27 @@ class _ChatViewState extends State<ChatView> {
                           Navigator.pop(ctx);
                           HapticFeedback.selectionClick();
                           final ok = await dsh.switchModel(m.id, sessionId: currentSession?.sessionId);
-                          if (context.mounted) {
-                            if (ok) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text('已成功切换模型为: ${m.name}'),
-                                  backgroundColor: context.c.success,
-                                  behavior: SnackBarBehavior.floating,
-                                ),
-                              );
-                            } else {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text('模型切换失败: ${dsh.lastError.isNotEmpty ? dsh.lastError : "请检查网络或授权码"}'),
-                                  backgroundColor: context.c.danger,
-                                  behavior: SnackBarBehavior.floating,
-                                ),
-                              );
-                            }
+                          // [fix 2026-10-11] Guard the OUTER sheet/chat context,
+                          // not the list item's: after Navigator.pop the item
+                          // context is unmounted, so the SnackBar here was dead
+                          // code and a failed switch showed no feedback at all.
+                          if (!itemCtx.mounted) return;
+                          if (ok) {
+                            ScaffoldMessenger.of(itemCtx).showSnackBar(
+                              SnackBar(
+                                content: Text('已成功切换模型为: ${m.name}'),
+                                backgroundColor: itemCtx.c.success,
+                                behavior: SnackBarBehavior.floating,
+                              ),
+                            );
+                          } else {
+                            ScaffoldMessenger.of(itemCtx).showSnackBar(
+                              SnackBar(
+                                content: Text('模型切换失败: ${dsh.lastError.isNotEmpty ? dsh.lastError : "请检查网络或授权码"}'),
+                                backgroundColor: itemCtx.c.danger,
+                                behavior: SnackBarBehavior.floating,
+                              ),
+                            );
                           }
                         },
                         child: Container(
@@ -1590,8 +1593,17 @@ class _ChatViewState extends State<ChatView> {
     final sessionId = currentSession?.sessionId ?? 'default';
     final policy = dsh.getSessionPermission(sessionId);
     final currentSessionId = currentSession?.sessionId;
+    // [fix 2026-10-11] The old second clause compared currentSession with
+    // dsh.currentSession — usually itself — so it carried no information and
+    // the flag degenerated to `isRunning || dsh.isSending`, letting another
+    // session's running turn light up THIS session's stop/queue affordances.
+    // Gate on the service's actual running-session id instead.
+    final dshRunningId = dsh.currentSession?.sessionId;
     final isSessionRunning = (currentSession?.isRunning ?? false) ||
-        (dsh.isSending && (currentSession?.matchesSessionId(dsh.currentSession?.sessionId) ?? false));
+        (dsh.isSending &&
+            dshRunningId != null &&
+            currentSessionId != null &&
+            (currentSession?.matchesSessionId(dshRunningId) ?? false));
     final activeApprovals = dsh.pendingApprovals.where((ApprovalRequest a) {
       if (currentSessionId == null) return false;
       // 会话归属不明的审批（网关侧 sessionId 解析失败落了 'default'）不进
@@ -2262,19 +2274,23 @@ class _ChatViewState extends State<ChatView> {
 
           // 会话内查找面板（v1.4.2）。位置在交互块之上、输入框之下：查找是会话级
           // 操作，不该被某个提问卡片挤到屏幕外。
+          //
+          // [fix 2026-10-11] Run the full-text scan exactly once per build.
+          // Calling MessageSearch.search twice here meant every streaming
+          // rebuild scanned all messages two more times (O(n·len) × 2).
           if (_searchOpen)
-            MessageSearchPanel(
-              query: _searchQuery,
-              results: _searchQuery.trim().isEmpty
-                  ? const []
-                  : MessageSearch.collapse(MessageSearch.search(dsh.messages, _searchQuery)),
-              totalHits: _searchQuery.trim().isEmpty
-                  ? 0
-                  : MessageSearch.search(dsh.messages, _searchQuery).length,
-              onQueryChanged: _onSearchChanged,
-              onClose: _toggleSearch,
-              onJumpTo: (hit) => _jumpToHit(hit, dsh),
-            ),
+            Builder(builder: (searchCtx) {
+              final q = _searchQuery.trim();
+              final rawHits = q.isEmpty ? const <SearchHit>[] : MessageSearch.search(dsh.messages, _searchQuery);
+              return MessageSearchPanel(
+                query: _searchQuery,
+                results: q.isEmpty ? const [] : MessageSearch.collapse(rawHits),
+                totalHits: rawHits.length,
+                onQueryChanged: _onSearchChanged,
+                onClose: _toggleSearch,
+                onJumpTo: (hit) => _jumpToHit(hit, dsh),
+              );
+            }),
 
           // 审批卡片 —— 与提问卡同处输入框上方的固定 dock，不再是消息流里的一项。
           //
@@ -2954,9 +2970,20 @@ class _ChatViewState extends State<ChatView> {
   Future<void> _endHoldTalk(DshService dsh) async {
     if (_holdPhase != _HoldTalkPhase.recording) return;
     _holdTick?.cancel();
-    _holdWatchdog?.cancel();
     _holdAwaitingFinal = true;
-    await VoiceInputService.instance.stop();
+    // [fix 2026-10-11] The watchdog must outlive stop(): if stop() hangs on a
+    // platform callback (the exact bug c810842 fixed), cancelling it here
+    // leaves _holdPhase stuck at recording with nothing to fire — gestures are
+    // swallowed and the composer becomes untappable again. Timeout-stop first,
+    // and only then release the watchdog.
+    try {
+      await VoiceInputService.instance.stop().timeout(const Duration(seconds: 5));
+    } catch (_) {
+      // stop() failed or timed out — force-cancel recognition and fall through
+      // so the UI never stays stuck in the recording phase.
+      VoiceInputService.instance.cancel();
+    }
+    _holdWatchdog?.cancel();
     if (!mounted) return;
 
     final text = _holdText.trim();

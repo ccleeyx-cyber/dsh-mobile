@@ -934,6 +934,14 @@ export function apply(ctx, config = {}, internals = {}) {
   }
 
   function updateSessionModel(sessionId, modelId) {
+    // [fix 2026-10-11] sessionId is interpolated into a file path below; without
+    // this gate a crafted id ("../../mobile-bridge/foo") escapes projcache and
+    // this function WRITES there. Same invariant deleteSession already enforces.
+    const idCheck = assertSessionId(sessionId);
+    if (!idCheck.ok) {
+      audit('session/model', { sessionId, error: idCheck.error });
+      return false;
+    }
     const cleanId = sessionId.startsWith('session-') ? sessionId.replace('session-', '') : sessionId;
     const projCacheDir = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions');
     const candidates = [
@@ -1147,6 +1155,11 @@ export function apply(ctx, config = {}, internals = {}) {
   }
 
   async function getSessionHistory(sessionId) {
+    // [fix 2026-10-11] Path-traversal gate: read face of the same hole as
+    // updateSessionModel — a crafted id would read arbitrary .json files
+    // outside projcache and return their rows content.
+    const idCheck = assertSessionId(sessionId);
+    if (!idCheck.ok) return { messages: [], isRunning: false, model: '', error: idCheck.error };
     const cleanId = sessionId.startsWith('session-') ? sessionId.replace('session-', '') : sessionId;
     const projCacheDir = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions');
     const candidates = [
@@ -2302,7 +2315,11 @@ export function apply(ctx, config = {}, internals = {}) {
       logger.warn('[dsh-mobile-bridge] 审批回传失败，保留队列供重试:', rpcError);
     }
 
-    coreApprovals.remove(appr, eventId);
+    // [fix 2026-10-11] Only dequeue when the RPC actually succeeded — otherwise
+    // the 502 below tells the user "retry", but the card is already gone and a
+    // retry 404s at the not-found check above (the contradiction the comment
+    // above promised to avoid). Mirrors handleQuestionAnswer's retain-on-failure.
+    if (rpcOk) coreApprovals.remove(appr, eventId);
 
     audit('approval/respond', {
       approvalId: appr.eventId || eventId,
@@ -2444,7 +2461,17 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
 
-      const stat = fs.statSync(apkPath);
+      // [fix 2026-10-11] This whole block sits OUTSIDE the big try below, and
+      // existsSync→statSync→createReadStream is a TOCTOU chain: if the APK is
+      // swapped/removed in between, the throw escapes as an unhandled
+      // rejection and (Node ≥15) kills the entire dsh web process. Contain it.
+      let stat;
+      try {
+        stat = fs.statSync(apkPath);
+      } catch (e) {
+        sendJson(404, { error: 'APK file not found on server' });
+        return;
+      }
       res.writeHead(200, {
         'Content-Type': 'application/vnd.android.package-archive',
         'Content-Length': stat.size,
@@ -2452,7 +2479,12 @@ export function apply(ctx, config = {}, internals = {}) {
         'Cache-Control': 'no-cache'
       });
       if (req.method === 'HEAD') { res.end(); return; }
-      fs.createReadStream(apkPath).pipe(res);
+      const apkStream = fs.createReadStream(apkPath);
+      apkStream.on('error', (e) => {
+        logger.error('[dsh-mobile-bridge] APK stream failed:', e?.message || e);
+        try { res.destroy(); } catch (_) {}
+      });
+      apkStream.pipe(res);
       audit('apk/download', { ip: req.socket?.remoteAddress, size: stat.size });
       return;
     }
