@@ -58,7 +58,11 @@ window.__ModuleLoader__.load({
         try {
           const cfg = await call(ENDPOINTS.getConfig, {});
           setConfig(cfg);
-          setToken(cfg.token || 'DSH_SECURE_TOKEN_2026');
+          // No published default. store.mjs mints a random token on a fresh
+          // install, so a missing value here means "not generated yet" — showing
+          // the old literal made an unconfigured gateway look configured, and
+          // that literal was in every published build.
+          setToken(cfg.token || '');
           setPort(cfg.port || 3088);
           setNpsHost(cfg.npsHost || 'n.cnm.asia');
           setNpsPort(cfg.npsPort || 3088);
@@ -159,7 +163,7 @@ window.__ModuleLoader__.load({
                 value: token,
                 onChange: (e) => setToken(e.target.value),
                 style: { ...S.input, fontFamily: 'ui-monospace,SFMono-Regular,Consolas,monospace' },
-                placeholder: '请输入授权码，例如: DSH_SECURE_TOKEN_2026'
+                placeholder: '请输入授权码 (dsh_ 开头)'
               }),
               h('button', {
                 type: 'button',
@@ -256,7 +260,7 @@ window.__ModuleLoader__.load({
             ),
             h('div', { style: S.metricCard },
               h('div', { style: S.metricLabel }, '授权码 (Token)'),
-              h('div', { style: S.metricValue }, token || 'DSH_SECURE_TOKEN_2026'),
+              h('div', { style: S.metricValue }, token || '未生成'),
             ),
             h('div', { style: S.metricCard },
               h('div', { style: S.metricLabel }, '局域网 Host (本地测试)'),

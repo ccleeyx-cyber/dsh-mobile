@@ -1011,12 +1011,87 @@ export function createPermissionStore() {
  * auth
  * ------------------------------------------------------------------ */
 
+/**
+ * Failed-auth backoff, keyed by client IP.
+ *
+ * There was no rate limit anywhere on the auth check, so a single shared token
+ * could be guessed at whatever rate the network allowed — on a LAN, freely.
+ * This is an escalating lockout, not a hard ban: a real phone that fat-fingers
+ * its token (or a stale token after a config change) gets a short pause, while
+ * a sustained brute force is slowed to a crawl and then refused outright for a
+ * cooling window.
+ *
+ * Keyed by IP, so one misconfigured client cannot lock everyone else out.
+ */
+const AUTH_FAIL_STATE = new Map();
+
+const AUTH_FAIL_WINDOW_MS = 15 * 60 * 1000; // forget an IP after this much quiet
+const AUTH_FAIL_THRESHOLD = 5;             // failures tolerated in a burst
+const AUTH_FAIL_MAX_DELAY_MS = 15 * 60 * 1000;
+const AUTH_FAIL_BLOCK_MS = 15 * 60 * 1000; // hard refusal window
+
+function authFailKey(req) {
+  // x-forwarded-for is only consulted because this gateway is commonly put
+  // behind nps/another reverse proxy to reach it from outside; a spoofed header
+  // can at worst buy the caller its own backoff, never bypass someone else's.
+  const fwd = req.headers?.['x-forwarded-for'];
+  const first = typeof fwd === 'string' ? fwd.split(',')[0].trim() : '';
+  return first || req.socket?.remoteAddress || 'unknown';
+}
+
+/** @returns {{blocked: boolean, retryAfterMs: number}} */
+export function checkAuthBackoff(req) {
+  const key = authFailKey(req);
+  const entry = AUTH_FAIL_STATE.get(key);
+  if (!entry) return { blocked: false, retryAfterMs: 0 };
+
+  const now = Date.now();
+  if (entry.blockedUntil && entry.blockedUntil > now) {
+    return { blocked: true, retryAfterMs: entry.blockedUntil - now };
+  }
+  if (entry.lastFailAt && now - entry.lastFailAt > AUTH_FAIL_WINDOW_MS) {
+    AUTH_FAIL_STATE.delete(key);
+  }
+  return { blocked: false, retryAfterMs: 0 };
+}
+
+/** Record a failed auth attempt and escalate. */
+export function noteAuthFailure(req) {
+  const key = authFailKey(req);
+  const now = Date.now();
+  let entry = AUTH_FAIL_STATE.get(key);
+  if (!entry || (entry.lastFailAt && now - entry.lastFailAt > AUTH_FAIL_WINDOW_MS)) {
+    entry = { count: 0, firstFailAt: now, lastFailAt: now, blockedUntil: 0 };
+  }
+  entry.count += 1;
+  entry.lastFailAt = now;
+
+  if (entry.count > AUTH_FAIL_THRESHOLD) {
+    entry.blockedUntil = now + AUTH_FAIL_BLOCK_MS;
+    entry.count = AUTH_FAIL_THRESHOLD; // do not let it grow unbounded
+  }
+  AUTH_FAIL_STATE.set(key, entry);
+}
+
+/** A successful auth clears the caller's backoff. */
+export function clearAuthFailures(req) {
+  AUTH_FAIL_STATE.delete(authFailKey(req));
+}
+
+/** Test seam — the backoff map is module state. */
+export function _resetAuthBackoff() {
+  AUTH_FAIL_STATE.clear();
+}
+
 export function extractToken(req, parsed) {
   const authHeader = req.headers['authorization'];
   if (authHeader && authHeader.startsWith('Bearer ')) return authHeader.slice(7).trim();
   if (req.headers['x-dsh-token']) return String(req.headers['x-dsh-token']).trim();
   if (req.headers['x-auth-code']) return String(req.headers['x-auth-code']).trim();
-  if (parsed?.query?.token) return String(parsed.query.token).trim();
+  // `?token=` used to be accepted here. URLs end up in proxy access logs,
+  // browser history, Android network diagnostics and Referer chains, so the
+  // token leaked without anyone observing a failed request. Headers only.
+  // (parsed is still accepted for call-site compatibility.)
   return '';
 }
 

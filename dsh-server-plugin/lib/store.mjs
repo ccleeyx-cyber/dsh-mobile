@@ -118,13 +118,31 @@ export function generateToken() {
   return 'dsh_' + crypto.randomBytes(16).toString('hex');
 }
 
+/**
+ * Constant-time string comparison.
+ *
+ * `===` returns as soon as the first byte differs, which over a network is a
+ * measurable timing oracle. Compare digests of fixed length instead, so the
+ * loop's work does not depend on where the candidate first diverges.
+ */
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;
+  const ha = crypto.createHash('sha256').update(a, 'utf8').digest();
+  const hb = crypto.createHash('sha256').update(b, 'utf8').digest();
+  try {
+    return crypto.timingSafeEqual(ha, hb);
+  } catch (_) {
+    return false;
+  }
+}
+
 export function verifyToken(inputToken) {
   if (!inputToken || typeof inputToken !== 'string') return false;
   const trimmed = inputToken.trim();
   if (!trimmed) return false;
   const cfg = loadConfig();
-  if (trimmed === cfg.token) return true;
-  if (process.env.DSH_AUTH_TOKEN && trimmed === process.env.DSH_AUTH_TOKEN) return true;
+  if (safeEqual(trimmed, cfg.token)) return true;
+  if (process.env.DSH_AUTH_TOKEN && safeEqual(trimmed, process.env.DSH_AUTH_TOKEN)) return true;
   // Paired-device tokens. Previously the token minted at pairing was never
   // checked here, so a freshly paired phone got 401 on its next request and
   // revokeDevice() had no effect on auth at all. Hash (never the plaintext)

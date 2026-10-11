@@ -44,6 +44,9 @@ import {
   BRIDGE_VERSION,
   MAX_BODY_SIZE,
   HEARTBEAT_INTERVAL_MS,
+  checkAuthBackoff,
+  noteAuthFailure,
+  clearAuthFailures,
   createApprovalQueue,
   createFollowerRegistry,
   createTurnRegistry,
@@ -182,10 +185,40 @@ export function apply(ctx, config = {}, internals = {}) {
   const cfg = loadConfig();
   const dshPort = internals.dshPort ?? ctx.webServer?.port ?? config.dshPort ?? 3080;
   const listenPort = internals.port ?? config.port ?? cfg.port ?? 3088;
-  const bindHost = config.host ?? '0.0.0.0';
+  // Security default: loopback only.
+  //
+  // This gateway proxies the DSH engine's full surface (sessions, approvals,
+  // permission policy, workspace file reads) over plain HTTP with a single
+  // shared token. Binding every interface by default put it on the LAN — and
+  // therefore within reach of any other device on that network — without the
+  // operator ever asking for that. LAN / tunnel exposure is now explicit:
+  // set BRIDGE_HOST=0.0.0.0 (standalone) or `host:` in the Cordis plugin config.
+  const bindHost = config.host
+    ?? process.env.BRIDGE_HOST
+    ?? '127.0.0.1';
   const dshHomeDir = dshHome();
 
   ensureDataDir();
+
+  /**
+   * Origins allowed to make credentialed cross-origin calls.
+   *
+   * The Android client is a native app and sends no Origin at all, so it is
+   * unaffected by this list — this exists purely to stop *browsers* on other
+   * sites from reaching the gateway. Default: the DSH web UI on loopback (any
+   * port), which is the only browser surface that legitimately talks here.
+   * Override with BRIDGE_CORS_ORIGINS as a comma-separated list; `*` is not
+   * accepted on purpose — it is the configuration we are removing.
+   */
+  const CORS_ALLOWED_ORIGINS = new Set(
+    (process.env.BRIDGE_CORS_ORIGINS
+      ? process.env.BRIDGE_CORS_ORIGINS.split(',')
+      : []
+    )
+      .concat([`http://127.0.0.1:${dshPort}`, `http://localhost:${dshPort}`])
+      .map((o) => o.trim().toLowerCase())
+      .filter(Boolean)
+  );
 
   let isDisposed = false; // Lifecycle flag to prevent zombie reconnects (F4.4)
 
@@ -2312,12 +2345,25 @@ export function apply(ctx, config = {}, internals = {}) {
     const parsedUrl = url.parse(req.url, true);
     const pathname = parsedUrl.pathname;
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // CORS was `*` with Authorization explicitly allowed. Combined with the
+    // token-query fallback that meant any page the user happened to visit while
+    // signed in to nothing could fire authenticated cross-origin XHRs at this
+    // gateway — reading sessions, answering questions, approving commands.
+    // Only echo an Origin that the operator allow-listed; otherwise no CORS
+    // headers at all (the browser then blocks the read).
+    const origin = String(req.headers.origin || '');
+    const allowOrigin = origin && CORS_ALLOWED_ORIGINS.has(origin.toLowerCase());
+    if (allowOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-dsh-token, x-auth-code');
 
     if (req.method === 'OPTIONS') {
-      res.writeHead(204);
+      // Preflight for a disallowed origin must not answer 204-with-headers;
+      // 403 is what stops the follow-up request from being made.
+      res.writeHead(allowOrigin ? 204 : 403);
       res.end();
       return;
     }
@@ -2337,11 +2383,24 @@ export function apply(ctx, config = {}, internals = {}) {
         testToken = String(req.headers['x-dsh-token']).trim();
       } else if (req.headers['x-auth-code']) {
         testToken = String(req.headers['x-auth-code']).trim();
-      } else if (parsedUrl.query?.token) {
-        testToken = String(parsedUrl.query.token).trim();
       }
+      // No `?token=` fallback here: a token in a URL lands in proxy access logs,
+      // browser history and Android network diagnostics. Headers only.
       const isAuthed = verifyToken(testToken);
       if (!isAuthed) {
+        // /health is the cheapest endpoint to hammer, so it gets the same
+        // per-IP backoff as the business routes.
+        const bo = checkAuthBackoff(req);
+        if (bo.blocked) {
+          res.setHeader('Retry-After', String(Math.ceil(bo.retryAfterMs / 1000)));
+          sendJson(429, {
+            code: 429, ok: false, authenticated: false,
+            error: '认证失败次数过多，请稍后再试',
+            retryAfterMs: bo.retryAfterMs
+          });
+          return;
+        }
+        noteAuthFailure(req);
         sendJson(401, {
           code: 401,
           ok: false,
@@ -2353,6 +2412,7 @@ export function apply(ctx, config = {}, internals = {}) {
         });
         return;
       }
+      clearAuthFailures(req);
       sendJson(200, {
         code: 0,
         ok: true,
@@ -2499,11 +2559,31 @@ export function apply(ctx, config = {}, internals = {}) {
     }
 
     // 4. REST 业务接口鉴权
+    //
+    // A single shared token with no rate limit is brute-forceable at whatever
+    // rate the network allows, so a failing caller is backed off per IP before
+    // the check even runs. checkAuthBackoff first, verifyToken second, note /
+    // clear after.
+    const backoff = checkAuthBackoff(req);
+    if (backoff.blocked) {
+      res.setHeader('Retry-After', String(Math.ceil(backoff.retryAfterMs / 1000)));
+      sendJson(429, {
+        ok: false,
+        code: 429,
+        error: '认证失败次数过多，请稍后再试',
+        retryAfterMs: backoff.retryAfterMs
+      });
+      audit('auth/backoff-blocked', { path: pathname, retryAfterMs: backoff.retryAfterMs });
+      return;
+    }
+
     const auth = authenticateRequest(req, parsedUrl);
     if (!auth.ok) {
+      noteAuthFailure(req);
       sendJson(401, { error: 'Unauthorized', message: '缺少有效令牌或设备未配对' });
       return;
     }
+    clearAuthFailures(req);
     // Keep the device's lastSeenAt fresh so the settings page can show real usage.
     if (auth.device?.id && auth.device.id !== 'admin') touchDevice(auth.device.id, req.socket?.remoteAddress || '');
 
@@ -3320,6 +3400,11 @@ export function apply(ctx, config = {}, internals = {}) {
         socket.destroy();
         return;
       }
+      // Carry the authenticated role onto the request so the connection handler
+      // can stamp it onto the socket. Every write-ish WS frame is gated on it
+      // below — HTTP has WRITE_PATHS, the socket had nothing, so a readonly
+      // device could approve a command or answer an Agent prompt anyway.
+      req._mobileAuth = auth;
 
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit('connection', ws, req);
@@ -3377,8 +3462,10 @@ export function apply(ctx, config = {}, internals = {}) {
   wss.on('connection', (ws, req) => {
     ws.isAlive = true;
     ws._remoteIp = req.socket?.remoteAddress;
+    ws._role = req._mobileAuth?.device?.role || 'readwrite';
+    ws._deviceId = req._mobileAuth?.device?.id || 'admin';
     connectedClients.add(ws);
-    audit('ws/connect', { ip: ws._remoteIp });
+    audit('ws/connect', { ip: ws._remoteIp, role: ws._role });
 
     ws.on('pong', () => {
       ws.isAlive = true;
@@ -3429,6 +3516,12 @@ export function apply(ctx, config = {}, internals = {}) {
           // [0003] Answers the engine's user-questions waterfall over
           // $events/result. handleQuestionAnswer is async — it must be awaited,
           // or `res.ok` reads off a Promise and every ack reports undefined.
+          // Gated on role: answering a question injects content into the Agent's
+          // turn, which is exactly what a readonly viewer must not do.
+          if (!roleCanWrite(ws._role)) {
+            ws.send(JSON.stringify({ type: 'error', error: '只读设备无法回答提问 (read-only device)', code: 403 }));
+            return;
+          }
           const res = await handleQuestionAnswer(msg.eventId || msg.id, msg.answer ?? msg.payload);
           ws.send(JSON.stringify({
             type: 'question_ack',
@@ -3463,6 +3556,12 @@ export function apply(ctx, config = {}, internals = {}) {
             q.offeredTo?.delete(ws);
           }
         } else if (msg.type === 'approval_response') {
+          // Same gate as the HTTP WRITE_PATHS list: approving is the single
+          // highest-impact frame on this socket (it authorises shell/file ops).
+          if (!roleCanWrite(ws._role)) {
+            ws.send(JSON.stringify({ type: 'error', error: '只读设备无法审批 (read-only device)', code: 403 }));
+            return;
+          }
           const eventId = msg.eventId || msg.approvalId || msg.id;
           if (eventId && msg.outcome) {
             const res = await handleApprovalRespond(eventId, msg.outcome, msg.reason);

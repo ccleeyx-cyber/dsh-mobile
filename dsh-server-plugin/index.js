@@ -25,7 +25,8 @@ import { apply } from './lib/index.js';
 
 const port = Number(process.env.BRIDGE_PORT) || 3088;
 const dshPort = Number(process.env.DSH_PORT) || 3080;
-const host = process.env.BRIDGE_HOST || '0.0.0.0';
+// Loopback by default. Set BRIDGE_HOST=0.0.0.0 to opt into LAN/tunnel exposure.
+const host = process.env.BRIDGE_HOST || '127.0.0.1';
 
 const disposers = [];
 let shuttingDown = false;
