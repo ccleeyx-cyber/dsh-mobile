@@ -18,6 +18,13 @@ class ServerConfig {
   String npsAddress;
   String authCode;
 
+  /// 配对时网关分配的设备 id（dev_xxxxxxxx）。
+  ///
+  /// [feat 2026-10-12] 电脑端撤销设备会向**所有**在线客户端广播
+  /// {type:'device_revoked', deviceId}；只有本机 id 命中时才清凭据断连，
+  /// 否则多台手机会互相误伤。
+  String deviceId;
+
   ServerConfig({
     this.id = '',
     this.name = '',
@@ -27,6 +34,7 @@ class ServerConfig {
     this.useHttps = false,
     this.npsAddress = '',
     this.authCode = '',
+    this.deviceId = '',
   });
 
   /// What the switcher shows. Falls back to the host so an unnamed gateway is
@@ -49,6 +57,7 @@ class ServerConfig {
         useHttps: useHttps,
         npsAddress: npsAddress,
         authCode: authCode,
+        deviceId: deviceId,
       );
 
   String get _normalizedHost {
@@ -116,6 +125,7 @@ class ServerConfig {
     'useHttps': useHttps,
     'npsAddress': npsAddress,
     'authCode': authCode,
+    'deviceId': deviceId,
   };
 
   // Tolerant readers. A config written by an older build has no id/name at all,
@@ -140,5 +150,6 @@ class ServerConfig {
     useHttps: json['useHttps'] == true || json['useHttps'] == 'true',
     npsAddress: _str(json['npsAddress']),
     authCode: _str(json['authCode']),
+    deviceId: _str(json['deviceId']),
   );
 }

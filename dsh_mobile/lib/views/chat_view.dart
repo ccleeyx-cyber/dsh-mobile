@@ -108,6 +108,46 @@ class _ChatViewState extends State<ChatView> {
   int _lastMessageCount = 0;
   bool _wasLoadingHistory = false;
 
+  // ---- 会话历史无限上翻（v1.15）[feat 2026-10-12] ----
+  bool _loadingOlder = false;
+  /// 一次性的"这次长度增长来自 prepend"标记（见 build 里的浮钮抑制）。
+  bool _suppressTailButtonOnce = false;
+
+  /// 滑到顶部自动拉更早历史。列表是正序 ListView.builder（offset 0 = 最旧），
+  /// prepend 之后必须把 offset 平移新增内容的实际高度，否则视觉位置会跳。
+  ///
+  /// 时序：loadOlderHistory 返回时 notifyListeners 已发出，但 Provider 的重建
+  /// 发生在**下一帧**；whenComplete 此刻读到的 maxScrollExtent 仍是旧值 ——
+  /// 正好把它当作"prepend 前"的基准。postFrame 回调在重建帧结束后执行，那时
+  /// 的 maxScrollExtent 是新值，两者之差就是新增头部的总高度，把 offset 平移
+  /// 同样的量即可保持视觉位置。
+  void _maybeLoadOlder(DshService dsh) {
+    if (!dsh.hasMoreHistory || _loadingOlder) return;
+    if (!_scrollController.hasClients) return;
+    if (_scrollController.position.pixels > 120) return;
+    _loadingOlder = true;
+    _suppressTailButtonOnce = true;
+    final beforeCount = dsh.messages.length;
+    dsh.loadOlderHistory().whenComplete(() {
+      _loadingOlder = false;
+      if (!mounted || !_scrollController.hasClients) return;
+      final added = dsh.messages.length - beforeCount;
+      if (added <= 0) return;
+      final oldMax = _scrollController.position.maxScrollExtent; // prepend 前
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_scrollController.hasClients) return;
+        final newMax = _scrollController.position.maxScrollExtent; // prepend 后
+        final delta = newMax - oldMax;
+        if (delta > 0) {
+          _scrollController.jumpTo(
+            (_scrollController.offset + delta).clamp(0.0, newMax),
+          );
+        }
+      });
+    });
+  }
+
+
   // ---- 会话洞察（v1.14）：状态条 / 信息面板 / 本轮产出卡片 ----
 
   /// 队列 dock 是否已被用户就地展开（超过 3 条时才用得上）。
@@ -680,6 +720,78 @@ class _ChatViewState extends State<ChatView> {
     );
     if (choice == null || !mounted) return;
     await _attach(dsh, asFile: choice == 'file');
+  }
+
+  // ---- 斜杠命令 / 技能菜单 [feat 2026-10-12] ----
+  //
+  // 命令清单来自网关透传的引擎 `commands/list` RPC；引擎没有/失败时网关回空表，
+  // 这里直接不弹 sheet（提示一句话），绝不用硬编码命令名伪造菜单 —— 菜单里
+  // 出现引擎不认的名字等于教用户输错命令。
+
+  Future<void> _showCommandSheet(DshService dsh) async {
+    if (!dsh.isConnected) {
+      _toast('网络已断开，请先重试连接');
+      return;
+    }
+    final commands = await dsh.fetchCommands();
+    if (!mounted) return;
+    if (commands.isEmpty) {
+      _toast('当前会话没有可用的斜杠命令');
+      return;
+    }
+    final picked = await showModalBottomSheet<SlashCommand>(
+      context: context,
+      backgroundColor: context.c.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
+      ),
+      builder: (sheetCtx) => SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(sheetCtx).size.height * 0.6),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+                child: Text('命令',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: sheetCtx.c.textPrimary)),
+              ),
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: commands.length,
+                  itemBuilder: (_, i) {
+                    final c = commands[i];
+                    return ListTile(
+                      dense: true,
+                      title: Text('/${c.name}',
+                          style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: sheetCtx.c.textPrimary)),
+                      subtitle: c.description.isEmpty
+                          ? null
+                          : Text(c.description,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(fontSize: 11.5, color: sheetCtx.c.textTertiary)),
+                      onTap: () => Navigator.pop(sheetCtx, c),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (picked == null || !mounted) return;
+    // 点选把 "/name " 插入输入框（保留既有草稿），光标落到底。
+    final current = _inputController.text;
+    _inputController.text = current.startsWith('/')
+        ? '/${picked.name} ${current.substring(current.indexOf(' ') + 1)}'
+        : '$current/${picked.name} ';
+    _inputController.selection = TextSelection.collapsed(offset: _inputController.text.length);
+    dsh.updateDraft(_inputController.text);
+    _inputFocusNode.requestFocus();
   }
 
 
@@ -1677,10 +1789,20 @@ class _ChatViewState extends State<ChatView> {
       _jumpToBottom();
     } else if (dsh.messages.length != _lastMessageCount) {
       final wasNearBottom = !_userScrolledUp;
+      // [feat 2026-10-12] prepend（上翻）也使长度增长，但它不是"尾部新消息"，
+      // 不能点亮"回到最新消息"浮钮 —— _maybeLoadOlder 置一次抑制位。
+      final fromPrepend = _suppressTailButtonOnce;
+      _suppressTailButtonOnce = false;
+      final appendedAtTail = dsh.messages.length > _lastMessageCount && !fromPrepend;
       _lastMessageCount = dsh.messages.length;
       _lastStreamRevision = dsh.streamRevision;
       if (wasNearBottom) {
         _scrollToBottom();
+      } else if (appendedAtTail) {
+        // [feat 2026-10-12] 用户在上方、尾部来了新消息：确保"回到最新消息"
+        // 浮钮出现（_onScroll 只在滚动时刷新它，新消息到达不滚动的话浮钮
+        // 不会亮）。
+        if (!_showScrollToBottom) setState(() => _showScrollToBottom = true);
       }
     } else if (dsh.streamRevision != _lastStreamRevision || hasStreamContentGrowth) {
       _lastStreamRevision = dsh.streamRevision;
@@ -1689,6 +1811,12 @@ class _ChatViewState extends State<ChatView> {
       }
     }
     _wasLoadingHistory = dsh.isLoadingHistory;
+
+    // [feat 2026-10-12] 顶部触发上翻：仅在用户真的滑到顶部（pixels<=120）且
+    // 还有更早历史时拉取。放在会话切换块之后，避免切会话首帧误触发。
+    if (!dsh.isLoadingHistory && dsh.messages.isNotEmpty) {
+      _maybeLoadOlder(dsh);
+    }
 
     // 「本轮产出」卡片（v1.14）：**由事件驱动**，不是由"清单里有东西"驱动。
     //
@@ -2192,11 +2320,16 @@ class _ChatViewState extends State<ChatView> {
                             physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                             keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
                             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                            itemCount: dsh.messages.length + (showTurnOutput ? 1 : 0),
+                            itemCount: dsh.messages.length + (showTurnOutput ? 1 : 0) + _historyHeaderItemCount(dsh),
                             itemBuilder: (context, index) {
+                              // 0. [feat 2026-10-12] 上翻头部：加载圈 / 已到开头。
+                              if (index < _historyHeaderItemCount(dsh)) {
+                                return _buildHistoryHeader(dsh);
+                              }
+                              final msgIndex = index - _historyHeaderItemCount(dsh);
                               // 1. Messages first (historical and streaming assistant response)
-                              if (index < dsh.messages.length) {
-                                final m = dsh.messages[index];
+                              if (msgIndex < dsh.messages.length) {
+                                final m = dsh.messages[msgIndex];
                                 // 附 GlobalKey：会话内查找要靠 ensureVisible 精确滚到
                                 // 命中的那条消息。没有 key 只能按索引估算 offset，而
                                 // 消息高度是可变的，估算必然滚偏。
@@ -2530,6 +2663,42 @@ class _ChatViewState extends State<ChatView> {
         ),
       ),
     );
+  }
+
+  // ---- 会话历史无限上翻（v1.15）[feat 2026-10-12] ----
+
+  /// 上翻头部占几个槽位：还有更多历史、正在加载、或已到开头时占 1，
+  /// （历史本来就一条不剩的短会话不占，避免空会话顶部挂一条"已到开头"）。
+  int _historyHeaderItemCount(DshService dsh) {
+    if (dsh.messages.isEmpty) return 0;
+    if (dsh.isLoadingOlder || dsh.hasMoreHistory || dsh.historyExhausted) return 1;
+    return 0;
+  }
+
+  /// 顶部状态：加载中转圈 / 已到会话开头。
+  Widget _buildHistoryHeader(DshService dsh) {
+    if (dsh.isLoadingOlder) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 14),
+        child: Center(
+          child: SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    if (dsh.historyExhausted) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 10),
+        child: Center(
+          child: Text('已到会话开头', style: TextStyle(color: context.c.textTertiary, fontSize: 12)),
+        ),
+      );
+    }
+    // 还有更多但未触发（等滑到顶部）：占位保持高度稳定，避免触发瞬间列表跳动。
+    return const SizedBox(height: 1);
   }
 
   Widget _buildMessageItem(ChatMessage msg) {
@@ -3166,6 +3335,23 @@ class _ChatViewState extends State<ChatView> {
             onKillJob: (job) => d.killJob(job.id),
             onDeleteSchedule: (s) => d.deleteSchedule(s.id),
             onRefresh: d.fetchSessionExtras,
+            // [feat 2026-10-12] 子代理 / goal 控制 / 一键诊断。子代理列表属于
+            // 第三档懒加载（面板 onRefresh 一起拉）；拉不到（null）整块隐藏。
+            subagents: d.subagents,
+            subagentsUnavailable: d.subagentsUnavailable,
+            onInterruptSubagent: (sub) async {
+              final ok = await d.interruptSubagent(sub.id);
+              if (ok) await d.fetchSubagents();
+              return ok;
+            },
+            onControlGoal: (action, goal) => d.controlGoal(
+                  action,
+                  goalId: goal.goalId ?? '',
+                  revision: goal.revision ?? 0,
+                ),
+            onRunDiagnostics: () => d.runDiagnostics(),
+            diagnostics: d.diagnostics,
+            diagnosticsBusy: d.diagnosticsBusy,
           ),
         ),
       ),
@@ -3364,11 +3550,13 @@ class _ChatViewState extends State<ChatView> {
                     // 的模型胶囊会把整行顶出去（实测 317 > 316，溢出 1px）。
                     // 所以胶囊的可读宽度按**剩余空间**算，而不是钉死一个常量。
                     //
-                    // 预留：停止键 36（不显示时 0）+ 附件键 36 + 麦克风 44 +
-                    // 发送键 44 + 三处间隔 6 + 胶囊自身装饰（内边距/图标/箭头）
-                    // 47 + 4 的安全余量。
+                    // 预留：停止键 36（不显示时 0）+ 斜杠命令键 36 + 附件键 36 +
+                    // 麦克风 44 + 发送键 44 + 三处间隔 6 + 胶囊自身装饰（内边距/
+                    // 图标/箭头）47 + 4 的安全余量。
                     final stopWidth = (dsh.isSending || dsh.isCanceling) ? 36.0 : 0.0;
-                    final reserved = 36.0 + 44.0 + 44.0 + 6.0 + 47.0 + 4.0;
+                    // [feat 2026-10-12] 新增的 "/" 命令键也占 36，必须计入预留，
+                    // 否则 360dp 屏上胶囊把整行顶溢出 1px（queue_steer_impl_test 锁的就是这条）。
+                    final reserved = 36.0 + 36.0 + 44.0 + 44.0 + 6.0 + 47.0 + 4.0;
                     final textCap = (box.maxWidth - stopWidth - reserved).clamp(40.0, 104.0);
                     return Row(
                       children: [
@@ -3377,6 +3565,15 @@ class _ChatViewState extends State<ChatView> {
                         // 动作的情况下把发送键变成停止键 —— 手一抖就取消掉自己正在跑的
                         // 回合。位置分开之后，任何状态变化都不会改变任何按钮的含义。
                         _buildStopButton(dsh),
+                        // [feat 2026-10-12] "/" 命令菜单入口。输入框已有 / 开头
+                        // 草稿时高亮，两个入口共用同一个 sheet。
+                        _buildComposerIcon(
+                          key: const ValueKey('composer-slash-button'),
+                          icon: Icons.bolt_rounded,
+                          tooltip: '斜杠命令',
+                          highlighted: _inputController.text.startsWith('/'),
+                          onTap: () => _showCommandSheet(dsh),
+                        ),
                         _buildComposerIcon(
                           icon: Icons.add_rounded,
                           tooltip: '添加图片或文件',
@@ -3923,12 +4120,14 @@ class _ChatViewState extends State<ChatView> {
   /// 刻意**不画圆圈边框**：这一行里已经有一个模型胶囊和一个实心发送键，再套三个
   /// 圆圈就又回到"一堆控件并列"的碎感。图标本身足够表达功能，触摸区仍给足 36px。
   Widget _buildComposerIcon({
+    Key? key,
     required IconData icon,
     required String tooltip,
     required VoidCallback onTap,
     bool highlighted = false,
   }) {
     return Tooltip(
+      key: key,
       message: tooltip,
       child: InkWell(
         onTap: onTap,

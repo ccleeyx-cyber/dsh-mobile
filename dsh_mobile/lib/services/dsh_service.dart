@@ -137,6 +137,20 @@ class DshService extends ChangeNotifier {
   int _reasoningBudget = 8000;
   double _temperature = 0.7;
   bool _isLoadingHistory = false;
+
+  // ---- 会话历史无限上翻（v1.15）[feat 2026-10-12] ----
+  /// 是否还有更早历史可拉。
+  bool _hasMoreHistory = false;
+  /// 正在拉取更早历史（顶部转圈的信号源）。
+  bool _isLoadingOlder = false;
+  /// 下一页游标：当前最旧一条带 seq 消息的 seq。null = 还没有可翻页的锚点。
+  int? _oldestHistorySeq;
+  /// 已到会话开头（拉过一页且 hasMore=false）。
+  bool _historyExhausted = false;
+  bool get hasMoreHistory => _hasMoreHistory && !_historyExhausted && _oldestHistorySeq != null;
+  bool get isLoadingOlder => _isLoadingOlder;
+  bool get historyExhausted => _historyExhausted;
+
   bool _isSending = false;
   bool _isCanceling = false;
   int _activeTurnSeq = 0;
@@ -396,6 +410,133 @@ class DshService extends ChangeNotifier {
   int get reasoningBudget => _reasoningBudget;
   double get temperature => _temperature;
   bool get isLoadingHistory => _isLoadingHistory;
+
+  /// 切会话/新建会话时重置上翻分页状态。
+  void _resetHistoryPaging() {
+    _hasMoreHistory = false;
+    _isLoadingOlder = false;
+    _oldestHistorySeq = null;
+    _historyExhausted = false;
+  }
+
+  /// 从已加载的消息里重算分页锚点（进入会话后调用一次）。
+  void _recomputeHistoryAnchor() {
+    for (final m in _messages) {
+      if (m.seq != null && m.seq! < 900000) {
+        _oldestHistorySeq = m.seq;
+        break;
+      }
+    }
+  }
+
+  /// [feat 2026-10-12] 拉取更早一页历史并插入列表头部。
+  ///
+  /// 去重：网关页与实时流/轮询尾部可能重叠（边界 seq 同时出现在两边），按
+  /// 「seq 相同」或「id 相同」丢弃已有消息；没有 seq 的页消息按内容+角色去重。
+  ///
+  /// 锚点推进：即使本页没有任何可渲染消息（全是注入上下文被过滤），也用网关
+  /// 返回的 oldestSeq 前进游标，否则会永远卡在同一页。
+  Future<void> loadOlderHistory() async {
+    if (_isLoadingOlder || _historyExhausted) return;
+    final cfg = _currentConfig;
+    final session = _currentSession;
+    if (cfg == null || session == null) return;
+    final sessionId = session.sessionId;
+    final anchor = _oldestHistorySeq;
+    if (anchor == null) return;
+
+    _isLoadingOlder = true;
+    notifyListeners();
+    try {
+      final uri = Uri.parse('${cfg.httpBaseUrl}/api/mobile/sessions/history/page')
+          .replace(queryParameters: {
+        'sessionId': sessionId,
+        'beforeSeq': '$anchor',
+        'max': '60',
+      });
+      final res = await _httpClient.get(uri, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return;
+      if (_currentSession == null || !_currentSession!.matchesSessionId(sessionId)) return;
+      if (res.statusCode != 200) return;
+
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      final payload = (data['data'] ?? data) as Map<String, dynamic>?;
+      if (payload == null) return;
+      final rawPage = payload['messages'] as List<dynamic>? ?? [];
+      final hasMore = payload['hasMore'] == true;
+      final oldestSeqRaw = payload['oldestSeq'];
+      final pageOldest = oldestSeqRaw is num ? oldestSeqRaw.toInt() : null;
+
+      // 去重身份集：已有消息的 seq 与 id。
+      final knownSeqs = _messages.map((m) => m.seq).whereType<int>().toSet();
+      final knownIds = _messages.map((m) => m.id).toSet();
+      final older = <ChatMessage>[];
+      for (final m in rawPage) {
+        if (m is! Map) continue;
+        final raw = Map<String, dynamic>.from(m);
+        final seq = raw['seq'] is int ? raw['seq'] as int : (raw['seq'] is num ? (raw['seq'] as num).toInt() : null);
+        final id = raw['id'] as String?;
+        if ((seq != null && knownSeqs.contains(seq)) || (id != null && knownIds.contains(id))) {
+          continue;
+        }
+        final msg = ChatMessage(
+          id: id ?? _uuid.v4(),
+          role: raw['role'] ?? 'assistant',
+          content: raw['content'] ?? '',
+          thinking: raw['thinking'],
+          isMemory: raw['isMemory'] == true || raw['role'] == 'memory',
+          isContext: raw['isContext'] == true || raw['role'] == 'context',
+          seq: seq,
+          tools: (raw['tools'] as List<dynamic>? ?? []).map((t) => ToolExecution(
+            name: t['name'] ?? '',
+            input: _coerceToolInput(t['input']),
+            output: _coerceToolInput(t['output']),
+            isRunning: t['isRunning'] ?? false,
+          )).toList(),
+          timestamp: raw['time'] != null ? DateTime.fromMillisecondsSinceEpoch(raw['time']) : null,
+        );
+        knownSeqs.add(seq ?? -1);
+        knownIds.add(msg.id);
+        older.add(msg);
+      }
+
+      // 锚点：优先用本页最旧一条"真实消息"的 seq；退化用网关的 oldestSeq
+      //（它按事件计，一定 <= 任何消息 seq，保证前进）。
+      int? nextAnchor;
+      for (final m in older) {
+        if (m.seq != null && m.seq! < 900000) {
+          nextAnchor = m.seq;
+          break;
+        }
+      }
+      nextAnchor ??= (pageOldest != null && pageOldest < anchor) ? pageOldest : null;
+
+      if (!hasMore || nextAnchor == null) {
+        _historyExhausted = true;
+        _hasMoreHistory = false;
+        if (older.isNotEmpty) {
+          _messages.insertAll(0, older);
+          _streamRevision++;
+        }
+        notifyListeners();
+        return;
+      }
+
+      _messages.insertAll(0, older);
+      _oldestHistorySeq = nextAnchor;
+      _hasMoreHistory = hasMore;
+      _streamRevision++;
+    } catch (e) {
+      debugPrint('[DshService] loadOlderHistory error: $e');
+      // 静默失败：一次翻页失败不该打断用户正在看的会话。
+    } finally {
+      if (_currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
+        _isLoadingOlder = false;
+        notifyListeners();
+      }
+    }
+  }
+
   bool get isSending => _isSending;
   bool get isCanceling => _isCanceling;
 
@@ -430,14 +571,56 @@ class DshService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 最近一次 401 是否因「电脑端已移除此设备」。
+  ///
+  /// [feat 2026-10-12] 网关在设备被撤销后的 401 响应体带 device_revoked: true，
+  /// 客户端凭它区分「token 输错了」与「被电脑端踢掉了」——前者提示换 token 即可，
+  /// 后者要清本地凭据并回到配置页重新配对。
+  bool _lastAuthFailureWasRevoked = false;
+  bool get lastAuthFailureWasDeviceRevoked => _lastAuthFailureWasRevoked;
+
+  /// 处理被电脑端撤销：清除本地凭据（token/authCode）、停掉重连与心跳、
+  /// 关闭 socket。保留 host/port 与网关名，用户重新扫码/输入配对码时少打字。
+  Future<void> handleDeviceRevoked() async {
+    _lastAuthFailureWasRevoked = true;
+    final cfg = _currentConfig;
+    if (cfg != null) {
+      cfg.token = '';
+      cfg.authCode = '';
+      try {
+        await StorageService.saveConfig(cfg);
+      } catch (e) {
+        debugPrint('[DshService] 清除被撤销设备的凭据失败: $e');
+      }
+    }
+    handleAuthFailure('电脑端已移除此设备');
+    _isExplicitlyDisconnected = true;
+    try {
+      await _channel?.sink.close(ws_status.goingAway);
+    } catch (_) {}
+    _channel = null;
+  }
+
   void clearAuthError() {
     _isTokenInvalid = false;
     _lastError = '';
+    _lastAuthFailureWasRevoked = false;
     notifyListeners();
   }
 
   bool _checkResponseAuth(http.Response res) {
     if (res.statusCode == 401 || res.statusCode == 403) {
+      // [feat 2026-10-12] 401 + device_revoked：电脑端把这台手机踢了。
+      // 清凭据 + 停连接；UI 层据 lastAuthFailureWasDeviceRevoked 弹提示并跳配置页。
+      if (res.statusCode == 401) {
+        try {
+          final body = jsonDecode(utf8.decode(res.bodyBytes));
+          if (body is Map && (body['device_revoked'] == true || body['code2'] == 'device_revoked')) {
+            unawaited(handleDeviceRevoked());
+            return true;
+          }
+        } catch (_) {/* 非 JSON 401 走通用分支 */}
+      }
       handleAuthFailure('Token已失效或无访问权限 (HTTP ${res.statusCode})');
       return true;
     }
@@ -514,6 +697,18 @@ class DshService extends ChangeNotifier {
       for (final res in responses) {
         if (res == null) continue;
         if (res.statusCode == 401 || res.statusCode == 403) {
+          // [feat 2026-10-12] testConnection 也可能撞上被撤销设备的 401：
+          // 识别 device_revoked 并清凭据，让 UI 能引导回配对页。
+          if (res.statusCode == 401) {
+            try {
+              final errBody = jsonDecode(utf8.decode(res.bodyBytes));
+              if (errBody is Map && (errBody['device_revoked'] == true || errBody['code2'] == 'device_revoked')) {
+                await handleDeviceRevoked();
+                _lastError = '电脑端已移除此设备，请重新配对';
+                return false;
+              }
+            } catch (_) {}
+          }
           _lastError = '认证失败 (HTTP ${res.statusCode}): 请核对访问令牌或授权码';
           return false;
         }
@@ -1042,6 +1237,8 @@ class DshService extends ChangeNotifier {
     // 上一个会话的读数（交付物/变更/作业/用量）必须清掉：不清的话新会话的状态条
     // 会拿旧会话的上下文压力与作业数当自己的（这比"多打几个请求"严重得多）。
     _resetSessionInsights();
+    // [feat 2026-10-12] 上翻分页状态跟会话走：切走即清。
+    _resetHistoryPaging();
     notifyListeners();
 
     // Notify server to follow this session for real-time streaming
@@ -1080,6 +1277,8 @@ class DshService extends ChangeNotifier {
             thinking: m['thinking'],
             isMemory: m['isMemory'] == true || m['role'] == 'memory',
             isContext: m['isContext'] == true || m['role'] == 'context',
+            // [feat 2026-10-12] seq：反向翻页游标 + 实时流去重身份键。
+            seq: m['seq'] is int ? m['seq'] as int : (m['seq'] is num ? (m['seq'] as num).toInt() : null),
             tools: rawTools.map((t) => ToolExecution(
               name: t['name'] ?? '',
               input: _coerceToolInput(t['input']),
@@ -1097,6 +1296,12 @@ class DshService extends ChangeNotifier {
         } else {
           _isSending = false;
         }
+
+        // [feat 2026-10-12] 首屏历史加载完成后，用最旧一条带 seq 的消息作为
+        // 上翻锚点。网关getSessionHistory 已在消息上带 seq。
+        _recomputeHistoryAnchor();
+        _historyExhausted = false;
+        _hasMoreHistory = _oldestHistorySeq != null;
       } else {
         _lastError = '加载历史失败 (HTTP ${res.statusCode})';
         debugPrint('[DshService] $_lastError');
@@ -1136,6 +1341,7 @@ class DshService extends ChangeNotifier {
 
     // Immediately empty out messages as requested: "点击新增会话之后应该是出现一个空的会话"
     _messages = [];
+    _resetHistoryPaging();
     // 新会话没有任何读数：清掉上一个会话的（同 selectSession）。
     _resetSessionInsights();
 
@@ -1443,6 +1649,8 @@ class DshService extends ChangeNotifier {
         thinking: m['thinking'],
         isMemory: m['isMemory'] == true || m['role'] == 'memory',
         isContext: m['isContext'] == true || m['role'] == 'context',
+        // [feat 2026-10-12] seq：反向翻页游标 + 实时流去重身份键。
+        seq: m['seq'] is int ? m['seq'] as int : (m['seq'] is num ? (m['seq'] as num).toInt() : null),
         tools: rawTools.map((t) => ToolExecution(
           name: t['name'] ?? '',
           input: _coerceToolInput(t['input']),
@@ -2242,6 +2450,21 @@ class DshService extends ChangeNotifier {
   SessionStats? _sessionStats;
   PushConfig? _pushConfig;
 
+  // [feat 2026-10-12] 子代理列表 / 一键诊断。子代理是会话域数据（会话切换要清），
+  // 诊断是网关域数据（跨会话有效，不清）。
+  List<SubagentItem>? _subagents;
+  bool _subagentsUnavailable = false;
+  DiagnosticsReport? _diagnostics;
+  bool _diagnosticsBusy = false;
+
+  /// null = 还没拉过或引擎没有列出能力（UI 隐藏区块）。
+  List<SubagentItem>? get subagents => _subagents;
+
+  /// true = 拉取失败/引擎不可达（UI 显示"状态未知"而不是空表）。
+  bool get subagentsUnavailable => _subagentsUnavailable;
+  DiagnosticsReport? get diagnostics => _diagnostics;
+  bool get diagnosticsBusy => _diagnosticsBusy;
+
   /// 本轮消耗的基线：**回合开始那一刻**的累计 token 读数。
   int? _statsBaselineTokens;
 
@@ -2336,6 +2559,10 @@ class DshService extends ChangeNotifier {
     _turnRunningSeen = false;
     _hasMeasuredTurn = false;
     _measuredTurnTokens = null;
+    // [feat 2026-10-12] 子代理列表是会话域数据：切会话必须清，否则新会话的
+    // 面板会短暂显示上一个会话的子代理（诊断是网关域的，故意不清）。
+    _subagents = null;
+    _subagentsUnavailable = false;
   }
 
   /// 拉取当前会话的排队消息。
@@ -2867,6 +3094,140 @@ class DshService extends ChangeNotifier {
     }
   }
 
+  // ---- 一键诊断 / 子代理中断 / goal 控制 / slash 命令 [feat 2026-10-12] ----
+
+  /// 一键连接诊断。永不抛异常：网关保证各项 check 都有答案（引擎挂掉只让
+  /// `engine_rpc` 变 ok:false），这里再把网络层异常兜成一份最小失败报告。
+  Future<DiagnosticsReport?> runDiagnostics() async {
+    if (_currentConfig == null) return null;
+    _diagnosticsBusy = true;
+    notifyListeners();
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/diagnostics');
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
+      if (_checkResponseAuth(res)) return null;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        _diagnostics = DiagnosticsReport.fromJson(Map<String, dynamic>.from(data));
+        return _diagnostics;
+      }
+    } catch (e) {
+      debugPrint('[DshService] runDiagnostics error: $e');
+    } finally {
+      _diagnosticsBusy = false;
+      notifyListeners();
+    }
+    return null;
+  }
+
+  /// 当前会话的子代理列表。引擎没有列出能力/失败时返回 null（界面隐藏该区块）。
+  Future<List<SubagentItem>?> fetchSubagents() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return null;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/subagents')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return null;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final raw = data['entries'];
+        _subagents = raw is List
+            ? raw
+                .whereType<Map>()
+                .map((e) => SubagentItem.fromJson(Map<String, dynamic>.from(e)))
+                .where((s) => s.id.isNotEmpty)
+                .toList(growable: false)
+            : const <SubagentItem>[];
+        _subagentsUnavailable = false;
+        notifyListeners();
+        return _subagents;
+      }
+      // 501/502：引擎没有列出能力或 RPC 失败 —— 明确"未知"，不落成假空表。
+      _subagents = null;
+      _subagentsUnavailable = true;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('[DshService] fetchSubagents error: $e');
+      _subagents = null;
+      _subagentsUnavailable = true;
+      notifyListeners();
+    }
+    return null;
+  }
+
+  /// 中断一个 continuable 子代理（引擎对 one-shot 一律拒绝，App 端提前拦下）。
+  Future<bool> interruptSubagent(String childSessionId) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null || childSessionId.isEmpty) return false;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/subagents/interrupt');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'parentSessionId': sessionId, 'childSessionId': childSessionId}),
+      ).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return false;
+      return res.statusCode == 200;
+    } catch (e) {
+      debugPrint('[DshService] interruptSubagent error: $e');
+      return false;
+    }
+  }
+
+  /// goal 操作：pause / resume / complete。ref 来自最近一次 session/stats。
+  /// 引擎拒绝（502）时返回 false，由界面显示"引擎拒绝了这次操作"。
+  Future<bool> controlGoal(String action, {required String goalId, required int revision}) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return false;
+    if (!const {'pause', 'resume', 'complete'}.contains(action)) return false;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/goals/$action');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'sessionId': sessionId, 'goalId': goalId, 'revision': revision}),
+      ).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return false;
+      if (res.statusCode == 200) {
+        // 引擎的 goal 操作改了 revision：立刻重读 stats，让面板的 ref 和相位
+        // 跟上，否则下一次操作会带着旧 revision 被拒。
+        await fetchSessionStats();
+        return true;
+      }
+      return false;
+    } catch (e) {
+      debugPrint('[DshService] controlGoal error: $e');
+      return false;
+    }
+  }
+
+  /// 会话可用的 slash 命令。失败/降级返回空列表（界面隐藏 "/" 入口）。
+  Future<List<SlashCommand>> fetchCommands() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return const [];
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/commands')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return const [];
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final raw = data['commands'];
+        return raw is List
+            ? raw
+                .whereType<Map>()
+                .map((e) => SlashCommand.fromJson(Map<String, dynamic>.from(e)))
+                .where((c) => c.name.isNotEmpty)
+                .toList(growable: false)
+            : const <SlashCommand>[];
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchCommands error: $e');
+    }
+    return const [];
+  }
+
   /// 用量 / 上下文压力 / goal。带 [_sessionLoadSeq] 守卫。
   ///
   /// [endOfTurn] 为 true 表示这是 `done` 之后为了量"本轮消耗"补的一次读：
@@ -2939,7 +3300,7 @@ class DshService extends ChangeNotifier {
 
   /// 第三档：**只在信息面板打开时**拉（面板的 `onRefresh` 也用它）。
   Future<void> fetchSessionExtras() async {
-    await Future.wait([fetchJobs(), fetchSchedules()]);
+    await Future.wait([fetchJobs(), fetchSchedules(), fetchSubagents()]); // [feat 2026-10-12] 子代理随面板懒加载
   }
 
   /// 下载交付物并交给系统应用打开。
@@ -3060,6 +3421,18 @@ class DshService extends ChangeNotifier {
       // Auth error check from WS frame
       if (json['code'] == 401 || json['type'] == 'unauthorized' || json['status'] == 401) {
         handleAuthFailure(json['error']?.toString() ?? json['message']?.toString() ?? '认证失败: Token无效');
+        return;
+      }
+
+      // [feat 2026-10-12] 电脑端撤销设备的广播帧。广播发给**所有**在线客户端，
+      // 只有本机 deviceId 命中才清凭据断连；deviceId 未知（旧配置）时退化为
+      // 忽略广播 —— 等 HTTP 轮询的 401+device_revoked 再处理，避免误伤别的设备。
+      if (type == 'device_revoked') {
+        final myId = _currentConfig?.deviceId ?? '';
+        final revokedId = json['deviceId']?.toString() ?? '';
+        if (myId.isNotEmpty && revokedId == myId) {
+          unawaited(handleDeviceRevoked());
+        }
         return;
       }
 

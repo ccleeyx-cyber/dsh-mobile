@@ -333,9 +333,14 @@ export function touchDevice(deviceId, ip = '') {
 
 export function revokeDevice(deviceId) {
   const state = loadDevices();
-  const before = state.devices.length;
-  state.devices = state.devices.filter((d) => d.id !== deviceId);
-  if (state.devices.length === before) return false;
+  // [feat 2026-10-12] 标记 revoked 而不是删除整行：撤销后的下一次请求要能
+  // 返回带 device_revoked 标记的 401（客户端据此清凭据回配对页），而那需要
+  // token → 设备的映射还在。verifyToken 已拒绝 revoked 设备，安全性不变。
+  const dev = state.devices.find((d) => d.id === deviceId);
+  if (!dev) return false;
+  if (dev.revoked === true) return false;
+  dev.revoked = true;
+  dev.revokedAt = Date.now();
   return saveDevices(state);
 }
 

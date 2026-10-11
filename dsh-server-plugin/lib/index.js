@@ -16,6 +16,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import url from 'node:url';
 import { homedir } from 'node:os';
+import os from 'node:os';
+import zlib from 'node:zlib';
 import { createRequire } from 'node:module';
 
 import {
@@ -37,6 +39,8 @@ import {
   combineChanges,
   parseUnifiedDiff,
   collectSessionRecords,
+  convertSessionRecordsToMessages,
+  readHistoryPage,
   projectionCacheFileNames,
   claimsMobileFeatureRoute
 } from './features.mjs';
@@ -64,6 +68,7 @@ import {
   describeTurnEnd,
   isFailedTurnEnd,
   toFullSessionId,
+  extractToken,
   authenticateRequest,
   readBodyWithLimit,
   parseJsonBody,
@@ -1235,94 +1240,24 @@ export function apply(ctx, config = {}, internals = {}) {
       });
 
       if (pageResult && Array.isArray(pageResult.records)) {
-        let currentAssistantMsg = null;
+        // [feat 2026-10-12] The record→message conversion now lives in
+        // features.mjs (convertSessionRecordsToMessages) so the new reverse
+        // paging endpoint /api/mobile/sessions/history/page reuses the exact
+        // same logic — including the carried-context filter and tool merging —
+        // instead of a second drifting copy.
+        messages.push(...convertSessionRecordsToMessages(pageResult.records).messages);
+        // lastTurn is a tail-only concern (see stale-drop below) and stays
+        // computed here from the same page.
         for (const record of pageResult.records) {
-          const ev = record.event;
-          if (!ev) continue;
-
-          if (ev.type === 'user/message') {
-            currentAssistantMsg = null;
-            let text = '';
-            if (Array.isArray(ev.data?.content)) {
-              for (const part of ev.data.content) {
-                if (part.type === 'text' && part.text) text += part.text;
-              }
-            } else if (typeof ev.data?.content === 'string') {
-              text = ev.data.content;
-            }
-
-            // 过滤系统注入的元信息与内部记忆快照
-            // isCarriedContext (core) recognises the full set of injected blocks,
-            // including Mnemon plugin-sourced snapshots that the previous inline
-            // prefix check missed — those were being shown to the user as if they
-            // had typed them.  [unified]
-            if (isCarriedContext(text, ev) ||
-                text.startsWith('Time sampled while preparing turn') ||
-                text.startsWith('Memory recall guidance') ||
-                text.includes('<system_information>')) {
-              continue;
-            }
-
-            if (text.trim()) {
-              messages.push({
-                id: crypto.randomUUID(),
-                role: 'user',
-                content: text.trim(),
-                time: ev.time || Date.now()
-              });
-            }
-          } else if (ev.type === 'assistant/message') {
-            const msgObj = ev.data?.message;
-            let reasoning = '';
-            let text = '';
-            if (Array.isArray(msgObj?.content)) {
-              for (const part of msgObj.content) {
-                if (part.type === 'reasoning') reasoning += part.text || '';
-                if (part.type === 'text') text += part.text || '';
-              }
-            } else if (typeof msgObj?.content === 'string') {
-              text = msgObj.content;
-            }
-
-            if (reasoning || text) {
-              if (!currentAssistantMsg) {
-                currentAssistantMsg = {
-                  id: crypto.randomUUID(),
-                  role: 'assistant',
-                  content: text,
-                  thinking: reasoning,
-                  tools: [],
-                  time: ev.time || Date.now()
-                };
-                messages.push(currentAssistantMsg);
-              } else {
-                if (reasoning) {
-                  currentAssistantMsg.thinking = (currentAssistantMsg.thinking ? currentAssistantMsg.thinking + '\n' : '') + reasoning;
-                }
-                if (text) {
-                  currentAssistantMsg.content = (currentAssistantMsg.content ? currentAssistantMsg.content + '\n' : '') + text;
-                }
-              }
-            }
-          } else if (ev.type === 'tool/call') {
-            const callData = ev.data;
-            if (currentAssistantMsg && callData?.name) {
-              currentAssistantMsg.tools.push({
-                name: callData.name,
-                input: coerceToolInput(callData.arguments),
-                id: callData.callId
-              });
-            }
-          } else if (ev.type === 'turn/end') {
-            // 记录最近一次回合的结束原因（后面以 lastTurn 交给手机）。
-            const end = describeTurnEnd(ev.data?.reason);
+          if (record?.event?.type === 'turn/end') {
+            const end = describeTurnEnd(record.event.data?.reason);
             lastTurn = {
               kind: end.kind,
               text: end.text,
               code: end.code || '',
-              failed: isFailedTurnEnd(ev.data?.reason),
-              turn: typeof ev.data?.turn === 'number' ? ev.data.turn : null,
-              time: ev.time || Date.now()
+              failed: isFailedTurnEnd(record.event.data?.reason),
+              turn: typeof record.event.data?.turn === 'number' ? record.event.data.turn : null,
+              time: record.event.time || Date.now()
             };
           }
         }
@@ -2385,9 +2320,25 @@ export function apply(ctx, config = {}, internals = {}) {
       return;
     }
 
+    // [feat 2026-10-12] >4KB 的 JSON 响应在客户端声明支持时用 gzip 压缩：
+    // 工作区/会话列表的 JSON 轻松几十 KB，弱网下传输减半以上。只压 sendJson
+    // 这条路径 —— SSE/WS/文件流本来就不是 JSON，且流式响应绝不能走同步压缩。
     const sendJson = (status, obj) => {
-      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify(obj));
+      const raw = Buffer.from(JSON.stringify(obj), 'utf8');
+      const headers = { 'Content-Type': 'application/json; charset=utf-8' };
+      const accept = String(req.headers['accept-encoding'] || '');
+      if (raw.length > 4096 && /\bgzip\b/i.test(accept)) {
+        const gz = zlib.gzipSync(raw);
+        headers['Content-Encoding'] = 'gzip';
+        headers['Content-Length'] = String(gz.length);
+        headers['Vary'] = 'Accept-Encoding';
+        res.writeHead(status, headers);
+        res.end(gz);
+        return;
+      }
+      headers['Content-Length'] = String(raw.length);
+      res.writeHead(status, headers);
+      res.end(raw);
     };
 
     // 1. 健康探测与鉴权测试 (供手机端 testConnection 测试连通性)
@@ -2418,6 +2369,18 @@ export function apply(ctx, config = {}, internals = {}) {
           return;
         }
         noteAuthFailure(req);
+        // [feat 2026-10-12] health 路由有自己独立的 401 分支（早于统一鉴权门），
+        // 同样要带上 device_revoked 标记 —— 客户端 testConnection/心跳轮询走的
+        // 正是这条路，少了它被踢设备的 App 只会报"token 错误"。
+        const revDev = testToken ? findDeviceByToken(testToken) : null;
+        if (revDev) {
+          sendJson(401, {
+            code: 401, ok: false, authenticated: false,
+            code2: 'device_revoked', device_revoked: true, deviceId: revDev.id,
+            error: '电脑端已移除此设备'
+          });
+          return;
+        }
         sendJson(401, {
           code: 401,
           ok: false,
@@ -2486,6 +2449,82 @@ export function apply(ctx, config = {}, internals = {}) {
       });
       apkStream.pipe(res);
       audit('apk/download', { ip: req.socket?.remoteAddress, size: stat.size });
+      return;
+    }
+
+    // 2b. 扫码配对：二维码 / 兜底 JSON
+    //
+    // [feat 2026-10-12] 安全模型：二维码内容是**一次性 6 位配对码**（复用现有
+    // pairSession 体系），绝不内嵌长期 token —— 屏幕上的二维码会被拍照/截图留存，
+    // 嵌入长期 token 等于把凭据印在纸上。手机扫到码后仍要走 /__mobile/pair
+    // 换取真正的设备 token，5 次错码作废、10 分钟过期逻辑全部沿用。
+    // 该路由在鉴权之前可达（配对前手机没有凭据），与 /__mobile/pair 同级；
+    // 泄露面 = 一枚 10 分钟过期的配对码，与设置页手工生成等价。
+    if ((pathname === '/pair/qr' || pathname === '/api/mobile/pair/qr') && req.method === 'GET') {
+      // 生成一枚新配对码，等价于设置页点了一次"生成配对码"。
+      const code = newPairCode();
+      const expiresAt = Date.now() + pairCodeTtlMs();
+      pairSession = { code, expiresAt };
+      audit('pair/qr-generated', { expiresAt, ip: req.socket?.remoteAddress });
+
+      // 本机非内部 IPv4 列表：手机在局域网内需要知道打哪个地址。
+      const hosts = [];
+      for (const list of Object.values(os.networkInterfaces())) {
+        for (const ni of list || []) {
+          if (ni.family === 'IPv4' && !ni.internal) hosts.push(ni.address);
+        }
+      }
+      const payload = {
+        v: 1,
+        hosts,
+        host: hosts[0] || '',
+        port: listenPort,
+        pairCode: code,
+        name: os.hostname()
+      };
+
+      // 依赖纯 JS 的 `qrcode` 包（无原生模块）。装不了时退化为 JSON，
+      // 让客户端自己显示 6 位数字配对码（见 GET /pair/info）。
+      let png = null;
+      try {
+        const { createRequire } = await import('node:module');
+        const require_ = createRequire(import.meta.url);
+        png = await require_('qrcode').toBuffer(JSON.stringify(payload), {
+          type: 'png', width: 360, margin: 2
+        });
+      } catch (e) {
+        logger.warn('dsh-mobile-bridge: qrcode 包不可用，回退 JSON:', e?.message || e);
+      }
+
+      if (png) {
+        res.writeHead(200, {
+          'Content-Type': 'image/png',
+          'Content-Length': png.length,
+          'Cache-Control': 'no-store'
+        });
+        res.end(png);
+      } else {
+        sendJson(200, { ...payload, error: 'qrcode-unavailable', hint: '本机缺少 qrcode 包，请改用 GET /pair/info 手动输入配对码' });
+      }
+      return;
+    }
+
+    if ((pathname === '/pair/info' || pathname === '/api/mobile/pair/info') && req.method === 'GET') {
+      // 兜底：不依赖 qrcode 包的 JSON 形态，App 显示 6 位数字码供手工输入。
+      const code = newPairCode();
+      const expiresAt = Date.now() + pairCodeTtlMs();
+      pairSession = { code, expiresAt };
+      audit('pair/info-generated', { expiresAt, ip: req.socket?.remoteAddress });
+      const hosts = [];
+      for (const list of Object.values(os.networkInterfaces())) {
+        for (const ni of list || []) {
+          if (ni.family === 'IPv4' && !ni.internal) hosts.push(ni.address);
+        }
+      }
+      sendJson(200, {
+        v: 1, hosts, host: hosts[0] || '', port: listenPort,
+        pairCode: code, name: os.hostname(), expiresAt
+      });
       return;
     }
 
@@ -2612,6 +2651,20 @@ export function apply(ctx, config = {}, internals = {}) {
     const auth = authenticateRequest(req, parsedUrl);
     if (!auth.ok) {
       noteAuthFailure(req);
+      // [feat 2026-10-12] 若曾以某设备 token 认证、但该设备已被撤销，明确回
+      // device_revoked，客户端据此清除本地凭据回到配对页，而不是笼统的"token 错误"。
+      const presented = extractToken(req, parsedUrl);
+      const prevDev = presented ? findDeviceByToken(presented) : null;
+      if (prevDev) {
+        sendJson(401, {
+          ok: false, code: 401, error: 'Unauthorized',
+          code2: 'device_revoked',
+          device_revoked: true,
+          deviceId: prevDev.id,
+          message: '电脑端已移除此设备'
+        });
+        return;
+      }
       sendJson(401, { error: 'Unauthorized', message: '缺少有效令牌或设备未配对' });
       return;
     }
@@ -2644,7 +2697,15 @@ export function apply(ctx, config = {}, internals = {}) {
       '/api/mobile/schedules/delete',
       '/api/mobile/jobs/kill',
       '/api/mobile/push/config',
-      '/api/mobile/push/test'
+      '/api/mobile/push/test',
+      // v1.15：设备撤销（电脑端踢设备）
+      '/api/mobile/devices/revoke',
+      '/__mobile/devices/revoke',
+      // [feat 2026-10-12] 子代理中断与 goal 暂停/继续/完成（真实引擎 RPC 的写操作）
+      '/api/mobile/sessions/subagents/interrupt',
+      '/api/mobile/goals/pause',
+      '/api/mobile/goals/resume',
+      '/api/mobile/goals/complete'
     ];
     if (req.method === 'POST' || req.method === 'PUT') {
       const isWrite = WRITE_PATHS.some((p) => pathname === p) ||
@@ -2826,6 +2887,50 @@ export function apply(ctx, config = {}, internals = {}) {
 
 
     try {
+      // 4.0 设备管理（v1.15）：列表 + 撤销
+      //
+      // [feat 2026-10-12] 撤销要求 write/admin（走 WRITE_PATHS 同款 roleCanWrite
+      // 判断 —— revoke 已加入 WRITE_PATHS），列表 read 即可。撤销时向其余在线
+      // 客户端广播 device_revoked，让电脑端 UI 即时刷新设备列表。
+      if ((pathname === '/api/mobile/devices' || pathname === '/__mobile/devices') && req.method === 'GET') {
+        const state = loadDevices();
+        // 撤销是打 revoked 标记而非删行（认证路径要反查 token→设备），列表只展示还活着的设备。
+        const devices = state.devices.filter((d) => d.revoked !== true).map((d) => ({
+          id: d.id,
+          name: d.name,
+          role: d.role || 'readwrite',
+          platform: d.platform || '',
+          createdAt: d.createdAt,
+          lastSeenAt: d.lastSeenAt,
+          lastIp: d.lastIp || '',
+          connectCount: d.connectCount || 0
+          // tokenHash 故意不下发 —— 客户端永远不该拿到哪怕摘要形式的凭据。
+        }));
+        sendJson(200, { ok: true, code: 0, devices });
+        return;
+      }
+
+      if ((pathname === '/api/mobile/devices/revoke' || pathname === '/__mobile/devices/revoke') && req.method === 'POST') {
+        const deviceId = String(jsonBody.deviceId || '').trim();
+        if (!deviceId) {
+          sendJson(400, { ok: false, error: 'deviceId is required' });
+          return;
+        }
+        if (deviceId === auth.device?.id && auth.device?.id !== 'admin') {
+          sendJson(400, { ok: false, error: '不能撤销当前正在使用的设备本身' });
+          return;
+        }
+        const ok = revokeDevice(deviceId);
+        if (!ok) {
+          sendJson(404, { ok: false, error: '设备不存在或已移除', deviceId });
+          return;
+        }
+        audit('device/revoked', { deviceId, by: auth.device?.id || 'admin', ip: req.socket?.remoteAddress });
+        broadcastToMobileClients({ type: 'device_revoked', deviceId });
+        sendJson(200, { ok: true, code: 0, deviceId, message: '设备已移除' });
+        return;
+      }
+
       // 4.1 工作区与会话
       if (pathname === '/api/mobile/workspaces' && req.method === 'GET') {
         // ?archived=exclude|only|include. Anything else — a missing value, a typo,
@@ -2914,11 +3019,20 @@ export function apply(ctx, config = {}, internals = {}) {
         readProjectionRows,
         readSessionRecords,
         readWorkspaceChanges,
+        assertSessionId,
         readConfig: loadConfig,
         writeConfig: saveConfig,
         pushTest,
         audit,
-        logger
+        logger,
+        // [feat 2026-10-12] diagnostics + subagent/goal/command control deps.
+        // All gateway-local state the diagnostics route reads; nothing here can
+        // leak a token or a path (features.mjs redacts before answering).
+        bridgeVersion: BRIDGE_VERSION,
+        mobileClients: connectedClients,
+        eventsStreamReady: () => Boolean(currentEventsClientId) && upstreamMuxWs?.readyState === WebSocket.OPEN,
+        deviceCount: () => { try { return loadDevices().devices.filter((d) => !d.revoked).length; } catch { return null; } },
+        dshHomeDir
       })) {
         return;
       }

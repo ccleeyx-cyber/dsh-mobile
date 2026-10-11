@@ -1,5 +1,8 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:http/http.dart' as http;
+import 'package:mobile_scanner/mobile_scanner.dart';
 import '../models/server_config.dart';
 import '../services/dsh_service.dart';
 import '../services/storage_service.dart';
@@ -24,6 +27,10 @@ class _ConfigPageState extends State<ConfigPage> {
   final _authCodeController = TextEditingController(text: '');
   bool _useHttps = false;
   bool _isTesting = false;
+
+  /// 配对成功后网关分配的本机设备 id（dev_xxxxxxxx），保存进配置。
+  /// [feat 2026-10-12] 电脑端撤销广播按它命中本机。
+  String _pairedDeviceId = '';
 
   /// Saved gateways, for the switcher at the top of the page.
   List<ServerConfig> _profiles = [];
@@ -101,6 +108,7 @@ class _ConfigPageState extends State<ConfigPage> {
     _useHttps = cfg.useHttps;
     _npsController.text = cfg.npsAddress;
     _authCodeController.text = cfg.authCode;
+    _pairedDeviceId = cfg.deviceId;
   }
 
   ServerConfig _buildConfig() {
@@ -119,6 +127,7 @@ class _ConfigPageState extends State<ConfigPage> {
       useHttps: _useHttps,
       npsAddress: _npsController.text.trim(),
       authCode: authText,
+      deviceId: _pairedDeviceId,
     );
   }
 
@@ -253,6 +262,78 @@ class _ConfigPageState extends State<ConfigPage> {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
+
+  // ------------------------------------------------------------- 扫码配对 --
+
+  /// 扫码连接（v1.15）。
+  ///
+  /// [feat 2026-10-12] 二维码内容是网关 /pair/qr 生成的 JSON：
+  ///   {v, hosts[], host, port, pairCode, name}
+  /// 其中 pairCode 是**一次性 6 位配对码**（10 分钟过期、5 次错码作废），
+  /// 不是长期 token —— 安全第一。扫码后本地调用 POST /__mobile/pair
+  /// 用配对码换取真正的设备 token，再填充表单并保存连接。
+  Future<void> _scanAndConnect() async {
+    final scanned = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => const _QrScanPage()),
+    );
+    if (scanned == null || !mounted) return;
+
+    Map<String, dynamic>? payload;
+    try {
+      final decoded = jsonDecode(scanned);
+      if (decoded is Map) payload = Map<String, dynamic>.from(decoded);
+    } catch (_) {
+      _toast('二维码内容无法识别（不是 DSH 配对码）');
+      return;
+    }
+    final port = payload?['port'];
+    final pairCode = payload?['pairCode']?.toString() ?? payload?['code']?.toString() ?? '';
+    final hosts = (payload?['hosts'] as List?)?.map((e) => e.toString()).toList() ?? const [];
+    final firstHost = payload?['host']?.toString() ??
+        (hosts.isNotEmpty ? hosts.first : '');
+    if (firstHost.isEmpty || pairCode.isEmpty || port is! int) {
+      _toast('二维码缺少网关地址/端口/配对码');
+      return;
+    }
+
+    _toast('正在用配对码换取设备凭据...');
+    // 用配对码走现有 /__mobile/pair 握手换设备 token。
+    String? token;
+    String? deviceId;
+    String? errMsg;
+    try {
+      final res = await http.post(
+        Uri.parse('http://$firstHost:$port/__mobile/pair'),
+        headers: const {'Content-Type': 'application/json'},
+        body: jsonEncode({'code': pairCode, 'name': payload?['name']?.toString() ?? '扫码配对的手机', 'platform': 'android'}),
+      ).timeout(const Duration(seconds: 8));
+      final body = jsonDecode(res.body);
+      if (res.statusCode == 200 && body is Map && body['ok'] == true) {
+        token = body['token']?.toString();
+        deviceId = body['deviceId']?.toString();
+      } else {
+        errMsg = body is Map ? (body['error']?.toString() ?? 'HTTP ${res.statusCode}') : 'HTTP ${res.statusCode}';
+      }
+    } catch (e) {
+      errMsg = e.toString();
+    }
+    if (!mounted) return;
+    if (token == null || token.isEmpty) {
+      _toast('配对失败: ${errMsg ?? "网关无响应"}');
+      return;
+    }
+
+    setState(() {
+      _hostController.text = firstHost;
+      _portController.text = port.toString();
+      _tokenController.text = token!;
+      _authCodeController.text = '';
+      _pairedDeviceId = deviceId ?? '';
+    });
+    _toast('配对成功${deviceId != null ? "（设备 $deviceId）" : ""}，点「保存并进入聊天」完成连接');
+  }
+
+  /// 全屏二维码扫描页。返回扫描到的原始字符串，取消返回 null。
 
   /// The gateway switcher row. Rendered above the form so switching is the first
   /// thing available on the page.
@@ -553,6 +634,15 @@ class _ConfigPageState extends State<ConfigPage> {
                 ),
               ),
               const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: _scanAndConnect,
+                icon: const Icon(Icons.qr_code_scanner),
+                label: const Text('扫码连接（扫电脑端二维码，自动配对）'),
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+              ),
+              const SizedBox(height: 12),
               FilledButton.icon(
                 onPressed: _saveAndConnect,
                 icon: const Icon(Icons.login),
@@ -564,6 +654,75 @@ class _ConfigPageState extends State<ConfigPage> {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 全屏二维码扫描页（v1.15 扫码配对）。
+///
+/// [feat 2026-10-12] 识别到内容即返回；同一内容只触发一次，避免对同一个码
+/// 连续吐出多帧。torch/相册导入这类增强刻意不做 —— 配对是低频动作，够用就好。
+class _QrScanPage extends StatefulWidget {
+  const _QrScanPage();
+
+  @override
+  State<_QrScanPage> createState() => _QrScanPageState();
+}
+
+class _QrScanPageState extends State<_QrScanPage> {
+  bool _delivered = false;
+  final _controller = MobileScannerController(
+    formats: const [BarcodeFormat.qrCode],
+  );
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onDetect(BarcodeCapture capture) {
+    if (_delivered) return;
+    for (final barcode in capture.barcodes) {
+      final raw = barcode.rawValue;
+      if (raw == null || raw.isEmpty) continue;
+      _delivered = true;
+      Navigator.of(context).pop(raw);
+      return;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('扫描电脑端配对二维码'),
+        centerTitle: true,
+      ),
+      body: Stack(
+        children: [
+          MobileScanner(
+            controller: _controller,
+            onDetect: _onDetect,
+          ),
+          Positioned(
+            left: 0, right: 0, bottom: 32,
+            child: Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Text(
+                  '对准电脑「设置 → 移动终端」页生成的二维码',
+                  style: TextStyle(color: Colors.white, fontSize: 13),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

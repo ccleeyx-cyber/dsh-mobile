@@ -59,6 +59,10 @@ dependencies:
   intl: ^0.19.0
   uuid: ^4.4.0
 
+  # 扫码配对（v1.15）：扫电脑端 GET /pair/qr 生成的二维码，
+  # 解析 {hosts, port, pairCode, name} 后填表并走 /__mobile/pair 换取设备 token。
+  mobile_scanner: ^5.2.3
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

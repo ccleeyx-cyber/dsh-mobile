@@ -18,6 +18,15 @@
 import { sendFile } from './send-file.mjs';
 
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
+
+import {
+  coerceToolInput,
+  describeTurnEnd,
+  isCarriedContext,
+  isFailedTurnEnd
+} from './core.mjs';
 
 /* ------------------------------------------------------------------ *
  * 1. Queue / steer (running-session input)
@@ -299,6 +308,196 @@ export async function collectSessionRecords({ callDshRpc, sessionId, maxPages = 
 }
 
 /* ------------------------------------------------------------------ *
+ * 2b. Chat-history paging (mobile infinite scroll-up)  [feat 2026-10-12]
+ * ------------------------------------------------------------------ */
+
+/**
+ * Convert `session/page` records into the same chat-message shape
+ * `getSessionHistory` in lib/index.js has always returned, so the phone can
+ * render a history page and the live tail with one renderer.
+ *
+ * Extracted from index.js (which previously inlined this loop) so the two
+ * callers cannot drift. Differences from the inline version are deliberate and
+ * documented:
+ *   - every message carries `seq` (the event seq that produced it) — the phone
+ *     needs it as the `beforeSeq` cursor and for dedup against the live stream;
+ *   - `tool/call` after a page boundary (no preceding assistant/message in this
+ *     page) is dropped rather than silently attached to the wrong message;
+ *   - `turn/end` is ignored here: lastTurn is a tail concern owned by
+ *     getSessionHistory, not something a deep-history page should report.
+ *
+ * @param records - `session/page` records (`{ event }` entries), ascending.
+ * @returns `{ messages }` — ascending, same fields as getSessionHistory plus seq.
+ */
+export function convertSessionRecordsToMessages(records) {
+  const messages = [];
+  let currentAssistantMsg = null;
+  for (const record of Array.isArray(records) ? records : []) {
+    const ev = record?.event;
+    if (!ev) continue;
+
+    if (ev.type === 'user/message') {
+      currentAssistantMsg = null;
+      let text = '';
+      if (Array.isArray(ev.data?.content)) {
+        for (const part of ev.data.content) {
+          if (part.type === 'text' && part.text) text += part.text;
+        }
+      } else if (typeof ev.data?.content === 'string') {
+        text = ev.data.content;
+      }
+
+      // Same injected-context filter as the live tail — otherwise a history
+      // page would surface memory snapshots and system reminders as if the
+      // user had typed them.
+      if (isCarriedContext(text, ev) ||
+          text.startsWith('Time sampled while preparing turn') ||
+          text.startsWith('Memory recall guidance') ||
+          text.includes('<system_information>')) {
+        continue;
+      }
+
+      if (text.trim()) {
+        messages.push({
+          id: `hist_${typeof ev.seq === 'number' ? ev.seq : messages.length}`,
+          role: 'user',
+          content: text.trim(),
+          time: ev.time || Date.now(),
+          seq: typeof ev.seq === 'number' ? ev.seq : null
+        });
+      }
+    } else if (ev.type === 'assistant/message') {
+      const msgObj = ev.data?.message;
+      let reasoning = '';
+      let text = '';
+      if (Array.isArray(msgObj?.content)) {
+        for (const part of msgObj.content) {
+          if (part.type === 'reasoning') reasoning += part.text || '';
+          if (part.type === 'text') text += part.text || '';
+        }
+      } else if (typeof msgObj?.content === 'string') {
+        text = msgObj.content;
+      }
+
+      if (reasoning || text) {
+        if (!currentAssistantMsg) {
+          currentAssistantMsg = {
+            id: `hist_${typeof ev.seq === 'number' ? ev.seq : messages.length}`,
+            role: 'assistant',
+            content: text,
+            thinking: reasoning,
+            tools: [],
+            time: ev.time || Date.now(),
+            seq: typeof ev.seq === 'number' ? ev.seq : null
+          };
+          messages.push(currentAssistantMsg);
+        } else {
+          if (reasoning) {
+            currentAssistantMsg.thinking = (currentAssistantMsg.thinking ? currentAssistantMsg.thinking + '\n' : '') + reasoning;
+          }
+          if (text) {
+            currentAssistantMsg.content = (currentAssistantMsg.content ? currentAssistantMsg.content + '\n' : '') + text;
+          }
+        }
+      }
+    } else if (ev.type === 'tool/call') {
+      const callData = ev.data;
+      if (currentAssistantMsg && callData?.name) {
+        currentAssistantMsg.tools.push({
+          name: callData.name,
+          input: coerceToolInput(callData.arguments),
+          id: callData.callId
+        });
+      }
+    }
+    // turn/end and every other event type: not a chat message.
+  }
+  return { messages };
+}
+
+/**
+ * Fetch ONE reverse page of older history, ending just above `beforeSeq`.
+ *
+ * Unlike `collectSessionRecords` (which probes the cursor and walks up to 8
+ * pages for the deliverable scan), this answers a single scroll-up: the phone
+ * asks for one page, the gateway answers with one page. The cursor probe is
+ * reused (the past-cursor rejection IS the cursor) but capped at one page walk
+ * so a scroll cannot hammer the engine.
+ *
+ * @param deps - `{ callDshRpc, sessionId, beforeSeq?, max? }`. `sessionId` must
+ *   already be the full `session-…` id.
+ * @returns `{ messages, hasMore, oldestSeq }`. On ANY engine failure this
+ *   degrades to `{ messages: [], hasMore: false, oldestSeq: null }` — an
+ *   endpoint that answers 500 turns one bad scroll into a broken chat.
+ */
+export async function readHistoryPage({ callDshRpc, sessionId, beforeSeq, max = 60 }) {
+  const empty = { messages: [], hasMore: false, oldestSeq: null };
+  if (typeof callDshRpc !== 'function' || !sessionId) return empty;
+
+  const address = { kind: 'session', sessionId };
+  const pageSize = Math.min(Math.max(Number(max) || 60, 1), 200);
+
+  // 1. Cursor probe — identical mechanism to collectSessionRecords.
+  let cursor;
+  try {
+    await callDshRpc('session/page', { args: { request: { address, throughSeq: Number.MAX_SAFE_INTEGER, maxMessages: 1 } } });
+    // The engine should reject a probe past the cursor; an accepted probe means
+    // the cursor is at/above MAX_SAFE_INTEGER — treat "latest" as the anchor.
+    cursor = Number.MAX_SAFE_INTEGER;
+  } catch (err) {
+    const parsed = parseCursorFromPastSeqError(err?.message);
+    if (parsed === null) return empty;
+    cursor = parsed;
+  }
+
+  // 2. The upper bound of THIS page: the oldest seq the phone already has.
+  //    Engine contract (verified, see parseCursorFromPastSeqError notes):
+  //    `{ address, throughSeq: U, maxMessages: N }` answers the newest N events
+  //    with seq <= U; `beforeSeq` is optional and only narrows the lower end.
+  //    So for "older than S" we pass throughSeq = S and let maxMessages bound
+  //    the window — the phone dedups the possibly-included boundary seq itself.
+  let upperBound;
+  if (typeof beforeSeq === 'number' && Number.isFinite(beforeSeq) && beforeSeq > 0) {
+    upperBound = Math.min(beforeSeq, cursor);
+  } else {
+    // No beforeSeq: first page. Anchor at the cursor so we get the same newest
+    // window getSessionHistory would show.
+    upperBound = cursor;
+  }
+  if (upperBound <= 0) return empty;
+
+  let page;
+  try {
+    page = await callDshRpc('session/page', {
+      args: {
+        request: {
+          address,
+          throughSeq: upperBound,
+          maxMessages: pageSize
+        }
+      }
+    });
+  } catch {
+    return empty;
+  }
+
+  const records = Array.isArray(page?.records) ? page.records : [];
+  const { messages } = convertSessionRecordsToMessages(records);
+
+  // Records come back ascending; oldestSeq is the seq of the oldest event we
+  // actually saw (message-bearing or not — it is the paging anchor).
+  const seqs = records.map((r) => r?.event?.seq).filter((s) => typeof s === 'number');
+  const oldestSeq = seqs.length ? Math.min(...seqs) : null;
+
+  // hasMore: the engine said there is more, AND the page was not empty, AND
+  // there is still room above the oldest seq we saw.
+  const engineHasMore = page?.hasMore !== false;
+  const hasMore = records.length > 0 && engineHasMore && (oldestSeq === null || oldestSeq > 1);
+
+  return { messages, hasMore, oldestSeq };
+}
+
+/* ------------------------------------------------------------------ *
  * 3. Workspace changes (what the agent edited)
  * ------------------------------------------------------------------ */
 
@@ -472,7 +671,12 @@ export function summarizeUsage(values, rows) {
         phase: typeof g.phase === 'string' ? g.phase : 'active',
         roundsStarted: num(goalRow?.roundsStarted),
         maxGoalRounds: num(g.maxGoalRounds),
-        blockedReason: g.blockedReason?.message ?? null
+        blockedReason: g.blockedReason?.message ?? null,
+        // [feat 2026-10-12] CAS ref for goals/pause|resume|complete. The engine
+        // has no goal-read RPC, so the projection row is the only source of
+        // { id, revision }; the phone sends both back verbatim on an action.
+        goalId: typeof g.id === 'string' ? g.id : null,
+        revision: num(g.revision)
       };
     })()
   };
@@ -820,6 +1024,120 @@ export async function deliverNtfy({
 }
 
 /* ------------------------------------------------------------------ *
+ * 7. One-tap connection diagnostics [feat 2026-10-12]
+ * ------------------------------------------------------------------ */
+
+/**
+ * Redact anything that could leak a secret or a host path from one diagnostic
+ * detail string. Tokens and absolute paths never reach the phone; a detail is
+ * a short reason code, not a message from the engine (engine error text can
+ * embed a URL with the topic or a home path, so it is never passed through).
+ */
+export function redactDiagnosticDetail(text) {
+  let s = typeof text === 'string' ? text : String(text ?? '');
+  // Collapse any absolute path (posix or win32) to its last two segments so
+  // "which file" survives but the home directory does not.
+  s = s.replace(/([A-Za-z]:)?(?:[\\/][^\s"']*)+/g, (m) => {
+    const parts = m.split(/[\\/]/).filter(Boolean);
+    return parts.length ? `…/${parts.slice(-2).join('/')}` : '[path]';
+  });
+  // Credential-shaped fragments (bearer tokens, long hex/base64 runs) never
+  // pass through: an engine error message can echo an auth header verbatim.
+  s = s.replace(/\b(?:Bearer\s+|token[=:\s]+|sk-)[A-Za-z0-9._~+/=-]{8,}/gi, '[credential]');
+  s = s.replace(/\b[A-Fa-f0-9]{32,}\b/g, '[credential]');
+  return s.slice(0, 120);
+}
+
+/**
+ * Probe the engine's live RPC surface with the cheapest real call.
+ *
+ * `session/page` was chosen over `workspace/list` because it is the RPC the
+ * bridge already speaks with a shape we know is accepted (a past-cursor
+ * rejection is itself proof the engine answered), and it does not depend on
+ * any workspace being registered. Any answer — including an engine-side
+ * rejection — counts as "the engine is reachable"; only transport failure
+ * (ECONNREFUSED / timeout / parse error) counts as down.
+ *
+ * @param deps - `{ callDshRpc, timeoutMs? }`.
+ * @returns `{ ok, detail, ms }`.
+ */
+export async function probeEngineRpc({ callDshRpc, timeoutMs = 4000 } = {}) {
+  const started = Date.now();
+  if (typeof callDshRpc !== 'function') {
+    return { ok: false, detail: 'rpc caller unavailable', ms: 0 };
+  }
+  try {
+    // `throughSeq: 0` is a valid wire field for a REQUIRED number; an engine
+    // that is alive answers (possibly with an input error, which still proves
+    // the transport + gateway are up).
+    await withTimeout(callDshRpc('session/page', {
+      args: { request: { address: { kind: 'session', sessionId: 'diagnostics-probe' }, throughSeq: 0, maxMessages: 1 } }
+    }), timeoutMs);
+    return { ok: true, detail: 'ok', ms: Date.now() - started };
+  } catch (err) {
+    return { ok: false, detail: redactDiagnosticDetail(err?.message || 'unreachable'), ms: Date.now() - started };
+  }
+}
+
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`engine rpc timeout after ${ms}ms`)), ms);
+    Promise.resolve(promise).then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
+/**
+ * Disk writability probe under one directory: write a temp file, delete it.
+ * Never throws; returns { ok, detail } with no paths in the detail.
+ */
+export function probeDiskWritable(dir) {
+  const probe = path.join(dir, `.diag-${process.pid}-${Date.now()}.tmp`);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(probe, 'dsh-mobile diagnostics');
+    try { fs.unlinkSync(probe); } catch { /* already gone is fine */ }
+    return { ok: true, detail: 'ok' };
+  } catch (err) {
+    return { ok: false, detail: redactDiagnosticDetail(err?.code || err?.message || 'write failed') };
+  }
+}
+
+/**
+ * Subagent catalog normalization: project the engine's `subagents/list`
+ * result onto the rows the phone renders. One-shot children cannot take a
+ * continuation, so they carry no interrupt affordance — the gateway marks them
+ * and the App hides the button rather than sending an RPC that must fail.
+ *
+ * @param catalog - `SubagentCatalog` from the engine, when the RPC answered.
+ * @returns list rows, or null when the engine has no listing capability.
+ */
+export function normalizeSubagentCatalog(catalog) {
+  if (!catalog || !Array.isArray(catalog.entries)) return null;
+  return {
+    parentAvailable: catalog.parentAvailable === true,
+    entries: catalog.entries.map((e) => {
+      if (!e || typeof e !== 'object') return null;
+      const id = typeof e.id === 'string' ? e.id : '';
+      if (!id) return null;
+      if (e.kind === 'diagnostic') {
+        return { id, kind: 'diagnostic', reason: String(e.reason || 'unavailable') };
+      }
+      return {
+        id,
+        kind: 'child',
+        activity: e.activity === 'running' ? 'running' : 'inactive',
+        mode: e.mode === 'continuable' ? 'continuable' : 'one-shot',
+        label: typeof e.label === 'string' ? e.label : '',
+        hasChildren: e.hasChildren === true
+      };
+    }).filter(Boolean)
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Route handling
  * ------------------------------------------------------------------ */
 
@@ -844,6 +1162,8 @@ export async function deliverNtfy({
  * `handleFeatureRoute`'s real behaviour, so the two cannot drift apart.
  */
 export const FEATURE_ROUTES = [
+  ['GET', '/api/mobile/diagnostics'], // [feat 2026-10-12] one-tap connection diagnostics
+  ['GET', '/api/mobile/sessions/history/page'], // [feat 2026-10-12] reverse history paging
   ['GET', '/api/mobile/sessions/queue'],
   ['POST', '/api/mobile/sessions/queue'],
   ['GET', '/api/mobile/schedules'],
@@ -857,7 +1177,16 @@ export const FEATURE_ROUTES = [
   ['GET', '/api/mobile/session/stats'],
   ['GET', '/api/mobile/push/config'],
   ['POST', '/api/mobile/push/config'],
-  ['POST', '/api/mobile/push/test']
+  ['POST', '/api/mobile/push/test'],
+  // [feat 2026-10-12] subagent control (engine RPC: subagents/list, subagents/interruptByParent)
+  ['GET', '/api/mobile/sessions/subagents'],
+  ['POST', '/api/mobile/sessions/subagents/interrupt'],
+  // [feat 2026-10-12] goal control (engine RPC: goals/pause, goals/resume, goals/complete)
+  ['POST', '/api/mobile/goals/pause'],
+  ['POST', '/api/mobile/goals/resume'],
+  ['POST', '/api/mobile/goals/complete'],
+  // [feat 2026-10-12] slash-command discovery (engine RPC: commands/list)
+  ['GET', '/api/mobile/sessions/commands']
 ];
 
 /**
@@ -884,10 +1213,41 @@ export function claimsMobileFeatureRoute(method, pathname) {
 export async function handleFeatureRoute(deps) {
   const {
     pathname, req, res, jsonBody, sendJson, callDshRpc, readStreamOnce,
-    readProjections, readSessionRecords, readConfig, writeConfig, audit, logger
+    readProjections, readSessionRecords, readConfig, writeConfig, audit, logger,
+    assertSessionId
   } = deps;
 
   /* ---- queue ---- */
+  // [feat 2026-10-12] Reverse history paging for the mobile infinite scroll-up.
+  // Degrades, never 500s: an engine failure answers hasMore:false so the phone
+  // simply shows "已到会话开头" instead of a broken chat.
+  if (pathname === '/api/mobile/sessions/history/page' && req.method === 'GET') {
+    const sessionId = String(deps.parsedUrl.query?.sessionId || '').trim();
+    if (!sessionId) { sendJson(400, { ok: false, error: 'sessionId is required' }); return true; }
+    const idCheck = deps.assertSessionId
+      ? deps.assertSessionId(sessionId)
+      : { ok: true };
+    if (!idCheck.ok) { sendJson(400, { ok: false, error: idCheck.error || 'invalid sessionId' }); return true; }
+    const fullId = sessionId.startsWith('session-') ? sessionId : `session-${sessionId}`;
+    const beforeSeqRaw = deps.parsedUrl.query?.beforeSeq;
+    const beforeSeq = beforeSeqRaw != null && beforeSeqRaw !== '' ? Number(beforeSeqRaw) : undefined;
+    if (beforeSeq !== undefined && (!Number.isFinite(beforeSeq) || beforeSeq < 0)) {
+      sendJson(400, { ok: false, error: 'beforeSeq must be a non-negative number' });
+      return true;
+    }
+    const max = Number(deps.parsedUrl.query?.max || 60);
+    try {
+      const page = await readHistoryPage({ callDshRpc, sessionId: fullId, beforeSeq, max });
+      sendJson(200, { ok: true, code: 0, ...page });
+    } catch (err) {
+      // readHistoryPage already swallows engine errors; this belt-and-braces
+      // guard keeps the contract: a paging hiccup must never 500 the chat.
+      logger?.warn?.('[history/page] failed:', err?.message || err);
+      sendJson(200, { ok: true, code: 0, messages: [], hasMore: false, oldestSeq: null });
+    }
+    return true;
+  }
+
   if (pathname === '/api/mobile/sessions/queue' && req.method === 'GET') {
     const sessionId = String(deps.parsedUrl.query?.sessionId || '').trim();
     if (!sessionId) { sendJson(400, { ok: false, error: 'sessionId is required' }); return true; }
@@ -1111,6 +1471,161 @@ export async function handleFeatureRoute(deps) {
       code: ok ? 0 : 502,
       error: ok ? undefined : '推送未配置或发送失败（检查 ntfy 地址与 topic）'
     });
+    return true;
+  }
+
+  /* ---- one-tap diagnostics [feat 2026-10-12] ----
+   *
+   * Serial checks that never 500: every check is individually wrapped, and an
+   * engine that is down only makes `engine_rpc` answer ok:false — the rest of
+   * the report (bridge version, ws clients, stream state, devices, disk) is
+   * gateway-local and stays meaningful. No token, no path, no engine error
+   * text ever leaves this route: details pass through redactDiagnosticDetail.
+   */
+  if (pathname === '/api/mobile/diagnostics' && req.method === 'GET') {
+    const checks = [];
+    const push = (name, body) => checks.push({ name, ...body });
+
+    // 1. bridge version (always known)
+    push('bridge_version', { ok: true, value: deps.bridgeVersion ?? '' });
+
+    // 2. engine RPC probe — one real lightweight call with its own timeout
+    const rpc = await probeEngineRpc({ callDshRpc, timeoutMs: 4000 });
+    push('engine_rpc', { ok: rpc.ok, detail: rpc.detail, value: `${rpc.ms}ms` });
+
+    // 3. mobile WS clients (live count uses the same predicate the broadcast uses)
+    push('ws_clients', { ok: true, value: countDeliverableClients(deps.mobileClients ?? []) });
+
+    // 4. engine $events stream: the gateway's own subscription state
+    const streamOk = deps.eventsStreamReady?.() === true;
+    push('engine_events_stream', { ok: streamOk, detail: streamOk ? 'ready' : 'not connected' });
+
+    // 5. paired devices
+    push('devices', { ok: true, value: deps.deviceCount?.() ?? null });
+
+    // 6. disk writability under dshHomeDir/storages
+    const diskDir = deps.diagnosticsDir ?? path.join(deps.dshHomeDir ?? os.tmpdir(), 'storages');
+    const disk = probeDiskWritable(diskDir);
+    push('disk', { ok: disk.ok, detail: disk.detail });
+
+    audit('diagnostics/run', {
+      engineRpc: rpc.ok,
+      eventsStream: streamOk,
+      disk: disk.ok,
+      wsClients: checks[2].value
+    });
+
+    sendJson(200, {
+      ok: checks.every((c) => c.ok !== false),
+      checks,
+      generatedAt: new Date().toISOString()
+    });
+    return true;
+  }
+
+  /* ---- subagent control [feat 2026-10-12] ----
+   *
+   * Real engine RPCs verified against the installed engine's typert wire
+   * definitions (@deepseek-ai/dsh-subagent): `subagents/list(parentSessionId)`
+   * and `subagents/interruptByParent(childSessionId, parentSessionId,
+   * mode:'continuable')`. Interrupt is continuable-mode only: one-shot
+   * children are terminal by design and the engine rejects them.
+   */
+  if (pathname === '/api/mobile/sessions/subagents' && req.method === 'GET') {
+    const sessionId = String(deps.parsedUrl.query?.sessionId || '').trim();
+    if (!sessionId) { sendJson(400, { ok: false, error: 'sessionId is required' }); return true; }
+    try {
+      const catalog = await callDshRpc('subagents/list', { args: { parentSessionId: sessionId } });
+      const view = normalizeSubagentCatalog(catalog);
+      if (view === null) {
+        // Engine answered but did not look like a catalog: say so honestly.
+        sendJson(501, { ok: false, code: 501, error: 'engine rpc not available' });
+        return true;
+      }
+      sendJson(200, { ok: true, code: 0, ...view });
+    } catch (err) {
+      sendJson(502, { ok: false, code: 502, error: 'engine rpc not available' });
+    }
+    return true;
+  }
+
+  if (pathname === '/api/mobile/sessions/subagents/interrupt' && req.method === 'POST') {
+    const parentSessionId = String(jsonBody.parentSessionId || jsonBody.sessionId || '').trim();
+    const childSessionId = String(jsonBody.childSessionId || '').trim();
+    if (!parentSessionId || !childSessionId) {
+      sendJson(400, { ok: false, error: 'parentSessionId and childSessionId are required' });
+      return true;
+    }
+    try {
+      const result = await callDshRpc('subagents/interruptByParent', {
+        args: { childSessionId, parentSessionId, mode: 'continuable' }
+      });
+      audit('subagent/interrupt', { parentSessionId, childSessionId, accepted: result?.accepted === true });
+      sendJson(200, { ok: true, code: 0, result });
+    } catch (err) {
+      audit('subagent/interrupt-failed', { parentSessionId, childSessionId });
+      sendJson(502, { ok: false, code: 502, error: 'engine rpc not available' });
+    }
+    return true;
+  }
+
+  /* ---- goal control [feat 2026-10-12] ----
+   *
+   * Real engine RPCs verified against @deepseek-ai/dsh-goal's wire
+   * definitions: goals/pause, goals/resume, goals/complete — all shaped
+   * `(agentId: SessionId, ref: { id, revision })`. The engine has NO
+   * goal-read or goal-list RPC, so the phone must supply the ref (it gets
+   * id+revision from the `goal` projection row the stats route already
+   * serves). An unknown engine error is 502 with a stable string, never a
+   * fabricated success.
+   */
+  const GOAL_ACTIONS = { pause: 'goals/pause', resume: 'goals/resume', complete: 'goals/complete' };
+  if (pathname?.startsWith('/api/mobile/goals/') && req.method === 'POST') {
+    const action = pathname.replace('/api/mobile/goals/', '');
+    const rpcName = GOAL_ACTIONS[action];
+    if (!rpcName) return false; // not ours
+    const sessionId = String(jsonBody.sessionId || '').trim();
+    const goalId = String(jsonBody.goalId || '').trim();
+    const revision = Number(jsonBody.revision);
+    if (!sessionId || !goalId || !Number.isSafeInteger(revision) || revision <= 0) {
+      sendJson(400, { ok: false, error: 'sessionId, goalId and a positive revision are required' });
+      return true;
+    }
+    try {
+      const view = await callDshRpc(rpcName, { args: { agentId: sessionId, ref: { id: goalId, revision } } });
+      audit(`goal/${action}`, { sessionId, goalId, revision, phase: view?.phase ?? null });
+      sendJson(200, { ok: true, code: 0, view: view ?? null });
+    } catch (err) {
+      audit(`goal/${action}-failed`, { sessionId, goalId, revision });
+      sendJson(502, { ok: false, code: 502, error: 'engine rpc not available' });
+    }
+    return true;
+  }
+
+  /* ---- slash commands [feat 2026-10-12] ----
+   *
+   * The engine HAS a real listing RPC: `commands/list(agentId)` in
+   * @deepseek-ai/dsh-commands, answering `CommandDescriptor[]`
+   * ({ name, description, input? }). Pass it through with no fabricated rows
+   * when it fails — the App hides the "/" entry rather than showing a fake
+   * menu.
+   */
+  if (pathname === '/api/mobile/sessions/commands' && req.method === 'GET') {
+    const sessionId = String(deps.parsedUrl.query?.sessionId || '').trim();
+    if (!sessionId) { sendJson(400, { ok: false, error: 'sessionId is required' }); return true; }
+    try {
+      const list = await callDshRpc('commands/list', { args: { agentId: sessionId } });
+      const commands = (Array.isArray(list) ? list : [])
+        .map((c) => (c && typeof c.name === 'string' && c.name
+          ? { name: c.name, description: typeof c.description === 'string' ? c.description : '', hint: c?.input?.hint ?? null }
+          : null))
+        .filter(Boolean);
+      sendJson(200, { ok: true, code: 0, commands });
+    } catch (err) {
+      // No static fallback on purpose: a stale hard-coded list would teach the
+      // user slash names the engine may not accept. Empty + reason instead.
+      sendJson(200, { ok: true, code: 0, commands: [], degraded: 'engine rpc not available' });
+    }
     return true;
   }
 

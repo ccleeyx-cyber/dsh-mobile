@@ -84,6 +84,37 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     }
   }
 
+  /// 「电脑端已移除此设备」对话框只弹一次的闸（本 shell 生命周期内）。
+  bool _revokedDialogShown = false;
+
+  /// [feat 2026-10-12] 被踢提示：弹窗说明 + 确认后跳配置页重新扫码/输入配对码。
+  void _showRevokedDialog(BuildContext context) {
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.no_accounts_rounded, size: 36),
+        title: const Text('电脑端已移除此设备'),
+        content: const Text(
+          '这台手机在电脑端被移除，连接凭据已自动清除。\n\n'
+          '请回到配置页重新扫码或输入配对码完成配对。',
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const ConfigPage()),
+              );
+            },
+            child: const Text('去重新配对'),
+          ),
+        ],
+      ),
+    ).whenComplete(() => _revokedDialogShown = false);
+  }
+
   Widget _buildNavBadge(Widget icon, int count) {
     if (count <= 0) return icon;
     return Stack(
@@ -142,6 +173,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     //     放在 tab 上反而误导（"这是哪个会话的队列？"）；
     //   * 作业状态只出现在当前会话的状态条与信息面板里。
     final isTokenInvalid = context.select<DshService, bool>((d) => d.isTokenInvalid);
+    // [feat 2026-10-12] 电脑端撤销设备：弹提示并把用户带回配置页重新配对。
+    final isDeviceRevoked = context.select<DshService, bool>((d) => d.lastAuthFailureWasDeviceRevoked);
+    if (isDeviceRevoked && !_revokedDialogShown) {
+      _revokedDialogShown = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _showRevokedDialog(context));
+    }
 
     // 键盘弹出时隐藏底部导航栏 —— 这是修一个真实的布局缺陷，不是装饰性调整。
     //

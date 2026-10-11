@@ -39,6 +39,11 @@ class ChatMessage {
   final bool isMemory;
   final bool isContext;
 
+  /// [feat 2026-10-12] 引擎事件序号：反向翻页的 beforeSeq 游标 + 与实时流
+  /// 去重的身份键。网关从 1.14.x 起在历史消息上带 seq；本地乐观消息和旧网关
+  /// 没有时为 null（这类消息不参与翻页与去重，只留在尾部）。
+  final int? seq;
+
   ChatMessage({
     required this.id,
     required this.role,
@@ -49,6 +54,7 @@ class ChatMessage {
     DateTime? timestamp,
     this.isMemory = false,
     this.isContext = false,
+    this.seq,
   })  : tools = tools ?? [],
         timestamp = timestamp ?? DateTime.now();
 

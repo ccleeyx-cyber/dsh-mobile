@@ -388,12 +388,20 @@ class GoalInfo {
   final int? maxGoalRounds;
   final String? blockedReason;
 
+  /// [feat 2026-10-12] 引擎的 goal 操作 RPC（goals/pause 等）需要一个
+  /// `{ id, revision }` 的 CAS ref。网关把投影行里的 id/revision 一并透出；
+  /// 缺省时 App 端隐藏操作按钮（没有 ref 就没有可信的操作目标）。
+  final String? goalId;
+  final int? revision;
+
   const GoalInfo({
     required this.objective,
     required this.phase,
     this.roundsStarted,
     this.maxGoalRounds,
     this.blockedReason,
+    this.goalId,
+    this.revision,
   });
 
   factory GoalInfo.fromJson(Map<String, dynamic> json) => GoalInfo(
@@ -402,7 +410,12 @@ class GoalInfo {
         roundsStarted: _int(json['roundsStarted']),
         maxGoalRounds: _int(json['maxGoalRounds']),
         blockedReason: json['blockedReason']?.toString(),
+        goalId: json['goalId']?.toString(),
+        revision: _int(json['revision']),
       );
+
+  /// 暂停/继续/完成操作是否可用：必须同时有 ref 的两半。
+  bool get operable => (goalId?.isNotEmpty ?? false) && (revision ?? 0) > 0;
 
   String get phaseLabel {
     switch (phase) {
@@ -442,6 +455,148 @@ class PushConfig {
       );
 
   bool get configured => enabled && url.trim().isNotEmpty && topic.trim().isNotEmpty;
+}
+
+/// One diagnostic check row returned by GET /api/mobile/diagnostics. [feat 2026-10-12]
+class DiagnosticCheck {
+  final String name;
+  final bool? ok;
+  final String? value;
+  final String? detail;
+
+  const DiagnosticCheck({
+    required this.name,
+    this.ok,
+    this.value,
+    this.detail,
+  });
+
+  factory DiagnosticCheck.fromJson(Map<String, dynamic> json) => DiagnosticCheck(
+        name: json['name']?.toString() ?? '',
+        // `ok` 真的缺省（例如 bridge_version 只报 value）时保持 null，
+        // 界面渲染成中性而非假的通过/失败。
+        ok: json['ok'] is bool ? json['ok'] as bool : null,
+        value: json['value']?.toString(),
+        detail: json['detail']?.toString(),
+      );
+
+  /// 中文标签；未知名字原样显示，不猜语义。
+  String get label => switch (name) {
+        'bridge_version' => '网关版本',
+        'engine_rpc' => '引擎 RPC',
+        'ws_clients' => '在线设备',
+        'engine_events_stream' => '事件流',
+        'devices' => '已配对设备',
+        'disk' => '磁盘可写',
+        _ => name,
+      };
+}
+
+/// Full diagnostics report.
+class DiagnosticsReport {
+  final bool ok;
+  final List<DiagnosticCheck> checks;
+  final DateTime? generatedAt;
+
+  const DiagnosticsReport({
+    required this.ok,
+    required this.checks,
+    this.generatedAt,
+  });
+
+  factory DiagnosticsReport.fromJson(Map<String, dynamic> json) {
+    final raw = json['checks'];
+    return DiagnosticsReport(
+      ok: json['ok'] == true,
+      checks: raw is List
+          ? raw
+              .whereType<Map>()
+              .map((e) => DiagnosticCheck.fromJson(Map<String, dynamic>.from(e)))
+              .where((c) => c.name.isNotEmpty)
+              .toList(growable: false)
+          : const <DiagnosticCheck>[],
+      generatedAt: DateTime.tryParse(json['generatedAt']?.toString() ?? ''),
+    );
+  }
+
+  /// 可复制的纯文本报告（脱敏后的 detail 原样带出）。
+  String toPlainText() {
+    final b = StringBuffer('DSH 连接诊断 ${generatedAt ?? ''}'.trim());
+    for (final c in checks) {
+      final mark = c.ok == null ? '•' : (c.ok! ? '✓' : '✗');
+      final tail = [c.value, c.detail].where((e) => e != null && e.isNotEmpty).join(' · ');
+      b.write('\n$mark ${c.label}${tail.isEmpty ? '' : '：$tail'}');
+    }
+    return b.toString();
+  }
+}
+
+/// One subagent row from GET /api/mobile/sessions/subagents. [feat 2026-10-12]
+class SubagentItem {
+  final String id;
+  final String kind; // 'child' | 'diagnostic'
+  final String activity; // 'running' | 'inactive' (child only)
+  final String mode; // 'continuable' | 'one-shot' (child only)
+  final String label;
+  final String reason; // diagnostic only
+
+  const SubagentItem({
+    required this.id,
+    required this.kind,
+    this.activity = 'inactive',
+    this.mode = 'one-shot',
+    this.label = '',
+    this.reason = '',
+  });
+
+  factory SubagentItem.fromJson(Map<String, dynamic> json) => SubagentItem(
+        id: json['id']?.toString() ?? '',
+        kind: json['kind']?.toString() ?? 'child',
+        activity: json['activity']?.toString() ?? 'inactive',
+        mode: json['mode']?.toString() ?? 'one-shot',
+        label: json['label']?.toString() ?? '',
+        reason: json['reason']?.toString() ?? '',
+      );
+
+  bool get isDiagnostic => kind == 'diagnostic';
+
+  /// 只有 continuable 的子代理能被中断（引擎对 one-shot 一律拒绝）。
+  bool get interruptible => !isDiagnostic && mode == 'continuable';
+
+  bool get isRunning => !isDiagnostic && activity == 'running';
+
+  String get displayLabel => label.isNotEmpty ? label : id;
+}
+
+/// Goal ref + operation result. [feat 2026-10-12]
+///
+/// 引擎没有 goal 读 RPC，ref（id + revision）必须由调用方带上 —— App 从
+/// `session/stats` 的 goal 投影行拿到 objective，但 revision 只能由网关透出；
+/// 这里保存最近一次 stats 返回的 goalId/revision 供操作使用。
+class GoalAction {
+  final String action; // pause | resume | complete
+  final bool ok;
+  final String? phase;
+
+  const GoalAction({required this.action, required this.ok, this.phase});
+}
+
+/// One slash command from GET /api/mobile/sessions/commands. [feat 2026-10-12]
+class SlashCommand {
+  final String name;
+  final String description;
+  final String? hint;
+
+  const SlashCommand({required this.name, required this.description, this.hint});
+
+  factory SlashCommand.fromJson(Map<String, dynamic> json) => SlashCommand(
+        name: json['name']?.toString() ?? '',
+        description: json['description']?.toString() ?? '',
+        hint: json['hint']?.toString(),
+      );
+
+  /// 插进输入框的文本：`/name `（带尾随空格，让用户直接接参数）。
+  String get insertText => '/$name ';
 }
 
 /// Tolerant int parsing: accepts int, double and numeric strings.

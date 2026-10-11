@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../models/task_center.dart';
 import '../../theme/app_colors.dart';
@@ -39,6 +40,13 @@ class SessionInfoSheet extends StatefulWidget {
     this.onKillJob,
     this.onDeleteSchedule,
     this.onRefresh,
+    this.subagents,
+    this.subagentsUnavailable = false,
+    this.onInterruptSubagent,
+    this.onControlGoal,
+    this.onRunDiagnostics,
+    this.diagnostics,
+    this.diagnosticsBusy = false,
   });
 
   /// 用量 / 上下文 / goal。`null` 表示还没取到。
@@ -84,6 +92,28 @@ class SessionInfoSheet extends StatefulWidget {
   /// `schedules` 是一次 RPC），所以只在用户明确要看的时候拉，不在进会话时拉。
   final Future<void> Function()? onRefresh;
 
+  // ---- [feat 2026-10-12] 子代理 / goal 操作 / 一键诊断 ----
+
+  /// 子代理列表。`null` 表示引擎没有列出能力或读取失败（隐藏区块，不显示假空表）。
+  final List<SubagentItem>? subagents;
+
+  /// true = 还没拉到或拉取失败（与"确定没有子代理"区分开）。
+  final bool subagentsUnavailable;
+
+  /// 中断一个子代理（仅 continuable 行会显示按钮）。
+  final Future<bool> Function(SubagentItem sub)? onInterruptSubagent;
+
+  /// goal 操作（pause/resume/complete）。引擎拒绝时返回 false，界面提示。
+  final Future<bool> Function(String action, GoalInfo goal)? onControlGoal;
+
+  /// 运行一键诊断。
+  final Future<DiagnosticsReport?> Function()? onRunDiagnostics;
+
+  /// 最近一次诊断报告。
+  final DiagnosticsReport? diagnostics;
+
+  final bool diagnosticsBusy;
+
   @override
   State<SessionInfoSheet> createState() => _SessionInfoSheetState();
 }
@@ -94,7 +124,11 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
   final _changesKey = GlobalKey();
   final _jobsKey = GlobalKey();
   final _schedulesKey = GlobalKey();
+  final _subagentsKey = GlobalKey();
+  final _diagnosticsKey = GlobalKey();
   bool _refreshing = false;
+  String? _interruptingId;
+  String? _goalActionInProgress;
 
   @override
   void initState() {
@@ -248,7 +282,13 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                     KeyedSubtree(key: _deliverablesKey, child: _buildDeliverables()),
                     KeyedSubtree(key: _changesKey, child: _buildChanges()),
                     KeyedSubtree(key: _jobsKey, child: _buildJobs()),
+                    // [feat 2026-10-12] 子代理区块。引擎没有列出能力/读取失败时
+                    // 返回 null —— 整块隐藏，绝不显示一张假空表。
+                    if (widget.subagents != null)
+                      KeyedSubtree(key: _subagentsKey, child: _buildSubagents()),
                     KeyedSubtree(key: _schedulesKey, child: _buildSchedules()),
+                    // [feat 2026-10-12] 一键连接诊断。
+                    KeyedSubtree(key: _diagnosticsKey, child: _buildDiagnostics()),
                   ],
                 ),
               ),
@@ -356,12 +396,68 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
               const SizedBox(height: 4),
               Text('受阻：${goal.blockedReason}', style: TextStyle(fontSize: 11.5, color: context.c.danger)),
             ],
+            // [feat 2026-10-12] 暂停/继续/完成。只在拿得到引擎 CAS ref（id+revision）
+            // 时出现：没有 ref 的按钮会带着猜测的目标发 RPC，宁可不显示。
+            if (goal.operable && widget.onControlGoal != null) ...[
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  if (goal.phase == 'active')
+                    _goalAction('暂停', 'pause', goal, key: const ValueKey('goal-pause'))
+                  else if (goal.phase == 'paused' || goal.phase == 'blocked')
+                    _goalAction('继续', 'resume', goal, key: const ValueKey('goal-resume')),
+                  if (goal.phase != 'complete') ...[
+                    const SizedBox(width: 8),
+                    _goalAction('完成', 'complete', goal, key: const ValueKey('goal-complete')),
+                  ],
+                ],
+              ),
+            ],
           ],
         ),
       ));
     }
 
     return _section(title: '用量与上下文', icon: Icons.data_usage_rounded, children: children);
+  }
+
+  /// 一个 goal 操作按钮。执行中转圈；引擎拒绝给一条明确的失败说明。
+  Widget _goalAction(String label, String action, GoalInfo goal, {Key? key}) {
+    final busy = _goalActionInProgress == action;
+    return TextButton(
+      key: key,
+      onPressed: busy ? null : () => _doGoalAction(action, goal),
+      style: TextButton.styleFrom(
+        minimumSize: Size.zero,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        backgroundColor: context.c.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(6),
+          side: BorderSide(color: context.c.border),
+        ),
+      ),
+      child: busy
+          ? const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2))
+          : Text(label, style: TextStyle(fontSize: 11.5, color: context.c.textPrimary)),
+    );
+  }
+
+  Future<void> _doGoalAction(String action, GoalInfo goal) async {
+    final handler = widget.onControlGoal;
+    if (handler == null) return;
+    setState(() => _goalActionInProgress = action);
+    try {
+      final ok = await handler(action, goal);
+      if (!mounted) return;
+      if (!ok) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('引擎拒绝了这次目标操作（$action）——目标可能已被模型侧修改，刷新后重试'),
+          behavior: SnackBarBehavior.floating,
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _goalActionInProgress = null);
+    }
   }
 
   String _formatTurnBurn(int? burn) => burn == null ? '—' : _compact(burn);
@@ -639,6 +735,211 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         ],
       ),
     );
+  }
+
+  // ------------------------------------------------- 子代理 [feat 2026-10-12] ----
+
+  Widget _buildSubagents() {
+    final subs = widget.subagents;
+    return _section(
+      title: '子代理',
+      icon: Icons.account_tree_rounded,
+      children: [
+        if (widget.subagentsUnavailable)
+          Row(
+            children: [
+              Icon(Icons.help_outline_rounded, size: 15, color: context.c.warning),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  '子代理状态未知（引擎暂不可达，不代表没有子代理在跑）。',
+                  key: ValueKey('subagents-unknown'),
+                  style: TextStyle(fontSize: 12),
+                ),
+              ),
+            ],
+          )
+        else if (subs == null || subs.isEmpty)
+          _hint('没有子代理记录。委派出去的子任务会出现在这里。')
+        else
+          for (final sub in subs)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(
+                children: [
+                  Container(
+                    margin: const EdgeInsets.only(right: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: (sub.isDiagnostic ? context.c.textTertiary : sub.isRunning ? context.c.accent : context.c.border).withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(5),
+                    ),
+                    child: Text(
+                      sub.isDiagnostic ? '异常' : (sub.isRunning ? '运行中' : '已结束'),
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        color: sub.isDiagnostic ? context.c.textSecondary : sub.isRunning ? context.c.accent : context.c.textSecondary,
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: Text(
+                      sub.isDiagnostic ? '${sub.displayLabel}（${sub.reason}）' : sub.displayLabel,
+                      style: TextStyle(fontSize: 12.5, color: context.c.textPrimary),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  // 引擎只接受 continuable 子代理的中断；one-shot 是终态的，
+                  // 发了必拒 —— 按钮从一开始就不出现。
+                  if (sub.interruptible && widget.onInterruptSubagent != null)
+                    TextButton(
+                      onPressed: _interruptingId == null ? () => _confirmInterruptSubagent(sub) : null,
+                      style: TextButton.styleFrom(
+                        minimumSize: Size.zero,
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      ),
+                      child: _interruptingId == sub.id
+                          ? const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2))
+                          : Text('中断', style: TextStyle(fontSize: 12, color: context.c.danger)),
+                    ),
+                ],
+              ),
+            ),
+      ],
+    );
+  }
+
+  Future<void> _confirmInterruptSubagent(SubagentItem sub) async {
+    final handler = widget.onInterruptSubagent;
+    if (handler == null) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('中断这个子代理？'),
+        content: Text('将请求引擎停止「${sub.displayLabel}」当前的回合。它已排队但未发送的消息会保留，'
+            '稍后仍可继续对话。'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('中断')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _interruptingId = sub.id);
+    try {
+      final done = await handler(sub);
+      if (!mounted) return;
+      if (!done) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('中断请求被引擎拒绝或未送达'),
+          behavior: SnackBarBehavior.floating,
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _interruptingId = null);
+    }
+  }
+
+  // ------------------------------------------------- 一键诊断 [feat 2026-10-12] ----
+
+  Widget _buildDiagnostics() {
+    final report = widget.diagnostics;
+    return _section(
+      title: '连接诊断',
+      icon: Icons.monitor_heart_rounded,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: _hint('逐项检查网关、引擎 RPC、事件流与磁盘。全程只读、不泄露令牌与路径。'),
+            ),
+            TextButton.icon(
+              key: const ValueKey('run-diagnostics'),
+              onPressed: widget.diagnosticsBusy ? null : _runDiagnostics,
+              icon: widget.diagnosticsBusy
+                  ? const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2))
+                  : Icon(Icons.play_arrow_rounded, size: 16, color: context.c.accent),
+              label: Text(widget.diagnosticsBusy ? '检测中…' : (report == null ? '运行诊断' : '重新诊断'),
+                  style: TextStyle(fontSize: 12, color: context.c.accent)),
+            ),
+          ],
+        ),
+        if (report != null) ...[
+          const SizedBox(height: 8),
+          for (final c in report.checks)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 3),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SizedBox(
+                    width: 18,
+                    child: Text(
+                      // ok 缺省（如 bridge_version）渲染成中性 •，不装作通过。
+                      c.ok == null ? '•' : (c.ok! ? '✓' : '✗'),
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: c.ok == null
+                            ? context.c.textTertiary
+                            : (c.ok! ? context.c.success : context.c.danger),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text.rich(
+                      TextSpan(
+                        text: c.label,
+                        style: TextStyle(fontSize: 12, color: context.c.textPrimary),
+                        children: [
+                          if (c.value != null && c.value!.isNotEmpty)
+                            TextSpan(text: '  ${c.value}', style: TextStyle(fontSize: 11, color: context.c.textTertiary)),
+                          if (c.detail != null && c.detail!.isNotEmpty && c.detail != 'ok')
+                            TextSpan(text: '  ${c.detail}', style: TextStyle(fontSize: 11, color: context.c.textTertiary)),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton.icon(
+              key: const ValueKey('copy-diagnostics'),
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: report.toPlainText()));
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text('诊断报告已复制'),
+                    duration: Duration(milliseconds: 900),
+                    behavior: SnackBarBehavior.floating,
+                  ));
+                }
+              },
+              icon: Icon(Icons.copy_rounded, size: 14, color: context.c.textSecondary),
+              label: Text('复制报告', style: TextStyle(fontSize: 11.5, color: context.c.textSecondary)),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Future<void> _runDiagnostics() async {
+    final runner = widget.onRunDiagnostics;
+    if (runner == null) return;
+    final report = await runner();
+    if (!mounted) return;
+    if (report == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('诊断请求失败（网关不可达）'),
+        behavior: SnackBarBehavior.floating,
+      ));
+    }
   }
 
   // -------------------------------------------------------- 通用 ----
