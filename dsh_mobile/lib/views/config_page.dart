@@ -288,7 +288,10 @@ class _ConfigPageState extends State<ConfigPage> {
     }
     final port = payload?['port'];
     final pairCode = payload?['pairCode']?.toString() ?? payload?['code']?.toString() ?? '';
-    final hosts = (payload?['hosts'] as List?)?.map((e) => e.toString()).toList() ?? const [];
+    // [fix 2026-10-12] hosts 列表现在按「公网在前、局域网在后」排列（v1.15.1
+    // 网关）。逐个尝试配对：家里 Wi-Fi 下公网地址也通，在外面时局域网地址
+    // 不通自动落到下一个 —— 哪个先配对成功用哪个。
+    final hosts = (payload?['hosts'] as List?)?.map((e) => e.toString()).where((h) => h.isNotEmpty).toList() ?? const [];
     final firstHost = payload?['host']?.toString() ??
         (hosts.isNotEmpty ? hosts.first : '');
     if (firstHost.isEmpty || pairCode.isEmpty || port is! int) {
@@ -301,21 +304,30 @@ class _ConfigPageState extends State<ConfigPage> {
     String? token;
     String? deviceId;
     String? errMsg;
-    try {
-      final res = await http.post(
-        Uri.parse('http://$firstHost:$port/__mobile/pair'),
-        headers: const {'Content-Type': 'application/json'},
-        body: jsonEncode({'code': pairCode, 'name': payload?['name']?.toString() ?? '扫码配对的手机', 'platform': 'android'}),
-      ).timeout(const Duration(seconds: 8));
-      final body = jsonDecode(res.body);
-      if (res.statusCode == 200 && body is Map && body['ok'] == true) {
-        token = body['token']?.toString();
-        deviceId = body['deviceId']?.toString();
-      } else {
-        errMsg = body is Map ? (body['error']?.toString() ?? 'HTTP ${res.statusCode}') : 'HTTP ${res.statusCode}';
+    String? usedHost;
+    final candidates = <String>{firstHost, ...hosts};
+    for (final host in candidates) {
+      try {
+        final res = await http.post(
+          Uri.parse('http://$host:$port/__mobile/pair'),
+          headers: const {'Content-Type': 'application/json'},
+          body: jsonEncode({'code': pairCode, 'name': payload?['name']?.toString() ?? '扫码配对的手机', 'platform': 'android'}),
+        ).timeout(const Duration(seconds: 8));
+        final body = jsonDecode(res.body);
+        if (res.statusCode == 200 && body is Map && body['ok'] == true) {
+          token = body['token']?.toString();
+          deviceId = body['deviceId']?.toString();
+          usedHost = host;
+          break;
+        } else {
+          // 网关明确拒绝（如配对码错）——换地址也没用，直接报错。
+          errMsg = body is Map ? (body['error']?.toString() ?? 'HTTP ${res.statusCode}') : 'HTTP ${res.statusCode}';
+          break;
+        }
+      } catch (e) {
+        // 该地址不可达 —— 尝试下一个 host。
+        errMsg = e.toString();
       }
-    } catch (e) {
-      errMsg = e.toString();
     }
     if (!mounted) return;
     if (token == null || token.isEmpty) {
@@ -324,7 +336,7 @@ class _ConfigPageState extends State<ConfigPage> {
     }
 
     setState(() {
-      _hostController.text = firstHost;
+      _hostController.text = usedHost ?? firstHost;
       _portController.text = port.toString();
       _tokenController.text = token!;
       _authCodeController.text = '';

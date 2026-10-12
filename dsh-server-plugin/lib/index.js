@@ -2474,11 +2474,19 @@ export function apply(ctx, config = {}, internals = {}) {
           if (ni.family === 'IPv4' && !ni.internal) hosts.push(ni.address);
         }
       }
+      // [fix 2026-10-12] 配置了 nps 公网地址时它优先 —— 扫码的手机多半在外面。
+      const cfgForPair = loadConfig();
+      const pairPublicHost = (cfgForPair.npsHost || '').trim();
+      const pairPublicPort = Number(cfgForPair.npsPort) || listenPort;
+      const pairPrimaryHost = pairPublicHost || hosts[0] || '';
       const payload = {
         v: 1,
-        hosts,
-        host: hosts[0] || '',
-        port: listenPort,
+        hosts: [pairPrimaryHost, ...hosts].filter(Boolean),
+        host: pairPrimaryHost,
+        port: pairPublicHost ? pairPublicPort : listenPort,
+        publicHost: pairPublicHost || null,
+        publicPort: pairPublicHost ? pairPublicPort : null,
+        lanHosts: hosts,
         pairCode: code,
         name: os.hostname()
       };
@@ -2521,8 +2529,19 @@ export function apply(ctx, config = {}, internals = {}) {
           if (ni.family === 'IPv4' && !ni.internal) hosts.push(ni.address);
         }
       }
+      // [fix 2026-10-12] 与 /pair/qr 同步：配置了 nps 公网地址时它优先。
+      const cfgForInfo = loadConfig();
+      const infoPublicHost = (cfgForInfo.npsHost || '').trim();
+      const infoPublicPort = Number(cfgForInfo.npsPort) || listenPort;
+      const infoPrimaryHost = infoPublicHost || hosts[0] || '';
       sendJson(200, {
-        v: 1, hosts, host: hosts[0] || '', port: listenPort,
+        v: 1,
+        hosts: [infoPrimaryHost, ...hosts].filter(Boolean),
+        host: infoPrimaryHost,
+        port: infoPublicHost ? infoPublicPort : listenPort,
+        publicHost: infoPublicHost || null,
+        publicPort: infoPublicHost ? infoPublicPort : null,
+        lanHosts: hosts,
         pairCode: code, name: os.hostname(), expiresAt
       });
       return;
@@ -3776,7 +3795,28 @@ export function apply(ctx, config = {}, internals = {}) {
           if (ni.family === 'IPv4' && !ni.internal) hosts.push(ni.address);
         }
       }
-      return { v: 1, hosts, host: hosts[0] || '', port: listenPort, pairCode: code, name: os.hostname(), expiresAt, ttlMs: pairCodeTtlMs() };
+      // [fix 2026-10-12] The phone that scans this QR is usually OUTSIDE the
+      // LAN (nps tunnel), so the configured public host leads the candidate
+      // list; a phone on the same Wi-Fi falls through to the LAN addresses.
+      // The QR carries only the FIRST host — pick by where the user actually
+      // connects, per the settings page's own config.
+      const cfg = loadConfig();
+      const publicHost = (cfg.npsHost || '').trim();
+      const publicPort = Number(cfg.npsPort) || Number(listenPort) || listenPort;
+      const primaryHost = publicHost || hosts[0] || '';
+      return {
+        v: 1,
+        hosts: [primaryHost, ...hosts].filter(Boolean),
+        host: primaryHost,
+        port: publicHost ? publicPort : listenPort,
+        publicHost: publicHost || null,
+        publicPort: publicHost ? publicPort : null,
+        lanHosts: hosts,
+        pairCode: code,
+        name: os.hostname(),
+        expiresAt,
+        ttlMs: pairCodeTtlMs()
+      };
     }
   });
 

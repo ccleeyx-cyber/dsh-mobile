@@ -132,6 +132,10 @@ window.__ModuleLoader__.load({
       const npsScheme = useHttps ? 'https' : 'http';
       const npsApkUrl = `${npsScheme}://${npsHost}:${npsPort}/dsh-agent.apk`;
       const localApkUrl = `http://${config?.localIp || '127.0.0.1'}:${port}/dsh-agent.apk`;
+      const RELEASES_URL = 'https://github.com/ccleeyx-cyber/dsh-mobile/releases';
+      // 手机真正在用的公网地址 = NPS 穿透地址（config 里用户自己填的）。
+      const publicHost = npsHost;
+      const publicPort = npsPort;
 
       // ---- 扫码配对卡片状态 [feat 2026-10-12] ----
       const [qr, setQr] = useState(null);            // {qrDataUrl, pairCode, host, port, expiresAt, ttlMs}
@@ -351,9 +355,13 @@ window.__ModuleLoader__.load({
                 h('div', { style: { ...S.metricValue, fontSize: 22, letterSpacing: 4 } }, qr.pairCode)
               ),
               h('div', { style: S.metricCard },
-                h('div', { style: S.metricLabel }, '网关地址'),
+                h('div', { style: S.metricLabel }, '二维码里的地址'),
                 h('div', { style: S.metricValue }, `${qr.host}:${qr.port}`)
               ),
+              (qr.host !== publicHost && publicHost)
+                ? h('div', { style: { ...S.noticeBox, marginTop: 0 } },
+                    `手机在外面时请手动填公网地址 ${publicHost}:${publicPort}，再用上面的配对码配对（二维码里是局域网地址，出门连不上）。`)
+                : null,
               h('div', { style: S.metricCard },
                 h('div', { style: S.metricLabel }, '过期时间'),
                 h('div', { style: S.metricValue }, fmtTime(qr.expiresAt))
@@ -395,36 +403,26 @@ window.__ModuleLoader__.load({
             : h('div', { style: { ...S.noticeBox, marginTop: 12 } }, devicesError || '还没有设备配对。生成配对二维码，手机扫码即可加入。')
         ),
 
-        // 6. Android APK 下载
+        // 6. Android APK 下载 —— 只指 GitHub Releases（CI 构建的最新签名包）
         h('div', { style: S.card },
           h('div', { style: S.header },
-            h('div', { style: S.title }, '📦 Android APK 客户端安装包 (v1.2.8)'),
+            h('div', { style: S.title }, '📦 Android APK 客户端安装包'),
             h('a', {
-              href: npsApkUrl,
+              href: RELEASES_URL,
               target: '_blank',
               style: S.primaryBtn
-            }, '📥 立即下载 APK')
+            }, '📥 前往 GitHub Releases 下载')
           ),
           h('div', { style: S.subtitle },
-            '最新构建的 Fluent Design 2 正式版客户端，支持流畅空会话、深度会话隔离与实时思考流。'
+            'APK 由 GitHub Actions 按每次 push 自动构建并发布到 Releases 页，那里永远是最新版本（v1.15 起：扫码配对、历史无限上翻、一键诊断等）。'
           ),
-          h('div', { style: { marginTop: 12, display: 'flex', flexDirection: 'column', gap: 8 } },
-            h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--dsw-alias-bg-layer-2, #f9fafb)', borderRadius: 6, fontSize: 12 } },
-              h('span', { style: { fontFamily: 'monospace', color: 'var(--dsw-alias-label-secondary, #4b5563)' } }, `公网下载: ${npsApkUrl}`),
-              h('button', {
-                type: 'button',
-                style: copiedKey === 'npsApk' ? S.btnSuccess : S.btn,
-                onClick: () => copyText(npsApkUrl, 'npsApk')
-              }, copiedKey === 'npsApk' ? '已复制' : '复制链接')
-            ),
-            h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--dsw-alias-bg-layer-2, #f9fafb)', borderRadius: 6, fontSize: 12 } },
-              h('span', { style: { fontFamily: 'monospace', color: 'var(--dsw-alias-label-secondary, #4b5563)' } }, `局域网下载: ${localApkUrl}`),
-              h('button', {
-                type: 'button',
-                style: copiedKey === 'localApk' ? S.btnSuccess : S.btn,
-                onClick: () => copyText(localApkUrl, 'localApk')
-              }, copiedKey === 'localApk' ? '已复制' : '复制链接')
-            )
+          h('div', { style: { marginTop: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--dsw-alias-bg-layer-2, #f9fafb)', borderRadius: 6, fontSize: 12 } },
+            h('span', { style: { fontFamily: 'monospace', color: 'var(--dsw-alias-label-secondary, #4b5563)' } }, RELEASES_URL),
+            h('button', {
+              type: 'button',
+              style: copiedKey === 'releases' ? S.btnSuccess : S.btn,
+              onClick: () => copyText(RELEASES_URL, 'releases')
+            }, copiedKey === 'releases' ? '已复制' : '复制链接')
           )
         ),
 
