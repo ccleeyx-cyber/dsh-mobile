@@ -23,8 +23,7 @@ class _ConfigPageState extends State<ConfigPage> {
   // No pre-filled token: the gateway generates a random one on first install,
   // so a hard-coded default here would only mislead the user.
   final _tokenController = TextEditingController();
-  final _npsController = TextEditingController(text: '');
-  final _authCodeController = TextEditingController(text: '');
+  final _npsController = TextEditingController(text: ''); // 兼容旧数据保留，UI 已移除
   bool _useHttps = false;
   bool _isTesting = false;
 
@@ -59,7 +58,6 @@ class _ConfigPageState extends State<ConfigPage> {
     _portController.dispose();
     _tokenController.dispose();
     _npsController.dispose();
-    _authCodeController.dispose();
     super.dispose();
   }
 
@@ -106,16 +104,11 @@ class _ConfigPageState extends State<ConfigPage> {
     _portController.text = cfg.port.toString();
     _tokenController.text = cfg.token;
     _useHttps = cfg.useHttps;
-    _npsController.text = cfg.npsAddress;
-    _authCodeController.text = cfg.authCode;
+    _npsController.text = cfg.npsAddress; // 旧数据兼容：保留但不显示
     _pairedDeviceId = cfg.deviceId;
   }
 
   ServerConfig _buildConfig() {
-    final tokenText = _tokenController.text.trim();
-    final authText = _authCodeController.text.trim();
-    final effectiveToken = tokenText.isNotEmpty ? tokenText : authText;
-
     return ServerConfig(
       // 带上当前选中的身份，这样「保存并进入聊天」是修改这个网关，
       // 而不是悄悄新建一个重复项。
@@ -123,10 +116,11 @@ class _ConfigPageState extends State<ConfigPage> {
       name: _activeName,
       host: _hostController.text.trim(),
       port: int.tryParse(_portController.text.trim()) ?? 3088,
-      token: effectiveToken,
+      token: _tokenController.text.trim(),
       useHttps: _useHttps,
+      // npsAddress 透传旧值：字段已从 UI 移除，但不能把存量配置悄悄清掉。
       npsAddress: _npsController.text.trim(),
-      authCode: authText,
+      authCode: '',
       deviceId: _pairedDeviceId,
     );
   }
@@ -303,10 +297,12 @@ class _ConfigPageState extends State<ConfigPage> {
     // 用配对码走现有 /__mobile/pair 握手换设备 token。
     String? token;
     String? deviceId;
-    String? errMsg;
+    final attempted = <String>[]; // [fix 2026-10-12] 每个地址的尝试结果，失败时全量展示，绝不静默
+    String? rejectReason; // 网关明确拒绝（换地址也没用的那类）
     String? usedHost;
     final candidates = <String>{firstHost, ...hosts};
     for (final host in candidates) {
+      attempted.add(host);
       try {
         final res = await http.post(
           Uri.parse('http://$host:$port/__mobile/pair'),
@@ -320,18 +316,21 @@ class _ConfigPageState extends State<ConfigPage> {
           usedHost = host;
           break;
         } else {
-          // 网关明确拒绝（如配对码错）——换地址也没用，直接报错。
-          errMsg = body is Map ? (body['error']?.toString() ?? 'HTTP ${res.statusCode}') : 'HTTP ${res.statusCode}';
+          // 网关明确拒绝（如配对码错/过期）——换地址也没用，直接报错。
+          rejectReason = body is Map ? (body['error']?.toString() ?? 'HTTP ${res.statusCode}') : 'HTTP ${res.statusCode}';
           break;
         }
       } catch (e) {
         // 该地址不可达 —— 尝试下一个 host。
-        errMsg = e.toString();
       }
     }
     if (!mounted) return;
     if (token == null || token.isEmpty) {
-      _toast('配对失败: ${errMsg ?? "网关无响应"}');
+      if (rejectReason != null) {
+        _toast('配对被网关拒绝: $rejectReason');
+      } else {
+        _toast('配对失败：以下地址都连不上（请确认电脑端网关已启动、隧道已开启）：\n${attempted.join('\n')}');
+      }
       return;
     }
 
@@ -339,7 +338,6 @@ class _ConfigPageState extends State<ConfigPage> {
       _hostController.text = usedHost ?? firstHost;
       _portController.text = port.toString();
       _tokenController.text = token!;
-      _authCodeController.text = '';
       _pairedDeviceId = deviceId ?? '';
     });
     _toast('配对成功${deviceId != null ? "（设备 $deviceId）" : ""}，点「保存并进入聊天」完成连接');
@@ -554,7 +552,9 @@ class _ConfigPageState extends State<ConfigPage> {
                       SizedBox(width: 12),
                       Expanded(
                         child: Text(
-                          '请输入你的公网 IP 及 DSH 安全网关配置，Token 用于验证手机身份以保证安全。',
+                          '推荐点下方「扫码连接」自动配对；手动填写时只需'
+                          '电脑的公网地址（或局域网 IP）、端口和 Token。'
+                          '配对过的手机会在电脑设置页「已配对设备」中列出，可被单独移除。',
                           style: TextStyle(fontSize: 13, height: 1.4),
                         ),
                       ),
@@ -595,39 +595,13 @@ class _ConfigPageState extends State<ConfigPage> {
                   border: OutlineInputBorder(),
                 ),
                 obscureText: true,
-                validator: (v) {
-                  final token = v?.trim() ?? '';
-                  final authCode = _authCodeController.text.trim();
-                  if (token.isEmpty && authCode.isEmpty) {
-                    return '请输入安全认证 Token 密钥或授权码';
-                  }
-                  return null;
-                },
+                validator: (v) => (v == null || v.trim().isEmpty) ? '请输入安全认证 Token 密钥' : null,
               ),
               const SizedBox(height: 16),
-              // NPS 地址 field
-              TextFormField(
-                controller: _npsController,
-                decoration: const InputDecoration(
-                  labelText: 'NPS 地址 (可选)',
-                  hintText: '例如 10.0.0.1 或 domain.nps.com',
-                  prefixIcon: Icon(Icons.network_check),
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const SizedBox(height: 16),
-              // Auth Code field
-              TextFormField(
-                controller: _authCodeController,
-                decoration: const InputDecoration(
-                  labelText: '授权码 (可选)',
-                  hintText: '用于额外授权或审计',
-                  prefixIcon: Icon(Icons.lock),
-                  border: OutlineInputBorder(),
-                ),
-                obscureText: true,
-              ),
-              const SizedBox(height: 12),
+              // [fix 2026-10-12] NPS 地址 / 授权码两个旧字段已删除：npsAddress
+              // 从未参与连接（只在旧设置页拼 APK 链接），授权码与 Token 是同一
+              // 凭据的重复输入框（effectiveToken = token 优先、authCode 回落）。
+              // 表单只剩连接真正需要的四项。模型字段保留做旧数据兼容读。
               SwitchListTile(
                 title: const Text('启用 HTTPS / WSS'),
                 subtitle: const Text('如果使用了域名和 SSL 证书请勾选'),
