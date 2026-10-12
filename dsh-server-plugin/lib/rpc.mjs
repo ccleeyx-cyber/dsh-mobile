@@ -117,16 +117,25 @@ async function dispatch(endpoint, payload, deps) {
     }
 
     case 'devices/list': {
-      // Never return token hashes to the client.
+      // Never return token hashes to the client. Tombstoned (revoked) devices
+      // are hidden — [fix 2026-10-12] they used to stay visible after a
+      // successful revoke, so the settings page looked like the revoke never
+      // happened even though the device was already dead.
       const state = loadDevices();
-      return state.devices.map(({ tokenHash, ...rest }) => rest);
+      return state.devices
+        .filter((d) => d.revoked !== true)
+        .map(({ tokenHash, ...rest }) => rest);
     }
 
     case 'devices/revoke': {
       const id = payload?.deviceId;
       if (!id) throw new Error('deviceId is required');
       const ok = revokeDevice(id);
-      return { ok, deviceId: id };
+      // Surface failure as an RPC error so the client shows "移除失败" instead
+      // of silently refreshing an unchanged list. The old code returned
+      // {ok:false} inside value — the client treats value as success data.
+      if (!ok) throw new Error('设备不存在或已移除');
+      return { ok: true, deviceId: id };
     }
 
     case 'audit/list': {
