@@ -753,10 +753,16 @@ export function buildNtfyRequest(config, message) {
   const topic = String(message?.topic || config?.ntfyTopic || '').trim();
   if (!topic) return null;
 
+  // [fix 2026-10-12] JSON 发布必须 POST 到**根路径**且 body 带 `topic` 字段
+  // （ntfy 官方文档 "Publish as JSON"）。之前的实现 POST 到
+  // `/<topic>` 且 body 里没有 topic —— ntfy 认不出这是 JSON 发布请求，把整个
+  // JSON 字符串当成纯文本消息展示，用户手机上看到的就是一坨转义代码，click /
+  // actions 字段也全部失效（它们只有 JSON body 形态才生效）。改为根路径 +
+  // body.topic，与官方 curl 示例完全一致。
   let url;
   try {
     const u = new URL(base);
-    u.pathname = `${u.pathname.replace(/\/+$/, '')}/${encodeURIComponent(topic)}`;
+    u.pathname = `${u.pathname.replace(/\/+$/, '')}/`;
     url = u.toString();
   } catch {
     return null;
@@ -767,6 +773,7 @@ export function buildNtfyRequest(config, message) {
   if (token) headers.Authorization = `Bearer ${token}`;
 
   const body = {
+    topic,
     title: String(message?.title || 'DSH'),
     message: String(message?.body || ''),
     priority: typeof message?.priority === 'number' ? message.priority : 3

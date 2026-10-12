@@ -255,13 +255,18 @@ test('normalizeSchedule: drops records without an id', () => {
  * ntfy
  * ------------------------------------------------------------------ */
 
-test('buildNtfyRequest: joins topic onto the base URL and carries the token', () => {
+test('buildNtfyRequest: posts to the ROOT path with topic in the body (ntfy JSON publish contract)', () => {
   const req = buildNtfyRequest(
     { ntfyUrl: 'https://ntfy.sh/', ntfyTopic: 'dsh-abc', ntfyToken: 'tk_x' },
     { title: '需要你授权', body: 'pwsh：删除文件', priority: 5, tags: ['lock'], click: 'dshmobile://open?session=session-1' }
   );
-  assert.equal(req.url, 'https://ntfy.sh/dsh-abc');
+  // [fix 2026-10-12] ntfy 的 "Publish as JSON" 契约：POST 根路径 + body.topic。
+  // 旧行为（topic 拼 URL、body 无 topic）会被 ntfy 当成纯文本消息，用户手机上
+  // 看到一坨转义 JSON，click/actions 全部失效 —— 这是用户实测抓到的。
+  assert.equal(req.url, 'https://ntfy.sh/');
+  assert.equal(req.body.topic, 'dsh-abc');
   assert.equal(req.headers.Authorization, 'Bearer tk_x');
+  assert.equal(req.headers['Content-Type'], 'application/json');
   assert.equal(req.body.title, '需要你授权');
   assert.equal(req.body.priority, 5);
   assert.equal(req.body.click, 'dshmobile://open?session=session-1');
@@ -274,9 +279,10 @@ test('buildNtfyRequest: refuses to build without a base URL or topic', () => {
   assert.equal(buildNtfyRequest({ ntfyUrl: 'not a url', ntfyTopic: 't' }, {}), null);
 });
 
-test('buildNtfyRequest: an inline topic overrides the configured one', () => {
+test('buildNtfyRequest: an inline topic overrides the configured one (in the body)', () => {
   const req = buildNtfyRequest({ ntfyUrl: 'https://ntfy.sh', ntfyTopic: 'default' }, { topic: 'per-device' });
-  assert.equal(req.url, 'https://ntfy.sh/per-device');
+  assert.equal(req.url, 'https://ntfy.sh/');
+  assert.equal(req.body.topic, 'per-device');
 });
 
 test('pushForEvent: only human-blocking and completion events push', () => {
