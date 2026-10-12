@@ -10,7 +10,10 @@ window.__ModuleLoader__.load({
     const ENDPOINTS = {
       getConfig: 'config/get',
       updateConfig: 'config/update',
-      generateToken: 'token/generate'
+      generateToken: 'token/generate',
+      pairQrData: 'pair/qrdata',
+      devicesList: 'devices/list',
+      devicesRevoke: 'devices/revoke'
     };
 
     const S = {
@@ -129,6 +132,63 @@ window.__ModuleLoader__.load({
       const npsScheme = useHttps ? 'https' : 'http';
       const npsApkUrl = `${npsScheme}://${npsHost}:${npsPort}/dsh-agent.apk`;
       const localApkUrl = `http://${config?.localIp || '127.0.0.1'}:${port}/dsh-agent.apk`;
+
+      // ---- 扫码配对卡片状态 [feat 2026-10-12] ----
+      const [qr, setQr] = useState(null);            // {qrDataUrl, pairCode, host, port, expiresAt, ttlMs}
+      const [qrBusy, setQrBusy] = useState(false);
+      const [qrError, setQrError] = useState('');
+      const [qrCopied, setQrCopied] = useState(false);
+
+      const generateQr = useCallback(async () => {
+        setQrBusy(true); setQrError('');
+        try {
+          const res = await call(ENDPOINTS.pairQrData, {});
+          setQr(res);
+        } catch (e) {
+          setQrError('生成失败: ' + e.message);
+        } finally {
+          setQrBusy(false);
+        }
+      }, [call]);
+
+      const qrText = qr ? `Host: ${qr.host}:${qr.port}\n配对码: ${qr.pairCode}\n${qr.ttlMs / 60000 | 0} 分钟内有效` : '';
+      const copyQr = () => { copyText(qrText, 'qrText'); setQrCopied(true); setTimeout(() => setQrCopied(false), 2500); };
+
+      // ---- 设备管理卡片状态 ----
+      const [devices, setDevices] = useState(null);
+      const [devicesError, setDevicesError] = useState('');
+      const [revokingId, setRevokingId] = useState('');
+
+      const loadDevices = useCallback(async () => {
+        try {
+          setDevices(await call(ENDPOINTS.devicesList, {}));
+          setDevicesError('');
+        } catch (e) {
+          setDevicesError('设备列表加载失败: ' + e.message);
+        }
+      }, [call]);
+
+      useEffect(() => { loadDevices(); }, [loadDevices]);
+
+      const revokeDevice = async (deviceId) => {
+        if (!window.confirm('确定移除此设备？被移除的手机下次请求将被拒绝并要求重新配对。')) return;
+        setRevokingId(deviceId);
+        try {
+          await call(ENDPOINTS.devicesRevoke, { deviceId });
+          await loadDevices();
+        } catch (e) {
+          setDevicesError('移除失败: ' + e.message);
+        } finally {
+          setRevokingId('');
+        }
+      };
+
+      const fmtTime = (ts) => {
+        try { return new Date(ts).toLocaleTimeString(); } catch { return String(ts); }
+      };
+      const fmtDate = (ts) => {
+        try { return new Date(ts).toLocaleString(); } catch { return String(ts); }
+      };
 
       return h('div', { style: S.container },
         // 1. 状态卡片
@@ -269,7 +329,73 @@ window.__ModuleLoader__.load({
           ),
         ),
 
-        // 4. Android APK 下载
+        // 4. 扫码配对 [feat 2026-10-12]
+        h('div', { style: S.card },
+          h('div', { style: S.header },
+            h('div', { style: S.title }, '📷 扫码配对'),
+            h('button', {
+              type: 'button', style: S.primaryBtn,
+              disabled: qrBusy, onClick: generateQr
+            }, qrBusy ? '生成中...' : (qr ? '🔄 重新生成' : '生成配对二维码'))
+          ),
+          h('div', { style: S.subtitle },
+            '生成一次性 6 位配对码的二维码（10 分钟有效、5 次错码作废）。手机 App「连接配置」页点「扫码连接」扫描即可自动配对——二维码不含长期凭据，截图留存也只暴露一枚短时配对码。'
+          ),
+          qr ? h('div', { style: { display: 'flex', gap: 18, marginTop: 14, alignItems: 'flex-start', flexWrap: 'wrap' } },
+            qr.qrDataUrl
+              ? h('img', { src: qr.qrDataUrl, alt: '配对二维码', style: { width: 180, height: 180, borderRadius: 8, border: '1px solid var(--dsw-alias-border-l2, #e5e7eb)' } })
+              : h('div', { style: { width: 180, height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center', fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #6b7280)', border: '1px dashed var(--dsw-alias-border-l2, #d1d5db)', borderRadius: 8 } }, 'qrcode 包不可用\n请手动输入配对码'),
+            h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, minWidth: 220 } },
+              h('div', { style: S.metricCard },
+                h('div', { style: S.metricLabel }, '配对码（10 分钟内有效）'),
+                h('div', { style: { ...S.metricValue, fontSize: 22, letterSpacing: 4 } }, qr.pairCode)
+              ),
+              h('div', { style: S.metricCard },
+                h('div', { style: S.metricLabel }, '网关地址'),
+                h('div', { style: S.metricValue }, `${qr.host}:${qr.port}`)
+              ),
+              h('div', { style: S.metricCard },
+                h('div', { style: S.metricLabel }, '过期时间'),
+                h('div', { style: S.metricValue }, fmtTime(qr.expiresAt))
+              ),
+              h('button', {
+                type: 'button', style: qrCopied ? S.btnSuccess : S.btn,
+                onClick: copyQr
+              }, qrCopied ? '已复制' : '复制配对信息')
+            )
+          ) : null,
+          qrError ? h('div', { style: { ...S.noticeBox, background: '#fef2f2', borderColor: '#fecaca', color: '#b91c1c', marginTop: 12 } }, qrError) : null
+        ),
+
+        // 5. 已配对设备管理 [feat 2026-10-12]
+        h('div', { style: S.card },
+          h('div', { style: S.header },
+            h('div', { style: S.title }, '🖥️ 已配对设备'),
+            h('button', { type: 'button', style: S.btn, onClick: loadDevices }, '刷新')
+          ),
+          h('div', { style: S.subtitle },
+            '每台配对过的手机一行。被「移除」的设备其凭据立即失效——手机端下次请求会收到下线通知并回到配对页。'
+          ),
+          devices && devices.length
+            ? h('div', { style: { marginTop: 12, display: 'flex', flexDirection: 'column', gap: 6 } },
+                devices.map((d) => h('div', {
+                  key: d.id || d.deviceId || d.tokenHash,
+                  style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '9px 12px', background: 'var(--dsw-alias-bg-layer-2, #f9fafb)', borderRadius: 6, fontSize: 12 }
+                },
+                  h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+                    h('span', { style: { fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111827)' } }, `${d.name || '未命名设备'}${d.platform ? ' · ' + d.platform : ''}`),
+                    h('span', { style: { color: 'var(--dsw-alias-label-tertiary, #6b7280)' } }, `配对于 ${fmtDate(d.pairedAt || d.createdAt)}`)
+                  ),
+                  h('button', {
+                    type: 'button', style: S.btn,
+                    disabled: revokingId === (d.id || d.deviceId),
+                    onClick: () => revokeDevice(d.id || d.deviceId)
+                  }, revokingId === (d.id || d.deviceId) ? '移除中...' : '移除')
+                )))
+            : h('div', { style: { ...S.noticeBox, marginTop: 12 } }, devicesError || '还没有设备配对。生成配对二维码，手机扫码即可加入。')
+        ),
+
+        // 6. Android APK 下载
         h('div', { style: S.card },
           h('div', { style: S.header },
             h('div', { style: S.title }, '📦 Android APK 客户端安装包 (v1.2.8)'),

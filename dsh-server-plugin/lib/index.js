@@ -3760,7 +3760,24 @@ export function apply(ctx, config = {}, internals = {}) {
   const disposeRpc = installRpc(ctx, {
     dshPort,
     isListening: true,
-    readAudit
+    readAudit,
+    // [feat 2026-10-12] pair/qrdata RPC needs the same minting machinery the
+    // HTTP /pair/qr route uses — the settings page asks for a data-URL QR over
+    // the RPC channel instead of hitting the unauthenticated HTTP route, so a
+    // logged-in web session never depends on the pre-auth QR endpoint.
+    mintPairSession: () => {
+      const code = newPairCode();
+      const expiresAt = Date.now() + pairCodeTtlMs();
+      pairSession = { code, expiresAt };
+      audit('pair/qrdata-generated', { expiresAt });
+      const hosts = [];
+      for (const list of Object.values(os.networkInterfaces())) {
+        for (const ni of list || []) {
+          if (ni.family === 'IPv4' && !ni.internal) hosts.push(ni.address);
+        }
+      }
+      return { v: 1, hosts, host: hosts[0] || '', port: listenPort, pairCode: code, name: os.hostname(), expiresAt, ttlMs: pairCodeTtlMs() };
+    }
   });
 
   server.on('error', (err) => {

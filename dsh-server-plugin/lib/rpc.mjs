@@ -10,7 +10,8 @@ export const ENDPOINTS = {
   getConfig: 'config/get',
   updateConfig: 'config/update',
   generateToken: 'token/generate',
-  generatePairCode: 'pair/code'
+  generatePairCode: 'pair/code',
+  pairQrData: 'pair/qrdata'
 };
 
 function getLocalIp() {
@@ -89,6 +90,30 @@ async function dispatch(endpoint, payload, deps) {
       const code = newPairCode();
       const expiresAt = Date.now() + pairCodeTtlMs();
       return { code, expiresAt, ttlMs: pairCodeTtlMs() };
+    }
+
+    // [feat 2026-10-12] QR data for the settings page. Mints a fresh one-time
+    // pair code (same machinery as the HTTP /pair/qr route) and, when the
+    // qrcode package is available, renders it as a PNG data URL the page can
+    // show inline. Without the package we return the payload only and the page
+    // falls back to displaying the 6-digit code for manual entry.
+    case ENDPOINTS.pairQrData: {
+      if (typeof deps.mintPairSession !== 'function') {
+        throw new Error('配对码生成器未注入');
+      }
+      const payload = deps.mintPairSession();
+      let qrDataUrl = null;
+      try {
+        const { createRequire } = await import('node:module');
+        const require_ = createRequire(import.meta.url);
+        const buf = await require_('qrcode').toBuffer(JSON.stringify(payload), {
+          type: 'png', width: 360, margin: 2
+        });
+        qrDataUrl = `data:image/png;base64,${buf.toString('base64')}`;
+      } catch {
+        // qrcode unavailable — client falls back to manual code entry.
+      }
+      return { ...payload, qrDataUrl };
     }
 
     case 'devices/list': {
