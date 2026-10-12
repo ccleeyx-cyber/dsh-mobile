@@ -34,6 +34,21 @@ class VoiceInputService {
   bool _available = false;
   bool _listening = false;
 
+  /// [fix 2026-10-12] 引擎在**用户未主动停止**时自己结束了会话（时长上限、
+  /// 静音超时、引擎内部断句）。这是"说了一大段 → 提示没有听清"的根源：引擎
+  /// 已经停了，UI 还显示"正在聆听…"，用户松手时对着一具尸体调 stop()。
+  ///
+  /// onStatus('done'/'notListening') 是唯一的权威信号；把它转发出去，让长按
+  /// 状态机立刻进入确认态，保住已经识别到的 partial 文本。
+  ///
+  /// 注意在 start() 里临时挂上、在 stop/cancel 时摘掉——避免上一次会话的
+  /// 迟到状态污染下一次。
+  void Function(String reason)? onAutoStopped;
+
+  /// 最近一次引擎自动结束的时间与原因（诊断报告用）。
+  DateTime? lastAutoStopAt;
+  String? lastAutoStopReason;
+
   /// 上一次探测是否因为**平台不回调**而超时。
   ///
   /// 单独记这一位：它与"设备不支持"的处置完全不同 —— 前者值得重试一次
@@ -87,7 +102,18 @@ class VoiceInputService {
             onStatus: (status) {
               // done / notListening：自动结束，UI 据此把麦克风按钮恢复常态。
               if (status == 'done' || status == 'notListening') {
+                final wasListening = _listening;
                 _listening = false;
+                // [fix 2026-10-12] 引擎自己断了（不是用户调 stop()/cancel()
+                // ——那两个路径会先把 _listening 置 false 再等状态回调，且会
+                // 摘掉本回调）。把这件事告诉监听方，长按 UI 才能立刻收尾。
+                if (wasListening) {
+                  lastAutoStopAt = DateTime.now();
+                  lastAutoStopReason = status;
+                  final cb = onAutoStopped;
+                  onAutoStopped = null;
+                  cb?.call(status);
+                }
               }
             },
             onError: (e) {
@@ -209,6 +235,13 @@ class VoiceInputService {
 
     final err = lastError;
     if (err != null && err.isNotEmpty) lines.add('上次错误: $err');
+    // [fix 2026-10-12] 引擎自动结束的记录：定位"说了一大段却没识别到"的关键证据。
+    if (lastAutoStopAt != null) {
+      lines.add('引擎自动结束: ${lastAutoStopAt!.toIso8601String()} (${lastAutoStopReason ?? "未知"})');
+      if (lastAutoStopReason == 'finalResult-empty') {
+        lines.add('  → 引擎结束但没产出文本（no_match/静音掐断/时长上限）');
+      }
+    }
 
     return lines.join('\n');
   }
@@ -225,12 +258,17 @@ class VoiceInputService {
     required void Function(String text) onFinal,
     void Function(String message)? onError,
     String localeId = defaultLocaleId,
+    // [fix 2026-10-12] 引擎在用户未停止时自行结束（时长上限/静音超时）时回调。
+    // 迟到的状态只会触发一次，之后自动摘除；stop()/cancel() 也会主动摘除。
+    void Function(String reason)? onAutoStopped,
   }) async {
     // 测试钩子：假识别模式。不碰任何平台通道，直接把脚本里的中间结果回放出来，
     // 最终结果留到 stop() 时交付（与 speech_to_text 的时序一致）。
     if (_fakePartials != null) {
       _listening = true;
       _fakeOnFinal = onFinal;
+      // 测试钩子同样接上自动结束回调，状态机路径才能在 widget 测试里驱动。
+      onAutoStopped = onAutoStopped;
       for (final p in _fakePartials!) {
         onPartial(p, 1.0);
       }
@@ -267,7 +305,16 @@ class VoiceInputService {
             // 表现成"功能看着在跑、就是没结果"。
             onResult: (result) {
               final text = result.recognizedWords;
-              if (text.isEmpty) return;
+              if (text.isEmpty) {
+                // [fix 2026-10-12] finalResult 且空文本：引擎结束但没有产出
+                // （no_match / 静音掐断 / 时长上限）。以前这里直接 return，
+                // "说了一大段却一个字都没有"在诊断里完全不可见。记下来。
+                if (result.finalResult) {
+                  lastAutoStopAt = DateTime.now();
+                  lastAutoStopReason = 'finalResult-empty';
+                }
+                return;
+              }
               if (result.finalResult) {
                 onFinal(text);
               } else {
@@ -279,8 +326,11 @@ class VoiceInputService {
               localeId: await _resolveLocale(localeId),
               // 流式：文字边说边出，不必等说完。
               partialResults: true,
-              // dictation：说完一句自动停顿，把结果当成完整一段。
-              listenMode: ListenMode.dictation,
+              // [fix 2026-10-12] ListenMode.dictation 在部分国产 ROM 上中文识别
+              // 质量明显更差（识别模型不同，且静音断句更激进），是"准确率差 +
+              // 说一半就断"的复合来源之一。改回默认 confirmation 模式：少漏字、
+              // 引擎自动断开的行为由 onAutoStopped 兜住，不再依赖 dictation。
+              listenMode: ListenMode.confirmation,
               // 永久性错误（如权限被收回）时自动结束本次会话，避免反复重试。
               cancelOnError: true,
             ),
@@ -402,20 +452,29 @@ class VoiceInputService {
       final t = _fakeFinal;
       final cb = _fakeOnFinal;
       _fakeOnFinal = null;
+      // [fix 2026-10-12] 主动停止要摘掉自动结束回调——迟到的引擎状态不该
+      // 再触发一次 onAutoStopped。
+      onAutoStopped = null;
       if (t.isNotEmpty) cb?.call(t);
       return;
     }
-    if (!_listening) return;
+    if (!_listening) {
+      onAutoStopped = null;
+      return;
+    }
     try {
       await _speech.stop();
     } catch (e) {
       debugPrint('[VoiceInput] 停止失败: $e');
     }
     _listening = false;
+    onAutoStopped = null;
   }
 
   /// 取消识别并丢弃结果。
   Future<void> cancel() async {
+    // [fix 2026-10-12] 同 stop()：摘回调，防止迟到状态触发自动结束通知。
+    onAutoStopped = null;
     if (_fakePartials != null) {
       _listening = false;
       _fakeOnFinal = null;
@@ -459,6 +518,9 @@ class VoiceInputService {
     initTimeout = const Duration(seconds: 12);
     listenTimeout = const Duration(seconds: 6);
     localeProbeTimeout = const Duration(seconds: 2);
+    onAutoStopped = null;
+    lastAutoStopAt = null;
+    lastAutoStopReason = null;
   }
 
   @visibleForTesting

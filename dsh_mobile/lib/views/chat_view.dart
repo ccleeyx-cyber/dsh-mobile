@@ -3040,6 +3040,13 @@ class _ChatViewState extends State<ChatView> {
       // 中间结果是累积的，必须整段替换。
       onPartial: (text, _) => _applyVoiceText(text, dsh),
       onFinal: (text) => _applyVoiceText(text, dsh),
+      // [fix 2026-10-12] 引擎自动结束（时长上限/静音）：立刻灭掉聆听态，
+      // 以前按钮会一直亮着"聆听中"但引擎早已停了，说的内容也不会再进来。
+      onAutoStopped: mounted
+          ? (_) {
+              if (mounted) setState(() => _voiceListening = false);
+            }
+          : null,
       onError: (msg) {
         _toast(msg);
         if (mounted) setState(() => _voiceListening = false);
@@ -3097,6 +3104,13 @@ class _ChatViewState extends State<ChatView> {
     });
 
     final ok = await VoiceInputService.instance.start(
+      // [fix 2026-10-12] 引擎自动结束（时长上限/静音超时/内部断句）：长按模式
+      // 下立刻进入确认态，用已有的 partial 文本收尾。以前这条路径没有任何
+      // 通知 —— 引擎停了 UI 还在"聆听"，用户松手时收到"没有听清"，说过的话
+      // 全部丢失。这正是"说一大段 → 未识别到"的根源。
+      onAutoStopped: mounted
+          ? (reason) => _finishHoldTalk(dsh, autoStopped: reason)
+          : null,
       onPartial: (text, _) {
         if (!mounted) return;
         setState(() {
@@ -3154,22 +3168,50 @@ class _ChatViewState extends State<ChatView> {
     }
     _holdWatchdog?.cancel();
     if (!mounted) return;
+    await _finishHoldTalk(dsh);
+  }
+
+  /// [fix 2026-10-12] 录音收尾的统一出口：把已识别文本送进"重录/发送"确认态。
+  ///
+  /// 两条路径共用：用户松手（_endHoldTalk）与引擎自动结束（onAutoStopped，
+  /// 时长上限/静音超时）。autoStopped 非空时 toast 说明原因 —— 用户需要知道
+  /// "引擎替我停了"，而不是对着还亮着的聆听界面发呆。
+  ///
+  /// 关键语义：**只要有 partial 文本就进确认态，不再报"没有听清"**。引擎被
+  /// 掐断时已识别的部分比一句"重来"有价值得多；真正一个字都没有才回 idle。
+  ///
+  /// ⚠️ 这里刻意**不做任何 sleep/延迟等待**：迟到的 final 由既有的
+  /// `_holdAwaitingFinal` 机制补写进输入框（onFinal 分支），不需要在这里等它。
+  /// 之前试过"空文本先等 300ms 再放弃"，但在 widget 测试的 fake clock 里
+  /// pumpAndSettle 推不动无 frame 调度的 timer，启动失败用例会卡在录音态。
+  Future<void> _finishHoldTalk(DshService dsh, {String? autoStopped}) async {
+    if (_holdPhase != _HoldTalkPhase.recording) return;
+    _holdTick?.cancel();
+    _holdWatchdog?.cancel();
 
     final text = _holdText.trim();
     if (text.isEmpty) {
+      // 一个字都没有：直接回 idle。松手后若引擎的 final 迟到，onFinal 分支
+      // 会因为 _holdAwaitingFinal 仍为 true 而把它补进输入框 —— 文本不丢。
       setState(() {
         _holdPhase = _HoldTalkPhase.idle;
         _holdText = '';
       });
-      _toast('没有听清，再长按说一次');
+      _toast(autoStopped != null
+          ? '引擎提前结束且没有识别到内容（$autoStopped），请再长按说一次'
+          : '没有听清，再长按说一次');
       return;
     }
+
     setState(() {
       _holdPhase = _HoldTalkPhase.confirm;
       _inputController.text = text;
       _inputController.selection = TextSelection.collapsed(offset: text.length);
     });
     dsh.updateDraft(text);
+    if (autoStopped != null && mounted) {
+      _toast('引擎到达时长上限自动停止，已识别的内容已保留，可继续编辑或直接发送');
+    }
   }
 
   /// 手势被系统打断（来电、手势冲突等）：直接放弃这次录音。
