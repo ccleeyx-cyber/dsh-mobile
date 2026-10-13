@@ -1,8 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../../models/bridge_extras.dart';
 import '../../models/task_center.dart';
 import '../../theme/app_colors.dart';
+import '../../widgets/safe_markdown.dart';
 import 'session_status_strip.dart';
 import 'turn_output_card.dart';
 
@@ -30,14 +34,19 @@ class SessionInfoSheet extends StatefulWidget {
     this.changes = const <WorkspaceChange>[],
     this.changesAvailable = false,
     this.changesReason = '',
+    this.changesSource = '',
+    this.changesNote = '',
+    this.repoCandidates = const <RepoCandidate>[],
     this.jobs = const <JobItem>[],
     this.jobsUnavailable = false,
     this.schedules = const <ScheduleItem>[],
     this.busyDeliverablePath,
     this.initialSection = SessionInsightSection.usage,
     this.onOpenDeliverable,
+    this.onPreviewDeliverable,
     this.onLoadDiff,
     this.onKillJob,
+    this.onLoadJobOutput,
     this.onDeleteSchedule,
     this.onRefresh,
     this.subagents,
@@ -65,10 +74,39 @@ class SessionInfoSheet extends StatefulWidget {
   /// 不可用的原因（网关的 `reason`）。
   final String changesReason;
 
+  /// [feat 2026-10-13] 变更行的来源：`git` / `git+tool-calls` / `tool-calls`，
+  /// 空串 = 老网关没给（此时不编来源，什么都不说）。
+  ///
+  /// 需要它是因为清单里可能混着两种行：git 的工作树状态（有行数）和会话日志里
+  /// Agent 自己的 `write`/`edit`（**没有**行数）。不说来源，用户无法理解为什么
+  /// 同一个列表里有的行有 "±行数"、有的只有一个 "—"。
+  final String changesSource;
+
+  /// [feat 2026-10-13] 网关给的一句话说明，解释"为什么 git 这里是空的"。
+  ///
+  /// 例：`当前工作区不是 git 仓库，但相邻有 2 个仓库；下方文件列表来自本轮
+  /// Agent 的文件写入记录`。这是**解释性**的一句，永远优先于本地拼的通用文案
+  /// —— 泛泛的"暂不可用"说不清"读不到"和"工作区干净"的区别。
+  final String changesNote;
+
+  /// [feat 2026-10-13] 会话工作区相邻的 git 仓库。
+  ///
+  /// **只能当标签渲染，没有任何可点的目标**：网关刻意不下发绝对路径（这是不
+  /// 泄露主机目录结构的前提），所以这里既没有可打开的路径，也没有可切换的
+  /// 工作区 —— 它只是在解释"git 明明有东西，只是不在这一层"。
+  final List<RepoCandidate> repoCandidates;
+
   final List<JobItem> jobs;
 
   /// 作业状态**未知**（网关降级）。与"没有作业"是两件事。
   final bool jobsUnavailable;
+
+  /// [feat 2026-10-13] 按字节偏移读取一个后台任务的输出（引擎 `job/follow`）。
+  ///
+  /// 为什么需要它：引擎的 job 输出是一个**可按偏移续读的环**，手机看日志的唯一
+  /// 正确姿势就是拿着上一次的 `next` 继续读。为 null 时整块日志入口隐藏（老网关
+  /// 没有这个路由），而不是给一个点了报错的按钮。
+  final Future<JobOutputChunk> Function(JobItem job, int? from)? onLoadJobOutput;
 
   final List<ScheduleItem> schedules;
 
@@ -79,10 +117,25 @@ class SessionInfoSheet extends StatefulWidget {
 
   final ValueChanged<DeliverableItem>? onOpenDeliverable;
 
+  /// [feat 2026-10-13] **就地预览**交付物的文本内容（P0-4）。
+  ///
+  /// 调用方（`chat_view.dart`）传的是 `(item) => dsh.fetchDeliverableText(item.path)`。
+  /// 为 null 时**一点旧行为都不改**：点一行还是走"下载 + 拉起系统应用"那条链路。
+  /// 非 null 时主点击改成预览，下载退到**长按**（见 [_buildDeliverableGroup] 的
+  /// 注释说明为什么选长按而不是再加一个下载图标）。
+  final Future<TextFileContent> Function(DeliverableItem item)? onPreviewDeliverable;
+
   /// 取单个文件的 diff。
   final Future<List<DiffHunk>> Function(String path)? onLoadDiff;
 
-  final Future<void> Function(JobItem job)? onKillJob;
+  /// 请求停止一个后台作业。
+  ///
+  /// 返回 [JobStopResult] 而不是 bool：引擎**没有任何**能停作业的 Remote（网关
+  /// 过去调的 `job/kill` 在引擎的 74 个 Remote 里根本不存在，这就是这个列表过去
+  /// 永远报 `degraded` 的同一条根因）。网关只能把请求转交给 Agent 自己的作业
+  /// 工具，所以 `mediated == true` 时界面必须说"已请求 Agent 停止（会消耗一轮
+  /// 对话）"，**不能**说"已终止" —— 那一刻作业还在跑。
+  final Future<JobStopResult> Function(JobItem job)? onKillJob;
 
   final Future<void> Function(ScheduleItem schedule)? onDeleteSchedule;
 
@@ -130,14 +183,63 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
   String? _interruptingId;
   String? _goalActionInProgress;
 
+  /// [feat 2026-10-13] 作业列表里至少有一个"还活着"的作业时，用 1s 的 ticker 让
+  /// 时长往前走。只在有活作业时开，自己 `dispose` 时一定取消 —— 一个没人看的
+  /// 定时器在弹层关掉之后继续跑，既是电也是"关掉了还在刷新"的假象。
+  Timer? _jobTicker;
+
+  /// 行数据是"取数那一刻"的快照：`durationMs` 是网关算的 `now - startedAt`，
+  /// 它自己不会长。跳动要在它**上面**加上"距离取数过了多久"，所以这里记下这份
+  /// jobs 是什么时候拿到的（列表换一份就重置）。
+  DateTime _jobsAnchor = DateTime.now();
+
+  /// 上一次「停止作业」的结果。**内联渲染**，不用 SnackBar。
+  ///
+  /// 这个面板本身就是弹层，而 SnackBar 挂在宿主 Scaffold 上 —— 会被弹层盖住，
+  /// 用户根本看不到自己刚按下去的那个按钮的结果（TurnOutputCard 里"错误内联在
+  /// 卡片里"是同一个理由）。
+  String? _jobStopNotice;
+  bool _jobStopNoticeError = false;
+
   @override
   void initState() {
     super.initState();
+    _syncJobTicker();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _scrollTo(widget.initialSection);
       _refresh();
     });
+  }
+
+  @override
+  void didUpdateWidget(covariant SessionInfoSheet oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.jobs, widget.jobs)) {
+      // 换了一份行数据 = 重新取过数：时长的锚点跟着重置。
+      _jobsAnchor = DateTime.now();
+    }
+    _syncJobTicker();
+  }
+
+  @override
+  void dispose() {
+    _jobTicker?.cancel();
+    _jobTicker = null;
+    super.dispose();
+  }
+
+  /// 按"列表里还有没有活作业"开关 ticker。
+  void _syncJobTicker() {
+    final needsTick = widget.jobs.any((job) => job.isLive);
+    if (needsTick && _jobTicker == null) {
+      _jobTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    } else if (!needsTick && _jobTicker != null) {
+      _jobTicker!.cancel();
+      _jobTicker = null;
+    }
   }
 
   GlobalKey? _keyFor(SessionInsightSection section) {
@@ -186,22 +288,87 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
     );
   }
 
+  /// 就地预览一个交付物（P0-4）。
+  ///
+  /// 只在拿到了 `onPreviewDeliverable` 时才会被调到；没有它时行上走的仍是原来的
+  /// 下载链路。预览弹层的下载出口复用同一个 `onOpenDeliverable`，所以两条路
+  /// 永远是同一份实现（不会出现"预览里能下载、列表里下载不动"）。
+  Future<void> _openDeliverablePreview(DeliverableItem item) async {
+    final loader = widget.onPreviewDeliverable;
+    if (loader == null) return;
+    final open = widget.onOpenDeliverable;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: context.c.surface,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (_) => _DeliverablePreviewSheet(
+        item: item,
+        loader: () => loader(item),
+        onDownload: open == null ? null : () => open(item),
+      ),
+    );
+  }
+
+  /// 停止一个后台作业的确认与结果处理（P1-6）。
+  ///
+  /// 引擎**没有**停止作业的 Remote，所以这里发出去的是"请 Agent 去停"，结果以
+  /// [JobStopResult] 回来 —— 三种结局必须分开说：已请求（mediated，作业还在跑，
+  /// 且会消耗一轮对话）、已停止、已经结束了（409，是正常事态而不是错误）。
   Future<void> _confirmKillJob(JobItem job) async {
     final kill = widget.onKillJob;
     if (kill == null) return;
+    final name = job.label.isEmpty ? job.id : job.label;
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('终止这个后台作业？'),
-        content: Text('将请求引擎终止「${job.label.isEmpty ? job.id : job.label}」。'
-            '已经产生的结果不会回滚。'),
+        // 点之前就说清"这不是立刻生效的硬杀"，否则按钮的文字会承诺一件做不到的事。
+        content: Text('引擎没有直接的停止接口，将请求 Agent 终止「$name」——'
+            '这会占用一轮对话，作业不会立刻结束。已经产生的结果不会回滚。'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
           FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('终止')),
         ],
       ),
     );
-    if (ok == true) await kill(job);
+    if (ok != true) return;
+    if (!mounted) return;
+
+    JobStopResult result;
+    try {
+      result = await kill(job);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _jobStopNoticeError = true;
+        _jobStopNotice = '终止请求失败：$e';
+      });
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      if (result.ok) {
+        // ⚠️ `requested` 是引擎"已受理"，不是"已终止"：生产者的 cancel 是异步的，
+        // 紧接着的一次列表读取里任务仍可能是活的。所以措辞是"已请求停止"，并且
+        // 提示用户列表可能还会短暂显示它 —— 报"已终止"就是撒谎。
+        _jobStopNoticeError = false;
+        _jobStopNotice = result.outcome == 'requested'
+            ? '已请求停止「$name」——停止是异步的，列表可能还会短暂显示它。'
+            : '已终止「$name」。';
+      } else if (result.alreadySettled) {
+        // `already-finished`：这是"不用做"，不是失败，不该渲染成红色错误。
+        _jobStopNoticeError = false;
+        _jobStopNotice = '该后台任务已经结束，无需停止。';
+      } else if (result.notFound) {
+        // `job/not-found`：本会话的可停止列表里已经没有这一行了。
+        _jobStopNoticeError = false;
+        _jobStopNotice = '该后台任务已不在本会话的可停止列表中。';
+      } else {
+        _jobStopNoticeError = true;
+        _jobStopNotice = result.error.isNotEmpty ? result.error : '停止请求被拒绝或未送达。';
+      }
+    });
   }
 
   Future<void> _confirmDeleteSchedule(ScheduleItem schedule) async {
@@ -493,28 +660,48 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
 
   Widget _buildDeliverables() {
     final groups = groupDeliverablesByTurn(widget.deliverables);
+    // 只有**两条路都通**时才需要教用户手势：只有预览没下载时说明不了什么，
+    // 只有下载时更不需要（旧行为本来就是"点一下就下载"）。
+    final needsHint = groups.isNotEmpty &&
+        widget.onPreviewDeliverable != null &&
+        widget.onOpenDeliverable != null;
     return _section(
       title: '交付物',
       icon: Icons.folder_special_rounded,
       children: [
         if (groups.isEmpty)
           _hint('这次任务还没有声明交付文件。agent 交付 docx/xlsx/pdf 时会出现在这里。')
-        else
+        else ...[
+          if (needsHint) _hint('点文件名就地预览内容；长按仍走下载 / 用其它应用打开。'),
           // 按轮倒序分组，**默认只展开最新一轮**：长会话可能声明过几十个文件，
           // 而用户要的是"刚给我的那批"。其余轮次折起来但不隐藏。
           for (var i = 0; i < groups.length; i++) _buildDeliverableGroup(groups[i], i == 0),
+        ],
       ],
     );
   }
 
   Widget _buildDeliverableGroup(DeliverableGroup group, bool expanded) {
+    final preview = widget.onPreviewDeliverable;
+    final open = widget.onOpenDeliverable;
     final rows = <Widget>[
       for (final item in group.items)
-        DeliverableRow(
-          item: item,
-          dense: true,
-          busy: widget.busyDeliverablePath != null && widget.busyDeliverablePath == item.path,
-          onOpen: widget.onOpenDeliverable == null ? null : () => widget.onOpenDeliverable!(item),
+        // 主点击 = 预览（拿到预览回调时），下载退到**长按**。
+        //
+        // 选长按而不是"再加一个小下载图标按钮"：DeliverableRow 尾部本来就画了
+        // 一个下载图标，旁边再放一个可点的下载按钮，等于把同一个图标画两遍、
+        // 其中只有一个能点 —— 那比手势难发现更糟。长按是这个行上唯一不与主
+        // 点击冲突、也不新增视觉噪声的第二动作位。
+        GestureDetector(
+          onLongPress: (preview != null && open != null) ? () => open(item) : null,
+          child: DeliverableRow(
+            item: item,
+            dense: true,
+            busy: widget.busyDeliverablePath != null && widget.busyDeliverablePath == item.path,
+            onOpen: preview != null
+                ? () => _openDeliverablePreview(item)
+                : (open == null ? null : () => open(item)),
+          ),
         ),
     ];
 
@@ -559,57 +746,187 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
   /// 状态层（状态条计数 + 这里），不会像交付物那样拆到每轮消息后面 —— 那样做
   /// 等于编数据。
   Widget _buildChanges() {
+    final note = widget.changesNote.trim();
+    final children = <Widget>[];
+
     if (!widget.changesAvailable) {
-      // 不可用**不等于**干净。这里只说清楚为什么看不到。
-      final reason = widget.changesReason == 'not-a-git-repository'
-          ? '这个工作区不是 git 仓库，列不出改动（引擎侧的变更快照不通过 RPC 暴露）。'
-          : (widget.changesReason.isNotEmpty ? '变更清单暂不可用：${widget.changesReason}' : '变更清单暂不可用。');
-      return _section(
-        title: '本次变更',
-        icon: Icons.difference_rounded,
-        children: [_hint(reason)],
-      );
+      // 不可用**不等于**干净 —— 这两件事必须永远分得开。
+      //
+      // 优先说网关给的 note：它才是那句真正解释"为什么 git 这里是空的"的话
+      // （例："当前工作区不是 git 仓库，但相邻有 2 个仓库；下方文件列表来自本轮
+      // Agent 的文件写入记录"）。本地拼的通用文案只是 note 缺席时的兜底。
+      children.add(_changesBanner(note.isNotEmpty ? note : _changesFallbackReason()));
+    } else if (note.isNotEmpty) {
+      // 有内容也可能带说明：清单里混了"没有行数的 Agent 写入行"时，note 就是
+      // 用来解释这个的，必须显示在列表**上方**而不是折叠起来。
+      children.add(_changesBanner(note));
     }
 
-    return _section(
-      title: '本次变更',
-      icon: Icons.difference_rounded,
+    if (widget.repoCandidates.isNotEmpty) {
+      if (children.isNotEmpty) children.add(const SizedBox(height: 8));
+      children.add(_buildRepoCandidates());
+    }
+
+    if (widget.changesAvailable) {
+      if (widget.changes.isEmpty) {
+        children.add(_hint('工作区是干净的 —— 没有未提交改动。'));
+      } else {
+        if (children.isNotEmpty) children.add(const SizedBox(height: 8));
+        final source = _changesSourceCaption();
+        if (source != null) children.add(_hint(source));
+        for (final change in widget.changes) children.add(_buildChangeRow(change));
+      }
+    }
+
+    return _section(title: '本次变更', icon: Icons.difference_rounded, children: children);
+  }
+
+  /// note 缺席时用来解释"读不到"的兜底文案。**只有**在这里才退回通用说法 ——
+  /// 泛泛的"暂不可用"永远没有网关那句具体。
+  String _changesFallbackReason() {
+    if (widget.changesReason == 'not-a-git-repository') {
+      return '这个工作区不是 git 仓库，列不出改动（引擎侧的变更快照不通过 RPC 暴露）。';
+    }
+    if (widget.changesReason.isNotEmpty) return '变更清单暂不可用：${widget.changesReason}';
+    return '变更清单暂不可用。';
+  }
+
+  /// 这份清单的来源说明。老网关不给 `source` 时返回 null —— 宁可不说话，不猜。
+  String? _changesSourceCaption() {
+    switch (widget.changesSource) {
+      case 'git':
+        return '来源：git 工作区状态（未提交改动）。';
+      case 'git+tool-calls':
+        return '来源：git 工作区状态 + 本轮 Agent 的文件写入记录；标了「Agent 写入」的行没有行数。';
+      case 'tool-calls':
+        return '来源：本轮 Agent 的文件写入记录（这个工作区不是 git 仓库，所以没有行级行数）。';
+      default:
+        return null;
+    }
+  }
+
+  /// 解释性横幅。用 warning 系而不是 danger：这既不是失败也不是错误，只是
+  /// "这里为什么是空的/为什么不完整"。
+  Widget _changesBanner(String text) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: context.c.warningSurface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: context.c.warningBorder),
+      ),
+      child: Text(
+        text,
+        key: const ValueKey('changes-note'),
+        style: TextStyle(fontSize: 11.5, color: context.c.warning, height: 1.35),
+      ),
+    );
+  }
+
+  /// 相邻仓库的芯片行。
+  ///
+  /// **纯展示，一个都不可点**：网关只下发仓库名（工作区相对名），刻意不下发
+  /// 绝对路径 —— 这是不泄露主机目录结构的前提。所以这里既没有可打开的路径，
+  /// 也没有可切换的工作区，它只是在回答"git 明明有东西，只是不在这一层"。
+  Widget _buildRepoCandidates() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        if (widget.changes.isEmpty)
-          _hint('工作区是干净的 —— 没有未提交改动。')
-        else
-          for (final change in widget.changes)
-            InkWell(
-              onTap: widget.onLoadDiff == null ? null : () => _openDiff(change),
-              borderRadius: BorderRadius.circular(8),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: Row(
-                  children: [
-                    SizedBox(
-                      width: 34,
-                      child: Text(change.label,
-                          style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: context.c.warning)),
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        change.path,
-                        style: TextStyle(fontSize: 12, fontFamily: 'monospace', color: context.c.textPrimary),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    Text(change.delta, style: TextStyle(fontSize: 10.5, color: context.c.textTertiary)),
-                    const SizedBox(width: 4),
-                    Icon(Icons.chevron_right_rounded, size: 16, color: context.c.textTertiary),
-                  ],
+        Text('相邻仓库', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: context.c.textSecondary)),
+        const SizedBox(height: 4),
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: [
+            for (final repo in widget.repoCandidates)
+              Container(
+                key: ValueKey('repo-chip-${repo.name}'),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: context.c.surfaceMuted,
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: context.c.border),
                 ),
+                child: Text(repo.name, style: TextStyle(fontSize: 11, color: context.c.textSecondary)),
               ),
-            ),
+          ],
+        ),
       ],
     );
+  }
+
+  /// 一行变更。两种来源长得**必须不一样**：git 的行有行数，Agent 写入的行没有。
+  Widget _buildChangeRow(WorkspaceChange change) {
+    // `fromToolCall` 的行来自会话日志里 Agent 自己的 write/edit 调用，它**没有**
+    // git 行数（也就没有旧版本可比）。所以这里硬写 "—"，不碰 `change.delta`：
+    // 万一网关某天给它回一个 0，`change.delta` 就会算成 "+0 −0"，那是在声称
+    // "这个文件没变化"，而真相是"我们不知道它改了几行"。
+    final fromToolCall = change.fromToolCall;
+    final delta = fromToolCall ? '—' : change.delta;
+    final tool = change.tool ?? '';
+    final sourceHint = fromToolCall
+        ? '来源：Agent 写入${tool.isNotEmpty ? '（$tool）' : ''}，会话日志没有行级改动'
+        : null;
+
+    VoidCallback? onTap;
+    if (fromToolCall) {
+      // 这类行**不发** diff 请求：它本来就不是 git 的一条状态，`onLoadDiff` 只会
+      // 拿到空 hunk，渲染出来像"这个文件没有改动"。
+      onTap = _explainToolCallRow;
+    } else if (widget.onLoadDiff != null) {
+      onTap = () => _openDiff(change);
+    }
+
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: 34,
+              child: Text(change.label,
+                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: context.c.warning)),
+            ),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    change.path,
+                    style: TextStyle(fontSize: 12, fontFamily: 'monospace', color: context.c.textPrimary),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  // 为什么这一行没有行数：不说清，用户只能把它读成"没改"。
+                  if (sourceHint != null)
+                    Text(sourceHint, style: TextStyle(fontSize: 10, color: context.c.textTertiary, height: 1.3)),
+                ],
+              ),
+            ),
+            const SizedBox(width: 6),
+            Text(delta, style: TextStyle(fontSize: 10.5, color: context.c.textTertiary)),
+            const SizedBox(width: 4),
+            // 这类行没有可展开的 diff，所以不画"能点开"的 chevron —— 画了就骗人。
+            Icon(fromToolCall ? Icons.info_outline_rounded : Icons.chevron_right_rounded,
+                size: 16, color: context.c.textTertiary),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 点到一条"Agent 写入"行时给出的解释（它没有 git diff 可看）。
+  void _explainToolCallRow() {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      content: Text('这一行来自本轮 Agent 的文件写入记录，没有对应的 git diff：'
+          '会话日志只记了「哪个文件被写过」，不记行级改动。'),
+      behavior: SnackBarBehavior.floating,
+    ));
   }
 
   // --------------------------------------------------------- 作业 ----
@@ -638,49 +955,178 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         else if (widget.jobs.isEmpty)
           _hint('没有后台作业。长时间命令与子代理会在这里出现。')
         else
-          for (final job in widget.jobs)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 6),
-              child: Row(
-                children: [
-                  Container(
-                    margin: const EdgeInsets.only(right: 8),
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                    decoration: BoxDecoration(
-                      color: (job.isLive ? context.c.accent : context.c.textTertiary).withOpacity(0.12),
-                      borderRadius: BorderRadius.circular(5),
-                      border: Border.all(color: (job.isLive ? context.c.accent : context.c.border).withOpacity(0.5)),
-                    ),
-                    child: Text(
-                      job.statusLabel,
-                      style: TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.bold,
-                        color: job.isLive ? context.c.accent : context.c.textSecondary,
-                      ),
-                    ),
+          for (final job in widget.jobs) _buildJobRow(job),
+        // 停止请求的结果内联在这里（见 [_jobStopNotice] 的说明）。
+        if (_jobStopNotice != null) _buildJobStopNotice(),
+      ],
+    );
+  }
+
+  /// 打开一个后台任务的输出查看器。
+  ///
+  /// 用 `showModalBottomSheet` 而不是新页面：日志要和作业列表一起看（列表会随
+  /// 事件刷新，用户需要对照"哪个任务"，而不是在两级页面之间来回跳）。
+  Future<void> _openJobLog(JobItem job) async {
+    final load = widget.onLoadJobOutput;
+    if (load == null) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: context.c.surface,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (_) => _JobLogSheet(job: job, load: load),
+    );
+  }
+
+  Widget _buildJobRow(JobItem job) {
+    final color = _jobStatusColor(job);
+    // kind / detail 都是可选的；一个都没有时不留一行空白。
+    final meta = <String>[
+      if (job.kind.isNotEmpty) job.kind,
+      if ((job.detail ?? '').isNotEmpty) job.detail!,
+    ];
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            margin: const EdgeInsets.only(right: 8, top: 1),
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(5),
+              border: Border.all(color: color.withOpacity(0.5)),
+            ),
+            child: Text(
+              job.statusLabel,
+              style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: color),
+            ),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  job.label.isEmpty ? job.id : job.label,
+                  style: TextStyle(fontSize: 12.5, color: context.c.textPrimary),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                if (meta.isNotEmpty)
+                  Text(
+                    meta.join(' · '),
+                    style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                   ),
-                  Expanded(
-                    child: Text(
-                      job.label.isEmpty ? job.id : job.label,
-                      style: TextStyle(fontSize: 12.5, color: context.c.textPrimary),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  if (job.isLive && widget.onKillJob != null)
-                    TextButton(
-                      onPressed: () => _confirmKillJob(job),
-                      style: TextButton.styleFrom(
-                        minimumSize: Size.zero,
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      ),
-                      child: Text('终止', style: TextStyle(fontSize: 12, color: context.c.danger)),
-                    ),
-                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: 6),
+          // [feat 2026-10-13] 日志入口。
+          //
+          // 只要回调存在就显示（不要求 `hasOutput`）：一个刚起的活作业此刻 total
+          // 可能还是 0，但它马上就要写输出 —— 按"现在有没有输出"来决定要不要给
+          // 入口，会让入口在用户最需要它的那一刻恰好消失。
+          if (widget.onLoadJobOutput != null)
+            InkWell(
+              key: ValueKey('job-log-${job.id}'),
+              onTap: () => _openJobLog(job),
+              borderRadius: BorderRadius.circular(4),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                child: Icon(Icons.article_outlined, size: 15, color: context.c.accent),
               ),
             ),
-      ],
+          const SizedBox(width: 4),
+          // 时长：活着的作业按秒走，结束的显示网关给的最终值；**取不到就 "—"**，
+          // 绝不写 "0 秒"（0 会被读成"这个作业瞬间就结束了"）。
+          Text(
+            _jobDurationLabel(job),
+            key: ValueKey('job-duration-${job.id}'),
+            style: TextStyle(fontSize: 10.5, color: job.isLive ? context.c.success : context.c.textTertiary),
+          ),
+          if (job.isLive && widget.onKillJob != null)
+            TextButton(
+              onPressed: () => _confirmKillJob(job),
+              style: TextButton.styleFrom(
+                minimumSize: Size.zero,
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              ),
+              child: Text('终止', style: TextStyle(fontSize: 12, color: context.c.danger)),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 状态 → 颜色，照引擎自己的语义映射。
+  ///
+  /// 刻意不再用 `isLive ? accent : tertiary`：那会让 `stopping`（已经在停、不可
+  /// 逆，但还没结束）看起来和 `running` 一模一样；同理 `killed` 不是失败，用
+  /// danger 会和真失败的作业混成一片。
+  Color _jobStatusColor(JobItem job) {
+    switch (job.status) {
+      case 'running':
+        return context.c.success;
+      case 'stopping':
+        return context.c.warning;
+      case 'completed':
+        return context.c.textSecondary;
+      case 'killed':
+        return context.c.warning;
+      case 'failed':
+        return context.c.danger;
+      default:
+        return context.c.textSecondary;
+    }
+  }
+
+  /// 行内时长文案。
+  ///
+  /// 活着的作业：网关给的 `durationMs` 是"取数那一刻的已跑时长"，它自己不会走，
+  /// 所以用 ticker 在它上面加上"距离取数过了多久"。**网关没给起点时显示「计时中」**
+  /// 而不是从 0 往上跳 —— 从一个假的 0 开始数比承认不知道更糟。
+  ///
+  /// 已结束的作业：用网关的 `durationLabel`；它也是 null 时显示 "—"。
+  String _jobDurationLabel(JobItem job) {
+    if (!job.isLive) return job.durationLabel ?? '—';
+    final base = job.durationMs;
+    if (base == null) return '计时中';
+    final elapsed = base + DateTime.now().difference(_jobsAnchor).inMilliseconds;
+    return _durationText(elapsed);
+  }
+
+  /// 与 [JobItem.durationLabel] 同口径的时长格式化。
+  ///
+  /// 模型那个 getter 吃的是自己的字段，而 ticker 要喂一个算出来的值，所以这里
+  /// 必须有一份；两处口径必须一致，否则同一行会"运行中显示 1 分 5 秒、结束后
+  /// 跳成另一种写法"。
+  static String _durationText(int ms) {
+    final total = ms ~/ 1000;
+    final s = total % 60;
+    final m = (total ~/ 60) % 60;
+    final h = total ~/ 3600;
+    if (h > 0) return '$h 小时 $m 分';
+    if (m > 0) return '$m 分 $s 秒';
+    return '$s 秒';
+  }
+
+  Widget _buildJobStopNotice() {
+    final color = _jobStopNoticeError ? context.c.danger : context.c.textSecondary;
+    return Padding(
+      key: const ValueKey('job-stop-notice'),
+      padding: const EdgeInsets.only(top: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(_jobStopNoticeError ? Icons.error_outline_rounded : Icons.info_outline_rounded, size: 14, color: color),
+          const SizedBox(width: 6),
+          Expanded(child: Text(_jobStopNotice!, style: TextStyle(fontSize: 11.5, color: color, height: 1.35))),
+        ],
+      ),
     );
   }
 
@@ -992,6 +1438,284 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       );
 }
 
+/// 交付物文本预览（P0-4）：不下载、不拉起外部应用，直接在这里看内容。
+///
+/// 为什么值得单独做一个弹层：绝大多数交付物（.md / .txt / .csv / 源码）用户想
+/// 做的第一件事是**看一眼**，而"下载 + 切到别的应用 + 再切回来"对看一眼来说
+/// 成本高得离谱。下载这条路仍然保留（长按列表行，或本弹层底部的按钮），因为它
+/// 是二进制文件和"要拿去用"时的唯一出口。
+///
+/// 三种结局分开渲染，绝不混：读失败（原因 + 重试）、二进制（说明 + 下载出口，
+/// **不渲染字节**）、文本（Markdown 或等宽纯文本 + 截断横幅）。
+class _DeliverablePreviewSheet extends StatefulWidget {
+  const _DeliverablePreviewSheet({
+    required this.item,
+    required this.loader,
+    this.onDownload,
+  });
+
+  final DeliverableItem item;
+
+  /// 取内容的那次请求（调用方包好的 `dsh.fetchDeliverableText(path)`）。
+  final Future<TextFileContent> Function() loader;
+
+  /// 下载 / 用其它应用打开。二进制文件预览不了时它是唯一的出口。
+  final VoidCallback? onDownload;
+
+  @override
+  State<_DeliverablePreviewSheet> createState() => _DeliverablePreviewSheetState();
+}
+
+class _DeliverablePreviewSheetState extends State<_DeliverablePreviewSheet> {
+  /// 初值即"加载中"，所以 initState 里不需要先 setState 一次。
+  bool _loading = true;
+  TextFileContent? _result;
+
+  /// 网络层抛出来的异常（与网关的 `ok:false` 分开存，但渲染在同一个出口）。
+  String _error = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final r = await widget.loader();
+      if (!mounted) return;
+      setState(() {
+        _result = r;
+        _error = '';
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+      });
+    }
+  }
+
+  void _retry() {
+    setState(() {
+      _loading = true;
+      _result = null;
+      _error = '';
+    });
+    _load();
+  }
+
+  Future<void> _copy() async {
+    final text = _result?.content ?? '';
+    if (text.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      content: Text('内容已复制'),
+      duration: Duration(milliseconds: 900),
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
+  /// 字节数：与信息面板别处的口径一致（B / KB / MB）。
+  static String _bytes(int n) {
+    if (n < 1024) return '$n B';
+    if (n < 1024 * 1024) return '${(n / 1024).toStringAsFixed(1)} KB';
+    return '${(n / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final result = _result;
+    final maxHeight = MediaQuery.of(context).size.height * 0.8;
+    // 有内容可复制 / 可下载时才画底部动作条：读失败时只有"重试"是有意义的动作。
+    final hasText = result != null && result.ok && !result.binary;
+
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: maxHeight),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 8, 8),
+              child: Row(
+                children: [
+                  Icon(deliverableIconFor(widget.item.extension), size: 18, color: context.c.accent),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          widget.item.fileName,
+                          style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        if (widget.item.display.isNotEmpty && widget.item.display != widget.item.fileName)
+                          Text(
+                            widget.item.display,
+                            style: TextStyle(fontSize: 10.5, fontFamily: 'monospace', color: context.c.textTertiary),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: '关闭',
+                    icon: Icon(Icons.close_rounded, size: 20, color: context.c.textSecondary),
+                    onPressed: () => Navigator.of(context).maybePop(),
+                  ),
+                ],
+              ),
+            ),
+            Divider(height: 1, color: context.c.border),
+            Flexible(child: _buildBody(result)),
+            if (result != null && result.ok) ...[
+              Divider(height: 1, color: context.c.border),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                child: Row(
+                  children: [
+                    if (hasText)
+                      TextButton.icon(
+                        key: const ValueKey('deliverable-preview-copy'),
+                        onPressed: _copy,
+                        icon: Icon(Icons.copy_rounded, size: 14, color: context.c.textSecondary),
+                        label: Text('复制', style: TextStyle(fontSize: 11.5, color: context.c.textSecondary)),
+                      ),
+                    const Spacer(),
+                    if (widget.onDownload != null)
+                      TextButton.icon(
+                        key: const ValueKey('deliverable-preview-download'),
+                        onPressed: () {
+                          Navigator.of(context).maybePop();
+                          widget.onDownload!();
+                        },
+                        icon: Icon(Icons.download_rounded, size: 14, color: context.c.accent),
+                        label: Text('下载 / 打开', style: TextStyle(fontSize: 11.5, color: context.c.accent)),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBody(TextFileContent? result) {
+    if (_loading) {
+      return const Padding(
+        padding: EdgeInsets.all(28),
+        child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+      );
+    }
+
+    // 异常与网关的 ok:false 走同一个出口：都只是"这次没读到"，给原因 + 重试。
+    if (_error.isNotEmpty || result == null || !result.ok) {
+      final reason = _error.isNotEmpty
+          ? _error
+          : (result!.error.isNotEmpty ? result.error : '预览失败');
+      return Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '读取失败：$reason',
+              key: const ValueKey('deliverable-preview-error'),
+              style: TextStyle(fontSize: 12.5, color: context.c.danger, height: 1.35),
+            ),
+            const SizedBox(height: 8),
+            TextButton.icon(
+              onPressed: _retry,
+              icon: Icon(Icons.refresh_rounded, size: 16, color: context.c.accent),
+              label: Text('重试', style: TextStyle(fontSize: 12, color: context.c.accent)),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (result.binary) {
+      // **不渲染字节**：把 PNG/xlsx 的字节塞进文本视图只会得到一屏乱码，它对
+      // 用户零信息，还会让人以为"文件坏了"。给一句说明 + 底部的下载出口。
+      return Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(Icons.description_outlined, size: 26, color: context.c.textTertiary),
+            const SizedBox(height: 8),
+            Text(
+              result.note.isNotEmpty ? result.note : '这是二进制文件，无法在手机上按文本预览。',
+              key: const ValueKey('deliverable-preview-binary'),
+              style: TextStyle(fontSize: 12.5, color: context.c.textSecondary, height: 1.4),
+            ),
+            if (result.size != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text('文件大小 ${_bytes(result.size!)}',
+                    style: TextStyle(fontSize: 11.5, color: context.c.textTertiary)),
+              ),
+            const SizedBox(height: 6),
+            Text('用下载按钮在其它应用里打开。', style: TextStyle(fontSize: 11.5, color: context.c.textTertiary)),
+          ],
+        ),
+      );
+    }
+
+    final content = result.content ?? '';
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (result.truncated)
+            // 截断必须说在前面：用户会把预览当成全文来下判断，而它只是前一段。
+            Container(
+              key: const ValueKey('deliverable-preview-truncated'),
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+              decoration: BoxDecoration(
+                color: context.c.warningSurface,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: context.c.warningBorder),
+              ),
+              child: Text(
+                '只显示开头的一部分${result.size != null ? '（文件共 ${_bytes(result.size!)}）' : ''}，'
+                '完整内容请下载后用其它应用打开。',
+                style: TextStyle(fontSize: 11.5, color: context.c.warning, height: 1.35),
+              ),
+            ),
+          if (result.isMarkdown)
+            // 交付物里 .md 很常见，而它是唯一"排版本身就是信息"的类型。
+            SafeMarkdown(data: content)
+          else
+            // 其余按纯文本等宽渲染：csv/日志/源码的对齐在等宽下才读得出来。
+            SelectableText(
+              content,
+              style: TextStyle(
+                fontSize: 12,
+                fontFamily: 'monospace',
+                height: 1.45,
+                color: context.c.textPrimary,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
 /// diff 面板：先异步取 hunk，再逐行渲染。加载中/空/二进制都有明确文案。
 ///
 /// 从旧的任务页原样迁移过来 —— 它是这一堆只读视图里唯一"内容一定很长"的地方，
@@ -1106,6 +1830,258 @@ class _DiffSheetState extends State<_DiffSheet> {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// 一个后台任务的输出查看器（引擎 `job/follow` 流）。
+///
+/// 为什么是"轮询追加"而不是长连接：引擎的 `job/follow` 是一条流（`opened` →
+/// 若干 `output` → 终结 `status`），而 App 到网关只有 HTTP 请求/响应。网关把一次
+/// 轮询实现成受限帧收集，所以这里拿到的永远是"到目前为止的增量 + 下一个游标"。
+///
+/// 两条必须逐字遵守的诚实性约束（都来自引擎自己的语义）：
+///   1. `settled` 只在**真的收到终结 `status` 帧**时为真。活着的任务没有那一帧，
+///      所以"没动静"绝不能被读成"已结束"。
+///   2. `lossy` 为真表示环的头部已被丢弃（生产者或保留策略）。此时日志是**不完整
+///      的**，界面必须明说，不能把残片当成完整日志展示。
+class _JobLogSheet extends StatefulWidget {
+  final JobItem job;
+  final Future<JobOutputChunk> Function(JobItem job, int? from) load;
+
+  const _JobLogSheet({required this.job, required this.load});
+
+  @override
+  State<_JobLogSheet> createState() => _JobLogSheetState();
+}
+
+class _JobLogSheetState extends State<_JobLogSheet> {
+  final List<JobLogLine> _lines = [];
+  final ScrollController _scroll = ScrollController();
+  Timer? _poll;
+
+  bool _loading = true;
+  bool _busy = false;
+  bool _lossy = false;
+  bool _settled = false;
+  int? _next;
+  String _error = '';
+  JobItem _job;
+
+  _JobLogSheetState() : _job = const JobItem(id: '', kind: '', label: '', status: 'running');
+
+  @override
+  void initState() {
+    super.initState();
+    _job = widget.job;
+    _refresh(initial: true);
+    // 活着的任务每 2 秒追一次增量；结束的任务没有新输出可追，不浪费请求。
+    _poll = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (_settled || _busy || !mounted) return;
+      _refresh();
+    });
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  Future<void> _refresh({bool initial = false}) async {
+    if (_busy) return;
+    _busy = true;
+    try {
+      // 首次不带 `from`（从环里最早保留的字节开始）；此后带上一次的 `next`。
+      // `_next` 为 null 时（引擎没报偏移）不敢编一个，退回从头读。
+      final chunk = await widget.load(_job, initial ? null : _next);
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        if (!chunk.ok) {
+          _error = chunk.error.isEmpty ? '读取失败' : chunk.error;
+          return;
+        }
+        _error = '';
+        if (chunk.lines.isNotEmpty) _lines.addAll(chunk.lines);
+        if (chunk.next != null) _next = chunk.next;
+        if (chunk.lossy) _lossy = true;
+        if (chunk.settled) _settled = true;
+        if (chunk.job != null) _job = chunk.job!;
+      });
+      if (_settled) _poll?.cancel();
+      _autoScroll();
+    } finally {
+      _busy = false;
+    }
+  }
+
+  void _autoScroll() {
+    if (!_scroll.hasClients) return;
+    // 追加后滚到底：看日志的人关心的是最新一行（历史可以往上翻）。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scroll.hasClients) return;
+      _scroll.jumpTo(_scroll.position.maxScrollExtent);
+    });
+  }
+
+  Color _channelColor(BuildContext context, String channel) {
+    switch (channel) {
+      case 'stderr':
+        return context.c.danger;
+      case 'log':
+        return context.c.textSecondary;
+      default:
+        return context.c.textPrimary;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final title = _job.label.isEmpty ? _job.id : _job.label;
+    return Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: SizedBox(
+        height: MediaQuery.of(context).size.height * 0.72,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 8, 6),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          title,
+                          style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          [
+                            if (_job.kind.isNotEmpty) _job.kind,
+                            _job.statusLabel,
+                            // 未结束就明说"跟随中"，避免用户以为日志到此为止。
+                            if (!_settled) '跟随中（每 2 秒追加）',
+                          ].join(' · '),
+                          style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: '立即刷新',
+                    onPressed: _busy ? null : () => _refresh(),
+                    icon: Icon(Icons.refresh_rounded, size: 20, color: context.c.accent),
+                  ),
+                  IconButton(
+                    tooltip: '关闭',
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: Icon(Icons.close_rounded, size: 20, color: context.c.textSecondary),
+                  ),
+                ],
+              ),
+            ),
+            // lossy 横幅：日志不完整这一事实必须一直在视野里，而不是只在某一帧闪现。
+            if (_lossy)
+              Container(
+                width: double.infinity,
+                margin: const EdgeInsets.symmetric(horizontal: 16),
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                decoration: BoxDecoration(
+                  color: context.c.warningSurface,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: context.c.warningBorder),
+                ),
+                child: Text(
+                  '日志开头部分已被丢弃（超出保留窗口），下面是仍保留的片段 —— 这不是完整日志。',
+                  style: TextStyle(fontSize: 11, color: context.c.warning, height: 1.35),
+                ),
+              ),
+            if (_job.outputHeadLost && !_lossy)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+                child: Text(
+                  '引擎报告最早可读偏移为 ${_job.outputEarliest}，之前的内容已不在环内。',
+                  style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                ),
+              ),
+            const SizedBox(height: 6),
+            Expanded(child: _buildBody(context)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBody(BuildContext context) {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error.isNotEmpty && _lines.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(_error, style: TextStyle(fontSize: 12.5, color: context.c.danger)),
+            const SizedBox(height: 10),
+            OutlinedButton(onPressed: () => _refresh(), child: const Text('重试')),
+          ],
+        ),
+      );
+    }
+    if (_lines.isEmpty) {
+      // 空 ≠ 失败，也 ≠ 完成：分别说清。
+      return Center(
+        child: Text(
+          _settled ? '该任务没有产生输出。' : '暂时还没有输出。',
+          style: TextStyle(fontSize: 12.5, color: context.c.textSecondary),
+        ),
+      );
+    }
+
+    return ListView.builder(
+      controller: _scroll,
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      itemCount: _lines.length + (_error.isNotEmpty ? 1 : 0),
+      itemBuilder: (_, i) {
+        if (i == _lines.length) {
+          return Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text('追加失败：$_error', style: TextStyle(fontSize: 11, color: context.c.danger)),
+          );
+        }
+        final line = _lines[i];
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // gapBefore：这一行之前的字节丢了。画一条明确的断口，而不是让两段
+            // 不相邻的输出看起来是接着的。
+            if (line.gapBefore)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Text(
+                  '—— 此处有丢失的字节 ——',
+                  style: TextStyle(fontSize: 10, color: context.c.warning, fontStyle: FontStyle.italic),
+                ),
+              ),
+            SelectableText(
+              line.text,
+              style: TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 11.5,
+                height: 1.35,
+                color: _channelColor(context, line.channel),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }

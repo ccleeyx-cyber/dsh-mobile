@@ -5,6 +5,7 @@ import '../models/audit_log.dart';
 import '../models/approval_preset.dart';
 import '../models/permission_config.dart';
 import '../services/dsh_service.dart';
+import 'approval_presets_view.dart';
 import '../theme/app_colors.dart';
 
 class SecurityPermissionsView extends StatefulWidget {
@@ -352,6 +353,35 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
         ),
         const SizedBox(height: 10),
         ...ApprovalPreset.values.map((p) => _buildPresetTile(context, dsh, permissions, p, current)),
+        // [feat 2026-10-13] 自定义预设入口。
+        //
+        // 上面四档是 App 内置的**已审阅组合**（它们之所以值当，是因为随包发布的那段
+        // 说明文字），网关刻意不存储它们；能存到网关的只有用户自己写的档。所以这里是
+        // 一个单独的二级页，而不是把自定义档混进同一列表 —— 两者的可信度不同。
+        const SizedBox(height: 6),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton.icon(
+            onPressed: () async {
+              await Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const ApprovalPresetsView()),
+              );
+              // 回来必须重读：这一页可能刚被删掉了自定义档。
+              if (!context.mounted) return;
+              await dsh.fetchPermissions();
+            },
+            icon: Icon(Icons.tune_rounded, size: 18, color: context.c.purple),
+            label: Text(
+              '自定义预设（可编辑 / 删除）',
+              style: TextStyle(fontSize: 12.5, color: context.c.purple),
+            ),
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+        ),
       ],
     );
   }

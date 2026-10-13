@@ -23,6 +23,7 @@ import '../models/audit_log.dart';
 import '../models/persona.dart';
 import '../models/gateway_features.dart';
 import '../models/task_center.dart';
+import '../models/bridge_extras.dart';
 
 enum ConnectionStatus {
   disconnected,
@@ -2435,6 +2436,20 @@ class DshService extends ChangeNotifier {
   String _workspaceChangesReason = '';
   bool _workspaceChangesAvailable = false;
 
+  /// [feat 2026-10-13] Where the change rows came from, and what git could not
+  /// answer. The gateway distinguishes `git`, `git+tool-calls` and `tool-calls`;
+  /// the panel needs that to explain a row with no line counts instead of
+  /// rendering a fake "+0 −0".
+  String _workspaceChangesSource = '';
+
+  /// [feat 2026-10-13] Repositories adjacent to a non-repo workspace, so the
+  /// panel can offer them rather than an empty screen. Empty when the cwd is a
+  /// repository or nothing was found.
+  List<RepoCandidate> _workspaceRepos = const <RepoCandidate>[];
+
+  /// [feat 2026-10-13] The gateway's one-line explanation for an empty git view.
+  String _workspaceChangesNote = '';
+
   /// 变更清单的可见性三态（同 [queueKnown] 语义）。
   bool? _changesKnown;
 
@@ -2498,6 +2513,20 @@ class DshService extends ChangeNotifier {
   String get workspaceChangesReason => _workspaceChangesReason;
   bool get workspaceChangesAvailable => _workspaceChangesAvailable;
 
+  /// 'git' | 'git+tool-calls' | 'tool-calls' | '' (unknown).
+  String get workspaceChangesSource => _workspaceChangesSource;
+
+  /// Adjacent repositories when the workspace is not itself one.
+  List<RepoCandidate> get workspaceRepos => _workspaceRepos;
+
+  /// Gateway prose explaining an empty or partial change list.
+  String get workspaceChangesNote => _workspaceChangesNote;
+
+  /// True when at least one row came from the session log rather than git, so
+  /// its line counts are genuinely unknown (render "—", never "+0 −0").
+  bool get changesIncludeToolCallRows =>
+      _workspaceChangesSource == 'tool-calls' || _workspaceChangesSource == 'git+tool-calls';
+
   /// 变更文件数：拉到了、且可列（git 仓库）时才有值，否则 null（隐藏）。
   int? get changeCount =>
       (_changesKnown == true && _workspaceChangesAvailable) ? _workspaceChanges.length : null;
@@ -2549,6 +2578,9 @@ class DshService extends ChangeNotifier {
     _workspaceChanges = [];
     _workspaceChangesReason = '';
     _workspaceChangesAvailable = false;
+    _workspaceChangesSource = '';
+    _workspaceChangesNote = '';
+    _workspaceRepos = const <RepoCandidate>[];
     _changesKnown = null;
     _changesDirty = false;
     _schedules = [];
@@ -2954,6 +2986,17 @@ class DshService extends ChangeNotifier {
             : const <WorkspaceChange>[];
         _workspaceChangesAvailable = data['available'] == true;
         _workspaceChangesReason = data['reason']?.toString() ?? '';
+        // [feat 2026-10-13] Provenance + the reasons git could not answer.
+        _workspaceChangesSource = data['source']?.toString() ?? '';
+        _workspaceChangesNote = data['note']?.toString() ?? '';
+        final repos = data['repoCandidates'];
+        _workspaceRepos = repos is List
+            ? repos
+                .whereType<Map>()
+                .map((e) => RepoCandidate.fromJson(Map<String, dynamic>.from(e)))
+                .where((r) => r.name.isNotEmpty)
+                .toList(growable: false)
+            : const <RepoCandidate>[];
         // 只有真拿到 `files` 才算"读过"：否则"读不到"会被当成"工作区干净"。
         _changesKnown = raw is List;
         notifyListeners();
@@ -3072,25 +3115,101 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  Future<bool> killJob(String jobId) async {
+  /// 请求停止一个后台任务（v1.16 改：这是引擎的**真实**停止接口）。
+  ///
+  /// ⚠️ 更正（2026-10-13）：上一版把这个动作写成"交给 Agent 中介"，理由是据称
+  /// 引擎没有停止作业的 Remote。该结论是错的 —— 它来自一个跳过了嵌套
+  /// `node_modules` 的包扫描，因此漏掉了
+  /// `@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-api-job-controller`：真实的
+  /// `job/kill(request:{sessionId, jobId})` 就声明在那里，向运行中的引擎直接验证
+  /// 也确认它确实被服务（会回真正的引擎错误 `unknown job …`）。所以中介逻辑已删除。
+  ///
+  /// 引擎回执 `requested` 是**已受理**而非**已终止**：生产者的 `cancel` 是异步的，
+  /// 紧随其后的一次列表读取里任务仍可能是活的 —— 界面不能声称已经终止。
+  /// `already-finished` 折成 [JobStopResult.alreadySettled]（无需停止，不是故障）。
+  Future<JobStopResult> stopJob(String jobId) async {
     final sessionId = _currentSession?.sessionId;
-    if (_currentConfig == null || sessionId == null || jobId.isEmpty) return false;
+    if (_currentConfig == null || sessionId == null || jobId.isEmpty) {
+      return const JobStopResult(ok: false, error: '未连接');
+    }
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/jobs/kill');
       final res = await _httpClient.post(
         url,
         headers: _authHeaders,
         body: jsonEncode({'sessionId': sessionId, 'jobId': jobId}),
-      ).timeout(const Duration(seconds: 10));
-      if (_checkResponseAuth(res)) return false;
+      ).timeout(const Duration(seconds: 20));
+      if (_checkResponseAuth(res)) return const JobStopResult(ok: false, error: '鉴权失败');
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
       if (res.statusCode == 200) {
         await fetchJobs();
-        return true;
+        return JobStopResult(ok: true, outcome: body['outcome']?.toString() ?? 'requested');
       }
-      return false;
+      if (res.statusCode == 409) {
+        // 任务已经结束：刷新一次列表即可，不必报错。
+        await fetchJobs();
+        return JobStopResult(
+          ok: false,
+          outcome: 'already-finished',
+          alreadySettled: true,
+          error: body['error']?.toString() ?? '该任务已结束',
+        );
+      }
+      if (res.statusCode == 404) {
+        await fetchJobs();
+        return JobStopResult(
+          ok: false,
+          notFound: true,
+          error: body['error']?.toString() ?? '该任务不在本会话的可停止列表中',
+        );
+      }
+      return JobStopResult(ok: false, error: body['error']?.toString() ?? 'HTTP ${res.statusCode}');
     } catch (e) {
-      debugPrint('[DshService] killJob error: $e');
-      return false;
+      debugPrint('[DshService] stopJob error: $e');
+      return const JobStopResult(ok: false, error: '请求失败或超时');
+    }
+  }
+
+  /// 读取一个后台任务的输出（引擎 `job/follow` 流的一次轮询）。
+  ///
+  /// `from` 是续读游标：不传就从环里最早保留的字节开始，返回里的 `next` 供下一次
+  /// 轮询使用。网关把它实现为受限帧收集（收到终结 `status` 帧、达到帧上限、或空闲
+  /// 超时即返回），所以一个**仍在运行**的任务会立刻把"到目前为止"的输出交出来，
+  /// 而不是把这个 HTTP 请求挂到任务结束 —— 那可能是几小时后。
+  ///
+  /// `lossy` 必须原样呈现：引擎可能已经丢弃了环的头部（或被保留策略裁掉），此时
+  /// 界面必须说明"开头部分已丢失"，绝不能把不完整的日志当成完整日志展示。
+  Future<JobOutputChunk> fetchJobOutput(String jobId, {int? from}) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null || jobId.isEmpty) {
+      return const JobOutputChunk(ok: false, error: '未连接');
+    }
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/jobs/follow').replace(
+        queryParameters: {
+          'sessionId': sessionId,
+          'jobId': jobId,
+          if (from != null) 'from': '$from',
+        },
+      );
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 25));
+      if (_checkResponseAuth(res)) return const JobOutputChunk(ok: false, error: '鉴权失败');
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      if (res.statusCode == 200) return JobOutputChunk.fromJson(body);
+      final parsed = JobOutputChunk.fromJson(body);
+      return JobOutputChunk(
+        ok: false,
+        next: from,
+        settled: parsed.settled,
+        error: parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error,
+      );
+    } catch (e) {
+      debugPrint('[DshService] fetchJobOutput error: $e');
+      return const JobOutputChunk(ok: false, error: '请求失败或超时');
     }
   }
 
@@ -3199,6 +3318,452 @@ class DshService extends ChangeNotifier {
     } catch (e) {
       debugPrint('[DshService] controlGoal error: $e');
       return false;
+    }
+  }
+
+  // ---- v1.16 bridge extensions (P0/P1, 2026-10-13) ----
+  //
+  // Design note that governs every method below: unlike the v1.13 task-center
+  // fetches, these do **not** write into service-wide fields. The v1.13 fetch
+  // family stores into `_jobs` / `_workspaceChanges` / … and notifies listeners
+  // on every poll, which was fine for one panel but would turn a file browser
+  // into a rebuild storm — every directory tap would rebuild the whole chat
+  // subtree. So each method here is a **stateless request** that returns its
+  // result; the page that opened it owns the state. The three genuinely
+  // session-scoped reads that already existed (deliverables, jobs, changes) keep
+  // their fields and are simply extended.
+  //
+  // Every method also honours the auth-failure hook (`_checkResponseAuth`) and
+  // returns the null/empty/`ok:false` shape of its type rather than throwing, so
+  // a page can render a reason instead of an exception screen.
+
+  /// Repositories the current session's workspace maps to (P0-1).
+  ///
+  /// Null means "could not ask" (no config, no session, transport failure) —
+  /// which is deliberately different from `available: false`, i.e. "asked and
+  /// there is no repository". The panel renders those two states differently.
+  Future<WorkspaceRepos?> fetchWorkspaceRepos() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return null;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/repos')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
+      if (_checkResponseAuth(res)) return null;
+      if (res.statusCode != 200) return null;
+      return WorkspaceRepos.fromJson(Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes))));
+    } catch (e) {
+      debugPrint('[DshService] fetchWorkspaceRepos error: $e');
+      return null;
+    }
+  }
+
+  /// The whitelisted command catalog (P1-5).
+  ///
+  /// Not session-scoped: the catalog is a server-side constant, so it is fetched
+  /// once per panel open rather than per session. An empty list is a real
+  /// answer ("no commands configured"), so callers must not treat it as an error.
+  Future<List<QuickCommandInfo>> fetchQuickCommands() async {
+    if (_currentConfig == null) return const [];
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/quick-commands');
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return const [];
+      if (res.statusCode != 200) return const [];
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      final raw = data['commands'];
+      return raw is List
+          ? raw
+              .whereType<Map>()
+              .map((e) => QuickCommandInfo.fromJson(Map<String, dynamic>.from(e)))
+              .where((c) => c.id.isNotEmpty)
+              .toList(growable: false)
+          : const <QuickCommandInfo>[];
+    } catch (e) {
+      debugPrint('[DshService] fetchQuickCommands error: $e');
+      return const [];
+    }
+  }
+
+  /// Run one whitelisted command in the session workspace (P1-5).
+  ///
+  /// Only the catalogue id crosses the wire; the gateway resolves it to a fixed
+  /// argv. There is no parameter to inject because none exists.
+  Future<QuickCommandResult> runQuickCommand(
+    String id, {
+    Duration timeout = const Duration(seconds: 40),
+  }) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null || id.isEmpty) {
+      return const QuickCommandResult(ok: false, error: '没有可用的会话');
+    }
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/quick-commands/run');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'sessionId': sessionId, 'id': id}),
+      ).timeout(timeout);
+      if (_checkResponseAuth(res)) return const QuickCommandResult(ok: false, error: '鉴权失败');
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      final parsed = QuickCommandResult.fromJson(body);
+      if (res.statusCode == 200) return parsed;
+      // Non-200 keeps `ok:false` and surfaces the gateway's reason, which is
+      // actionable ("该会话没有可用的工作目录") where a bare status is not.
+      return QuickCommandResult(ok: false, id: id, error: parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
+    } catch (e) {
+      debugPrint('[DshService] runQuickCommand error: $e');
+      return const QuickCommandResult(ok: false, error: '请求失败或超时');
+    }
+  }
+
+  /// List one workspace directory (P1-9). Read-only by construction.
+  Future<FsListing> fsList(String relPath) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) {
+      return const FsListing(ok: false, error: '没有可用的会话');
+    }
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/fs/list')
+          .replace(queryParameters: {'sessionId': sessionId, if (relPath.isNotEmpty) 'path': relPath});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
+      if (_checkResponseAuth(res)) return const FsListing(ok: false, error: '鉴权失败');
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      final parsed = FsListing.fromJson(body);
+      if (res.statusCode == 200) return parsed;
+      return FsListing(ok: false, path: relPath, error: parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
+    } catch (e) {
+      debugPrint('[DshService] fsList error: $e');
+      return const FsListing(ok: false, error: '请求失败或超时');
+    }
+  }
+
+  /// Read one workspace file, capped by the gateway (P1-9).
+  Future<TextFileContent> fsRead(String relPath) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) {
+      return const TextFileContent(ok: false, error: '没有可用的会话');
+    }
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/fs/read')
+          .replace(queryParameters: {'sessionId': sessionId, 'path': relPath});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
+      if (_checkResponseAuth(res)) return const TextFileContent(ok: false, error: '鉴权失败');
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      final parsed = TextFileContent.fromJson(body);
+      if (res.statusCode == 200) return parsed;
+      return TextFileContent(ok: false, path: relPath, error: parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
+    } catch (e) {
+      debugPrint('[DshService] fsRead error: $e');
+      return const TextFileContent(ok: false, error: '请求失败或超时');
+    }
+  }
+
+  /// Text preview of one declared deliverable (P0-4).
+  ///
+  /// Membership is enforced by the gateway against the same set the download
+  /// route uses, so a path the session never presented is refused with 403
+  /// rather than served.
+  Future<TextFileContent> fetchDeliverableText(String path) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null || path.isEmpty) {
+      return const TextFileContent(ok: false, error: '没有可用的会话');
+    }
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/deliverables/text')
+          .replace(queryParameters: {'sessionId': sessionId, 'path': path});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 20));
+      if (_checkResponseAuth(res)) return const TextFileContent(ok: false, error: '鉴权失败');
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      final parsed = TextFileContent.fromJson(body);
+      if (res.statusCode == 200) return parsed;
+      return TextFileContent(ok: false, path: path, error: parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
+    } catch (e) {
+      debugPrint('[DshService] fetchDeliverableText error: $e');
+      return const TextFileContent(ok: false, error: '请求失败或超时');
+    }
+  }
+
+  /// Custom approval presets stored on the gateway (P0-2).
+  ///
+  /// Returns null on "could not ask". The built-in presets live in the App as a
+  /// Dart enum and are merged by the caller, so this list is customs only.
+  Future<List<ApprovalPresetInfo>?> fetchApprovalPresets() async {
+    if (_currentConfig == null) return null;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approval-presets');
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return null;
+      if (res.statusCode != 200) return null;
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      final raw = data['presets'];
+      return raw is List
+          ? raw
+              .whereType<Map>()
+              .map((e) => ApprovalPresetInfo.fromJson(Map<String, dynamic>.from(e)))
+              .where((p) => p.id.isNotEmpty)
+              .toList(growable: false)
+          : const <ApprovalPresetInfo>[];
+    } catch (e) {
+      debugPrint('[DshService] fetchApprovalPresets error: $e');
+      return null;
+    }
+  }
+
+  /// Create or update one custom preset. Returns the gateway's error text, or
+  /// null on success — the editor shows the reason inline.
+  Future<String?> saveApprovalPreset({
+    String? id,
+    required String label,
+    required String summary,
+    required PresetConfig config,
+  }) async {
+    if (_currentConfig == null) return '未连接';
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approval-presets/save');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({
+          if (id != null && id.isNotEmpty) 'id': id,
+          'label': label,
+          'summary': summary,
+          'config': config.toJson(),
+        }),
+      ).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return '鉴权失败';
+      if (res.statusCode == 200) return null;
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      return body['error']?.toString() ?? 'HTTP ${res.statusCode}';
+    } catch (e) {
+      debugPrint('[DshService] saveApprovalPreset error: $e');
+      return '请求失败或超时';
+    }
+  }
+
+  /// Delete one custom preset. Built-in ids are refused by the gateway.
+  Future<String?> deleteApprovalPreset(String id) async {
+    if (_currentConfig == null) return '未连接';
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approval-presets/delete');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'id': id}),
+      ).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return '鉴权失败';
+      if (res.statusCode == 200) return null;
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      return body['error']?.toString() ?? 'HTTP ${res.statusCode}';
+    } catch (e) {
+      debugPrint('[DshService] deleteApprovalPreset error: $e');
+      return '请求失败或超时';
+    }
+  }
+
+  /// Mint a fresh ntfy topic on the gateway and turn push on (P0-3).
+  ///
+  /// The topic is random by design: ntfy topics are public by name, so a
+  /// memorable default would publish every approval prompt to whoever guessed
+  /// it. Null means the call failed; the settings page then keeps the manual
+  /// fields as the fallback path.
+  Future<PushTopicResult?> autoConfigurePushTopic({String? url}) async {
+    if (_currentConfig == null) return null;
+    try {
+      final target = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/auto-topic');
+      final res = await _httpClient.post(
+        target,
+        headers: _authHeaders,
+        body: jsonEncode({if (url != null && url.trim().isNotEmpty) 'url': url.trim()}),
+      ).timeout(const Duration(seconds: 15));
+      if (_checkResponseAuth(res)) return null;
+      if (res.statusCode != 200) return null;
+      final parsed = PushTopicResult.fromJson(Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes))));
+      // Keep the cached config in step so the settings card redraws immediately.
+      _pushConfig = PushConfig(
+        enabled: parsed.enabled,
+        url: parsed.url,
+        topic: parsed.topic,
+        hasToken: parsed.hasToken,
+      );
+      notifyListeners();
+      return parsed;
+    } catch (e) {
+      debugPrint('[DshService] autoConfigurePushTopic error: $e');
+      return null;
+    }
+  }
+
+  /// Full goal board state for the current session (P1-7).
+  Future<GoalBoard?> fetchGoalBoard() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return null;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/goals')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return null;
+      if (res.statusCode != 200) return null;
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      final goal = data['goal'];
+      if (goal is! Map) return null;
+      return GoalBoard.fromJson(Map<String, dynamic>.from(goal));
+    } catch (e) {
+      debugPrint('[DshService] fetchGoalBoard error: $e');
+      return null;
+    }
+  }
+
+  /// Create a goal from the phone (`goals/create`). Returns an error or null.
+  Future<String?> createGoal(String objective, {int? maxGoalRounds}) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return '未连接';
+    final text = objective.trim();
+    if (text.isEmpty) return '目标描述不能为空';
+    if (text.length > 2000) return '目标描述过长（上限 2000 字）';
+    if (maxGoalRounds != null && maxGoalRounds <= 0) return '轮数上限必须为正整数';
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/goals/create');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({
+          'sessionId': sessionId,
+          'objective': text,
+          if (maxGoalRounds != null) 'maxGoalRounds': maxGoalRounds,
+        }),
+      ).timeout(const Duration(seconds: 15));
+      if (_checkResponseAuth(res)) return '鉴权失败';
+      if (res.statusCode == 200) {
+        await fetchSessionStats();
+        return null;
+      }
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      return body['error']?.toString() ?? 'HTTP ${res.statusCode}';
+    } catch (e) {
+      debugPrint('[DshService] createGoal error: $e');
+      return '请求失败或超时';
+    }
+  }
+
+  /// Edit the current goal's objective and/or round cap (`goals/edit`).
+  ///
+  /// The CAS ref is mandatory: every durable mutation increments `revision`, so
+  /// an edit sent with a stale one must fail rather than overwrite a newer goal.
+  Future<String?> editGoal({
+    required String goalId,
+    required int revision,
+    String? objective,
+    int? maxGoalRounds,
+  }) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return '未连接';
+    if (goalId.isEmpty || revision <= 0) return '缺少目标 ref（id/revision）';
+    if ((objective == null || objective.trim().isEmpty) && maxGoalRounds == null) {
+      return '至少要改一项（目标描述或轮数上限）';
+    }
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/goals/edit');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({
+          'sessionId': sessionId,
+          'goalId': goalId,
+          'revision': revision,
+          if (objective != null && objective.trim().isNotEmpty) 'objective': objective.trim(),
+          if (maxGoalRounds != null) 'maxGoalRounds': maxGoalRounds,
+        }),
+      ).timeout(const Duration(seconds: 15));
+      if (_checkResponseAuth(res)) return '鉴权失败';
+      if (res.statusCode == 200) {
+        await fetchSessionStats();
+        return null;
+      }
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      return body['error']?.toString() ?? 'HTTP ${res.statusCode}';
+    } catch (e) {
+      debugPrint('[DshService] editGoal error: $e');
+      return '请求失败或超时';
+    }
+  }
+
+  /// Turn boundaries the current session can be forked from (P1-8).
+  Future<List<SessionCheckpoint>> fetchCheckpoints() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return const [];
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/checkpoints')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 30));
+      if (_checkResponseAuth(res)) return const [];
+      if (res.statusCode != 200) return const [];
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      final raw = data['checkpoints'];
+      return raw is List
+          ? raw
+              .whereType<Map>()
+              .map((e) => SessionCheckpoint.fromJson(Map<String, dynamic>.from(e)))
+              .where((c) => c.seq != null)
+              .toList(growable: false)
+          : const <SessionCheckpoint>[];
+    } catch (e) {
+      debugPrint('[DshService] fetchCheckpoints error: $e');
+      return const [];
+    }
+  }
+
+  /// Fork the current session from a completed turn (`session/fork`).
+  ///
+  /// Returns the new session id, or an error string. A null `atSeq` forks the
+  /// whole session. `fork-unavailable` (409) means the referenced turn never
+  /// completed; the picker prevents that case, and this surfaces it if it slips
+  /// through.
+  Future<ForkOutcome> forkSession({int? atSeq}) async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) {
+      return const ForkOutcome(ok: false, error: '未连接');
+    }
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/fork');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'sessionId': sessionId, if (atSeq != null) 'atSeq': atSeq}),
+      ).timeout(const Duration(seconds: 30));
+      if (_checkResponseAuth(res)) return const ForkOutcome(ok: false, error: '鉴权失败');
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      if (res.statusCode == 200) {
+        final newId = body['sessionId']?.toString() ?? '';
+        if (newId.isEmpty) return const ForkOutcome(ok: false, error: '引擎未返回新会话 id');
+        return ForkOutcome(ok: true, sessionId: newId);
+      }
+      return ForkOutcome(
+        ok: false,
+        error: body['error']?.toString() ?? 'HTTP ${res.statusCode}',
+        unavailable: res.statusCode == 409,
+      );
+    } catch (e) {
+      debugPrint('[DshService] forkSession error: $e');
+      return const ForkOutcome(ok: false, error: '请求失败或超时');
     }
   }
 

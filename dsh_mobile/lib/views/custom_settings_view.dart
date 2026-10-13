@@ -8,6 +8,7 @@ import '../services/dsh_service.dart';
 import '../services/platform_services.dart';
 import 'config_page.dart';
 import 'gateway_health_view.dart';
+import 'push_setup_view.dart';
 import '../theme/app_colors.dart';
 import '../main.dart';
 
@@ -384,6 +385,29 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
           ),
           const SizedBox(height: 10),
           _buildPushRequirementNote(context),
+          // [feat 2026-10-13] 一键生成的入口。
+          //
+          // 为什么必须在这里给一个按钮：ntfy 的 topic 是**按名字公开**的，可猜的名字
+          // 等于把每一条审批/提问广播给猜中的人，所以正确做法是用随机串；而随机的
+          // 20 位串没人愿意手打。下面对话框里既有一键生成，也有随机串的订阅深链。
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const PushSetupView()),
+              ),
+              icon: Icon(Icons.qr_code_2_rounded, size: 18, color: context.c.accent),
+              label: Text(
+                '一键生成随机 topic / 订阅链接',
+                style: TextStyle(fontSize: 12.5, color: context.c.accent),
+              ),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+            ),
+          ),
           const SizedBox(height: 12),
           TextField(
             key: CustomSettingsView.pushUrlFieldKey,

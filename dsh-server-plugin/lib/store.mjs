@@ -321,6 +321,72 @@ export function saveDevices(state) {
   return true;
 }
 
+/* ------------------------------------------------------------------ *
+ * custom approval presets (P0-2, 2026-10-13)
+ *
+ * The four built-in presets ("严格 / 均衡 / 自主 / 完全信任") live in the App as a
+ * Dart enum and are deliberately NOT stored here: their whole value is the
+ * reviewed prose that ships with the binary, and a stale copy on the host could
+ * disagree with the app about what a preset means. Only *user-authored*
+ * presets are persisted, so the host holds no opinion about the built-ins.
+ *
+ * Persisted at `~/.dsh/mobile-access/approval-presets.json`, next to
+ * permissions.json — a preset only ever becomes a live setting by being applied
+ * through the existing permissions route, so keeping them together makes the
+ * "what can change my policy" surface one directory.
+ * ------------------------------------------------------------------ */
+
+const PRESETS_FILE_NAME = 'approval-presets.json';
+const MAX_CUSTOM_PRESETS = 20;
+
+/** Ids the App owns. A custom preset must never shadow one. */
+export const RESERVED_PRESET_IDS = ['strict', 'balanced', 'autonomous', 'trusted'];
+
+function presetsFile() {
+  return path.join(permissionsDir(), PRESETS_FILE_NAME);
+}
+
+export function loadPresets() {
+  ensurePermissionsDir();
+  const f = presetsFile();
+  if (!fs.existsSync(f)) return { version: 1, presets: [] };
+  try {
+    const raw = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (!raw || typeof raw !== 'object') return { version: 1, presets: [] };
+    return {
+      version: raw.version ?? 1,
+      presets: Array.isArray(raw.presets) ? raw.presets : []
+    };
+  } catch {
+    return { version: 1, presets: [] };
+  }
+}
+
+export function savePresets(state) {
+  ensurePermissionsDir();
+  const presets = Array.isArray(state?.presets) ? state.presets.slice(0, MAX_CUSTOM_PRESETS) : [];
+  const payload = { version: 1, presets };
+  const target = presetsFile();
+  const tmp = path.join(permissionsDir(), `${PRESETS_FILE_NAME}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+    try {
+      fs.renameSync(tmp, target);
+    } catch {
+      fs.copyFileSync(tmp, target);
+      try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+    }
+  } catch (err) {
+    console.error('[Store] savePresets error:', err);
+    return false;
+  }
+  return true;
+}
+
+export function maxCustomPresets() {
+  return MAX_CUSTOM_PRESETS;
+}
+
 /** Record that a device just talked to the bridge. */
 export function touchDevice(deviceId, ip = '') {
   const state = loadDevices();

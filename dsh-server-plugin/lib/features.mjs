@@ -28,6 +28,8 @@ import {
   isFailedTurnEnd
 } from './core.mjs';
 
+import { orderJobs, summarizeJobFollow } from './extensions.mjs';
+
 /* ------------------------------------------------------------------ *
  * 1. Queue / steer (running-session input)
  * ------------------------------------------------------------------ */
@@ -1176,6 +1178,8 @@ export const FEATURE_ROUTES = [
   ['GET', '/api/mobile/schedules'],
   ['POST', '/api/mobile/schedules/delete'],
   ['GET', '/api/mobile/jobs'],
+  // [feat 2026-10-13] one job's output ring, resumable by byte offset (engine RPC: job/follow)
+  ['GET', '/api/mobile/jobs/follow'],
   ['POST', '/api/mobile/jobs/kill'],
   ['GET', '/api/mobile/deliverables'],
   ['GET', '/api/mobile/deliverables/download'],
@@ -1309,42 +1313,124 @@ export async function handleFeatureRoute(deps) {
     return true;
   }
 
-  /* ---- background jobs ---- */
+  /* ---- background jobs ----
+   *
+   * ⚠️ CORRECTION (2026-10-13, later the same day). An earlier revision of this
+   * file claimed `job/list` does not exist and rerouted this to
+   * `session/control`. That claim was WRONG, and it came from a scanner that
+   * skipped nested `node_modules` — which hid
+   * `@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-api-job-controller`, the sole
+   * declarer of the `job` namespace. Verified against the RUNNING engine by
+   * speaking its RPC protocol directly — a signed cookie plus
+   * `POST /api/<method>`, the same transport `createRpcCaller` uses:
+   * `job/list`, `job/follow` and `job/kill` are all served, and a production
+   * `job/kill` answers a real engine error (`unknown job …`) rather than a
+   * routing 404. The original call here was correct; this is the restored,
+   * extended version.
+   *
+   * `job/list` is a stream Remote whose frames are whole-set replacements
+   * (`{type:'rows', jobs: JobView[]}`), so the first frame IS the complete
+   * answer — `take: 1` and cancel.
+   */
   if (pathname === '/api/mobile/jobs' && req.method === 'GET') {
     const sessionId = String(deps.parsedUrl.query?.sessionId || '').trim();
     if (!sessionId) { sendJson(400, { ok: false, error: 'sessionId is required' }); return true; }
-    // `job/list` is a stream Remote; it is opened on the MUX and only its first
-    // whole-set frame is consumed (reconnect semantics guarantee that frame is
-    // already the truth).
     const frame = await readStreamOnce('job/list', { request: { sessionId } }, { take: 1, timeoutMs: 5000 });
     if (!frame) {
       sendJson(200, { ok: true, code: 0, jobs: [], degraded: 'jobs-unavailable' });
       return true;
     }
-    const jobs = (Array.isArray(frame.jobs) ? frame.jobs : []).map((job) => ({
-      id: String(job?.id ?? ''),
-      kind: String(job?.kind ?? ''),
-      label: String(job?.label ?? ''),
-      status: String(job?.status ?? 'running'),
-      progress: job?.progress ?? null,
-      detail: job?.detail ?? null,
-      startedAt: typeof job?.startedAt === 'number' ? job.startedAt : null,
-      finishedAt: typeof job?.finishedAt === 'number' ? job.finishedAt : null
-    }));
-    sendJson(200, { ok: true, code: 0, jobs });
+    sendJson(200, { ok: true, code: 0, jobs: orderJobs(frame.jobs) });
     return true;
   }
 
+  /* ---- one job's output, resumable by byte offset [feat 2026-10-13] ----
+   *
+   * `job/follow` is the real observation stream: `opened` (the job's projection
+   * plus the offset the first `output` frame continues from), then coalesced
+   * `output` batches, then one terminal `status` — after which the stream closes
+   * normally. Status rides the same stream as output precisely so settlement can
+   * never race a still-open output channel, so this route must consume it in
+   * order rather than asking for the status separately.
+   *
+   * `from` is the caller's resume cursor: a query without it starts at the
+   * oldest retained byte, and each answer returns `next` for the following poll.
+   * This is a poll, not a held-open socket, because the bridge's HTTP surface is
+   * request/response and the mobile app already owns one WebSocket.
+   *
+   * `lossy: true` means bytes were evicted from the producer's ring (or by
+   * retention) between the requested offset and the returned chunks. That is
+   * reported verbatim — the phone must be able to say "the beginning is gone"
+   * instead of rendering a silently incomplete log.
+   */
+  if (pathname === '/api/mobile/jobs/follow' && req.method === 'GET') {
+    const sessionId = String(deps.parsedUrl.query?.sessionId || '').trim();
+    const jobId = String(deps.parsedUrl.query?.jobId || '').trim();
+    if (!sessionId || !jobId) { sendJson(400, { ok: false, error: 'sessionId and jobId are required' }); return true; }
+    const fromRaw = deps.parsedUrl.query?.from;
+    const from = fromRaw != null && fromRaw !== '' ? Number(fromRaw) : undefined;
+    if (from !== undefined && (!Number.isFinite(from) || from < 0)) {
+      sendJson(400, { ok: false, error: 'from must be a non-negative number' });
+      return true;
+    }
+    try {
+      const collected = await deps.readStreamFrames(
+        'job/follow',
+        { request: { sessionId, jobId, ...(from === undefined ? {} : { from }) } },
+        { maxFrames: 60, idleTimeoutMs: 2500, totalTimeoutMs: 12000 }
+      );
+      const view = summarizeJobFollow(collected);
+      sendJson(200, { ok: true, code: 0, ...view });
+    } catch (err) {
+      // `job/not-found` is the engine's own refusal; a settled and evicted job is
+      // not an error the user should see as a crash.
+      const message = String(err?.message || '');
+      const notFound = /job\/not-found|unknown job/i.test(message);
+      sendJson(notFound ? 404 : 502, {
+        ok: false,
+        code: notFound ? 404 : 502,
+        error: notFound ? '该后台任务已不存在或已超出保留窗口' : 'engine rpc not available'
+      });
+    }
+    return true;
+  }
+
+  /* ---- stop a background job ----
+   *
+   * Real engine Remote: `job/kill(request:{ sessionId, jobId })` →
+   * `{ outcome: 'requested' | 'already-finished' }`, with `job/not-found` when
+   * the session's list no longer carries a killable row. There is therefore no
+   * need to mediate through the Agent, and an earlier revision of this file that
+   * did exactly that was reverted once the real interface was confirmed.
+   *
+   * `already-finished` is a 409 on purpose: the request is a no-op, not a
+   * failure, and the phone should say "已经结束" rather than show an error.
+   */
   if (pathname === '/api/mobile/jobs/kill' && req.method === 'POST') {
     const sessionId = String(jsonBody.sessionId || '').trim();
     const jobId = String(jsonBody.jobId || '').trim();
-    if (!jobId) { sendJson(400, { ok: false, error: 'jobId is required' }); return true; }
+    if (!sessionId || !jobId) {
+      sendJson(400, { ok: false, error: 'sessionId and jobId are required' });
+      return true;
+    }
     try {
-      const result = await callDshRpc('job/kill', { args: { request: { ...(sessionId ? { sessionId } : {}), jobId } } });
-      audit('job/kill', { sessionId, jobId, outcome: result?.outcome });
-      sendJson(200, { ok: true, code: 0, result });
+      const result = await callDshRpc('job/kill', { args: { request: { sessionId, jobId } } });
+      const outcome = result?.outcome === 'already-finished' ? 'already-finished' : 'requested';
+      audit('job/kill', { sessionId, jobId, outcome });
+      if (outcome === 'already-finished') {
+        sendJson(409, { ok: false, code: 409, outcome, error: '该后台任务已经结束，无需停止' });
+        return true;
+      }
+      sendJson(200, { ok: true, code: 0, outcome });
     } catch (err) {
-      sendJson(502, { ok: false, code: 502, error: err?.message || 'job/kill failed' });
+      const message = String(err?.message || '');
+      const notFound = /job\/not-found|unknown job/i.test(message);
+      audit('job/kill-failed', { sessionId, jobId, notFound });
+      sendJson(notFound ? 404 : 502, {
+        ok: false,
+        code: notFound ? 404 : 502,
+        error: notFound ? '该后台任务不在本会话的可停止列表中' : 'engine rpc not available'
+      });
     }
     return true;
   }

@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 
 import 'package:dsh_mobile/models/chat_message.dart';
+import 'package:dsh_mobile/models/bridge_extras.dart';
 import 'package:dsh_mobile/models/task_center.dart';
 import 'package:dsh_mobile/models/workspace.dart';
 import 'package:dsh_mobile/services/dsh_service.dart';
@@ -375,7 +376,13 @@ void main() {
         tester,
         SessionInfoSheet(
           jobs: const [JobItem(id: 'bash-1', kind: 'bash', label: 'npm test', status: 'running')],
-          onKillJob: (job) async => killed = job,
+          // The engine's real `job/kill` receipt is `{outcome}`; the old stub
+          // returned the JobItem itself, which is what the widened callback type
+          // caught at analyze time.
+          onKillJob: (job) async {
+            killed = job;
+            return const JobStopResult(ok: true, outcome: 'requested');
+          },
         ),
       );
       expect(find.text('npm test'), findsOneWidget);

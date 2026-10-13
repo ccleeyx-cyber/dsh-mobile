@@ -128,6 +128,15 @@ class WorkspaceChange {
   final int? deleted;
   final bool binary;
 
+  /// [feat 2026-10-13] 这一行来自**会话日志里 Agent 的写文件调用**，而不是 git。
+  ///
+  /// 此时 `added`/`deleted` 一定为 null（没有 git 就没有行数），界面必须渲染
+  /// "—" 并说明来源：把它显示成 "+0 −0" 等于声称"这个文件没变化"。
+  final bool fromToolCall;
+
+  /// 触发这行的工具名（`write` / `edit`），仅 [fromToolCall] 时有值。
+  final String? tool;
+
   const WorkspaceChange({
     required this.path,
     required this.status,
@@ -135,6 +144,8 @@ class WorkspaceChange {
     this.added,
     this.deleted,
     this.binary = false,
+    this.fromToolCall = false,
+    this.tool,
   });
 
   factory WorkspaceChange.fromJson(Map<String, dynamic> json) => WorkspaceChange(
@@ -144,6 +155,8 @@ class WorkspaceChange {
         added: _int(json['added']),
         deleted: _int(json['deleted']),
         binary: json['binary'] == true,
+        fromToolCall: json['fromToolCall'] == true,
+        tool: json['tool']?.toString(),
       );
 
   String get label {
@@ -245,6 +258,26 @@ class JobItem {
   final String? progress;
   final String? detail;
 
+  /// [feat 2026-10-13] 运行时长（毫秒），由网关按 `finishedAt ?? now - startedAt`
+  /// 算出。为 null 表示网关没给起点 —— 界面渲染成 "—" 而不是 0 秒。
+  final int? durationMs;
+
+  /// [feat 2026-10-13] 网关的权威"还活着"标记，与 [isLive] 同义。
+  ///
+  /// 保留两者：旧网关没有这个字段（回落成按 status 判断），新网关给了就信它。
+  final bool liveFlag;
+
+  /// [feat 2026-10-13] 输出环的绝对坐标（来自引擎 `JobView.output`）。
+  ///
+  /// `outputTotal` 是下一个 chunk 的起始偏移（= 已写入的总字节数），
+  /// `outputEarliest` 是最早仍保留的字节；后者大于 0 就说明保留策略把日志开头裁掉了，
+  /// 界面据此提示"开头已丢失"而不是假装日志完整。
+  final int? outputTotal;
+  final int? outputEarliest;
+
+  /// 引擎的进度行（`3/10`、当前阶段），结算时清空。
+  final String? progressLine;
+
   const JobItem({
     required this.id,
     required this.kind,
@@ -252,6 +285,11 @@ class JobItem {
     required this.status,
     this.progress,
     this.detail,
+    this.durationMs,
+    this.liveFlag = false,
+    this.outputTotal,
+    this.outputEarliest,
+    this.progressLine,
   });
 
   factory JobItem.fromJson(Map<String, dynamic> json) => JobItem(
@@ -261,9 +299,42 @@ class JobItem {
         status: json['status']?.toString() ?? 'running',
         progress: json['progress']?.toString(),
         detail: json['detail']?.toString(),
+        durationMs: _int(json['durationMs']),
+        liveFlag: json['live'] == true,
+        outputTotal: _int(json['outputTotal']),
+        outputEarliest: _int(json['outputEarliest']),
+        progressLine: json['progress']?.toString(),
       );
 
-  bool get isLive => status == 'running' || status == 'stopping';
+  bool get isLive => liveFlag || status == 'running' || status == 'stopping';
+
+  /// 日志开头已被裁掉（保留窗口之外），界面必须说明这一点。
+  bool get outputHeadLost => (outputEarliest ?? 0) > 0;
+
+  /// 是否有可读的输出（引擎报过 total 且大于 0）。
+  bool get hasOutput => (outputTotal ?? 0) > 0;
+
+  /// 已写入输出的可读体量；未知时 null（界面显示 "—"）。
+  String? get outputSizeLabel {
+    final total = outputTotal;
+    if (total == null) return null;
+    if (total < 1024) return '$total B';
+    if (total < 1024 * 1024) return '${(total / 1024).toStringAsFixed(1)} KB';
+    return '${(total / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  /// 时长的人读形式；未知时 null（界面显示 "—"）。
+  String? get durationLabel {
+    final ms = durationMs;
+    if (ms == null) return null;
+    final total = ms ~/ 1000;
+    final s = total % 60;
+    final m = (total ~/ 60) % 60;
+    final h = total ~/ 3600;
+    if (h > 0) return '$h 小时 $m 分';
+    if (m > 0) return '$m 分 $s 秒';
+    return '$s 秒';
+  }
 
   String get statusLabel {
     switch (status) {

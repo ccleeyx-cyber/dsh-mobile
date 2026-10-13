@@ -23,6 +23,7 @@ import 'widgets/message_search_panel.dart';
 import 'widgets/session_status_strip.dart';
 import 'widgets/session_info_sheet.dart';
 import 'widgets/turn_output_card.dart';
+import 'host_ops_view.dart';
 import 'config_page.dart';
 import '../theme/app_colors.dart';
 import '../main.dart';
@@ -2024,6 +2025,14 @@ class _ChatViewState extends State<ChatView> {
                 case 'workspaces':
                   widget.onOpenWorkspaces?.call();
                   break;
+                // [feat 2026-10-13] 运维面板：快捷命令 / 文件浏览 / 目标看板 / 会话分支。
+                // 放在会话菜单里而不是底部导航，是因为这四项都是**会话域**操作
+                // （工作目录、目标 ref、检查点都取自当前会话）。
+                case 'hostOps':
+                  Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const HostOpsView()),
+                  );
+                  break;
                 case 'clear':
                   dsh.createNewSession();
                   break;
@@ -2060,6 +2069,16 @@ class _ChatViewState extends State<ChatView> {
                     Icon(Icons.swap_horiz_rounded, color: context.c.accent, size: 18),
                     const SizedBox(width: 10),
                     Text('切换工作区', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'hostOps',
+                child: Row(
+                  children: [
+                    Icon(Icons.terminal_rounded, color: context.c.accent, size: 18),
+                    const SizedBox(width: 10),
+                    Text('运维面板', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
                   ],
                 ),
               ),
@@ -3367,14 +3386,26 @@ class _ChatViewState extends State<ChatView> {
             changes: d.workspaceChanges,
             changesAvailable: d.workspaceChangesAvailable,
             changesReason: d.workspaceChangesReason,
+            // [feat 2026-10-13] 变更清单的来源与"为什么 git 答不出来"。
+            // 工作区不是仓库时（多项目工作区的常见形态），面板必须说清原因并给出
+            // 相邻仓库，而不是留一片空白。
+            changesSource: d.workspaceChangesSource,
+            changesNote: d.workspaceChangesNote,
+            repoCandidates: d.workspaceRepos,
             jobs: d.jobs,
             jobsUnavailable: d.jobsDegraded.isNotEmpty,
             schedules: d.schedules,
             busyDeliverablePath: busyPath,
             initialSection: section,
             onOpenDeliverable: (item) => _openDeliverable(d, item),
+            // [feat 2026-10-13] 主点击改为文本预览（下载退到长按），回调为 null 时
+            // 面板自动退回旧行为，所以这里不做能力探测。
+            onPreviewDeliverable: (item) => d.fetchDeliverableText(item.path),
             onLoadDiff: d.fetchDiff,
-            onKillJob: (job) => d.killJob(job.id),
+            onKillJob: (job) => d.stopJob(job.id),
+            // [feat 2026-10-13] 后台任务输出查看器（引擎 `job/follow` 的可续读环）。
+            // 传回调即开启入口；null 时面板整块隐藏。
+            onLoadJobOutput: (job, from) => d.fetchJobOutput(job.id, from: from),
             onDeleteSchedule: (s) => d.deleteSchedule(s.id),
             onRefresh: d.fetchSessionExtras,
             // [feat 2026-10-12] 子代理 / goal 控制 / 一键诊断。子代理列表属于

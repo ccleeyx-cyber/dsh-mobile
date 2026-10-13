@@ -19,8 +19,8 @@
 class AppVersion {
   const AppVersion._();
 
-  static const String version = '1.14.4';
-  static const String buildNumber = '43';
+  static const String version = '1.16.0';
+  static const String buildNumber = '47';
 
   /// 客户端更新唯一的真值来源：GitHub Releases。
   ///

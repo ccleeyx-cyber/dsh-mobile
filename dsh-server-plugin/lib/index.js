@@ -38,12 +38,20 @@ import {
   parseNumstat,
   combineChanges,
   parseUnifiedDiff,
+  extractDeliverables,
+  resolveDeliverable,
   collectSessionRecords,
   convertSessionRecordsToMessages,
   readHistoryPage,
   projectionCacheFileNames,
   claimsMobileFeatureRoute
 } from './features.mjs';
+import {
+  handleExtensionRoute,
+  claimsExtensionRoute,
+  extractToolCallFiles
+} from './extensions.mjs';
+import { discoverGitRepos } from './host-ops.mjs';
 import {
   BRIDGE_VERSION,
   MAX_BODY_SIZE,
@@ -376,23 +384,80 @@ export function apply(ctx, config = {}, internals = {}) {
    * The engine's own `workspace/changes` event carries only the turn number and
    * keeps its summary/snapshot on the Host, so it cannot be replayed to a phone.
    * Reading the working tree with git gives the same practical answer — what did
-   * this task change — for any git repository, and degrades honestly (empty list
-   * + `reason`) when the workspace is not a repository.
+   * this task change.
+   *
+   * ⚠️ [fix 2026-10-13] The first version refused with a flat
+   * `not-a-git-repository` whenever the session's cwd was not itself a
+   * repository, which left the phone's diff panel **permanently blank** for a
+   * very common layout: a multi-project workspace such as
+   * `E:\workspace\个人`, whose repositories live in its children
+   * (`dsh_mobile`, `GZ`, `tickflow-stock-panel`, …). Two changes fix that:
+   *
+   *   1. **Repo discovery.** `discoverGitRepos` looks at the cwd, then at its
+   *      ancestors, then at its immediate children, so the panel can offer the
+   *      repositories it is standing next to instead of an empty screen.
+   *   2. **Tool-call fallback.** `extractToolCallFiles` reads the session log for
+   *      the files the agent's own `write`/`edit` calls named. That is durable
+   *      truth about intent, available with no git at all, and it is the only
+   *      source that still works when the change happened in a non-repo folder.
+   *
+   * Both are reported side by side rather than merged silently: `source` says
+   * where the rows came from, so the App can label them honestly.
    */
   async function readWorkspaceChanges(sessionId, wantedPath) {
     const cwd = readSessionCwd(sessionId);
-    if (!cwd) return { available: false, reason: 'no-workspace', files: [] };
+    if (!cwd) return { available: false, reason: 'no-workspace', files: [], source: 'none' };
 
-    const runGit = (args) => new Promise((resolve) => {
-      execFile('git', args, { cwd, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, stdout) => {
+    const runGit = (args, gitCwd = cwd) => new Promise((resolve) => {
+      execFile('git', args, { cwd: gitCwd, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, stdout) => {
         if (error) resolve(null);
         else resolve(String(stdout));
       });
     });
 
     const inside = await runGit(['rev-parse', '--is-inside-work-tree']);
-    if (inside === null || inside.trim() !== 'true') {
-      return { available: false, reason: 'not-a-git-repository', files: [] };
+    const isRepo = inside !== null && inside.trim() === 'true';
+
+    // The tool-call fallback is computed on every path: when git answers it is
+    // shown as a supplement (a file the agent wrote may be outside the repo, or
+    // gitignored), and when git cannot answer it is the whole answer.
+    let fallback = { changed: [], read: [] };
+    if (wantedPath || !isRepo) {
+      try {
+        const { records } = await readSessionRecords(sessionId);
+        fallback = extractToolCallFiles(records, cwd);
+      } catch (err) {
+        logger.warn('[dsh-mobile-bridge] tool/call fallback failed %s: %s', sessionId, err?.message || err);
+      }
+    }
+
+    if (!isRepo) {
+      const repos = discoverGitRepos(cwd);
+      return {
+        available: false,
+        reason: 'not-a-git-repository',
+        source: fallback.changed.length ? 'tool-calls' : 'none',
+        cwdKnown: true,
+        files: fallback.changed.map((row) => ({
+          // Workspace-relative on purpose: git rows use the same spelling, and
+          // the per-file diff route round-trips `path` verbatim, so mixing an
+          // absolute path in here would make one list carry two conventions.
+          path: row.display || row.path,
+          display: row.display || row.path,
+          status: 'M',
+          origPath: null,
+          added: null,
+          deleted: null,
+          binary: false,
+          fromToolCall: true,
+          tool: row.tool,
+          seq: row.seq
+        })),
+        readFiles: fallback.read.map((row) => ({ display: row.display, tool: row.tool, seq: row.seq })),
+        repoCandidates: repos.children.map((c) => ({ name: c.name, path: c.name })),
+        ancestorRepos: repos.ancestors.length,
+        note: repositionNote(fallback.changed.length, repos.children.length)
+      };
     }
 
     if (wantedPath) {
@@ -405,6 +470,7 @@ export function apply(ctx, config = {}, internals = {}) {
       const text = stagedDiff.trim() ? stagedDiff : (untracked ?? '');
       return {
         available: true,
+        source: 'git',
         path: wantedPath,
         hunks: parseUnifiedDiff(text),
         empty: !text.trim(),
@@ -414,8 +480,43 @@ export function apply(ctx, config = {}, internals = {}) {
 
     const porcelain = await runGit(['status', '--porcelain=v1', '-z']);
     const numstat = await runGit(['diff', '--numstat', 'HEAD']);
-    const files = combineChanges(parsePorcelain(porcelain ?? ''), parseNumstat(numstat ?? ''));
-    return { available: true, cwd, files };
+    const gitFiles = combineChanges(parsePorcelain(porcelain ?? ''), parseNumstat(numstat ?? ''));
+
+    // Union with the tool-call rows, git first (it has real counts), and mark the
+    // rows only the log knows about so the App can explain the missing counts.
+    const seen = new Set(gitFiles.map((f) => path.resolve(cwd, f.path)));
+    const extras = fallback.changed
+      .filter((row) => !seen.has(path.resolve(cwd, row.display || row.path)))
+      .map((row) => ({
+        path: row.display || row.path,
+        status: 'M',
+        origPath: null,
+        added: null,
+        deleted: null,
+        binary: false,
+        fromToolCall: true,
+        tool: row.tool,
+        seq: row.seq
+      }));
+
+    return {
+      available: true,
+      source: extras.length ? 'git+tool-calls' : 'git',
+      cwd,
+      files: [...gitFiles, ...extras],
+      readFiles: fallback.read.slice(0, 40).map((row) => ({ display: row.display, tool: row.tool, seq: row.seq }))
+    };
+  }
+
+  /** Honest one-liner for the phone when git has nothing and repos are nearby. */
+  function repositionNote(toolCallCount, repoCount) {
+    if (repoCount > 0) {
+      return `当前工作区不是 git 仓库，但相邻有 ${repoCount} 个仓库；下方文件列表来自本轮 Agent 的文件写入记录`;
+    }
+    if (toolCallCount > 0) {
+      return '当前工作区不是 git 仓库；下方文件列表来自本轮 Agent 的文件写入记录（不含行数）';
+    }
+    return '当前工作区不是 git 仓库，且本会话没有文件写入记录';
   }
 
   /**
@@ -429,12 +530,31 @@ export function apply(ctx, config = {}, internals = {}) {
    */
 
   /**
+   * Resolve one requested path against a session's declared deliverables.
+   *
+   * [feat 2026-10-13] Extracted for the text-preview route. Membership is an
+   * exact match against the same listing the download route already enforces, so
+   * preview inherits the identical guarantee: a phone cannot turn either route
+   * into an arbitrary file read. Returns the absolute path plus the display
+   * label, or null.
+   */
+  async function resolveDeliverableFile(sessionId, requested) {
+    if (typeof requested !== 'string' || !requested.trim()) return null;
+    const { records, cwd } = await readSessionRecords(sessionId);
+    const row = resolveDeliverable(extractDeliverables(records, cwd), requested);
+    if (!row) return null;
+    return { path: row.path, display: row.display };
+  }
+
+  /**
    * Open a stream Remote on the MUX, take its first `take` items, then cancel.
    *
-   * `job/list` is a stream method (the unary carrier rejects it outright), and
-   * its frames are whole-set replacements, so the first frame is already the
-   * complete answer. The stream is cancelled immediately afterwards — leaving
-   * one open per phone request would leak a subscription per poll.
+   * ⚠️ [fix 2026-10-13] The original note here named `job/list`, a remote the
+   * engine does not have — which is how the jobs route shipped permanently
+   * empty. The live caller is `session/control`, whose first frame is the
+   * whole-state baseline (`baseline.jobs[sessionId]`), so `take: 1` is the
+   * complete answer for a job list. The stream is cancelled immediately
+   * afterwards: leaving one open per phone request would leak a subscription.
    */
   function readStreamOnce(endpoint, args, { take = 1, timeoutMs = 5000 } = {}) {
     return new Promise((resolve) => {
@@ -481,6 +601,96 @@ export function apply(ctx, config = {}, internals = {}) {
 
   /** One-shot stream bookkeeping, keyed by streamId. */
   const pendingOneshot = new Map();
+
+  /**
+   * Collect several frames from one stream Remote, then cancel. [feat 2026-10-13]
+   *
+   * `readStreamOnce` is enough for whole-set streams (its first frame is the
+   * truth), but `job/follow` is a *sequence*: an `opened` anchor, coalesced
+   * `output` batches, then exactly one terminal `status` — and that ordering is
+   * the engine's guarantee that settlement can never race a still-open output
+   * channel. Taking only the first frame would therefore show an empty log, and
+   * waiting for the stream to close would hang on a live job.
+   *
+   * Resolution rules, in priority order:
+   *   - a frame whose `type` is in `stopOn` (the terminal frame) → resolve now;
+   *   - `maxFrames` reached → resolve with what we have;
+   *   - no frame for `idleTimeoutMs` (the producer went quiet) → resolve;
+   *   - `totalTimeoutMs` elapsed → resolve.
+   *
+   * The idle timer is the important one: it makes a still-running job return its
+   * output so far instead of blocking the phone's HTTP request until the job
+   * ends, which could be hours.
+   *
+   * @returns the frames collected so far as an array (empty on any failure).
+   */
+  function readStreamFrames(endpoint, args, {
+    maxFrames = 60,
+    idleTimeoutMs = 2500,
+    totalTimeoutMs = 12000,
+    stopOn = ['status']
+  } = {}) {
+    return new Promise((resolve) => {
+      if (!upstreamMuxWs || upstreamMuxWs.readyState !== WebSocket.OPEN) {
+        resolve([]);
+        return;
+      }
+      const streamId = `collect-${endpoint.replace(/\W+/g, '-')}-${crypto.randomUUID().slice(0, 8)}`;
+      const items = [];
+      let settled = false;
+      let idleTimer = null;
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        pendingOneshot.delete(streamId);
+        if (idleTimer) clearTimeout(idleTimer);
+        clearTimeout(totalTimer);
+        try {
+          upstreamMuxWs?.send(JSON.stringify({ type: 'cancel', streamId }));
+        } catch (_) {}
+        resolve(items);
+      };
+
+      const totalTimer = setTimeout(finish, Math.max(500, totalTimeoutMs));
+      const armIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(finish, Math.max(200, idleTimeoutMs));
+      };
+      armIdle();
+
+      pendingOneshot.set(streamId, {
+        push(value) {
+          // Defensive guard: `push` can still fire once after `finish` from a
+          // frame already in flight. Without this the array would grow past the
+          // cap the caller asked for.
+          if (settled) return;
+          items.push(value);
+          if (value && typeof value === 'object' && stopOn.includes(value.type)) {
+            finish();
+            return;
+          }
+          if (items.length >= maxFrames) {
+            finish();
+            return;
+          }
+          armIdle();
+        },
+        fail() { finish(); }
+      });
+
+      try {
+        upstreamMuxWs.send(JSON.stringify({
+          type: 'open',
+          streamId,
+          endpoint,
+          payload: { args }
+        }));
+      } catch (_) {
+        finish();
+      }
+    });
+  }
 
   /**
    * Deep link the App registers for, used as the ntfy click target.
@@ -3034,6 +3244,9 @@ export function apply(ctx, config = {}, internals = {}) {
         // download defect survived a whole release with green tests.
         callDshRpc,
         readStreamOnce,
+        // [feat 2026-10-13] sequence collector for `job/follow` (features.mjs),
+        // which must consume opened → output → status rather than one frame.
+        readStreamFrames,
         readProjections,
         readProjectionRows,
         readSessionRecords,
@@ -3056,11 +3269,43 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
 
+      // ---- v1.16 扩展路由（P0/P1，2026-10-13）----
+      //
+      // 与上面的 features 派发同样的排序约束：必须先于下面的
+      // `startsWith('/api/mobile/sessions/')` 通配路由。这里注册了
+      // `GET /api/mobile/sessions/checkpoints`，正是会被通配吞掉的形状。
+      // handleExtensionRoute 未命中时返回 false，落到既有路由与 404。
+      if (await handleExtensionRoute({
+        pathname,
+        req,
+        res,
+        parsedUrl,
+        jsonBody,
+        sendJson,
+        audit,
+        logger,
+        callDshRpc,
+        readStreamOnce,
+        readStreamFrames,
+        readProjections,
+        readProjectionRows,
+        readSessionCwd,
+        readSessionRecords,
+        readWorkspaceChanges,
+        resolveDeliverableFile,
+        readConfig: loadConfig,
+        writeConfig: saveConfig,
+        assertSessionId
+      })) {
+        return;
+      }
+
       // The second half of the guard: even if someone moves the feature dispatch
       // back below this branch, a claimed feature route can no longer be stolen
       // by the wildcard (see `claimsMobileFeatureRoute` in features.mjs).
       if (pathname.startsWith('/api/mobile/sessions/') && req.method === 'GET'
-          && !claimsMobileFeatureRoute(req.method, pathname)) {
+          && !claimsMobileFeatureRoute(req.method, pathname)
+          && !claimsExtensionRoute(req.method, pathname)) {
         const sessionId = pathname.replace('/api/mobile/sessions/', '').trim();
         const history = await getSessionHistory(sessionId);
         sendJson(200, { ok: true, code: 0, data: history });
