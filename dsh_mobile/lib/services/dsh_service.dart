@@ -1527,6 +1527,11 @@ class DshService extends ChangeNotifier {
         // 正文还回草稿：网关没收到，用户不该只能凭记忆重打。
         // 还回**发起会话**的草稿键，而不是当前的（用户可能已切走）。
         drafts.write(draftKeyAtSend, text);
+        // [fix 2026-10-14] 失败≠引擎没收到（超时/代理断连最常见）。启动一次
+        // 延迟 resync 兜底：若引擎其实已在跑，下次对账把状态接回来；若真没
+        // 收到，快照不变、草稿还在，用户重发即可。不再启动轮询的话，用户
+        // 只能切走再切回才能发现"其实发成功了"。
+        _scheduleFailedSendResync(sessionId);
         notifyListeners();
       }
     } catch (e) {
@@ -1537,8 +1542,20 @@ class DshService extends ChangeNotifier {
       assistantMsg.isStreaming = false;
       _isSending = false;
       drafts.write(draftKeyAtSend, text);
+      _scheduleFailedSendResync(sessionId);
       notifyListeners();
     }
+  }
+
+  /// [fix 2026-10-14] 发送失败后的延迟对账：5 秒后拉一次会话快照。若引擎其实
+  /// 已受理（超时误判），_reconcileSessionMessages 会用服务端状态接回正轨；
+  /// 若真失败，快照无变化，无副作用。幂等、一次性。
+  void _scheduleFailedSendResync(String sessionId) {
+    Future.delayed(const Duration(seconds: 5), () {
+      if (_currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
+        _resyncActiveSession(sessionId);
+      }
+    });
   }
 
   // Active Session Polling (Live Reasoning & Execution Sync)
@@ -1719,13 +1736,24 @@ class DshService extends ChangeNotifier {
     }
 
     // 3. Preserve recent local user prompts without duplicating or inversing order
+    // [fix 2026-10-14] 服务端快照缺最新一问一答的窗口远大于 45 秒：网关投影缓存
+    // 可能滞后数小时（实测事故：日志 seq 794 vs 投影 723，隔天都没追上）。
+    // 本地用户消息的保留窗放宽到 10 分钟，且去重比较改用「剥离附件名后的
+    // 正文」——displayText 拼了 "📎 文件名" 而服务端历史没有这一段，全等比较
+    // 永远不等，纯附件消息超窗后被整体替换吞掉（= 少一条提问）。
     final serverUserTexts = serverMessages.where((m) => m.isUser).map((m) => m.content).toSet();
+    String stripAttachmentLabel(String s) {
+      final idx = s.indexOf('\n\n📎 ');
+      return idx >= 0 ? s.substring(0, idx) : s;
+    }
     for (final localMsg in _messages.where((m) => m.isUser)) {
-      if (localMsg.content.isNotEmpty && !serverUserTexts.contains(localMsg.content)) {
-        // ChatMessage.timestamp is a non-nullable DateTime (the constructor
-        // defaults it to DateTime.now()), so the old `timestamp != null` guard
-        // was dead code and the `!` was a no-op.
-        if (DateTime.now().difference(localMsg.timestamp).inSeconds < 45) {
+      final localCore = stripAttachmentLabel(localMsg.content);
+      final matchedOnServer = localCore.isNotEmpty && serverUserTexts.any((s) {
+        if (s == localMsg.content) return true;
+        return s == localCore;
+      });
+      if (localMsg.content.isNotEmpty && !matchedOnServer) {
+        if (DateTime.now().difference(localMsg.timestamp).inMinutes < 10) {
           final assistIdx = serverMessages.indexWhere((m) => m.isAssistant && m.isStreaming);
           if (assistIdx != -1) {
             serverMessages.insert(assistIdx, localMsg);
@@ -4148,6 +4176,49 @@ class DshService extends ChangeNotifier {
           _isCanceling = false;
           _streamRevision++;
         }
+        notifyListeners();
+        return;
+      }
+
+      // [fix 2026-10-14] stream_snapshot：网关在订阅/重连时补发的累积流式内容
+      // 快照（delta 窗口期断线丢掉的那段）。按「服务端为准、本地只多不少」
+      // 合并：本地已有的前缀不动，缺失的部分补齐。replay=true 表示回合已结束，
+      // 补完后不再标 streaming。
+      if (type == 'stream_snapshot') {
+        final sId = json['sessionId']?.toString();
+        if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
+          return;
+        }
+        final snapText = json['text']?.toString() ?? '';
+        final snapThinking = json['thinking']?.toString() ?? '';
+        final isReplay = json['replay'] == true;
+        if (snapText.isEmpty && snapThinking.isEmpty) return;
+
+        if (_messages.isEmpty || !_messages.last.isAssistant) {
+          _messages.add(ChatMessage(
+            id: _uuid.v4(),
+            role: 'assistant',
+            content: snapText,
+            thinking: snapThinking,
+            isStreaming: !isReplay,
+            timestamp: DateTime.now(),
+          ));
+        } else {
+          final current = _messages.last;
+          // 只补不缩：本地内容若是快照的前缀（正常 delta 路径），补齐尾部；
+          // 本地比快照长（本地收到过更多 delta），保持本地。
+          if (snapText.length > current.content.length && snapText.startsWith(current.content)) {
+            current.content = snapText;
+          }
+          if (snapThinking.length > (current.thinking?.length ?? 0) &&
+              snapThinking.startsWith(current.thinking ?? '')) {
+            current.thinking = snapThinking;
+          }
+          if (isReplay) {
+            current.isStreaming = false;
+          }
+        }
+        _streamRevision++;
         notifyListeners();
         return;
       }

@@ -43,6 +43,7 @@ import {
   collectSessionRecords,
   convertSessionRecordsToMessages,
   readHistoryPage,
+  probeSessionCursor,
   projectionCacheFileNames,
   claimsMobileFeatureRoute
 } from './features.mjs';
@@ -888,6 +889,9 @@ export function apply(ctx, config = {}, internals = {}) {
 
   /** 每会话最近一次"丢弃过期 lastTurn"的审计时间（节流，见 getSessionHistory）。 */
   const staleTurnAuditAt = new Map();
+  // [fix 2026-10-14] 历史转换中被启发式过滤/空内容丢弃的消息的审计节流表
+  //（key: sessionId|why）。手机每 2.5s 轮询一次，不节流会刷爆审计缓冲。
+  const droppedUserAuditAt = new Map();
 
   const sessionFollowers = new Map();
   const pendingApprovals = new Map();
@@ -1437,13 +1441,24 @@ export function apply(ctx, config = {}, internals = {}) {
     })();
 
     // 1. 调用 DSH 原生 RPC session/page 获取真实历史事件流
+    //
+    // ⚠️ [fix 2026-10-14] 分页上界必须用引擎的**权威 cursor**（past-cursor 拒绝
+    // 探测，见 probeSessionCursor），不能用投影缓存的水位线。实测事故：引擎
+    // 事件日志已到 seq 794，而 projcache 停在 723（自前一天的落盘后再没刷过）
+    // ——用 723 当 throughSeq，最新一轮 user/message + assistant/message（seq
+    // 724-794）被整轮切掉，手机上表现为"少了一问一答"，HTTP 仍 200。
+    // 投影 seq 仍参与两件事：①探测失败时的保守回退；②拼 max 保证不回退。
     try {
       const targetSessionId = sessionId.startsWith('session-') ? sessionId : `session-${sessionId}`;
+      const probedCursor = await probeSessionCursor({ callDshRpc, sessionId: targetSessionId });
+      // 探测成功（或引擎不拒绝 MAX_SAFE_INTEGER）：用权威 cursor；拿不到时
+      // 退化到旧逻辑的投影水位线（lastSeq 默认 50000——由上面的 rows 推导）。
+      const throughSeq = probedCursor != null ? probedCursor : lastSeq;
       const pageResult = await callDshRpc('session/page', {
         args: {
           request: {
             address: { kind: 'session', sessionId: targetSessionId },
-            throughSeq: lastSeq,
+            throughSeq,
             maxMessages: 100
           }
         }
@@ -1455,7 +1470,18 @@ export function apply(ctx, config = {}, internals = {}) {
         // paging endpoint /api/mobile/sessions/history/page reuses the exact
         // same logic — including the carried-context filter and tool merging —
         // instead of a second drifting copy.
-        messages.push(...convertSessionRecordsToMessages(pageResult.records).messages);
+        // [fix 2026-10-14] 传入误杀审计回调（60 秒/会话/why 节流）——历史里的
+        // 用户消息被内容启发式吞掉必须留痕，否则"少了一条提问"无从查起。
+        messages.push(...convertSessionRecordsToMessages(pageResult.records, {
+          auditDropped: (info) => {
+            const key = `${sessionId}|${info.why}`;
+            const lastAt = droppedUserAuditAt.get(key) || 0;
+            if (Date.now() - lastAt > 60000) {
+              droppedUserAuditAt.set(key, Date.now());
+              audit('history/message-dropped', { sessionId, ...info });
+            }
+          }
+        }).messages);
         // lastTurn is a tail-only concern (see stale-drop below) and stays
         // computed here from the same page.
         for (const record of pageResult.records) {
@@ -2044,6 +2070,16 @@ export function apply(ctx, config = {}, internals = {}) {
               });
             }
             broadcastToMobileClients({ type: 'done', sessionId: sId, reason: end.kind, message: end.text });
+            // [fix 2026-10-14] turn/end 时把本轮完整正文快照存进 lastTurnPayload，
+            // 供断线重连的手机补拉（手机可能只收到部分 delta 或一个都没收到）。
+            // 60 秒 TTL：正常路径（App 收到了完整 delta 或已拉过快照）不需要它，
+            // 只为"delta 窗口期断线 + 回合恰好结束"的窄窗口兜底。
+            follower.lastTurnPayload = {
+              text: follower.textBuffer || '',
+              thinking: follower.thinkingBuffer || '',
+              seq: ev.seq || null,
+              expiresAt: Date.now() + 60000
+            };
             follower.thinkingBuffer = '';
             follower.textBuffer = '';
             follower.tools = [];
@@ -3918,6 +3954,34 @@ export function apply(ctx, config = {}, internals = {}) {
               sessionId: sId,
               isRunning: follower.isRunning
             }));
+            // [fix 2026-10-14] 断线重连/切回会话时补发累积的流式内容快照。
+            // 手机重连后只收到 session_status，而 follower.textBuffer 里已积累
+            // 的增量（delta 窗口期断线丢掉的那段）没有任何回放通道——回合已
+            // 结束的话 buffer 也已清空，这轮内容在手机上为零，直到下次快照。
+            // 这里把当前缓冲整体推一次；App 端按已有内容做前缀合并（多余的
+            // 部分会被去重，不足的部分被补齐）。
+            if (follower.isRunning && follower.subscribed !== false &&
+                ((follower.textBuffer && follower.textBuffer.length) ||
+                 (follower.thinkingBuffer && follower.thinkingBuffer.length))) {
+              ws.send(JSON.stringify({
+                type: 'stream_snapshot',
+                sessionId: sId,
+                text: follower.textBuffer || '',
+                thinking: follower.thinkingBuffer || ''
+              }));
+            } else if (!follower.isRunning && follower.lastTurnPayload &&
+                       follower.lastTurnPayload.expiresAt > Date.now() &&
+                       follower.lastTurnPayload.text) {
+              // 回合刚结束、手机可能错过了全部/部分 delta：补发本轮正文，
+              // 标记 replay 让 App 端按需合并（收过了就是重复，幂等）。
+              ws.send(JSON.stringify({
+                type: 'stream_snapshot',
+                sessionId: sId,
+                text: follower.lastTurnPayload.text,
+                thinking: follower.lastTurnPayload.thinking || '',
+                replay: true
+              }));
+            }
           }
           if (msg.type === 'follow' || msg.type === 'select_session') {
             ws.send(JSON.stringify({ type: 'follow_ack', sessionId: sId }));

@@ -220,6 +220,36 @@ export function projectionCacheFileNames(sessionId) {
  * @param message - an engine error message.
  * @returns the cursor, or null when the message is not a past-cursor rejection.
  */
+/**
+ * Probe the engine's authoritative session cursor (the newest event seq).
+ *
+ * The ONLY reliable way to learn a session's cursor is the "past cursor"
+ * rejection: ask for a page at throughSeq=MAX_SAFE_INTEGER and parse the real
+ * cursor out of the error message (see parseCursorFromPastSeqError notes).
+ * getSessionHistory used to take the paging upper bound from the projection
+ * cache's max row seq instead — but the projcache is an asynchronously
+ * flushed COPY and can lag the event log indefinitely (measured in production:
+ * projcache stuck at seq 723 while the log had reached 794 — the missing
+ * turn, user prompt + assistant reply, was silently sliced off the snapshot
+ * and the phone never saw it again). This probe reads the truth.
+ *
+ * @returns the cursor, or null when it cannot be determined (caller keeps
+ * whatever fallback it had).
+ */
+export async function probeSessionCursor({ callDshRpc, sessionId }) {
+  if (typeof callDshRpc !== 'function' || !sessionId) return null;
+  try {
+    await callDshRpc('session/page', {
+      args: { request: { address: { kind: 'session', sessionId }, throughSeq: Number.MAX_SAFE_INTEGER, maxMessages: 1 } }
+    });
+    // An accepted probe means the engine's cursor is at/above MAX_SAFE_INTEGER
+    // (or it does not enforce the bound). Treat "latest" as the anchor.
+    return Number.MAX_SAFE_INTEGER;
+  } catch (err) {
+    return parseCursorFromPastSeqError(err?.message);
+  }
+}
+
 export function parseCursorFromPastSeqError(message) {
   if (typeof message !== 'string') return null;
   const m = /past cursor (\d+)/.exec(message);
@@ -331,8 +361,9 @@ export async function collectSessionRecords({ callDshRpc, sessionId, maxPages = 
  * @param records - `session/page` records (`{ event }` entries), ascending.
  * @returns `{ messages }` — ascending, same fields as getSessionHistory plus seq.
  */
-export function convertSessionRecordsToMessages(records) {
+export function convertSessionRecordsToMessages(records, opts = {}) {
   const messages = [];
+  const auditDropped = typeof opts.auditDropped === 'function' ? opts.auditDropped : null;
   let currentAssistantMsg = null;
   for (const record of Array.isArray(records) ? records : []) {
     const ev = record?.event;
@@ -352,10 +383,16 @@ export function convertSessionRecordsToMessages(records) {
       // Same injected-context filter as the live tail — otherwise a history
       // page would surface memory snapshots and system reminders as if the
       // user had typed them.
+      // [fix 2026-10-14] 误杀审计：过滤条件是内容启发式（子串匹配），真实用户
+      // 消息引用了这些字样就会被整条丢弃且无迹可查。命中必须留痕，60 秒/会话
+      // 最多一条，避免轮询刷爆审计环形缓冲。
       if (isCarriedContext(text, ev) ||
           text.startsWith('Time sampled while preparing turn') ||
           text.startsWith('Memory recall guidance') ||
           text.includes('<system_information>')) {
+        if (auditDropped && typeof ev.seq === 'number') {
+          auditDropped({ seq: ev.seq, why: 'carried-context', length: text.length });
+        }
         continue;
       }
 
@@ -367,6 +404,10 @@ export function convertSessionRecordsToMessages(records) {
           time: ev.time || Date.now(),
           seq: typeof ev.seq === 'number' ? ev.seq : null
         });
+      } else if (auditDropped && typeof ev.seq === 'number') {
+        // [fix 2026-10-14] 纯附件/空文本用户消息以前是静默消失；现在留痕
+        //（是否生成占位消息由 App 端显示层决定，网关至少不能无声吞掉）。
+        auditDropped({ seq: ev.seq, why: 'empty-user-text', length: 0 });
       }
     } else if (ev.type === 'assistant/message') {
       const msgObj = ev.data?.message;
@@ -400,6 +441,22 @@ export function convertSessionRecordsToMessages(records) {
           if (text) {
             currentAssistantMsg.content = (currentAssistantMsg.content ? currentAssistantMsg.content + '\n' : '') + text;
           }
+        }
+      } else {
+        // [fix 2026-10-14] 空文本的 assistant/message 也要建宿主消息：一个只有
+        // 工具调用、没有正文的回复以前整轮不可见（工具结果挂在 null 宿主上被
+        // 一起丢掉）。空占位 + 后续 tool/call 填充 = 手机至少能看到"这轮跑了什么"。
+        if (!currentAssistantMsg) {
+          currentAssistantMsg = {
+            id: `hist_${typeof ev.seq === 'number' ? ev.seq : messages.length}`,
+            role: 'assistant',
+            content: '',
+            thinking: '',
+            tools: [],
+            time: ev.time || Date.now(),
+            seq: typeof ev.seq === 'number' ? ev.seq : null
+          };
+          messages.push(currentAssistantMsg);
         }
       }
     } else if (ev.type === 'tool/call') {
