@@ -35,10 +35,156 @@ export function installRpc(ctx, deps = {}) {
     }
   };
 
-  const disposer = ctx.connection?.rpc?.handle?.(RPC_CHANNEL, handler);
-  return async () => {
-    try { await disposer?.(); } catch {}
+  // [fix 2026-10-15] 改用 `ctx.inject(['webServer'], …)` 挂自己的前缀路由，
+  // 不再走 `ctx.connection.rpc.handle()`。
+  //
+  // 为什么必须换：`rpc.handle()` 在当前引擎版本里对外部插件**不可用**。
+  // 它内部是 `handle: (channel, handler) => this.register(owner, channel, handler)`
+  // （dsh-client-connection/lib/index.js:576），而 register 的实现是
+  // `owner.effect(() => owner.webServer.register(route), …)`（同文件 :656）——
+  // 它拿**连接服务自己**的 ctx 去访问 webServer。但 connection 声明的 inject 只有
+  // `['credentials']`（:798），根本没有 webServer，于是每次调用都抛
+  // `cannot get property "webServer" without inject`（cordis/lib/index.js:675）。
+  //
+  // 抛错发生在引擎自己的 fiber 上，插件无论怎么声明 inject 都绕不开。
+  // 引擎给自家 `/api` 路由用的正是另一条路：`ctx.inject(['webServer'], cb)`
+  // （:820）—— 同一个 ctx API，插件现在也用它。
+  //
+  // 为什么不用插件的静态 inject 声明去拿 webServer：声明 `webServer` 会让整个
+  // apply 被推迟到该服务就绪之后，而 connection 依赖 webRuntime、webRuntime 又要
+  // 等 webserver 绑定端口之后才 provide —— 互相等待，实测 apply 排不上队。
+  // `ctx.inject` 是运行时的、只推迟它自己的回调，不影响插件主体。
+  const channel = RPC_CHANNEL;
+
+  const register = (webCtx) => {
+    try {
+      const fetchHandler = createRpcFetchHandler(handler);
+      webCtx.effect(
+        () => webCtx.webServer.register({
+          kind: 'prefix',
+          path: channel,
+          handler: async (req, res) => {
+            await bridgeRpcRequest(req, res, fetchHandler);
+          },
+        }),
+        `dsh-mobile-bridge: ${channel} rpc channel`,
+      );
+      console.log(`[dsh-mobile-bridge] RPC 通道已注册：${channel}`);
+    } catch (err) {
+      console.error('[dsh-mobile-bridge] RPC 通道注册失败：', err?.message ?? String(err));
+    }
   };
+
+  try {
+    if (typeof ctx?.inject === 'function') {
+      const fiber = ctx.inject(['webServer'], register);
+      return async () => {
+        try { await fiber?.dispose?.(); } catch {}
+      };
+    }
+    console.error('[dsh-mobile-bridge] ctx.inject 不可用，无法注册 RPC 通道。');
+  } catch (err) {
+    console.error('[dsh-mobile-bridge] ctx.inject 调用失败：', err?.message ?? String(err));
+  }
+  return async () => {};
+}
+
+/**
+ * Wire format for the browser↔settings-page RPC channel.
+ *
+ * Mirrors the engine's own connection protocol
+ * (dsh-client-connection/lib/index.js:1212-1231 on the browser side,
+ * `clientRequestSchema` on the server side) so the unmodified client.js keeps
+ * working: request `{type:'client-request', rpcId, method, payload}`, answer
+ * `{type:'server-response', rpcId, result}` where `result` is
+ * `{ok:true, value}` or `{ok:false, error:{code,message}}`.
+ */
+function createRpcFetchHandler(handler) {
+  return async function fetchHandler(request) {
+    const endpoint = endpointFromPath(RPC_CHANNEL, new URL(request.url).pathname);
+    if (request.method !== 'POST' || endpoint === undefined) {
+      return new Response('not found', { status: 404 });
+    }
+    if ((request.headers.get('content-type') ?? '').split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
+      return new Response('content type must be application/json', { status: 415 });
+    }
+    let message;
+    try {
+      message = await request.json();
+    } catch {
+      return new Response('body is not JSON', { status: 400 });
+    }
+    if (message?.type !== 'client-request' || typeof message.rpcId !== 'string') {
+      return Response.json({
+        type: 'server-response',
+        rpcId: typeof message?.rpcId === 'string' ? message.rpcId : 'invalid-request',
+        result: { ok: false, error: { code: 'gateway/bad-request', message: 'invalid client-request message', details: { issues: [] } } },
+      });
+    }
+    // The path segment and the envelope's method must agree, exactly as the
+    // engine's own channel requires (same file, :689).
+    if (message.method !== endpoint) {
+      return Response.json({
+        type: 'server-response',
+        rpcId: message.rpcId,
+        result: { ok: false, error: { code: 'gateway/bad-request', message: `method ${JSON.stringify(message.method)} does not match endpoint ${JSON.stringify(endpoint)}`, details: { issues: [] } } },
+      });
+    }
+    try {
+      const result = await handler(endpoint, message.payload);
+      return Response.json({ type: 'server-response', rpcId: message.rpcId, result });
+    } catch (error) {
+      return new Response(`handler failure: ${String(error)}`, { status: 500 });
+    }
+  };
+}
+
+/** Node req/res → Fetch Request → write the Response back out. */
+async function bridgeRpcRequest(req, res, fetchHandler) {
+  const url = `http://127.0.0.1${req.url ?? '/'}`;
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (typeof value === 'string') headers.set(key, value);
+  }
+  const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
+  const request = new Request(url, {
+    method: req.method ?? 'GET',
+    headers,
+    ...(hasBody ? { body: await readAll(req), duplex: 'half' } : {}),
+  });
+  const response = await fetchHandler(request);
+  res.writeHead(response.status, Object.fromEntries(response.headers));
+  const body = response.body ? Buffer.from(await response.arrayBuffer()) : undefined;
+  res.end(body);
+}
+
+/** Collect a request body with a hard ceiling, so a bad actor cannot OOM us. */
+function readAll(req, limit = 2 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+/** Extract `<endpoint>` from `<channel>/<endpoint>`, rejecting empty/dot segments. */
+function endpointFromPath(channel, pathname) {
+  if (!pathname.startsWith(`${channel}/`)) return undefined;
+  const endpoint = pathname.slice(channel.length + 1);
+  if (endpoint.split('/').some((seg) => seg === '' || seg === '.' || seg === '..' || !/^[A-Za-z0-9_$.-]+$/.test(seg))) {
+    return undefined;
+  }
+  return endpoint;
 }
 
 async function dispatch(endpoint, payload, deps) {

@@ -1,4 +1,18 @@
 - insert:
     - id: dsh-mobile-bridge
       name: dsh-mobile-bridge
-
+      # ⚠️ 刻意**不写** inject。
+      #
+      # 2026-10-15 曾在这里加过 `inject: [connection, webServer]`，已撤回 ——
+      # 那是错的修法。声明 inject 会让 Cordis 把本插件的 apply 推迟到这两个服务
+      # 都就绪之后，而 connection 依赖 webRuntime，而 webRuntime 是 webserver
+      # 绑定端口之后才由 web-app 的 web-runtime 那一行 provide 的。结果 apply
+      # 排不上队，`ctx.webServer` 依然读不到，报同一个
+      # `cannot get property "webServer" without inject`，故障原样保留。
+      #
+      # 真正的修法在 lib/index.js：ctx.webServer 改为 try/catch 里的可选探测
+      # （Cordis 的 ctx 是 Proxy，访问未声明的服务会抛错，可选链挡不住），取不到
+      # 就退回 config/默认端口。不依赖 inject，也就不会被推迟执行。
+      #
+      # 故障表现（留档）：网关照常监听 3088，但设置页所有 RPC 报
+      # `transport failure ... HTTP 405`，设备列表与配对码全部失效。

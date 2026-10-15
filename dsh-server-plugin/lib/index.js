@@ -115,7 +115,20 @@ try {
 }
 
 const name = 'dsh-mobile-bridge';
-const inject = ['connection', 'webServer'];
+// [fix 2026-10-15] 只声明 `connection`，**去掉 `webServer`**。
+//
+// 为什么必须去掉：本插件不注入 webServer，就无法在本fiber 里访问它。Cordis 的
+// ctx 是 Proxy，未声明的服务一访问就抛 `cannot get property "webServer" without
+// inject`（cordis/lib/index.js:675）—— 而且这个抛出发生在 apply() 里，于是整个
+// apply 中断，installRpc() 从未被调用，浏览器里所有 RPC 落进 SPA fallback 回
+// 405，设备列表与配对码一起失效，而 3088 网关因为端口早已 bind 仍在监听。
+//
+// 而它其实并不需要 webServer：引擎端口取自 internals/config/默认值 3080，
+// readWebServerPort() 只是可选增强，取不到就退回 3080，行为完全正确。
+//
+// 保留 `connection` 是必须的 —— installRpc() 要用它注册 RPC 通道，没有它设置页
+// 的 devices/list 与 pair/qrdata 一律 405。
+const inject = ['connection'];
 
 /**
  * HMAC secret used to mint the signed cookie that lets the bridge talk to the
@@ -194,10 +207,50 @@ export function shouldDivertForBackpressure(bufferedAmount) {
     && bufferedAmount > MAX_CLIENT_BUFFER_BYTES;
 }
 
+/**
+ * Try to read the engine's webserver port without ever throwing.
+ *
+ * `ctx.webServer` is not a plain object: Cordis builds ctx as a Proxy that
+ * **throws** `cannot get property "webServer" without inject` for any service
+ * that was not declared on this fiber — an optional chain cannot swallow that,
+ * because the trap raises before `?.` ever sees `undefined`. Reading it from a
+ * bare `try` is the only way to degrade instead of aborting `apply()`.
+ *
+ * Returns undefined when the service is not visible from here, which is the
+ * normal case for the standalone gateway entry (index.js) and acceptable for the
+ * plugin: the caller falls back to configured/默认 ports.
+ */
+function readWebServerPort(ctx, logger) {
+  try {
+    const port = ctx.webServer?.port;
+    return typeof port === 'number' && port > 0 ? port : undefined;
+  } catch (err) {
+    // Not an error condition: this fiber simply cannot see the webserver
+    // service. Log once so the reason for the fallback is never a mystery.
+    logger.info?.(
+      'dsh-mobile-bridge: ctx.webServer 不可见（%s），引擎端口改用配置/默认值。',
+      err?.message ?? String(err)
+    );
+    return undefined;
+  }
+}
+
 export function apply(ctx, config = {}, internals = {}) {
   const logger = ctx.logger?.(name) ?? console;
   const cfg = loadConfig();
-  const dshPort = internals.dshPort ?? ctx.webServer?.port ?? config.dshPort ?? 3080;
+  // [fix 2026-10-15] 原来这里是 `ctx.webServer?.port` —— 可选链救不了它，因为
+  // Cordis 的 ctx 是一个 Proxy：访问未在 fiber.inject 里声明的服务会**抛错**，而
+  // 不是返回 undefined（cordis/lib/index.js:675）。于是这一行抛
+  // `cannot get property "webServer" without inject`，apply() 当场中断，
+  // installRpc() 从未被调用 → 浏览器里所有 RPC 落进 SPA fallback → HTTP 405，
+  // 设备列表和配对码全部失效，而 3088 网关因为在本行之前已经起了端口所以仍在监听。
+  //
+  // dshPort 只是"网关转发到引擎时用哪个端口"，真正需要的是它对得上引擎实际端口。
+  // 引擎默认 3080，config.dshPort 可覆盖，internals.dshPort 供独立网关入口
+  // （index.js 那条 `node index.js` 路径）显式传入。ctx.webServer 只是锦上添花，
+  // 拿不到就用下面的兜底 —— 为了一个可有可无的值把整个插件的 RPC 通道搭进去不划算。
+  const webServerPort = readWebServerPort(ctx, logger);
+  const dshPort = internals.dshPort ?? config.dshPort ?? webServerPort ?? 3080;
   const listenPort = internals.port ?? config.port ?? cfg.port ?? 3088;
   // Security default: loopback only.
   //
@@ -4085,6 +4138,10 @@ export function apply(ctx, config = {}, internals = {}) {
   });
 
   const apkFilePath = path.join(import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)), '..', 'public', 'dsh-agent.apk');
+  // 诊断锚点（2026-10-15）：apply() 走到这里就证明插件确实被加载了。与下面
+  // installRpc 里的注册日志配对，两行合起来能唯一区分"插件没加载"与
+  // "加载了但 connection 没注入"——这正是 405 一直查不下去的原因。
+  console.log(`[dsh-mobile-bridge] apply() 已执行，连接中… (webServer port=${dshPort})`);
   const disposeRpc = installRpc(ctx, {
     dshPort,
     isListening: true,
@@ -4191,5 +4248,9 @@ export function apply(ctx, config = {}, internals = {}) {
   };
 }
 
+apply.inject = inject;
+
+const plugin = { name, inject, apply };
+export default plugin;
 export { name, inject };
 
