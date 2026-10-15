@@ -41,18 +41,30 @@ IconData deliverableIconFor(String extension) {
 
 /// 一行交付物：图标 + 文件名 + 说明 + 尾部动作。
 ///
-/// 「本轮产出」卡片和信息面板共用这一行；点它会走下载 + 拉起系统应用那条链路。
+/// 「本轮产出」卡片和信息面板共用这一行。行上有**两个**动作位，这是刻意的：
+/// 主点击是"看一眼"（就地预览），长按才是"拿去用"（下载 / 拉起系统应用）。
+/// 把下载放在主点击上就等于说"每次想看一眼都要先落一份文件到手机里"，而
+/// 长按是这个行上唯一不与主点击冲突、也不新增视觉噪声的第二动作位。
 class DeliverableRow extends StatelessWidget {
   const DeliverableRow({
     super.key,
     required this.item,
     this.onOpen,
+    this.onLongPress,
+    this.trailingIcon,
     this.busy = false,
     this.dense = false,
   });
 
   final DeliverableItem item;
   final VoidCallback? onOpen;
+
+  /// 第二动作（下载 / 用其它应用打开）。为 null 时长按无动作。
+  final VoidCallback? onLongPress;
+
+  /// 尾部图标。默认画下载箭头；主点击已经是预览时，调用方应换成眼睛——尾部画着
+  /// 下载箭头却在点下去时开预览，图标就在说假话。
+  final IconData? trailingIcon;
 
   /// 正在为这一行下载（显示转圈，避免用户重复点两次）。
   final bool busy;
@@ -70,6 +82,7 @@ class DeliverableRow extends StatelessWidget {
 
     return InkWell(
       onTap: onOpen,
+      onLongPress: onLongPress,
       borderRadius: BorderRadius.circular(8),
       child: Padding(
         padding: EdgeInsets.symmetric(vertical: dense ? 5 : 7),
@@ -100,7 +113,7 @@ class DeliverableRow extends StatelessWidget {
             if (busy)
               const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
             else
-              Icon(Icons.download_rounded, size: 18, color: context.c.textSecondary),
+              Icon(trailingIcon ?? Icons.download_rounded, size: 18, color: context.c.textSecondary),
           ],
         ),
       ),
@@ -114,8 +127,12 @@ class DeliverableRow extends StatelessWidget {
 /// 出现在消息流的那个位置，而不是某个需要跳过去的页面。用户一旦发出下一条消息，
 /// 它就不再是"刚刚发生的事"，由调用方把它摘掉（常驻记录在信息面板里）。
 ///
+/// 两个动作位与信息面板**逐字对齐**（主点击 = 就地预览，长按 = 下载 / 用其它
+/// 应用打开）：同一个东西在会话里点一下是预览、在面板里点一下变成下载，是这次
+/// 改动之前真实存在的错位，用户没法从界面上学到任何一种。
+///
 /// ⚠️ **必须传 REST 返回的行**（`GET /api/mobile/deliverables`）：那里的 `path`
-/// 是网关解析后的**绝对路径**，也正是下载路由做成员判定时认的 key
+/// 是网关解析后的**绝对路径**，也正是下载路由与预览路由做成员判定时认的 key
 /// （`resolveDeliverable`）。WS `deliverables` 帧里只有相对路径 + 说明，
 /// 拿它去请求下载会被判 403 —— 帧只配用来触发"有新东西了"这个信号。
 class TurnOutputCard extends StatelessWidget {
@@ -126,6 +143,7 @@ class TurnOutputCard extends StatelessWidget {
     this.busyPath,
     this.errorText,
     this.onOpen,
+    this.onDownload,
     this.onShowAll,
   });
 
@@ -142,7 +160,14 @@ class TurnOutputCard extends StatelessWidget {
   /// 视线之外消失，而卡片才是他此刻正在看的地方。
   final String? errorText;
 
+  /// 主点击：就地预览内容。
   final ValueChanged<DeliverableItem>? onOpen;
+
+  /// 长按：下载 / 用其它应用打开。
+  ///
+  /// 传了它就意味着主点击已经被预览占住，所以卡片会自动换成眼睛图标并加一行
+  /// 手势说明 —— 长按是完全不可发现的，不写出来就等于没有这个功能。
+  final ValueChanged<DeliverableItem>? onDownload;
 
   /// "查看全部"→ 打开信息面板（那里按轮分组列出所有产出）。
   final VoidCallback? onShowAll;
@@ -160,6 +185,8 @@ class TurnOutputCard extends StatelessWidget {
     final title = latest.turnLabel == null
         ? '最近交付 · ${rows.length} 个文件'
         : '${latest.turnLabel}产出 · ${rows.length} 个文件';
+    final download = onDownload;
+    final hasSecondAction = download != null && onOpen != null;
 
     return Container(
       key: const ValueKey('turn-output-card'),
@@ -192,7 +219,9 @@ class TurnOutputCard extends StatelessWidget {
             DeliverableRow(
               item: item,
               busy: busyPath != null && busyPath == item.path,
+              trailingIcon: hasSecondAction ? Icons.visibility_rounded : null,
               onOpen: onOpen == null ? null : () => onOpen!(item),
+              onLongPress: hasSecondAction ? () => download(item) : null,
             ),
           if (hidden > 0)
             Align(
@@ -208,6 +237,15 @@ class TurnOutputCard extends StatelessWidget {
                   '还有 $hidden 个 · 查看全部',
                   style: TextStyle(fontSize: 11.5, color: context.c.accent),
                 ),
+              ),
+            ),
+          if (hasSecondAction)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                '点文件名就地预览 · 长按下载 / 用其它应用打开',
+                key: const ValueKey('turn-output-hint'),
+                style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
               ),
             ),
           if (errorText != null && errorText!.isNotEmpty)

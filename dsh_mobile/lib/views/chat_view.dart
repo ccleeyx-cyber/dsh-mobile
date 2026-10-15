@@ -15,6 +15,7 @@ import '../widgets/thinking_card.dart';
 import '../widgets/tool_call_card.dart';
 import '../widgets/approval_card.dart';
 import '../widgets/memory_card.dart';
+import '../widgets/inline_file_links.dart';
 import '../widgets/safe_markdown.dart';
 import 'widgets/question_card.dart';
 import 'widgets/attachment_tile.dart';
@@ -22,6 +23,7 @@ import 'widgets/message_search.dart';
 import 'widgets/message_search_panel.dart';
 import 'widgets/session_status_strip.dart';
 import 'widgets/session_info_sheet.dart';
+import 'widgets/deliverable_preview_sheet.dart';
 import 'widgets/turn_output_card.dart';
 import 'host_ops_view.dart';
 import 'config_page.dart';
@@ -2353,7 +2355,7 @@ class _ChatViewState extends State<ChatView> {
                                 // 命中的那条消息。没有 key 只能按索引估算 offset，而
                                 // 消息高度是可变的，估算必然滚偏。
                                 final highlighted = _highlightedMessageIds.contains(m.id);
-                                Widget built = _buildMessageItem(m);
+                                Widget built = _buildMessageItem(m, dsh);
                                 if (highlighted) {
                                   // 高亮放在这里而不是 _buildMessageItem 内部：这样
                                   // 记忆卡、工具卡等所有分支都被同一层覆盖，不必逐个
@@ -2381,11 +2383,16 @@ class _ChatViewState extends State<ChatView> {
 
                               // 「本轮产出」卡片：事件进流那一半 —— 交付物出现在
                               // 交付它的那一轮之后（见 build 里锚点的说明）。
+                              //
+                              // 主点击 = 就地预览，长按 = 下载 / 用其它应用打开 ——
+                              // 与信息面板逐字同一套手势。这两处曾经不一致：会话里
+                              // 点一下要下载 + 切应用，面板里点一下只是看一眼。
                               return TurnOutputCard(
                                 deliverables: dsh.deliverables,
                                 busyPath: _deliverableBusy.value,
                                 errorText: _deliverableError,
-                                onOpen: (item) => _openDeliverable(dsh, item),
+                                onOpen: (item) => _previewDeliverable(dsh, item),
+                                onDownload: (item) => _openDeliverable(dsh, item),
                                 onShowAll: () => _openSessionInfo(dsh, section: SessionInsightSection.deliverables),
                               );
                             },
@@ -2720,7 +2727,11 @@ class _ChatViewState extends State<ChatView> {
     return const SizedBox(height: 1);
   }
 
-  Widget _buildMessageItem(ChatMessage msg) {
+  /// 渲染一条消息气泡。
+  ///
+  /// [dsh] 是必需的：正文里的产物引用要链接化（靠会话的交付物清单做白名单），
+  /// 而点开那些链接又要回到同一个 `DshService` 去取内容。
+  Widget _buildMessageItem(ChatMessage msg, DshService dsh) {
     // 1. Standalone context or memory snapshot message -> Collapsed MemoryCard
     if (msg.isContextOrMemory) {
       return Padding(
@@ -2845,8 +2856,12 @@ class _ChatViewState extends State<ChatView> {
                       ],
                     ),
                     child: SafeMarkdown(
-                      data: displayContent,
+                      // 正文里提到本会话声明过的产物时，把它变成可点链接（长按
+                      // 复制原文仍然可用）。只认清单白名单，所以正文里的示例路径、
+                      // 别人的目录都不会被误变成一个点开就报错的链接。
+                      data: linkifyDeliverableRefs(displayContent, dsh.deliverables),
                       selectable: true,
+                      onTapLink: (text, href, title) => _openMessageLink(dsh, href),
                       fallbackTextStyle: TextStyle(
                         fontSize: 14,
                         color: isUser ? Colors.white : context.c.textPrimary,
@@ -3431,9 +3446,65 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
+  /// 就地预览一个交付物 —— 产出卡片主点击用的就是它。
+  ///
+  /// 和信息面板走的是**同一个** `showDeliverablePreview`：三个入口（卡片、正文
+  /// 链接、面板）共用一份实现与一套手势，所以不存在"同一个文件在三处行为不同"。
+  Future<void> _previewDeliverable(DshService dsh, DeliverableItem item) async {
+    if (!mounted) return;
+    await showDeliverablePreview(
+      context,
+      item: item,
+      loader: () => dsh.fetchDeliverableText(item.path),
+      onDownload: () => _openDeliverable(dsh, item),
+    );
+  }
+
+  /// 消息正文里点了一个链接。
+  ///
+  /// 分三类，且**只有两类能开**：产物链接（本 App 自己插的 `dsh-file:`）与
+  /// http(s) 链接。其余的给一句说明而不是静默失败 —— "点了没反应"和"这个链接
+  /// 打不开"是两件不同的事，用户至少该知道该换个办法。
+  Future<void> _openMessageLink(DshService dsh, String? href) async {
+    if (href == null || href.isEmpty) return;
+
+    // 1. 产物链接。解码出的绝对路径仍要在清单里复核一次：这条消息渲染之后清单
+    //    可能已经刷新过（切了会话、重新拉了 REST），拿旧路径去请求只会得到 403。
+    final refPath = decodeDshFileHref(href);
+    final item = matchDeliverableByRef(dsh.deliverables, refPath ?? href);
+    if (item != null) {
+      await _previewDeliverable(dsh, item);
+      return;
+    }
+    if (refPath != null) {
+      _showLinkNotice('这个产物已经不在当前会话的清单里了');
+      return;
+    }
+
+    // 2. 普通网页链接。
+    final scheme = Uri.tryParse(href)?.scheme.toLowerCase() ?? '';
+    if (scheme == 'http' || scheme == 'https') {
+      final opened = await UrlOpener.open(href);
+      if (!opened) _showLinkNotice('没有可用的浏览器打开这个链接');
+      return;
+    }
+
+    _showLinkNotice('这个链接不是本会话的产物，App 打不开');
+  }
+
+  void _showLinkNotice(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message),
+      duration: const Duration(milliseconds: 1600),
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
   /// 下载交付物并交给系统打开；失败说明**内联**在卡片/面板里。
   ///
-  /// `item.path` 必须是 REST 返回的绝对路径（下载路由按绝对路径做成员判定）。
+  /// 这是行上的**第二动作**（长按），不是主点击：主点击是预览。`item.path` 必须
+  /// 是 REST 返回的绝对路径（下载路由按绝对路径做成员判定）。
   Future<void> _openDeliverable(DshService dsh, DeliverableItem item) async {
     if (_deliverableBusy.value != null) return; // 防重复点
     setState(() {
