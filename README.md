@@ -61,11 +61,23 @@ DSH_E2E_FORCE=1 npm run test:sweep    # 连有内容的也归档（危险）
 版本号唯一真源是 `dsh_mobile/pubspec.yaml` 的 `version: x.y.z+n`。
 
 ```bash
-git tag v1.18.0 && git push origin v1.18.0
+git push origin main
 ```
 
-`.github/workflows/build-apk.yml` 会读 pubspec 里的版本、按 ABI 拆分构建、发布到
-GitHub Releases，release notes 取 `CHANGELOG.md` 对应小节的正文。
+**触发条件是「push 到 main」，不是打 tag**（2026-10-17 核对工作流后更正：本文档此前写的是
+`git tag v1.18.0 && git push origin v1.18.0`，而 `build-apk.yml` 的 `on:` 只有
+`branches: [main, master]` + `pull_request` + `workflow_dispatch` —— 没有 `tags:`，
+所以推 tag 不会触发任何构建；release job 的 `if:` 也明确要求
+`github.event_name == 'push' && github.ref == 'refs/heads/main'`）。
+
+`.github/workflows/build-apk.yml` 会读 pubspec 里的版本、按 ABI 拆分构建，然后**按该版本
+自动创建（或更新）GitHub Release `v<version>`**，release notes 取 `CHANGELOG.md` 里
+`## [<version>]` 那一节的正文（取不到就退回提交列表）。因此：
+
+- 发布 = 改 `pubspec.yaml` 的版本号 + 写 `CHANGELOG.md` 同名小节 + push 到 main；
+- 同一个版本号重复 push 会**更新**同一个 release（不会产生第二个），资产被覆盖；
+- tag 不必打，打了也不会触发构建 —— 真要和 tag 对齐，只能是 `v<version>` 与 pubspec 一致时
+  手工补一个，纯属文档性标记。
 
 App 里的版本号**不是手抄的**：CI 解析 pubspec（外加 `android/app/build.gradle` 的
 `applicationId`）后，通过 `--dart-define=APP_VERSION/APP_BUILD/APP_PACKAGE_NAME`
