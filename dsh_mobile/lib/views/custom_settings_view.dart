@@ -231,12 +231,17 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                                     trailing: isSelected ? Icon(Icons.check_circle, color: context.c.accent) : null,
                                     onTap: () async {
                                       Navigator.pop(ctx);
-                                      final ok = await dsh.switchModel(m.id);
+                                      // 设置页改的是**全局默认**，不是某个会话。以前这里
+                                      // 调 switchModel，它会同时写会话级（而那条路是哑的）
+                                      // 与全局，语义含混；现在各走各的。
+                                      final ok = await dsh.setDefaultModel(m.id);
                                       if (ok && context.mounted) {
                                         ScaffoldMessenger.of(context).clearSnackBars();
                                         ScaffoldMessenger.of(context).showSnackBar(
                                           SnackBar(
-                                            content: Text('已切换默认模型至: ${m.name}'),
+                                            // 写明生效范围与生效时机：实测写进 settings.yaml
+                                            // 后，正在运行的会话要到重启 dsh web 才会采用。
+                                            content: Text('已将全局默认模型设为 ${m.name}（新建会话生效；正在运行的会话需重启 dsh web）'),
                                             backgroundColor: context.c.success,
                                             behavior: SnackBarBehavior.floating,
                                             duration: const Duration(seconds: 2),
@@ -731,13 +736,18 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('当前默认模型', style: TextStyle(color: context.c.textSecondary, fontSize: 11)),
+                          Text('当前全局默认模型', style: TextStyle(color: context.c.textSecondary, fontSize: 11)),
                           const SizedBox(height: 2),
                           Text(
                             currentModel,
                             style: TextStyle(color: context.c.textPrimary, fontSize: 14, fontWeight: FontWeight.bold),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            '只影响新建会话；正在运行的会话在聊天页单独切换（立即生效）',
+                            style: TextStyle(color: context.c.textTertiary, fontSize: 10.5),
                           ),
                         ],
                       ),

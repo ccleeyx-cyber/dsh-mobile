@@ -1280,45 +1280,55 @@ export function apply(ctx, config = {}, internals = {}) {
     audit('settings/model', { modelId });
   }
 
-  function updateSessionModel(sessionId, modelId) {
-    // [fix 2026-10-11] sessionId is interpolated into a file path below; without
-    // this gate a crafted id ("../../mobile-bridge/foo") escapes projcache and
-    // this function WRITES there. Same invariant deleteSession already enforces.
-    const idCheck = assertSessionId(sessionId);
-    if (!idCheck.ok) {
-      audit('session/model', { sessionId, error: idCheck.error });
-      return false;
-    }
-    const cleanId = sessionId.startsWith('session-') ? sessionId.replace('session-', '') : sessionId;
-    // [fix 2026-10-15] 这里**故意不**用 projectionCacheCandidates()：那是读表，
-    // 含归档域的 sha256 文件名，而本函数是写路径，往归档域写会让归档管理器与
-    // 引擎的 domain 记账对不上。只保留主域的两种拼法。
-    const projCacheDir = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions');
-    const candidates = [
-      path.join(projCacheDir, `${sessionId}.json`),
-      path.join(projCacheDir, `session-${cleanId}.json`),
-      path.join(projCacheDir, `${cleanId}.json`)
-    ];
+  /**
+   * 模型目录（引擎的权威来源），带 60 秒缓存。
+   *
+   * 为什么需要它：会话级选模型要发 `{provider, model}` 给引擎，而 App 只知道
+   * model id。旧实现把 provider 硬编码成 `'wb'` —— 本机上 `cn:*` 恰好属于 `wb`，
+   * 所以看不出来；一旦选了别的 provider（qwen / deepseek-official / antigravity）
+   * 的模型，就会写出一对不匹配的组合。目录里每个 group 的 `id` 就是 provider。
+   */
+  let modelCatalogCache = { at: 0, value: null };
+  // 60 秒是"用户连续试几个模型"的量级；测试可把它设成 0 关掉缓存，
+  // 否则同一个插件实例会把第一个用例的目录带进下一个用例。
+  const MODEL_CATALOG_TTL_MS = (() => {
+    const raw = Number(config?.modelCatalogTtlMs);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 60 * 1000;
+  })();
 
-    let updated = false;
-    for (const cPath of candidates) {
-      const cache = projCacheReader.readJson(cPath);
-      if (cache && cache.record && cache.record.rows) {
-        try {
-          if (!cache.record.rows.modelSelection) cache.record.rows.modelSelection = { val: {} };
-          if (!cache.record.rows.modelSelection.val) cache.record.rows.modelSelection.val = {};
-          cache.record.rows.modelSelection.val.lastUsed = { provider: 'wb', model: modelId };
-          fs.writeFileSync(cPath, JSON.stringify(cache, null, 2), 'utf8');
-          projCacheReader.invalidate(cPath); // we just changed the mtime/content
-          updated = true;
-          break;
-        } catch (err) {
-          logger.error('[SessionModel] Error updating cache file:', cPath, err);
-        }
+  async function loadModelCatalog() {
+    const now = Date.now();
+    if (modelCatalogCache.value && now - modelCatalogCache.at < MODEL_CATALOG_TTL_MS) {
+      return modelCatalogCache.value;
+    }
+    const catalog = await callDshRpc('session/modelCatalog', { args: {} });
+    // 形状不对就不缓存 —— 宁可直接报错，也不要把一份坏数据缓存一分钟。
+    if (!catalog || !Array.isArray(catalog.groups)) {
+      throw new Error('引擎返回的模型目录形状异常');
+    }
+    modelCatalogCache = { at: now, value: catalog };
+    return catalog;
+  }
+
+  /**
+   * 把一个 model id 解析成引擎要求的 `{provider, model}`。
+   * @returns `{ok:true, provider, model}` 或 `{ok:false, error}`。
+   */
+  async function resolveModelSelection(modelId) {
+    let catalog;
+    try {
+      catalog = await loadModelCatalog();
+    } catch (err) {
+      return { ok: false, error: `读取模型目录失败：${err?.message || err}` };
+    }
+    for (const group of catalog.groups) {
+      if (!Array.isArray(group?.models)) continue;
+      if (group.models.some((m) => m?.id === modelId)) {
+        return { ok: true, provider: group.id, model: modelId };
       }
     }
-    audit('session/model', { sessionId, modelId, updated });
-    return updated;
+    // 目录里没有就如实失败。旧实现会照样写下去并回 200，用户以为切成功了。
+    return { ok: false, error: `模型目录里找不到 ${modelId}（可能已下线或未配置）` };
   }
 
   /**
@@ -1516,9 +1526,10 @@ export function apply(ctx, config = {}, internals = {}) {
   }
 
   async function getSessionHistory(sessionId) {
-    // [fix 2026-10-11] Path-traversal gate: read face of the same hole as
-    // updateSessionModel — a crafted id would read arbitrary .json files
-    // outside projcache and return their rows content.
+    // [fix 2026-10-11] Path-traversal gate: a crafted id would read arbitrary
+    // .json files outside projcache and return their rows content. (The write-side
+    // sibling of this hole lived in updateSessionModel, removed 2026-10-16 when
+    // session model selection moved to the engine's session/selectModel RPC.)
     const idCheck = assertSessionId(sessionId);
     if (!idCheck.ok) return { messages: [], isRunning: false, model: '', error: idCheck.error };
     const cleanId = sessionId.startsWith('session-') ? sessionId.replace('session-', '') : sessionId;
@@ -3735,8 +3746,45 @@ export function apply(ctx, config = {}, internals = {}) {
       }
 
       if (pathname === '/api/mobile/sessions/model' && req.method === 'POST') {
-        updateSessionModel(jsonBody.sessionId, jsonBody.model);
-        sendJson(200, { ok: true, code: 0, message: 'Updated session model' });
+        // [fix 2026-10-16] 以前这里只把 {provider:'wb', model} 写进投影缓存文件，
+        // 从不告诉引擎 —— 而投影缓存是引擎折叠日志的**输出**（字段语义是"最近一次
+        // 已记录请求消耗的选择"），手写进去等于断言一件没发生过的事。实测证据：
+        // 在 App 里 18:42:50 切换模型后，引擎侧 26 分钟内没有任何 model/selection
+        // 事件，请求仍跑旧模型，直到重启才换成新模型。
+        //
+        // 现在走引擎的正规 RPC（Host 校验后返回 accepted selection，并记录
+        // log-only 事件 model/selection）。同族的 session/prompt、session/delete、
+        // session/updateQueue 早就在用这条通道。
+        const sessionId = String(jsonBody.sessionId || '').trim();
+        const modelId = String(jsonBody.model || '').trim();
+        if (!sessionId || !modelId) {
+          sendJson(400, { ok: false, code: 400, error: 'sessionId 与 model 均为必填' });
+          return;
+        }
+        const idCheck = assertSessionId(sessionId);
+        if (!idCheck.ok) {
+          audit('session/model', { sessionId, error: idCheck.error });
+          sendJson(400, { ok: false, code: 400, error: idCheck.error });
+          return;
+        }
+        const resolved = await resolveModelSelection(modelId);
+        if (!resolved.ok) {
+          audit('session/model', { sessionId, modelId, error: resolved.error });
+          // 502：这是上游（引擎/目录）的问题，不是客户端请求格式的问题。
+          sendJson(502, { ok: false, code: 502, error: resolved.error });
+          return;
+        }
+        try {
+          const value = await callDshRpc('session/selectModel', {
+            args: { request: { sessionId, provider: resolved.provider, model: resolved.model } }
+          });
+          const selected = value && value.selected ? value.selected : { provider: resolved.provider, model: resolved.model };
+          audit('session/model', { sessionId, modelId, provider: resolved.provider, selected: true });
+          sendJson(200, { ok: true, code: 0, selected });
+        } catch (err) {
+          audit('session/model', { sessionId, modelId, error: err?.message || String(err) });
+          sendJson(502, { ok: false, code: 502, error: err?.message || 'session/selectModel 调用失败' });
+        }
         return;
       }
 

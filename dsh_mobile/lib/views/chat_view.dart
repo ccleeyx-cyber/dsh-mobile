@@ -1161,6 +1161,11 @@ class _ChatViewState extends State<ChatView> {
                       ),
                     ),
                   ),
+                const SizedBox(height: 6),
+                Text(
+                  '切换只对本次会话生效，立即生效；全局默认模型在「设置」页修改。',
+                  style: TextStyle(fontSize: 11.5, color: context.c.textTertiary),
+                ),
                 const SizedBox(height: 12),
                 StatefulBuilder(
                   builder: (context, setModalState) {
@@ -1213,7 +1218,10 @@ class _ChatViewState extends State<ChatView> {
                         onTap: () async {
                           Navigator.pop(ctx);
                           HapticFeedback.selectionClick();
-                          final ok = await dsh.switchModel(m.id, sessionId: currentSession?.sessionId);
+                          // 只切本会话。以前这里调的是 switchModel，它除了写会话级
+                          // 还顺手把全局默认也改了 —— 一个"给这个会话换模型"的动作
+                          // 不该影响别的会话。现在全局默认只在设置页改。
+                          final ok = await dsh.selectSessionModel(m.id, sessionId: currentSession?.sessionId);
                           // [fix 2026-10-11] Guard the OUTER sheet/chat context,
                           // not the list item's: after Navigator.pop the item
                           // context is unmounted, so the SnackBar here was dead
@@ -1222,7 +1230,7 @@ class _ChatViewState extends State<ChatView> {
                           if (ok) {
                             ScaffoldMessenger.of(itemCtx).showSnackBar(
                               SnackBar(
-                                content: Text('已成功切换模型为: ${m.name}'),
+                                content: Text('本会话模型已切换为: ${m.name}（立即生效）'),
                                 backgroundColor: itemCtx.c.success,
                                 behavior: SnackBarBehavior.floating,
                               ),

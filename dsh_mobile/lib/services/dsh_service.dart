@@ -1858,57 +1858,46 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  Future<bool> switchModel(String modelId, {String? sessionId}) async {
+  /// 切换**本会话**的模型（在聊天页做，立即生效）。
+  ///
+  /// 走网关的 `/api/mobile/sessions/model`，网关再调引擎的 RPC
+  /// `session/selectModel`。
+  ///
+  /// ⚠️ 此前这个动作是"哑"的：网关只把 `{provider:'wb', model}` 写进投影缓存文件，
+  /// 从不告诉引擎（投影缓存是引擎折叠日志的输出，手写等于断言一件没发生过的事）。
+  /// 实测：在 App 里切换后 26 分钟内引擎侧没有任何 `model/selection` 事件，请求仍跑
+  /// 旧模型。**同一操作还会顺带改掉全局默认模型**（见 [setDefaultModel]）——那既是
+  /// 越界（改一个会话却影响所有会话），也是延迟生效（要重启 dsh web）。现在两件事
+  /// 彻底分开，各由各自的入口触发。
+  Future<bool> selectSessionModel(String modelId, {String? sessionId}) async {
     if (_currentConfig == null) return false;
     final targetSessionId = sessionId ?? _currentSession?.sessionId;
-
-    // 两路设置（会话级 + 全局）各自独立成败。此前两处失败都被 catch 吞掉、
-    // 然后无条件更新本地并 return true —— UI 显示切换成功，下一次 prompt
-    // 仍用旧模型。现在必须**至少一路成功**才更新本地并返回 true；全失败
-    // 如实返回 false，让 UI 把失败显示出来。
-    bool sessionOk = false;
-    bool globalOk = false;
-
-    // 1. If we have an active session, attempt session/model endpoint
-    if (targetSessionId != null && targetSessionId.isNotEmpty && targetSessionId != 'default') {
-      try {
-        final sessionUrl = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/model');
-        final res = await _httpClient.post(
-          sessionUrl,
-          headers: _authHeaders,
-          body: jsonEncode({
-            'sessionId': targetSessionId,
-            'model': modelId,
-          }),
-        ).timeout(const Duration(seconds: 5));
-        if (_checkResponseAuth(res)) return false;
-        sessionOk = res.statusCode == 200;
-      } catch (e) {
-        debugPrint('[DshService] session model switch failed: $e');
-      }
-    }
-
-    // 2. Also persist to global settings
-    try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings/model');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'model': modelId}),
-      ).timeout(const Duration(seconds: 5));
-      if (_checkResponseAuth(res)) return false;
-      globalOk = res.statusCode == 200;
-    } catch (e) {
-      debugPrint('[DshService] global settings model switch failed: $e');
-    }
-
-    if (!sessionOk && !globalOk) {
-      _lastError = '模型切换失败：会话级与全局设置均未成功';
+    if (targetSessionId == null || targetSessionId.isEmpty || targetSessionId == 'default') {
+      _lastError = '没有可用于切换模型的会话';
       notifyListeners();
       return false;
     }
 
-    // 3. Update local state so subsequent prompts use this model
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/model');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'sessionId': targetSessionId, 'model': modelId}),
+      ).timeout(const Duration(seconds: 8));
+      if (_checkResponseAuth(res)) return false;
+      if (res.statusCode != 200) {
+        _lastError = _errorFromBody(res) ?? '切换模型失败 (HTTP ${res.statusCode})';
+        notifyListeners();
+        return false;
+      }
+    } catch (e) {
+      debugPrint('[DshService] selectSessionModel failed: $e');
+      _lastError = '切换模型失败: $e';
+      notifyListeners();
+      return false;
+    }
+
     _currentSessionModel = modelId;
     if (_currentSession != null) {
       _currentSession = _currentSession!.copyWith(model: modelId);
@@ -1920,9 +1909,54 @@ class DshService extends ChangeNotifier {
         }
       }
     }
+    notifyListeners();
+    return true;
+  }
+
+  /// 设置**全局默认模型**（在设置页做）。
+  ///
+  /// 写引擎的 `settings.yaml`（`agent-default-model`），影响所有会话与新建会话。
+  /// ⚠️ 实测它对**已经在运行的会话**不是立即生效的：18:42:50 写入后，直到 20:09
+  /// 重启 dsh web 引擎才采用。所以界面上必须写明这一点，不能让用户以为改完就换了。
+  Future<bool> setDefaultModel(String modelId) async {
+    if (_currentConfig == null) return false;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings/model');
+      final res = await _httpClient.post(
+        url,
+        headers: _authHeaders,
+        body: jsonEncode({'model': modelId}),
+      ).timeout(const Duration(seconds: 8));
+      if (_checkResponseAuth(res)) return false;
+      if (res.statusCode != 200) {
+        _lastError = _errorFromBody(res) ?? '设置默认模型失败 (HTTP ${res.statusCode})';
+        notifyListeners();
+        return false;
+      }
+    } catch (e) {
+      debugPrint('[DshService] setDefaultModel failed: $e');
+      _lastError = '设置默认模型失败: $e';
+      notifyListeners();
+      return false;
+    }
     await fetchSettings();
     notifyListeners();
     return true;
+  }
+
+  /// 从错误响应体里取网关/引擎给的原因（"模型目录里找不到 X"这类）。
+  ///
+  /// 只认 `error` 字段：网关的所有失败分支都写它，拿不到就返回 null 让调用方
+  /// 退回到带状态码的通用文案，而不是显示一个空错误。
+  String? _errorFromBody(http.Response res) {
+    try {
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      final err = data is Map ? data['error'] : null;
+      if (err != null && err.toString().trim().isNotEmpty) return err.toString();
+    } catch (_) {
+      // 非 JSON 的响应体（代理错误页等）——按"没有可用原因"处理
+    }
+    return null;
   }
 
   // Delete Session
