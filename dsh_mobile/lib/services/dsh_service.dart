@@ -564,6 +564,12 @@ class DshService extends ChangeNotifier {
             isRunning: t['isRunning'] ?? false,
           )).toList(),
           timestamp: raw['time'] != null ? DateTime.fromMillisecondsSinceEpoch(raw['time']) : null,
+          // [feat 2026-10-17] 网关标出的"注入通知"（子代理结算等）。没有这几个字段
+          // （老网关）时，ChatMessage 会按锚定文案自己认一次，见 HarnessNotice。
+          noticeKind: raw['noticeKind']?.toString(),
+          noticeVariant: raw['noticeVariant']?.toString(),
+          noticeChildId: raw['noticeChildId']?.toString(),
+          noticeBody: raw['noticeBody']?.toString(),
         );
         knownSeqs.add(seq ?? -1);
         knownIds.add(msg.id);
@@ -1359,6 +1365,12 @@ class DshService extends ChangeNotifier {
               isRunning: t['isRunning'] ?? false,
             )).toList(),
             timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
+            // [feat 2026-10-17] 网关标出的"注入通知"（子代理结算等）；老网关/本地
+            // 乐观消息没有这几个字段，ChatMessage 会按锚定文案兜底。
+            noticeKind: m['noticeKind']?.toString(),
+            noticeVariant: m['noticeVariant']?.toString(),
+            noticeChildId: m['noticeChildId']?.toString(),
+            noticeBody: m['noticeBody']?.toString(),
           );
         }).toList();
 

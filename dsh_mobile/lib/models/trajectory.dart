@@ -224,6 +224,27 @@ class Trajectory {
       // 时间线上重复出现同一件事比漏掉它更像 bug。
       if (!seenIds.add(m.id)) continue;
 
+      // [feat 2026-10-17] 引擎注入的通知（role 是 user，但没人打过这些字）不是用户
+      // 输入、也不是 agent 的动作：如果按 role 走，它会凭空开一轮"第 N 轮"，把整条
+      // 时间线的轮号全带偏。归到折叠那一档，默认不可见但能被计数。
+      if (m.isHarnessNotice) {
+        contextCount++;
+        final body = m.notice?.body;
+        add(TrajectoryEvent(
+          kind: TrajectoryEventKind.context,
+          messageId: m.id,
+          label: '通知',
+          seq: m.seq,
+          at: m.timestamp,
+          preview: TrajectoryEvent.firstLine(
+            (body != null && body.trim().isNotEmpty) ? body : m.content,
+            max: 72,
+          ),
+          detail: m.content,
+        ));
+        continue;
+      }
+
       if (m.isContextOrMemory) {
         contextCount++;
         add(TrajectoryEvent(

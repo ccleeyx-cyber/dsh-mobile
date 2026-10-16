@@ -83,6 +83,29 @@ void main() {
       expect(traj.turns.length, 1);
       expect(traj.turns.single.actionEvents.length, 1);
     });
+
+    test('引擎注入的通知不会凭空开一轮（它 role 是 user）', () {
+      final traj = Trajectory.build([
+        msg(id: 'u1', role: 'user', content: '开始', at: t0),
+        msg(id: 'a1', role: 'assistant', content: '好', at: t1),
+        // 子代理结算通知：role 是 user，但没人打过这些字。
+        msg(
+          id: 'n1',
+          role: 'user',
+          content: 'Background subagent 915eb2f4-0d12-4b86-8922-b2b26cfc3ecc finished and will '
+              'do no further work unless you send it more.Its closing message:做完了',
+          at: t2,
+        ),
+        msg(id: 'a2', role: 'assistant', content: '继续', at: t3),
+      ]);
+
+      expect(traj.turns.length, 1, reason: '通知既不是用户输入也不是 agent 动作，不能开新一轮');
+      // 本轮的动作只有：用户开的头 + 两条助手回复（通知不在这里面）。
+      expect(traj.turns.single.actionEvents.map((e) => e.label), ['你', '回复', '回复']);
+      expect(traj.contextEventCount, 1, reason: '但它必须仍然可被计数，不能静默消失');
+      expect(traj.turns.single.contextEvents.single.label, '通知');
+      expect(traj.turns.single.contextEvents.single.preview, '做完了');
+    });
   });
 
   group('耗时：取不到就是 null，绝不补一个假的 0', () {

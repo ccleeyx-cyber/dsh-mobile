@@ -3,8 +3,8 @@
 /// **唯一真源是 `dsh_mobile/pubspec.yaml` 的 `version: x.y.z+n`**，一路这样走到
 /// App 里，中途没有任何人手抄写：
 ///
-///   1. `pubspec.yaml` → `version: 1.22.0+56`
-///   2. `scripts/app-version.mjs` 解析出 `1.22.0` / `56` / `com.example.dsh_mobile`
+///   1. `pubspec.yaml` → `version: 1.23.0+57`
+///   2. `scripts/app-version.mjs` 解析出 `1.23.0` / `57` / `com.example.dsh_mobile`
 ///      （`android/app/build.gradle` 的 `applicationId`）
 ///   3. CI（`.github/workflows/build-apk.yml`）把三者经
 ///      `--dart-define=APP_VERSION=... --dart-define=APP_BUILD=... --dart-define=APP_PACKAGE_NAME=...`
@@ -28,14 +28,14 @@ class AppVersion {
 
   /// 展示用版本号（`x.y.z`），构建期由 pubspec 注入。
   static const String version =
-      String.fromEnvironment('APP_VERSION', defaultValue: '1.22.0');
+      String.fromEnvironment('APP_VERSION', defaultValue: '1.23.0');
 
   /// 构建号（pubspec `+n`），即 Android 的 versionCode 来源。
   ///
   /// 更新检查拿它做比较：**必须严格递增**，否则新 APK 装不上去（Android 拒绝
   /// 降级覆盖安装），清单里的 versionCode 也会被判成"没有新版"。
   static const String buildNumber =
-      String.fromEnvironment('APP_BUILD', defaultValue: '56');
+      String.fromEnvironment('APP_BUILD', defaultValue: '57');
 
   /// 本 APK 的 applicationId。用于校验 `latest.json` 不是给别的应用准备的。
   ///

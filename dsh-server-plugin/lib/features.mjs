@@ -22,6 +22,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 
 import {
+  classifyHarnessNotice,
   coerceToolInput,
   describeTurnEnd,
   isCarriedContext,
@@ -403,12 +404,23 @@ export function convertSessionRecordsToMessages(records, opts = {}) {
       }
 
       if (text.trim()) {
+        // [feat 2026-10-17] 注入通知带标记。role 仍然是 'user'（老 App 行为不变），
+        // 新 App 见到 noticeKind 就渲染成通知卡而不是"你说的话"。
+        const notice = classifyHarnessNotice(text, ev);
         messages.push({
           id: `hist_${typeof ev.seq === 'number' ? ev.seq : messages.length}`,
           role: 'user',
           content: text.trim(),
           time: ev.time || Date.now(),
-          seq: typeof ev.seq === 'number' ? ev.seq : null
+          seq: typeof ev.seq === 'number' ? ev.seq : null,
+          ...(notice
+            ? {
+                noticeKind: notice.kind,
+                noticeVariant: notice.variant,
+                noticeChildId: notice.childId,
+                noticeBody: notice.body
+              }
+            : {})
         });
       } else if (auditDropped && typeof ev.seq === 'number') {
         // [fix 2026-10-14] 纯附件/空文本用户消息以前是静默消失；现在留痕

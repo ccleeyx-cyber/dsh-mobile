@@ -34,6 +34,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 
+// [feat 2026-10-17] 「什么 origin 才算真人」的名单搬到 core.mjs 了：那里的
+// `classifyHarnessNotice`（把注入通知标出来给手机渲染）和这里的 `isHumanTurn`
+// 必须用同一份，否则两处判断迟早漂移。
+import { HUMAN_ORIGINS } from './core.mjs';
+
 /** Same charset gate as `assertSessionId` in core.mjs — these names hit the filesystem. */
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -49,8 +54,10 @@ const PROJECT_INDEX_TTL_MS = 30_000;
 /**
  * `user/message` origins that are an actual human turn. Anything else in the log
  * is a harness-injected notice and must not become the session's first prompt.
+ *
+ * [feat 2026-10-17] 名单本身已经搬到 core.mjs（第 40 行 import 进来）——
+ * 那边新增的 `classifyHarnessNotice` 要用同一份，而"什么算真人"只能有一个定义。
  */
-const HUMAN_ORIGINS = new Set(['user', 'human', 'user-input', 'user_input']);
 
 const MAIN_PROJCACHE_DIR = ['storages', 'session_projcache', 'sessions'];
 const ARCHIVE_PROJCACHE_DIRS = [

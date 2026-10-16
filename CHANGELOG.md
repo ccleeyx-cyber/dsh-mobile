@@ -7,6 +7,47 @@
 
 ---
 
+## [1.23.0] - 2026-10-17
+
+修一条"看起来是我自己发的消息"：引擎注入的通知（子代理结算等）被渲染成蓝色用户气泡。
+
+### 修复
+
+- **子代理结算通知不再伪装成用户消息。** 子代理结束时 `dsh-subagent` 会把
+  `Background subagent <childId> finished and will do no further work unless you send it
+  more. Its closing message: <整段收尾>` 作为一条 **`user/message`** 写进会话事件日志
+  —— 它就是这么唤醒父 agent 的。`role` 真的是 `user`，于是手机把它渲染成一个蓝色
+  右对齐气泡，和用户亲手打的字长得一模一样，里面还塞着子代理的整段收尾（实测能占满
+  两屏）。现在它渲染成**居中的灰色通知卡**：标题按种类给（子代理完成 / 被中止 /
+  token 用尽 / 插件通知 / 系统指令 / 引擎通知），收尾正文默认折叠 3 行并标出字数，
+  点一下展开，底部写明"引擎注入的通知（不是你说的话）"。
+- **轨迹面板里它不再凭空开一轮。** 时间线按 `role` 分轮，而它的 role 是 `user`，
+  于是会多出"第 N 轮"并把后面的轮号全带偏。现在归到折叠那一档（默认不可见、可计数）。
+- **检查点的提示语不再拿它当标题。** `extractCheckpoints` 的 `pendingPrompt` 原来会
+  被这类注入覆盖，分支列表里出现一行 `Background subagent …`。
+
+### 新增
+
+- **网关侧（权威判定）**：`core.mjs` 新增 `classifyHarnessNotice` / `readUserMessageSource`，
+  并成为"什么 origin 才算真人回合"的唯一名单（`sessiontitle.mjs` 的 `isHumanTurn` 也读它，
+  原先那份本地副本已删）。判定优先级：① 来源字段明确是人类 → **永远不是通知**（硬闸，
+  人类正文里恰好引用这些话术时绝不能被误伤）；② 来源存在但不是人类 → 按来源分类
+  （`plugin:<name>` / `agent-instructions` / …）；③ 来源缺失（老日志）→ 只认**锚定在
+  开头**的已知文案。命中后消息额外带 `noticeKind` / `noticeVariant` / `noticeChildId` /
+  `noticeBody`，**`role` 保持 `user`**（老 App 渲染行为不变）。
+- **App 侧（兜底 + 渲染）**：`models/harness_notice.dart`（网关标记优先，没有标记时按
+  同一套锚定文案认一次，供老网关与本地路径兜底）+ `widgets/harness_notice_card.dart`。
+  `ChatMessage` 新增 `isHarnessNotice` / `notice`，渲染层**先判通知再判 user**。
+
+### 说明
+
+- 网关改动需要重启 `dsh web` 才生效；App 侧改动随 APK 生效。两层合起来才是完整修复：
+  新 App + 旧网关走文案兜底，新网关 + 旧 App 保持原样（只是多了几个用不到的字段）。
+- 文案清单是同一份知识、两种语言（网关 `core.mjs` 的 `SETTLEMENT_VARIANTS` 与 App
+  `harness_notice.dart` 的 `_settlementVariants`），**改文案要两边一起改**，两边都有测试钉着。
+
+---
+
 ## [1.22.0] - 2026-10-17
 
 三件事：**新增「运行轨迹」面板**；**凭据迁进 Android Keystore**、把明文传输的风险说清；

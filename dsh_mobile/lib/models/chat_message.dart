@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'harness_notice.dart';
+
 class ToolExecution {
   final String name;
   final String input;
@@ -57,6 +59,16 @@ class ChatMessage {
   /// 没有时为 null（这类消息不参与翻页与去重，只留在尾部）。
   final int? seq;
 
+  /// [feat 2026-10-17] 引擎注入的通知语义（见 [HarnessNotice]）。
+  ///
+  /// 网关标了就用网关的（权威：它能读到事件上的 `source`），没标就按锚定文案兜底。
+  /// 用 `late final` 是为了**只判定一次** —— 四个字段出自同一个判定结果，写成四个
+  /// initializer 表达式会把同一段正则跑四遍。
+  late final String? noticeKind;
+  late final String? noticeVariant;
+  late final String? noticeChildId;
+  late final String? noticeBody;
+
   ChatMessage({
     required this.id,
     required this.role,
@@ -68,9 +80,42 @@ class ChatMessage {
     this.isMemory = false,
     this.isContext = false,
     this.seq,
+    String? noticeKind,
+    String? noticeVariant,
+    String? noticeChildId,
+    String? noticeBody,
   })  : tools = tools ?? [],
         timestamp = timestamp ?? DateTime.now(),
-        _isStreaming = isStreaming;
+        _isStreaming = isStreaming {
+    final notice = HarnessNotice.resolve(
+      kind: noticeKind,
+      variant: noticeVariant,
+      childId: noticeChildId,
+      body: noticeBody,
+      content: content,
+      // 只有 user 角色、且不是上下文/记忆块的消息才可能是注入通知。
+      mayBeNotice: role == 'user' && !isMemory && !isContext,
+    );
+    this.noticeKind = notice?.kind;
+    this.noticeVariant = notice?.variant;
+    this.noticeChildId = notice?.childId;
+    this.noticeBody = notice?.body;
+  }
+
+  /// 这条消息是引擎注入的通知 —— 它 `role` 是 `user`，但没人打过这些字。
+  ///
+  /// 渲染层必须**先**判它再判 [isUser]，否则子代理结算通知会显示成"你说的话"。
+  bool get isHarnessNotice => noticeKind != null;
+
+  /// 通知语义；不是通知时为 null。
+  HarnessNotice? get notice => isHarnessNotice
+      ? HarnessNotice(
+          kind: noticeKind!,
+          variant: noticeVariant,
+          childId: noticeChildId,
+          body: noticeBody,
+        )
+      : null;
 
   bool get isUser => role == 'user';
   bool get isAssistant => role == 'assistant';

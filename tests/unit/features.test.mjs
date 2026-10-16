@@ -38,9 +38,14 @@ import {
   projectionCacheFileNames,
   claimsMobileFeatureRoute,
   FEATURE_ROUTES,
+  convertSessionRecordsToMessages,
   handleFeatureRoute
 } from '../../dsh-server-plugin/lib/features.mjs';
-import { createAuditSink } from '../../dsh-server-plugin/lib/core.mjs';
+import {
+  classifyHarnessNotice,
+  createAuditSink,
+  readUserMessageSource
+} from '../../dsh-server-plugin/lib/core.mjs';
 
 /* ------------------------------------------------------------------ *
  * queue
@@ -885,4 +890,113 @@ test('route: schedules list normalizes what the engine returns', async () => {
   await handleFeatureRoute(deps);
   assert.equal(calls.sent[0].body.schedules.length, 1);
   assert.equal(calls.sent[0].body.schedules[0].schedule, '每天 09:00:00');
+});
+
+/* ------------------------------------------------------------------ *
+ * 引擎注入的通知（`user/message` 但没人打过字）
+ * ------------------------------------------------------------------ */
+
+const SETTLEMENT_TEXT =
+  'Background subagent 915eb2f4-0d12-4b86-8922-b2b26cfc3ecc finished and will do no ' +
+  'further work unless you send it more.Its closing message:2026-10-06 | 修复考勤报表；' +
+  '新增绩效报表正常开班小组课班级数';
+
+test('classifyHarnessNotice: 认得出子代理结算通知（来源字段缺失的老记录也认）', () => {
+  const notice = classifyHarnessNotice(SETTLEMENT_TEXT, { data: {} });
+  assert.equal(notice.kind, 'subagent-settlement');
+  assert.equal(notice.variant, 'completed');
+  assert.equal(notice.childId, '915eb2f4-0d12-4b86-8922-b2b26cfc3ecc');
+  assert.ok(notice.body.startsWith('2026-10-06 | 修复考勤报表'), '收尾正文要切出来');
+  assert.ok(!notice.body.includes('Its closing message:'), '分隔标记本身不该留在正文里');
+});
+
+test('classifyHarnessNotice: aborted / max-tokens 两个收尾分支也认，认不出只退化成 unknown', () => {
+  const aborted = classifyHarnessNotice(
+    'Background subagent c1 was stopped before it finished.',
+    { data: {} }
+  );
+  assert.equal(aborted.variant, 'aborted');
+  assert.equal(aborted.body, null, '没有收尾正文时 body 必须是 null，不能是空串');
+
+  const maxTokens = classifyHarnessNotice(
+    'Background subagent c1 ran out of room before it finished.',
+    { data: {} }
+  );
+  assert.equal(maxTokens.variant, 'max-tokens');
+
+  const other = classifyHarnessNotice('Background subagent c1 sent a new request to the parent.', { data: {} });
+  assert.equal(other.kind, 'subagent-settlement', '锚定开头就说明是注入');
+  assert.equal(other.variant, 'unknown', '认不出的分支只能退化成 unknown');
+});
+
+test('classifyHarnessNotice: 来源写明是人类 → 永不误伤（哪怕正文里满是这些字样）', () => {
+  // 用户把这条通知复制到输入框里问"这是什么" —— 它必须仍是一条人类消息。
+  assert.equal(classifyHarnessNotice(SETTLEMENT_TEXT, { data: { source: { kind: 'user' } } }), null);
+  assert.equal(classifyHarnessNotice(SETTLEMENT_TEXT, { data: { origin: 'human' } }), null);
+  assert.equal(classifyHarnessNotice(SETTLEMENT_TEXT, { data: { source: 'user-input' } }), null);
+});
+
+test('classifyHarnessNotice: 没有来源标记、又不是锚定文案 → 一律当真人消息', () => {
+  assert.equal(classifyHarnessNotice('帮我看下前面那段 Background subagent 是什么', { data: {} }), null);
+  assert.equal(classifyHarnessNotice('普通提问', { data: {} }), null);
+  assert.equal(classifyHarnessNotice('', { data: {} }), null);
+  assert.equal(classifyHarnessNotice(null, { data: {} }), null);
+});
+
+test('classifyHarnessNotice: 其它非人类来源按来源分类（批准通知 / agent 指令）', () => {
+  const approval = classifyHarnessNotice('请批准这次写盘', {
+    data: { source: { kind: 'plugin', plugin: 'user-approval' } }
+  });
+  assert.equal(approval.kind, 'plugin:user-approval');
+
+  const instructions = classifyHarnessNotice('一段系统注入的指令', {
+    data: { source: { kind: 'agent-instructions' } }
+  });
+  assert.equal(instructions.kind, 'agent-instructions');
+
+  const bare = classifyHarnessNotice('来源存在但没写 kind', { data: { source: {} } });
+  assert.equal(bare.kind, 'injected', '有 source 但读不出 kind 也不能当成真人');
+});
+
+test('readUserMessageSource: 三种形状都要读对，且"缺席"与"真人"必须分开', () => {
+  assert.deepEqual(readUserMessageSource({ data: {} }), { present: false, human: false, kind: '' });
+  assert.deepEqual(readUserMessageSource({ data: { origin: 'human' } }), { present: true, human: true, kind: 'human' });
+  assert.deepEqual(
+    readUserMessageSource({ data: { source: { kind: 'plugin', plugin: 'user-approval' } } }),
+    { present: true, human: false, kind: 'plugin:user-approval' }
+  );
+});
+
+test('convertSessionRecordsToMessages: 通知带标记、真人消息不带，且 role 都保持 user', () => {
+  const records = [
+    {
+      event: {
+        type: 'user/message',
+        seq: 1,
+        time: 1000,
+        data: { source: { kind: 'user' }, content: [{ type: 'text', text: '帮我改一下登录' }] }
+      }
+    },
+    {
+      event: {
+        type: 'user/message',
+        seq: 2,
+        time: 2000,
+        data: { content: [{ type: 'text', text: SETTLEMENT_TEXT }] }
+      }
+    }
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  assert.equal(messages.length, 2);
+
+  assert.equal(messages[0].role, 'user');
+  assert.equal(messages[0].noticeKind, undefined, '真人消息不该带任何通知字段');
+  assert.equal(messages[0].content, '帮我改一下登录');
+
+  assert.equal(messages[1].role, 'user', 'role 保持 user：老 App 的渲染行为不能变');
+  assert.equal(messages[1].noticeKind, 'subagent-settlement');
+  assert.equal(messages[1].noticeVariant, 'completed');
+  assert.equal(messages[1].noticeChildId, '915eb2f4-0d12-4b86-8922-b2b26cfc3ecc');
+  assert.ok(messages[1].noticeBody.startsWith('2026-10-06'));
 });

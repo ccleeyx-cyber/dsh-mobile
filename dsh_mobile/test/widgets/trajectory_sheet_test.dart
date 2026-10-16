@@ -213,7 +213,7 @@ void main() {
 
       expect(find.text('上下文'), findsNothing, reason: '上下文不是动作，默认折叠');
       expect(find.byKey(const ValueKey('trajectory-context-toggle')), findsOneWidget);
-      expect(find.textContaining('显示上下文/记忆块（1 条）'), findsOneWidget);
+      expect(find.textContaining('显示上下文/记忆块/通知（1 条）'), findsOneWidget);
 
       await tester.tap(find.byKey(const ValueKey('trajectory-context-toggle')));
       await tester.pump();

@@ -481,7 +481,7 @@ class _TrajectorySheetState extends State<TrajectorySheet> {
                 const SizedBox(width: AppSpace.s),
                 Expanded(
                   child: Text(
-                    '显示上下文/记忆块（${traj.contextEventCount} 条）',
+                    '显示上下文/记忆块/通知（${traj.contextEventCount} 条）',
                     style: TextStyle(fontSize: AppText.caption, color: context.c.textSecondary),
                   ),
                 ),

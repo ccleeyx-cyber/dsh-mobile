@@ -17,6 +17,8 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 
+import { classifyHarnessNotice } from './core.mjs';
+
 import {
   contentTypeFor,
   discoverGitRepos,
@@ -468,8 +470,12 @@ export function extractCheckpoints(records, { max = 40 } = {}) {
       const trimmed = String(text || '').trim();
       // Skip the injected context blocks: they are not something the user typed
       // and would make every checkpoint read the same.
+      //
+      // [feat 2026-10-17] 注入通知（子代理结算等）同样要跳：否则检查点会以
+      // "Background subagent … finished …" 当标题，比没有标题更糟。
       if (trimmed && !trimmed.startsWith('Time sampled while preparing turn') &&
-          !trimmed.startsWith('Memory recall guidance') && !trimmed.includes('<system_information>')) {
+          !trimmed.startsWith('Memory recall guidance') && !trimmed.includes('<system_information>') &&
+          !classifyHarnessNotice(trimmed, ev)) {
         pendingPrompt = trimmed.slice(0, 120);
       }
       continue;

@@ -17,6 +17,7 @@ import '../widgets/tool_call_card.dart';
 import '../widgets/approval_card.dart';
 import '../widgets/memory_card.dart';
 import '../widgets/inline_file_links.dart';
+import '../widgets/harness_notice_card.dart';
 import '../widgets/safe_markdown.dart';
 import 'widgets/question_card.dart';
 import 'widgets/attachment_tile.dart';
@@ -2775,6 +2776,18 @@ class _ChatViewState extends State<ChatView> {
   /// [dsh] 是必需的：正文里的产物引用要链接化（靠会话的交付物清单做白名单），
   /// 而点开那些链接又要回到同一个 `DshService` 去取内容。
   Widget _buildMessageItem(ChatMessage msg, DshService dsh) {
+    // 0. [feat 2026-10-17] 引擎注入的通知（role 是 user，但没人打过这些字）。
+    //
+    // 必须是**第一条**分支：它的 role 就是 'user'，一旦落到下面的用户气泡分支就会
+    // 渲染成蓝色右对齐气泡 —— 那正是用户报的"我什么时候发过这种消息"。判定放在
+    // ChatMessage 里（网关标记优先、锚定文案兜底），见 HarnessNotice。
+    if (msg.isHarnessNotice) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 4),
+        child: HarnessNoticeCard(notice: msg.notice!),
+      );
+    }
+
     // 1. Standalone context or memory snapshot message -> Collapsed MemoryCard
     if (msg.isContextOrMemory) {
       return Padding(

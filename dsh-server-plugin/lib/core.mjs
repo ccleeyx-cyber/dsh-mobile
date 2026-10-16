@@ -749,6 +749,120 @@ export function isCarriedContext(text, ev) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Engine-injected notices (a `user/message` nobody typed)
+ * ------------------------------------------------------------------ */
+
+/**
+ * `user/message` 的 source/origin 里，**什么样才算真人回合**。
+ *
+ * 名单只有这一份：`sessiontitle.mjs` 的 `isHumanTurn` 与这里的
+ * `classifyHarnessNotice` 都读它。引擎在事件上记 `data.source`
+ * （对象，例如 `{ kind: 'user' }` / `{ kind: 'plugin', plugin: 'user-approval' }`）
+ * 或老格式的 `data.origin`（字符串），其它值一律是 harness 注入的。
+ */
+export const HUMAN_ORIGINS = new Set(['user', 'human', 'user-input', 'user_input']);
+
+/** 子代理结算通知的开头：`Background subagent <childId> …`。 */
+const SUBAGENT_SETTLEMENT_RE = /^Background subagent (\S+)/;
+
+/** 结算通知里收尾正文的分隔标记。 */
+const CLOSING_MARKER = 'Its closing message:';
+
+/**
+ * 结算通知的收尾种类（`dsh-subagent` 的 `settlementSummary` 的 switch 分支）。
+ * 加新分支时这里要跟着加 —— 认不出来会退化成 `unknown`，不会误判成别的种类。
+ */
+const SETTLEMENT_VARIANTS = [
+  ['completed', 'finished and will do no further work'],
+  ['aborted', 'was stopped before it finished'],
+  ['max-tokens', 'ran out of room before it finished']
+];
+
+/**
+ * 读出一条 `user/message` 的来源标记。
+ *
+ * @param {Record<string, unknown>} ev - 会话事件。
+ * @returns {{ present: boolean, human: boolean, kind: string }}
+ */
+export function readUserMessageSource(ev) {
+  const data = ev?.data;
+  if (!data || typeof data !== 'object') return { present: false, human: false, kind: '' };
+  const source = data.source ?? data.origin;
+  if (typeof source === 'string') {
+    return { present: true, human: HUMAN_ORIGINS.has(source), kind: source };
+  }
+  if (source && typeof source === 'object') {
+    const kind = typeof source.kind === 'string' ? source.kind : '';
+    const plugin = typeof source.plugin === 'string' ? source.plugin : '';
+    return { present: true, human: HUMAN_ORIGINS.has(kind), kind: plugin ? `plugin:${plugin}` : kind };
+  }
+  return { present: false, human: false, kind: '' };
+}
+
+/**
+ * 这条 `user/message` 是不是**引擎注入的通知**？是就返回给手机渲染要用的语义。
+ *
+ * ## 为什么需要它（2026-10-17，用户报"我什么时候发过这种消息"）
+ *
+ * 子代理结束时 `dsh-subagent` 会把
+ * `Background subagent <childId> finished and will do no further work unless you
+ * send it more. Its closing message: <整段收尾>` 作为一条 **`user/message`** 写进
+ * 会话事件日志 —— 它就是这么唤醒父 agent 的。`role` 真的是 `user`，于是手机把它
+ * 渲染成一个蓝色右对齐气泡，和用户亲手打的字长得一模一样，里面还塞着子代理的整段
+ * 收尾（实测一次能占满两屏）。
+ *
+ * ## 判定优先级（高 → 低），每条都有测试
+ *
+ * 1. 来源字段**明确写了是人类** → 永远不是通知。这是硬闸：人类正文里恰好出现这些
+ *    字样时绝不能被误伤 —— `isCarriedContext` 那套纯内容启发式就吃过这个亏
+ *    （见 `convertSessionRecordsToMessages` 里的误杀审计）。
+ * 2. 来源字段存在但不是人类 → 是通知，`kind` 取 `plugin:<name>` 或 `source.kind`。
+ * 3. 来源字段缺失（老日志 / 部分历史记录）→ **只认锚定在开头的已知文案**。锚定是
+ *    刻意的：正文中间提到 `Background subagent` 的人类消息不该被吞掉。
+ *
+ * `role` 保持 `user` 不变（老 App 照旧渲染），通知信息走附加字段，新 App 才认识。
+ *
+ * @param {string} text - `user/message` 的正文。
+ * @param {Record<string, unknown>} ev - 会话事件（用来读 source）。
+ * @returns {null | { kind: string, variant: string|null, childId: string|null, body: string|null }}
+ */
+export function classifyHarnessNotice(text, ev) {
+  const value = String(text ?? '').trim();
+  if (!value) return null;
+
+  const source = readUserMessageSource(ev);
+  if (source.human) return null;
+
+  const settlement = SUBAGENT_SETTLEMENT_RE.exec(value);
+  if (settlement) {
+    return {
+      kind: 'subagent-settlement',
+      variant: settlementVariant(value),
+      childId: settlement[1],
+      body: closingBody(value)
+    };
+  }
+
+  // 没有结构化来源就不猜：只有锚定文案能证明这是注入。
+  if (!source.present) return null;
+  return { kind: source.kind || 'injected', variant: null, childId: null, body: closingBody(value) };
+}
+
+function settlementVariant(value) {
+  for (const [variant, phrase] of SETTLEMENT_VARIANTS) {
+    if (value.includes(phrase)) return variant;
+  }
+  return 'unknown';
+}
+
+function closingBody(value) {
+  const idx = value.indexOf(CLOSING_MARKER);
+  if (idx === -1) return null;
+  const body = value.slice(idx + CLOSING_MARKER.length).trim();
+  return body || null;
+}
+
+/* ------------------------------------------------------------------ *
  * turn-sequence bookkeeping (prompt/cancel race fencing)
  * ------------------------------------------------------------------ */
 
