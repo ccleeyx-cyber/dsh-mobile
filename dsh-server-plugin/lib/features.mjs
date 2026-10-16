@@ -28,6 +28,12 @@ import {
   isFailedTurnEnd
 } from './core.mjs';
 
+import {
+  normalizeAgentTeam,
+  agentTeamFromProjectionRows,
+  summarizeAgentTeam
+} from './agentteam.mjs';
+
 import { orderJobs, summarizeJobFollow } from './extensions.mjs';
 
 /* ------------------------------------------------------------------ *
@@ -1248,6 +1254,7 @@ export const FEATURE_ROUTES = [
   ['POST', '/api/mobile/push/test'],
   // [feat 2026-10-12] subagent control (engine RPC: subagents/list, subagents/interruptByParent)
   ['GET', '/api/mobile/sessions/subagents'],
+  ['GET', '/api/mobile/sessions/team'], // [feat 2026-10-16] Agent Team roster + task board
   ['POST', '/api/mobile/sessions/subagents/interrupt'],
   // [feat 2026-10-12] goal control (engine RPC: goals/pause, goals/resume, goals/complete)
   ['POST', '/api/mobile/goals/pause'],
@@ -1716,6 +1723,43 @@ export async function handleFeatureRoute(deps) {
       audit('subagent/interrupt-failed', { parentSessionId, childSessionId });
       sendJson(502, { ok: false, code: 502, error: 'engine rpc not available' });
     }
+    return true;
+  }
+
+  /* ---- Agent Team [feat 2026-10-16] ---- */
+  //
+  // The Web panel reads `projectionsBySession[lead].values.agentTeam`; the phone
+  // has no projection subscription, so it polls this route instead.
+  //
+  // Two sources, RPC first: `session/projections` is authoritative for a live
+  // session, while the projection cache is the only record of a finished team's
+  // roster and task board — and on a cold session the RPC answers nothing at
+  // all. An engine with no team support is a 501 (not an empty team), so the
+  // App can tell "no such feature" from "your team is gone".
+  if (pathname === '/api/mobile/sessions/team' && req.method === 'GET') {
+    const sessionId = String(deps.parsedUrl.query?.sessionId || '').trim();
+    if (!sessionId) { sendJson(400, { ok: false, error: 'sessionId is required' }); return true; }
+    const idCheck = deps.assertSessionId ? deps.assertSessionId(sessionId) : { ok: true };
+    if (!idCheck.ok) { sendJson(400, { ok: false, error: idCheck.error || 'invalid sessionId' }); return true; }
+
+    let source = 'rpc';
+    let team = normalizeAgentTeam((await readProjections(sessionId))?.agentTeam);
+    if (!team && typeof deps.readProjectionRows === 'function') {
+      const cached = agentTeamFromProjectionRows(deps.readProjectionRows(sessionId));
+      if (cached) { team = cached; source = 'cache'; }
+    }
+    if (!team) {
+      // Neither source produced anything. Distinguish "this engine has no team
+      // projection at all" from "this session simply is not a team".
+      const rows = typeof deps.readProjectionRows === 'function' ? deps.readProjectionRows(sessionId) : null;
+      if (rows && !('agentTeam' in rows)) {
+        sendJson(200, { ok: true, code: 0, team: null, supported: false, source });
+      } else {
+        sendJson(200, { ok: true, code: 0, team: { members: [], tasks: [], failure: '' }, supported: true, source });
+      }
+      return true;
+    }
+    sendJson(200, { ok: true, code: 0, team, supported: true, source, summary: summarizeAgentTeam(team) });
     return true;
   }
 

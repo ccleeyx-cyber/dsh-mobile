@@ -2505,6 +2505,17 @@ class DshService extends ChangeNotifier {
 
   /// true = 拉取失败/引擎不可达（UI 显示"状态未知"而不是空表）。
   bool get subagentsUnavailable => _subagentsUnavailable;
+
+  /// 智能体团队快照。 [feat 2026-10-16] 同为会话域数据，会话切换时清空。
+  AgentTeam? _team;
+
+  /// true = 拉取失败（区别于"这个会话本来就没有团队"）。
+  bool _teamUnavailable = false;
+
+  /// null = 还没拉过 / 拉取失败（UI 显示"状态未知"）。
+  AgentTeam? get team => _team;
+  bool get teamUnavailable => _teamUnavailable;
+
   DiagnosticsReport? get diagnostics => _diagnostics;
   bool get diagnosticsBusy => _diagnosticsBusy;
 
@@ -2623,6 +2634,9 @@ class DshService extends ChangeNotifier {
     // 面板会短暂显示上一个会话的子代理（诊断是网关域的，故意不清）。
     _subagents = null;
     _subagentsUnavailable = false;
+    // [feat 2026-10-16] 团队快照同理：它带着 Lead 和队友名字，留着会串会话。
+    _team = null;
+    _teamUnavailable = false;
   }
 
   /// 拉取当前会话的排队消息。
@@ -3303,6 +3317,43 @@ class DshService extends ChangeNotifier {
     return null;
   }
 
+  /// 当前会话的智能体团队快照（Lead + 队友 + 共享任务板）。 [feat 2026-10-16]
+  ///
+  /// 与 [fetchSubagents] 的区别：子代理是「我派出去的一次委派」，团队是
+  /// 「Lead + 多个有名有姓的队友 + 共享任务板」，且队友同时也会出现在
+  /// 子代理列表里。两者都要显示，不能二选一。
+  ///
+  /// 返回 null 表示取不到（网络失败 / 网关未升级）；此时 UI 应显示"状态未知"
+  /// 而不是空列表 —— 空列表会被读成"团队没了"。
+  Future<AgentTeam?> fetchTeam() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return null;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/team')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return null;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        if (data is! Map) return null;
+        final team = AgentTeam.fromJson(Map<String, dynamic>.from(data));
+        _team = team;
+        _teamUnavailable = false;
+        notifyListeners();
+        return team;
+      }
+      _team = null;
+      _teamUnavailable = true;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('[DshService] fetchTeam error: $e');
+      _team = null;
+      _teamUnavailable = true;
+      notifyListeners();
+    }
+    return null;
+  }
+
   /// 中断一个 continuable 子代理（引擎对 one-shot 一律拒绝，App 端提前拦下）。
   Future<bool> interruptSubagent(String childSessionId) async {
     final sessionId = _currentSession?.sessionId;
@@ -3893,7 +3944,7 @@ class DshService extends ChangeNotifier {
 
   /// 第三档：**只在信息面板打开时**拉（面板的 `onRefresh` 也用它）。
   Future<void> fetchSessionExtras() async {
-    await Future.wait([fetchJobs(), fetchSchedules(), fetchSubagents()]); // [feat 2026-10-12] 子代理随面板懒加载
+    await Future.wait([fetchJobs(), fetchSchedules(), fetchSubagents(), fetchTeam()]); // [feat 2026-10-12] 子代理随面板懒加载；[feat 2026-10-16] 团队同批
   }
 
   /// 下载交付物并交给系统应用打开。

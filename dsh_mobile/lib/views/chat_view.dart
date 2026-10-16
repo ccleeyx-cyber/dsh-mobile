@@ -3432,6 +3432,10 @@ class _ChatViewState extends State<ChatView> {
               if (ok) await d.fetchSubagents();
               return ok;
             },
+            // [feat 2026-10-16] 智能体团队（Lead + 队友 + 共享任务板）。与子代理
+            // 同属面板懒加载，同一批拉取。
+            team: d.team,
+            teamUnavailable: d.teamUnavailable,
             onControlGoal: (action, goal) => d.controlGoal(
                   action,
                   goalId: goal.goalId ?? '',

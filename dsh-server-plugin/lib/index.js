@@ -44,7 +44,6 @@ import {
   convertSessionRecordsToMessages,
   readHistoryPage,
   probeSessionCursor,
-  projectionCacheFileNames,
   claimsMobileFeatureRoute
 } from './features.mjs';
 import {
@@ -89,6 +88,10 @@ import {
   configurePermissionsPersistence
 } from './core.mjs';
 
+import {
+  projectionCacheCandidates,
+  createEventLogTitleReader
+} from './sessiontitle.mjs';
 // Inject the persistence helpers core needs; core must not import store.mjs
 // because store imports core (audit sink).
 configurePersistence({ verifyToken, findDeviceByToken });
@@ -323,6 +326,17 @@ export function apply(ctx, config = {}, internals = {}) {
   const projCacheReader = createProjCacheReader({ dir: path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions') });
 
   /**
+   * [fix 2026-10-15] 归档域 + 事件日志的标题兜底读法。
+   *
+   * 之前 readProjectionRecord 只认 `storages/session_projcache/sessions/` 一个
+   * 目录，于是 116/212 个会话在手机端显示成 `session-<uuid>`（实测，见
+   * sessiontitle.mjs 头部）。现在三个存储位置都读。
+   */
+  const eventLogTitles = createEventLogTitleReader({
+    log: (msg, err) => logger.warn(msg, err?.message || err)
+  });
+
+  /**
    * Signed-cookie minting and unary RPC live in core so both entry points speak
    * to the engine identically.  [unified]
    */
@@ -361,14 +375,37 @@ export function apply(ctx, config = {}, internals = {}) {
    * the sessions where it already worked.
    */
   function readProjectionRecord(sessionId) {
-    const names = projectionCacheFileNames(sessionId);
-    if (names.length === 0) return null;
-    const dir = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions');
-    for (const name of names) {
-      const record = projCacheReader.readJson(path.join(dir, name));
+    const candidates = projectionCacheCandidates(dshHomeDir, sessionId);
+    if (candidates.length === 0) return null;
+    for (const cPath of candidates) {
+      const record = projCacheReader.readJson(cPath);
       if (record) return record;
     }
     return null;
+  }
+
+  /**
+   * One session's title, from whichever store actually holds one.
+   *
+   * Order: projection cache (main domain → archive domain) → event log.
+   * `rows.title.val` is authoritative when present; `rows.titleInput.val.first.text`
+   * is the auto-title's first-prompt fallback, matching the pre-fix behaviour.
+   *
+   * @param {string} sessionId
+   * @returns {{ title: string, firstPrompt: string }}
+   */
+  function readSessionTitle(sessionId) {
+    const rows = readProjectionRows(sessionId);
+    const cachedTitle = rows?.title?.val;
+    const cachedPrompt = rows?.titleInput?.val?.first?.text || '';
+    if (typeof cachedTitle === 'string' && cachedTitle.trim()) {
+      return { title: cachedTitle.trim(), firstPrompt: cachedPrompt };
+    }
+    // Sync peek only: the decompress runs in the background (see
+    // sessiontitle.mjs 的 peek/warm 说明), and the next poll picks the title up.
+    const peeked = eventLogTitles.peek(dshHomeDir, sessionId);
+    if (peeked && peeked.title) return { title: peeked.title, firstPrompt: peeked.firstPrompt || cachedPrompt };
+    return { title: '', firstPrompt: cachedPrompt };
   }
 
   /** Decoded projection-cache rows for one session (no engine round trip). */
@@ -1215,6 +1252,9 @@ export function apply(ctx, config = {}, internals = {}) {
       return false;
     }
     const cleanId = sessionId.startsWith('session-') ? sessionId.replace('session-', '') : sessionId;
+    // [fix 2026-10-15] 这里**故意不**用 projectionCacheCandidates()：那是读表，
+    // 含归档域的 sha256 文件名，而本函数是写路径，往归档域写会让归档管理器与
+    // 引擎的 domain 记账对不上。只保留主域的两种拼法。
     const projCacheDir = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions');
     const candidates = [
       path.join(projCacheDir, `${sessionId}.json`),
@@ -1262,7 +1302,6 @@ export function apply(ctx, config = {}, internals = {}) {
       : 'exclude';
 
     const workspaceJsonPath = path.join(dshHomeDir, 'storages', 'workspace.json');
-    const projCacheDir = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions');
 
     if (!fs.existsSync(workspaceJsonPath)) return [];
 
@@ -1304,11 +1343,10 @@ export function apply(ctx, config = {}, internals = {}) {
           if (isArchived && mode === 'exclude') continue;
           if (!isArchived && mode === 'only') continue;
 
-          const candidates = [
-            path.join(projCacheDir, `${sId}.json`),
-            path.join(projCacheDir, `session-${cleanId}.json`),
-            path.join(projCacheDir, `${cleanId}.json`)
-          ];
+          // [fix 2026-10-15] 候选路径覆盖主域 + 归档域（归档域文件名是
+          // sha256(sessionId)，不是 sessionId —— 之前这里只写死主域两种拼法，
+          // 于是归档过的会话一条都读不到）。
+          const candidates = projectionCacheCandidates(dshHomeDir, sId);
 
           let sessionMeta = {
             sessionId: sId,
@@ -1346,7 +1384,7 @@ export function apply(ctx, config = {}, internals = {}) {
               if (rows.subagent?.val?.identity) {
                 isSubagentSession = true;
               }
-              sessionMeta.title = rows.title?.val || rows.titleInput?.val?.first?.text || '新会话';
+              sessionMeta.title = rows.title?.val || rows.titleInput?.val?.first?.text || '';
               sessionMeta.firstPrompt = rows.titleInput?.val?.first?.text || '';
               sessionMeta.lastPromptAt = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
               sessionMeta.model = rows.modelSelection?.val?.lastUsed?.model || '';
@@ -1362,6 +1400,25 @@ export function apply(ctx, config = {}, internals = {}) {
               break;
             }
           }
+
+          // [fix 2026-10-15] 标题兜底。候选路径全 miss（会话既不在主投影域也不在
+          // 归档域，例如只剩 zstd 事件日志的老会话）时，从事件日志的
+          // `session/title` 事件折叠出标题。实测这覆盖 29 条，之前全部显示
+          // `session-<uuid>`。
+          //
+          // peek 是同步的：命中记忆化结果就立刻拿到标题；否则 warm() 在后台解压，
+          // 下一个 3 秒轮询就能读到。绝不在这里内联解压 3 MB 日志 —— 这个循环
+          // 在 dsh web 进程里每 3 秒跑一次。
+          if (!sessionMeta.title) {
+            const folded = eventLogTitles.peek(dshHomeDir, sId);
+            if (folded && folded.title) {
+              sessionMeta.title = folded.title;
+              if (!sessionMeta.firstPrompt) sessionMeta.firstPrompt = folded.firstPrompt;
+            } else if (folded && folded.pending) {
+              eventLogTitles.warm(dshHomeDir, sId);
+            }
+          }
+          if (!sessionMeta.title) sessionMeta.title = '新会话';
 
           // subagent 会话在 Web 端等同于不存在，手机端此前却会列出来。
           // 实测：注册会话 2324 条，其中 subagent 321 条（one-shot 317 / continuable 4），
@@ -1433,12 +1490,9 @@ export function apply(ctx, config = {}, internals = {}) {
     const idCheck = assertSessionId(sessionId);
     if (!idCheck.ok) return { messages: [], isRunning: false, model: '', error: idCheck.error };
     const cleanId = sessionId.startsWith('session-') ? sessionId.replace('session-', '') : sessionId;
-    const projCacheDir = path.join(dshHomeDir, 'storages', 'session_projcache', 'sessions');
-    const candidates = [
-      path.join(projCacheDir, `${sessionId}.json`),
-      path.join(projCacheDir, `session-${cleanId}.json`),
-      path.join(projCacheDir, `${cleanId}.json`)
-    ];
+    // [fix 2026-10-15] 与 getWorkspacesData 读同一张候选表（含归档域的
+    // sha256 文件名），否则归档会话的 cwd/model/历史水位全部取空。
+    const candidates = projectionCacheCandidates(dshHomeDir, sessionId);
 
     let cacheData = null;
     for (const cPath of candidates) {
@@ -3852,6 +3906,15 @@ export function apply(ctx, config = {}, internals = {}) {
         ]) {
           projCacheReader.invalidate(cPath);
         }
+        // [fix 2026-10-15] rename 只写主投影域。归档域里那份记录（sha256 命名的
+        // 那份）现在也会被读到，所以必须一起失效，否则重命名后列表可能仍显示
+        // 归档域里的旧标题。事件日志那份同样要失效：引擎会追加新的 session/title
+        // 事件，但我们的折叠结果是按 (path, mtime, size) 缓存的，mtime 变了才重读，
+        // 这里主动清掉更稳妥。
+        for (const cPath of projectionCacheCandidates(dshHomeDir, jsonBody.sessionId)) {
+          projCacheReader.invalidate(cPath);
+        }
+        eventLogTitles.invalidate(result.sessionId);
         audit('session/rename', { sessionId: jsonBody.sessionId });
         broadcastToMobileClients({ type: 'session_renamed', sessionId: result.sessionId, title: result.title });
         sendJson(200, { ok: true, code: 0, sessionId: result.sessionId, title: result.title });

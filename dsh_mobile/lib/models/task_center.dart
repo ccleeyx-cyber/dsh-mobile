@@ -678,3 +678,132 @@ int? _int(dynamic v) {
   if (v is String) return int.tryParse(v.trim());
   return null;
 }
+
+/// One teammate (or the synthetic Lead) from `GET /api/mobile/sessions/team`. [feat 2026-10-16]
+///
+/// 对应引擎 `agentTeam` 投影的 wire view（`teamMemberProjectionSchema`）。
+/// [phase] 决定徽标颜色：active=进行中 / provisioning=创建中 / failed=失败。
+class TeamMember {
+  final String id;
+  final String name;
+  final String role; // 'lead' | 'teammate'
+  final String phase; // 'provisioning' | 'active' | 'failed'
+  final String error;
+
+  const TeamMember({
+    required this.id,
+    required this.name,
+    this.role = 'teammate',
+    this.phase = 'provisioning',
+    this.error = '',
+  });
+
+  factory TeamMember.fromJson(Map<String, dynamic> json) => TeamMember(
+        id: json['id']?.toString() ?? '',
+        name: json['name']?.toString() ?? '',
+        role: json['role']?.toString() ?? 'teammate',
+        phase: json['phase']?.toString() ?? 'provisioning',
+        error: json['error']?.toString() ?? '',
+      );
+
+  bool get isLead => role == 'lead';
+  bool get isActive => phase == 'active';
+  bool get isFailed => phase == 'failed';
+  bool get isProvisioning => phase == 'provisioning';
+
+  String get phaseLabel {
+    if (isLead) return '主导';
+    if (isFailed) return '失败';
+    if (isActive) return '进行中';
+    return '创建中';
+  }
+}
+
+/// One shared task-board row from `GET /api/mobile/sessions/team`. [feat 2026-10-16]
+///
+/// 对应 `teamTaskViewSchema`。已删除任务由网关过滤，不会出现在这里。
+class TeamTask {
+  final String id;
+  final int revision;
+  final String subject;
+  final String description;
+  final String status; // 'pending' | 'in_progress' | 'completed'
+  final List<String> blockedBy;
+  final String ownerName;
+  final bool ready;
+
+  const TeamTask({
+    required this.id,
+    this.revision = 1,
+    this.subject = '',
+    this.description = '',
+    this.status = 'pending',
+    this.blockedBy = const [],
+    this.ownerName = '',
+    this.ready = false,
+  });
+
+  factory TeamTask.fromJson(Map<String, dynamic> json) => TeamTask(
+        id: json['id']?.toString() ?? '',
+        revision: _int(json['revision']) ?? 1,
+        subject: json['subject']?.toString() ?? '',
+        description: json['description']?.toString() ?? '',
+        status: json['status']?.toString() ?? 'pending',
+        blockedBy: (json['blockedBy'] as List?)?.map((e) => e.toString()).toList() ?? const [],
+        ownerName: json['ownerName']?.toString() ?? '',
+        ready: json['ready'] == true,
+      );
+
+  bool get isInProgress => status == 'in_progress';
+  bool get isCompleted => status == 'completed';
+  bool get isBlocked => blockedBy.isNotEmpty || !ready;
+
+  String get statusLabel {
+    if (isCompleted) return '已完成';
+    if (isInProgress) return '进行中';
+    return '待办';
+  }
+}
+
+/// 一个会话的智能体团队快照。 [feat 2026-10-16]
+///
+/// [supported] 为 false 表示**引擎没装团队能力**，与「有团队但现在没人」是两种
+/// 完全不同的情况，必须分开显示，否则用户会以为队友全挂了。
+class AgentTeam {
+  final List<TeamMember> members;
+  final List<TeamTask> tasks;
+  final String failure;
+  final bool supported;
+  final String source; // 'rpc' | 'cache'
+
+  const AgentTeam({
+    this.members = const [],
+    this.tasks = const [],
+    this.failure = '',
+    this.supported = true,
+    this.source = 'rpc',
+  });
+
+  factory AgentTeam.fromJson(Map<String, dynamic> json) => AgentTeam(
+        members: (json['members'] as List?)
+                ?.map((e) => TeamMember.fromJson(Map<String, dynamic>.from(e as Map)))
+                .toList() ??
+            const [],
+        tasks: (json['tasks'] as List?)
+                ?.map((e) => TeamTask.fromJson(Map<String, dynamic>.from(e as Map)))
+                .toList() ??
+            const [],
+        failure: json['failure']?.toString() ?? '',
+        supported: json['supported'] != false,
+        source: json['source']?.toString() ?? 'rpc',
+      );
+
+  /// 队友（不含 Lead 自己）。
+  List<TeamMember> get teammates => members.where((m) => !m.isLead).toList();
+
+  bool get isEmpty => teammates.isEmpty && tasks.isEmpty;
+
+  /// 有队友在跑，或有任务没做完 —— 决定面板上要不要显出「正在工作」。
+  bool get isWorking =>
+      members.any((m) => m.isActive && !m.isLead) || tasks.any((t) => t.isInProgress);
+}

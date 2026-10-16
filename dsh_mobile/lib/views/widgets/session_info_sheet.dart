@@ -52,6 +52,8 @@ class SessionInfoSheet extends StatefulWidget {
     this.subagents,
     this.subagentsUnavailable = false,
     this.onInterruptSubagent,
+    this.team,
+    this.teamUnavailable = false,
     this.onControlGoal,
     this.onRunDiagnostics,
     this.diagnostics,
@@ -156,6 +158,18 @@ class SessionInfoSheet extends StatefulWidget {
   /// 中断一个子代理（仅 continuable 行会显示按钮）。
   final Future<bool> Function(SubagentItem sub)? onInterruptSubagent;
 
+  /// [feat 2026-10-16] 智能体团队快照（Lead + 队友 + 共享任务板）。
+  ///
+  /// 与 [subagents] 的分工：子代理 = 我派出去的一次委派；团队 = 有名有姓的
+  /// 队友 + 共享任务板。队友同时也会出现在子代理列表里，两个区块都要显示。
+  ///
+  /// `null` = 拉取失败（显示"状态未知"）；`supported == false` = 引擎没装团队
+  /// 能力；`isEmpty` = 这个会话确实不是团队会话。
+  final AgentTeam? team;
+
+  /// true = 拉取失败（区别于"确定没有团队"）。
+  final bool teamUnavailable;
+
   /// goal 操作（pause/resume/complete）。引擎拒绝时返回 false，界面提示。
   final Future<bool> Function(String action, GoalInfo goal)? onControlGoal;
 
@@ -178,10 +192,15 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
   final _jobsKey = GlobalKey();
   final _schedulesKey = GlobalKey();
   final _subagentsKey = GlobalKey();
+  final _teamKey = GlobalKey();
   final _diagnosticsKey = GlobalKey();
   bool _refreshing = false;
   String? _interruptingId;
   String? _goalActionInProgress;
+
+  /// [feat 2026-10-16] 展开的队友 id。团队可能十几个队友（实测 8 名），默认
+  /// 折叠成一行摘要，按需展开 —— 不占满整屏把用量/作业挤下去。
+  final Set<String> _expandedTeammates = {};
 
   /// [feat 2026-10-13] 作业列表里至少有一个"还活着"的作业时，用 1s 的 ticker 让
   /// 时长往前走。只在有活作业时开，自己 `dispose` 时一定取消 —— 一个没人看的
@@ -446,6 +465,10 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                     KeyedSubtree(key: _deliverablesKey, child: _buildDeliverables()),
                     KeyedSubtree(key: _changesKey, child: _buildChanges()),
                     KeyedSubtree(key: _jobsKey, child: _buildJobs()),
+                    // [feat 2026-10-16] 智能体团队。放在子代理**之前**：团队是更高
+                    // 层的组织视图，用户先想知道"谁在干活"，再看具体委派。
+                    if (widget.team != null || widget.teamUnavailable)
+                      KeyedSubtree(key: _teamKey, child: _buildTeam()),
                     // [feat 2026-10-12] 子代理区块。引擎没有列出能力/读取失败时
                     // 返回 null —— 整块隐藏，绝不显示一张假空表。
                     if (widget.subagents != null)
@@ -1251,6 +1274,224 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
               ),
             ),
       ],
+    );
+  }
+
+  // ------------------------------------------- 智能体团队 [feat 2026-10-16] ----
+
+  /// 队友徽标颜色：进行中用主色、创建中用弱化灰、失败用 danger。
+  Color _teamPhaseColor(TeamMember m) {
+    if (m.isFailed) return context.c.danger;
+    if (m.isActive) return context.c.accent;
+    return context.c.textTertiary;
+  }
+
+  Widget _buildTeam() {
+    final team = widget.team;
+    final children = <Widget>[];
+
+    // 三种"没有团队"必须说不同的话：
+    //   1. 拉取失败      → 状态未知（引擎可能正在跑，别让人以为队友全挂了）
+    //   2. 引擎没这能力  → 明确说不是"你没团队"
+    //   3. 确实不是团队会话 → 一句话带过
+    if (widget.teamUnavailable || team == null) {
+      children.add(Row(
+        key: const ValueKey('team-unknown'),
+        children: [
+          Icon(Icons.help_outline_rounded, size: 15, color: context.c.warning),
+          const SizedBox(width: 6),
+          const Expanded(
+            child: Text(
+              '团队状态未知（网关暂不可达，不代表团队已解散）。',
+              style: TextStyle(fontSize: 12),
+            ),
+          ),
+        ],
+      ));
+      return _section(
+        title: '智能体团队',
+        icon: Icons.groups_rounded,
+        children: children,
+      );
+    }
+
+    if (!team.supported) {
+      children.add(_hint('当前引擎未启用智能体团队能力。'));
+      return _section(title: '智能体团队', icon: Icons.groups_rounded, children: children);
+    }
+
+    if (team.failure.isNotEmpty) {
+      children.add(Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.error_outline_rounded, size: 15, color: context.c.danger),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              team.failure,
+              key: const ValueKey('team-failure'),
+              style: TextStyle(fontSize: 12, color: context.c.danger),
+            ),
+          ),
+        ],
+      ));
+    }
+
+    if (team.isEmpty) {
+      children.add(_hint('这个会话没有智能体团队。'));
+      return _section(title: '智能体团队', icon: Icons.groups_rounded, children: children);
+    }
+
+    final mates = team.teammates;
+    // 顶部一行计数：多少人 / 多少任务。手机上比逐条列更快看出"跑到哪了"。
+    children.add(Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        children: [
+          _chip('${team.members.length} 名成员',
+              color: team.isWorking ? context.c.accent : context.c.textSecondary),
+          const SizedBox(width: 6),
+          if (team.tasks.isNotEmpty)
+            _chip('${team.tasks.length} 个任务', color: context.c.textSecondary),
+          const Spacer(),
+          // source 徽标说明这份快照是引擎实时投影还是磁盘检查点 —— 两者可能
+          // 有分钟级时差，用户问"怎么进度不一样"时这是第一个要看的东西。
+          if (team.source == 'cache')
+            Text('离线快照', style: TextStyle(fontSize: 10, color: context.c.textTertiary)),
+        ],
+      ),
+    ));
+
+    for (final m in mates) {
+      children.add(_buildTeamMemberRow(m));
+    }
+
+    if (team.tasks.isNotEmpty) {
+      children.add(Padding(
+        padding: const EdgeInsets.only(top: 10, bottom: 4),
+        child: Text('共享任务板',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: context.c.textSecondary)),
+      ));
+      for (final t in team.tasks) {
+        children.add(_buildTeamTaskRow(t));
+      }
+    }
+
+    return _section(title: '智能体团队', icon: Icons.groups_rounded, children: children);
+  }
+
+  Widget _chip(String label, {required Color color}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(5),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: color),
+      ),
+    );
+  }
+
+  Widget _buildTeamMemberRow(TeamMember m) {
+    final expanded = _expandedTeammates.contains(m.id);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              _chip(m.phaseLabel, color: _teamPhaseColor(m)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  m.name,
+                  key: ValueKey('team-member-${m.id}'),
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: m.isLead ? FontWeight.w600 : FontWeight.normal,
+                    color: context.c.textPrimary,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              // Lead 是会话自己，没有"他的进度"可点；队友可以展开看失败原因。
+              if (m.error.isNotEmpty || (!m.isLead && m.isFailed))
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                  padding: EdgeInsets.zero,
+                  tooltip: expanded ? '收起' : '展开',
+                  icon: Icon(
+                    expanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
+                    size: 18,
+                    color: context.c.textSecondary,
+                  ),
+                  onPressed: () => setState(() {
+                    if (expanded) {
+                      _expandedTeammates.remove(m.id);
+                    } else {
+                      _expandedTeammates.add(m.id);
+                    }
+                  }),
+                ),
+            ],
+          ),
+          if (expanded && m.error.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(left: 4, top: 2),
+              child: Text(
+                m.error,
+                key: ValueKey('team-member-error-${m.id}'),
+                style: TextStyle(fontSize: 11.5, color: context.c.danger),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTeamTaskRow(TeamTask t) {
+    final color = t.isCompleted
+        ? context.c.success
+        : (t.isInProgress ? context.c.accent : context.c.textSecondary);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _chip(t.statusLabel, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  t.subject.isEmpty ? t.description : t.subject,
+                  key: ValueKey('team-task-${t.id}'),
+                  style: TextStyle(fontSize: 12.5, color: context.c.textPrimary),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                if (t.ownerName.isNotEmpty || t.isBlocked)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      [
+                        if (t.ownerName.isNotEmpty) '负责：${t.ownerName}',
+                        if (t.isBlocked) '被阻塞',
+                      ].join(' · '),
+                      style: TextStyle(fontSize: 11, color: context.c.textTertiary),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
