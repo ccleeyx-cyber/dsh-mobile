@@ -59,9 +59,12 @@
 
 ### 测试
 
-- `test:unit` 从手写文件列表改为 `tests/unit/**/*.test.mjs` glob。旧列表漏了 6 个
-  文件，其中 `features.test.mjs` 带一个**失败断言**（ntfy 改为根路径 JSON 发布后
-  断言没跟着改），绿灯纯属遗漏。单测 255 → 375。
+- `test:unit` 从手写文件列表改为目录默认发现（`cd tests/unit && node --test`）。旧列表
+  漏了 6 个文件，其中 `features.test.mjs` 带一个**失败断言**（ntfy 改为根路径 JSON
+  发布后断言没跟着改），绿灯纯属遗漏。单测 255 → 375。
+  > 注意**不能**把 glob 当参数传给 `node --test`：glob 展开是 Node 21+ 才有的，CI 的
+  > Node 20 会把 `"tests/unit/**/*.test.mjs"` 当字面路径报 `Could not find`（本轮
+  > 实测踩到 —— 本机 Node 24 全绿，所以本地测不出来）。默认发现从 Node 18 起就有。
 - 新增 `test/models/stream_buffer_test.dart`：钉住流式缓冲的三条契约（flush 前成品
   不可见、flush 后按序写回、streaming 结束必定 flush）。
 - 新增 `AttachmentImageTile` 的 `cacheWidth` 回归测试。

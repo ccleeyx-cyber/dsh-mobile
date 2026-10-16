@@ -5,12 +5,13 @@
   "type": "module",
   "scripts": {
     "//": "分层说明见 ANALYSIS-优化与新增功能.md §1.14 / §6.10。",
-    "//safe": "test = 只跑 hermetic 单测。tests/unit/**/*.test.mjs 全部用 mkdtempSync 隔离 DSH_HOME，0 次真实网关(3088)调用，不建会话、不打 LLM、不改任何真实配置。这是唯一可以随手跑的命令。用 glob 而不是手写文件列表：2026-10-16 之前手写列表漏了 6 个文件（其中 features.test.mjs 还带着一个失败断言），新增文件必须记得手动加回来的设计本身就不可靠。",
+    "//safe": "test = 只跑 hermetic 单测。tests/unit/**/*.test.mjs 全部用 mkdtempSync 隔离 DSH_HOME，0 次真实网关(3088)调用，不建会话、不打 LLM、不改任何真实配置。这是唯一可以随手跑的命令。**不是**手写文件列表：2026-10-16 之前手写列表漏了 6 个文件（其中 features.test.mjs 还带着一个失败断言），新增文件必须记得手动加回来的设计本身就不可靠。",
+    "//safe-path": "用 `cd tests/unit && node --test`（默认发现）而不是把 glob 当参数传给 node：`node --test <glob>` 的展开是 Node 21+ 才有的，CI 跑 Node 20 会把 \"tests/unit/**/*.test.mjs\" 当成字面路径直接报 Could not find（2026-10-16 实测踩到，本机 Node 24 全绿因此没发现）。默认发现从 Node 18 起就有，任何版本都成立。下面 live 那几个脚本仍用 glob —— 它们只在本地 Node 24 跑，没进 CI。",
     "//safe-detail": "其中 archived-filter.test.mjs 会用 mock Cordis ctx 真的把插件加载起来；event-forwarding.test.mjs 还会额外起一个假引擎（空闲端口上的 HTTP + WS），把网关的上游 MUX 和 $events/result RPC 都接管掉，好断言事件转发。两者打的都是自己起的实例，绝不碰你正在运行的 dsh web（3080/3081/3088 始终由真实进程持有）。",
     "//danger": "下面所有 live/destructive 脚本都会打真实网关(3088)、在真实工作区建会话、消耗真实 LLM token，其中 destructive 那批还会改你的真实策略且恢复不可靠。2026-10-08 之前 `npm test` 把它们全串在一起，一次跑约 750~850 次真实调用 + 55~65 个真实会话 + 25~30 次真实 prompt。现在必须显式指名才跑。",
 
     "test": "npm run test:unit",
-    "test:unit": "node --test --test-concurrency=1 --test-timeout=120000 \"tests/unit/**/*.test.mjs\"",
+    "test:unit": "cd tests/unit && node --test --test-concurrency=1 --test-timeout=120000",
 
     "//hook": "所有 live 脚本都挂 --import ./tests/cleanup-hook.mjs，让每个测试文件进程结束时把自己建的空会话归档掉。test:unit 故意不挂：它用 mkdtempSync 隔离 DSH_HOME、一个会话都不建，挂上反而会让一次\"安全\"的单测去扫并归档真实工作区的遗留会话。",
     "test:live": "npm run test:e2e && npm run test:challenger",
