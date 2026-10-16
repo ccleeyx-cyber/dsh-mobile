@@ -210,6 +210,30 @@ jobs:
           name: dsh-agent-release-apk-${{ steps.ver.outputs.version }}
           path: dist
 
+      # CHANGELOG.md 现在是 release notes 的事实来源（见该文件开头）。这条路以前
+      # 没接上：workflow 一直只开着 generate_release_notes，于是 v1.21.0 发出去时
+      # 说明里只有三行 compare 链接，而 CHANGELOG 里那段写得详细得多。
+      #
+      # 取不到当前版本小节（新版本忘了写）就退回提交列表 —— 宁可发"自上个 tag 起的
+      # 提交"，也不要发一个空说明。
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          awk -v ver="$VERSION" '
+            index($0, "## [" ver "]") == 1 { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ -s notes.md ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "--- CHANGELOG 小节 $VERSION ($(wc -l < notes.md) 行) ---"
+            cat notes.md
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "CHANGELOG.md 里没有 $VERSION 小节，退回提交列表"
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -218,9 +242,8 @@ jobs:
           # there was no way to answer "what changed in v1.2.6?".
           tag_name: v${{ steps.ver.outputs.version }}
           name: "DSH Mobile v${{ steps.ver.outputs.version }}"
-          # Notes belong in a committed CHANGELOG.md, not inlined in CI YAML
-          # where their diff is mixed into workflow changes and they are lost
-          # whenever the tag is reused. Until CHANGELOG.md exists, fall back to
-          # the commit list since the previous tag.
-          generate_release_notes: true
+          # 两者互斥：有 CHANGELOG 小节就用它当正文，没有才让 GitHub 生成提交列表。
+          # 不能同时给（那样正文后面会再缀一段自动列表，读起来像两份说明）。
+          body_path: ${{ steps.notes.outputs.found == 'true' && 'notes.md' || '' }}
+          generate_release_notes: ${{ steps.notes.outputs.found != 'true' }}
           files: dist/*.apk
