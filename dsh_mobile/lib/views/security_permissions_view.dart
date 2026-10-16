@@ -210,56 +210,14 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                   },
                 ),
 
-                const SizedBox(height: 14),
-                Divider(color: context.c.border),
                 const SizedBox(height: 10),
-
-                // Sandbox Escalation Toggle
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  activeColor: context.c.accent,
-                  title: Text('允许沙箱提权执行 (Privilege Escalation)', style: TextStyle(fontSize: 14, color: context.c.textPrimary)),
-                  subtitle: Text('允许 DSH 智能体执行需要管理员权限的命令', style: TextStyle(fontSize: 12, color: context.c.textSecondary)),
-                  value: permissions.sandboxMode == 'danger-full-access',
-                  onChanged: (val) async {
-                    final updated = permissions.copyWith(
-                      sandboxMode: val ? 'danger-full-access' : 'workspace-write',
-                    );
-                    final ok = await dsh.updatePermissions(updated);
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).clearSnackBars();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text(ok ? (val ? '已开启沙箱提权执行' : '已关闭沙箱提权执行') : '更新失败: ${dsh.lastError}'),
-                          duration: const Duration(seconds: 2),
-                          behavior: SnackBarBehavior.floating,
-                        ),
-                      );
-                    }
-                  },
-                ),
-
-                // Git & Protected Directory Protection Toggle
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  activeColor: context.c.accent,
-                  title: Text('敏感目录防护 (Protected Path Guard)', style: TextStyle(fontSize: 14, color: context.c.textPrimary)),
-                  subtitle: Text('拦截对 .git, .dsh, 系统根目录等敏感路径的覆盖写操作', style: TextStyle(fontSize: 12, color: context.c.textSecondary)),
-                  value: permissions.protectGit,
-                  onChanged: (val) async {
-                    final updated = permissions.copyWith(protectGit: val);
-                    final ok = await dsh.updatePermissions(updated);
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).clearSnackBars();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text(ok ? (val ? '已开启敏感目录保护' : '已关闭敏感目录保护') : '更新失败: ${dsh.lastError}'),
-                          duration: const Duration(seconds: 2),
-                          behavior: SnackBarBehavior.floating,
-                        ),
-                      );
-                    }
-                  },
+                // 沙箱范围与单轮步数上限原先在这里有两个开关，但它们只被网关存下来、
+                // 没有任何消费者（「敏感目录防护」更是连实现都没有），已移除。
+                // 说明留在界面上，免得用户以为是自己没找到。
+                Text(
+                  '沙箱可写范围、单轮步数上限由引擎自身的设置决定，此处不再提供开关'
+                  '（此前那两个开关不会改变实际行为）。',
+                  style: TextStyle(fontSize: 11.5, color: context.c.textTertiary, height: 1.5),
                 ),
               ],
             ),

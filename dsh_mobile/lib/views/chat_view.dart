@@ -813,12 +813,9 @@ class _ChatViewState extends State<ChatView> {
     final sessionId = currentSession?.sessionId ?? 'default';
     final currentPolicy = dsh.getSessionPermission(sessionId);
     String selectedPolicy = currentPolicy;
-    // NOTE: `dsh.permissions.sandboxMode` used to be read into a local here and
-    // then never rendered — the session sheet only ever let the user pick an
-    // execution policy. Surfacing sandboxMode/maxSteps in this sheet is a real
-    // UI gap (tracked in ANALYSIS-优化与新增功能.md §1.13), not something to
-    // silently reintroduce as another dead local.
-    int maxSteps = dsh.permissions.maxSteps;
+    // 这里曾有一个「单轮迭代步数上限 (Max Steps)」滑块：它改写 `maxSteps`，而那个
+    // 字段全链路无人消费（详见 PermissionConfig 的说明），所以滑块动了也不影响
+    // 任何行为，已移除。本弹窗只负责本会话的执行策略 —— 那也是唯一真的生效的旋钮。
 
     showModalBottomSheet(
       context: context,
@@ -919,38 +916,6 @@ class _ChatViewState extends State<ChatView> {
                       },
                     ),
 
-                    const SizedBox(height: 16),
-                    Text(
-                      '单轮迭代步数上限 (Max Steps)',
-                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: context.c.textPrimary),
-                    ),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Slider(
-                            value: maxSteps.toDouble(),
-                            min: 10,
-                            max: 60,
-                            divisions: 10,
-                            activeColor: context.c.accent,
-                            label: '$maxSteps 步',
-                            onChanged: (v) {
-                              setModalState(() => maxSteps = v.round());
-                            },
-                          ),
-                        ),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: context.c.surfaceMuted,
-                            borderRadius: BorderRadius.circular(6),
-                            border: Border.all(color: context.c.border),
-                          ),
-                          child: Text('$maxSteps 步', style: TextStyle(color: context.c.textPrimary, fontSize: 13, fontWeight: FontWeight.w600)),
-                        ),
-                      ],
-                    ),
-
                     const SizedBox(height: 20),
                     SizedBox(
                       width: double.infinity,
@@ -1001,7 +966,6 @@ class _ChatViewState extends State<ChatView> {
                           currentSessions[sessionId] = selectedPolicy;
                           final updatedPerms = dsh.permissions.copyWith(
                             sessionPolicies: currentSessions,
-                            maxSteps: maxSteps,
                           );
                           if (context.mounted) {
                             Navigator.pop(context);

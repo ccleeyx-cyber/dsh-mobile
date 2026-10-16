@@ -22,7 +22,6 @@
 library;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../models/approval_preset.dart';
@@ -30,12 +29,10 @@ import '../models/bridge_extras.dart';
 import '../services/dsh_service.dart';
 import '../theme/app_colors.dart';
 
-/// 两种 picker 的可选值。**文案不在这里写死** —— 一律走
-/// [PermissionConfigSnapshot.policyLabel] / [sandboxLabel]，与内置预设、
-/// 安全策略页用的是同一份措辞。同一个概念在两个页面上叫两个名字，是最便宜的
-/// 误导方式。
+/// picker 的可选值。**文案不在这里写死** —— 走
+/// [PermissionConfigSnapshot.policyLabel]，与内置预设、安全策略页用的是同一份
+/// 措辞。同一个概念在两个页面上叫两个名字，是最便宜的误导方式。
 const List<String> _policyValues = <String>['ask', 'auto-read', 'danger-full-access'];
-const List<String> _sandboxValues = <String>['sandboxed', 'workspace-write', 'danger-full-access'];
 
 class ApprovalPresetsView extends StatefulWidget {
   const ApprovalPresetsView({super.key});
@@ -521,7 +518,9 @@ class _CustomPresetCard extends StatelessWidget {
             ),
           ],
           const SizedBox(height: 9),
-          // 四个旋钮逐条列出来：只写一个名字，用户没法判断这个预设到底放宽了什么。
+          // 旋钮逐条列出来：只写一个名字，用户没法判断这个预设到底放宽了什么。
+          // 只有执行策略一个旋钮 —— 沙箱 / 单轮上限 / Git 保护三个字段全链路无人
+          // 消费，已从预设里删掉（详见 PermissionConfig 的说明）。
           Wrap(
             spacing: 6,
             runSpacing: 6,
@@ -531,24 +530,6 @@ class _CustomPresetCard extends StatelessWidget {
                 fg: context.c.textPrimary,
                 bg: context.c.surfaceMuted,
                 border: context.c.border,
-              ),
-              _KnobChip(
-                label: '沙箱：${PermissionConfigSnapshot.sandboxLabel(cfg.sandboxMode)}',
-                fg: context.c.textPrimary,
-                bg: context.c.surfaceMuted,
-                border: context.c.border,
-              ),
-              _KnobChip(
-                label: '单轮上限：${cfg.maxSteps} 步',
-                fg: context.c.textPrimary,
-                bg: context.c.surfaceMuted,
-                border: context.c.border,
-              ),
-              _KnobChip(
-                label: 'Git 保护：${cfg.protectGit ? '开' : '关'}',
-                fg: cfg.protectGit ? context.c.textPrimary : context.c.warning,
-                bg: cfg.protectGit ? context.c.surfaceMuted : context.c.warningBadgeSurface,
-                border: cfg.protectGit ? context.c.border : context.c.warningBorder,
               ),
             ],
           ),
@@ -633,11 +614,8 @@ class _PresetEditorPageState extends State<_PresetEditorPage> {
 
   late final TextEditingController _labelCtrl;
   late final TextEditingController _summaryCtrl;
-  late final TextEditingController _stepsCtrl;
 
   late String _policy;
-  late String _sandbox;
-  late bool _protectGit;
 
   bool _saving = false;
 
@@ -650,27 +628,23 @@ class _PresetEditorPageState extends State<_PresetEditorPage> {
     final cfg = widget.existing?.config;
     _labelCtrl = TextEditingController(text: widget.existing?.label ?? '');
     _summaryCtrl = TextEditingController(text: widget.existing?.summary ?? '');
-    _stepsCtrl = TextEditingController(text: '${cfg?.maxSteps ?? 30}');
-    // 新建时的初值刻意用最保守的一组（= 内置「严格」的旋钮），这样"随便存一个"
+    // 新建时的初值刻意用最保守的策略（= 内置「严格」），这样"随便存一个"
     // 也不会意外放宽权限；想放宽得自己动手改。
     _policy = cfg?.defaultPolicy ?? 'ask';
-    _sandbox = cfg?.sandboxMode ?? 'sandboxed';
-    _protectGit = cfg?.protectGit ?? true;
   }
 
   @override
   void dispose() {
     _labelCtrl.dispose();
     _summaryCtrl.dispose();
-    _stepsCtrl.dispose();
     super.dispose();
   }
 
   /// 这个组合会不会让 agent 不设防。
   ///
-  /// 两个旋钮任一为 `danger-full-access` 就算：策略放行=命令不再弹确认，
-  /// 沙箱放开=命令能写到工作区之外。网关也是这么判的（回 `dangerous: true`）。
-  bool get _dangerous => _policy == 'danger-full-access' || _sandbox == 'danger-full-access';
+  /// 策略为 `danger-full-access` 即算：命令不再弹确认。网关也是这么判的
+  /// （回 `dangerous: true`）。
+  bool get _dangerous => _policy == 'danger-full-access';
 
   String? _validateLabel(String? v) {
     final t = (v ?? '').trim();
@@ -682,15 +656,6 @@ class _PresetEditorPageState extends State<_PresetEditorPage> {
   String? _validateSummary(String? v) {
     final t = (v ?? '').trim();
     if (t.length > 80) return '摘要最多 80 字（当前 ${t.length} 字）';
-    return null;
-  }
-
-  String? _validateSteps(String? v) {
-    // 范围写进提示里：网关对 1–200 之外一律拒绝，与其让用户吃了服务端错误，
-    // 不如在这里就说清边界。
-    final n = int.tryParse((v ?? '').trim());
-    if (n == null) return '单轮步数上限必须是 1–200 的整数';
-    if (n < 1 || n > 200) return '单轮步数上限必须是 1–200 的整数（当前 $n）';
     return null;
   }
 
@@ -717,9 +682,6 @@ class _PresetEditorPageState extends State<_PresetEditorPage> {
       summary: _summaryCtrl.text.trim(),
       config: PresetConfig(
         defaultPolicy: _policy,
-        sandboxMode: _sandbox,
-        maxSteps: int.tryParse(_stepsCtrl.text.trim()) ?? 30,
-        protectGit: _protectGit,
       ),
     );
     if (!mounted) return;
@@ -738,7 +700,6 @@ class _PresetEditorPageState extends State<_PresetEditorPage> {
   Future<bool> _confirmDanger() async {
     final why = <String>[
       if (_policy == 'danger-full-access') '执行策略 = 全部放行：所有命令直接执行，不再弹任何确认。',
-      if (_sandbox == 'danger-full-access') '沙箱 = 完全开放：命令可以写到工作区之外的任何路径。',
     ];
     final ok = await showDialog<bool>(
       context: context,
@@ -868,79 +829,6 @@ class _PresetEditorPageState extends State<_PresetEditorPage> {
                         }),
                       ),
                     ),
-                  const SizedBox(height: 10),
-                  _fieldHeader(context, '沙箱模式 (sandboxMode)'),
-                  const SizedBox(height: 6),
-                  for (final v in _sandboxValues)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: _OptionTile(
-                        title: PermissionConfigSnapshot.sandboxLabel(v),
-                        subtitle: _sandboxHint(v),
-                        selected: _sandbox == v,
-                        danger: v == 'danger-full-access',
-                        onTap: () => setState(() {
-                          _sandbox = v;
-                          _serverError = null;
-                        }),
-                      ),
-                    ),
-                  const SizedBox(height: 10),
-                  TextFormField(
-                    controller: _stepsCtrl,
-                    keyboardType: TextInputType.number,
-                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                    maxLength: 3,
-                    decoration: const InputDecoration(
-                      labelText: '单轮步数上限 (maxSteps)',
-                      helperText: '必须是 1–200 的整数；长任务需要更多步',
-                      isDense: true,
-                      border: OutlineInputBorder(),
-                    ),
-                    style: const TextStyle(fontSize: 13.5),
-                    validator: _validateSteps,
-                  ),
-                  const SizedBox(height: 6),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: context.c.surface,
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: context.c.border),
-                    ),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const SizedBox(height: 8),
-                              Text(
-                                'Git 保护 (protectGit)',
-                                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: context.c.textPrimary),
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                _protectGit
-                                    ? '开：agent 不能自行 commit / push，改动留在工作区由你决定'
-                                    : '关：允许 agent 自己 commit / push —— 历史可能被改写',
-                                style: TextStyle(fontSize: 11, height: 1.35, color: context.c.textSecondary),
-                              ),
-                              const SizedBox(height: 8),
-                            ],
-                          ),
-                        ),
-                        Switch(
-                          value: _protectGit,
-                          activeColor: context.c.accent,
-                          onChanged: (v) => setState(() {
-                            _protectGit = v;
-                            _serverError = null;
-                          }),
-                        ),
-                      ],
-                    ),
-                  ),
                   if (_serverError != null) ...[
                     const SizedBox(height: 12),
                     Container(
@@ -1051,12 +939,6 @@ class _PresetEditorPageState extends State<_PresetEditorPage> {
         'ask' => '每一步都等你确认 —— 最安全，也最啰嗦',
         'auto-read' => '只读命令（ls / cat / grep / git status）直接放行，写操作仍然逐次确认',
         _ => '所有命令直接执行，不弹任何确认 —— 危险',
-      };
-
-  static String _sandboxHint(String v) => switch (v) {
-        'sandboxed' => '命令只能在沙箱里跑，写不到工作区',
-        'workspace-write' => '可以写工作区，不能写到工作区之外',
-        _ => '可以写到机器上的任何路径，包括工作区之外 —— 危险',
       };
 }
 

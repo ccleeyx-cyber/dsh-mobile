@@ -162,6 +162,9 @@ const POLICY_VALUES = new Set(['ask', 'auto-read', 'danger-full-access']);
 const SANDBOX_VALUES = new Set(['sandboxed', 'workspace-write', 'danger-full-access']);
 const MAX_STEPS_MIN = 1;
 const MAX_STEPS_MAX = 200;
+// 遗留字段缺失时的填充值，保持与 store.mjs 的 DEFAULT_PERMISSIONS 一致。
+const DEFAULT_SANDBOX_MODE = 'workspace-write';
+const DEFAULT_MAX_STEPS = 30;
 
 /** Strip control characters and collapse whitespace; never trust the wire. */
 function cleanText(value, maxLength) {
@@ -196,15 +199,28 @@ export function validatePresetInput(body) {
   if (!POLICY_VALUES.has(defaultPolicy)) {
     return { ok: false, error: `执行策略取值非法：${defaultPolicy || '(空)'}` };
   }
-  const sandboxMode = typeof cfg.sandboxMode === 'string' ? cfg.sandboxMode.trim() : '';
+
+  // [2026-10-16] sandboxMode / maxSteps / protectGit 是**遗留字段**。
+  //
+  // 它们仍然被存储和回显 —— 已安装的旧版 App 会发，磁盘上的旧预设也带着 —— 但
+  // 全链路没有任何消费者：真正驱动行为的是 defaultPolicy（见审批路径里的
+  // effectivePolicy）。新版 App 已把这几个控件删掉、不再发送它们，所以这里必须是
+  // "客户端带了才校验、没带就补默认值"，否则新 App 连预设都存不了。
+  //
+  // 若哪天把它们接到引擎（dsh-sandbox-policy / dsh-permission-presets），这段要
+  // 连同 App 侧的控件的删除一起改回强制校验 —— 那时它们才配叫可配置项。
+  const sandboxMode = cfg.sandboxMode === undefined || cfg.sandboxMode === null || cfg.sandboxMode === ''
+    ? DEFAULT_SANDBOX_MODE
+    : String(cfg.sandboxMode).trim();
   if (!SANDBOX_VALUES.has(sandboxMode)) {
     return { ok: false, error: `沙箱模式取值非法：${sandboxMode || '(空)'}` };
   }
-  const maxSteps = Number(cfg.maxSteps);
+  const maxSteps = cfg.maxSteps === undefined || cfg.maxSteps === null ? DEFAULT_MAX_STEPS : Number(cfg.maxSteps);
   if (!Number.isInteger(maxSteps) || maxSteps < MAX_STEPS_MIN || maxSteps > MAX_STEPS_MAX) {
     return { ok: false, error: `单轮步数上限必须是 ${MAX_STEPS_MIN}–${MAX_STEPS_MAX} 的整数` };
   }
-  if (typeof cfg.protectGit !== 'boolean') return { ok: false, error: 'protectGit 必须是布尔值' };
+  const protectGit = cfg.protectGit === undefined || cfg.protectGit === null ? true : cfg.protectGit;
+  if (typeof protectGit !== 'boolean') return { ok: false, error: 'protectGit 必须是布尔值' };
 
   const requestedId = cleanText(body?.id, 32);
   if (requestedId && RESERVED_PRESET_IDS.includes(requestedId)) {
@@ -220,7 +236,7 @@ export function validatePresetInput(body) {
       id: requestedId || `custom-${randomHex(8)}`,
       label,
       summary,
-      config: { defaultPolicy, sandboxMode, maxSteps, protectGit: cfg.protectGit },
+      config: { defaultPolicy, sandboxMode, maxSteps, protectGit },
       dangerous: defaultPolicy === 'danger-full-access' || sandboxMode === 'danger-full-access',
       updatedAt: Date.now()
     }

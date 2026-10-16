@@ -528,8 +528,36 @@ test('validatePresetInput: refuses bad values instead of clamping them', () => {
   assert.equal(longLabel.preset.label.length, 24);
 });
 
-test('validatePresetInput: built-in ids cannot be shadowed', () => {
-  for (const id of ['strict', 'balanced', 'autonomous', 'trusted']) {
+test('validatePresetInput: a preset without the legacy knobs still saves', () => {
+  // [2026-10-16] sandboxMode / maxSteps / protectGit 已从 App 侧删除（三者全链路
+  // 无人消费，见 extensions.mjs 的说明）。新版客户端只发 defaultPolicy，网关必须
+  // 接受并补上遗留默认值 —— 否则用户连预设都存不了。
+  const r = validatePresetInput({ label: '只带策略', config: { defaultPolicy: 'auto-read' } });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.preset.config.defaultPolicy, 'auto-read');
+  // 补齐成与 store.mjs 一致的默认值，而不是 undefined：旧版 App 会读这些字段。
+  assert.equal(r.preset.config.sandboxMode, 'workspace-write');
+  assert.equal(r.preset.config.maxSteps, 30);
+  assert.equal(r.preset.config.protectGit, true);
+});
+
+test('validatePresetInput: legacy knobs are still validated when present', () => {
+  // 容错只针对"没带"，不包括"乱填" —— 带了就必须合法，否则等于把校验也删了。
+  for (const bad of [
+    { defaultPolicy: 'ask', maxSteps: 0 },
+    { defaultPolicy: 'ask', maxSteps: 9999 },
+    { defaultPolicy: 'ask', sandboxMode: 'nope' },
+    { defaultPolicy: 'ask', protectGit: 'yes' }
+  ]) {
+    assert.equal(
+      validatePresetInput({ label: 'x', config: bad }).ok,
+      false,
+      `expected refusal for ${JSON.stringify(bad)}`
+    );
+  }
+});
+
+test('validatePresetInput: built-in ids cannot be shadowed', () => {  for (const id of ['strict', 'balanced', 'autonomous', 'trusted']) {
     const r = validatePresetInput({ id, label: 'x', config: GOOD_CONFIG });
     assert.equal(r.ok, false);
     assert.match(r.error, /内置预设/);

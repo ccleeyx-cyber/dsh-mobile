@@ -328,35 +328,26 @@ class TextFileContent {
   bool get isImage => contentType.startsWith('image/');
 }
 
-/// The four knobs a preset controls (P0-2).
+/// The knob a preset controls (P0-2).
 ///
 /// Separate from the live `PermissionConfig` so applying a preset can never
 /// rewrite per-session overrides by accident.
+///
+/// 只带 `defaultPolicy`：网关的预设 payload 里还有 `sandboxMode` / `maxSteps` /
+/// `protectGit`，但那三个字段全链路无人消费（见 `PermissionConfig` 的说明）。
+/// 旧版 App 存的预设里仍带着它们，解析时忽略即可 —— 这里不再建模，避免又出现
+/// "读得到一个值、写入一个值、却没有任何效果"的死配置项。
 class PresetConfig {
   final String defaultPolicy;
-  final String sandboxMode;
-  final int maxSteps;
-  final bool protectGit;
 
-  const PresetConfig({
-    required this.defaultPolicy,
-    required this.sandboxMode,
-    required this.maxSteps,
-    required this.protectGit,
-  });
+  const PresetConfig({required this.defaultPolicy});
 
   factory PresetConfig.fromJson(Map<String, dynamic> json) => PresetConfig(
         defaultPolicy: json['defaultPolicy']?.toString() ?? 'ask',
-        sandboxMode: json['sandboxMode']?.toString() ?? 'sandboxed',
-        maxSteps: _int(json['maxSteps']) ?? 30,
-        protectGit: json['protectGit'] != false,
       );
 
   Map<String, dynamic> toJson() => {
         'defaultPolicy': defaultPolicy,
-        'sandboxMode': sandboxMode,
-        'maxSteps': maxSteps,
-        'protectGit': protectGit,
       };
 }
 
@@ -366,8 +357,8 @@ class ApprovalPresetInfo {
   final String label;
   final String summary;
 
-  /// True for the four presets the App itself ships. The host never stores
-  /// those, so this is false for everything that came off the wire.
+  /// True for the presets the App itself ships. The host never stores those, so
+  /// this is false for everything that came off the wire.
   final bool builtin;
 
   /// True when the preset relaxes the policy to `danger-full-access`; the UI
@@ -397,7 +388,7 @@ class ApprovalPresetInfo {
       dangerous: json['dangerous'] == true,
       config: cfg is Map
           ? PresetConfig.fromJson(Map<String, dynamic>.from(cfg))
-          : const PresetConfig(defaultPolicy: 'ask', sandboxMode: 'sandboxed', maxSteps: 30, protectGit: true),
+          : const PresetConfig(defaultPolicy: 'ask'),
       updatedAt: _int(json['updatedAt']),
     );
   }

@@ -2,87 +2,51 @@ import 'permission_config.dart';
 
 /// Named permission presets (v1.4.2 审批规则化).
 ///
-/// Why presets at all: the raw settings expose four independent knobs
-/// (`defaultPolicy`, `sandboxMode`, `maxSteps`, `protectGit`) and every
-/// combination is legal, including several that are actively dangerous — for
-/// example `defaultPolicy: auto-read` together with a sandbox that still allows
-/// writes. A user picking values one at a time has no way to reason about the
-/// result, so they either leave it at `ask` forever or flip one switch and get
-/// a surprise.
+/// Why presets at all: an execution policy has exactly three values and each one
+/// is a real trade-off, so the settings page offers reviewed combinations with
+/// the concrete effect written out in plain words, plus
+/// [PermissionConfigSnapshot.describeDiff] so the page can show what switching
+/// would change *before* it changes anything.
 ///
-/// A preset bundles a **reviewed** combination, and — more importantly — each
-/// one carries the concrete effect in plain words, plus [describeDiff] so the
-/// settings page can show exactly what switching would change *before* it
-/// changes anything.
+/// ## 为什么只剩三个预设、且只描述执行策略
 ///
-/// The ordering here is deliberate: most restrictive first, so the safest
-/// option is the first thing read.
+/// 此前每个预设还带着 `sandboxMode` / `maxSteps` / `protectGit` 三个维度，但它们
+/// **全链路无人消费**（详见 [PermissionConfig] 的说明）。删掉之后：
+///
+/// - 四个预设塌缩成三个 —— 原来的 `autonomous` 与 `balanced` 的唯一区别就在这三个
+///   死字段上（执行策略同为 `auto-read`），保留下会出现两个"看起来不同、实际完全相同"
+///   的选项，那是换一种方式误导。
+/// - `effects` 只保留**执行策略真的会造成**的后果。沙箱可写范围与单轮步数上限属于
+///   引擎自身的设置，不由本预设控制，所以不再写成预设的效果。
 enum ApprovalPreset {
   strict(
     id: 'strict',
     label: '严格',
     summary: '每一步都问，只放行纯只读命令',
-    config: PermissionConfigSnapshot(
-      defaultPolicy: 'ask',
-      sandboxMode: 'sandboxed',
-      maxSteps: 15,
-      protectGit: true,
-    ),
+    config: PermissionConfigSnapshot(defaultPolicy: 'ask'),
     effects: [
       '任何写操作、任何非只读命令都会弹窗等你确认',
-      '命令在沙箱里跑，不能写到工作区以外',
-      '单轮最多 15 步（长任务会提前停下）',
+      '没有任何命令会被自动放行 —— 最安全，但最需要你陪着',
     ],
   ),
   balanced(
     id: 'balanced',
     label: '均衡',
     summary: '只读自动放行，写操作仍然逐次确认',
-    config: PermissionConfigSnapshot(
-      defaultPolicy: 'auto-read',
-      sandboxMode: 'workspace-write',
-      maxSteps: 30,
-      protectGit: true,
-    ),
+    config: PermissionConfigSnapshot(defaultPolicy: 'auto-read'),
     effects: [
       'ls / cat / grep / git status 这类只读命令直接放行，不再打扰你',
       '写操作、删除、执行脚本仍然逐次弹窗',
-      '命令可以写工作区，但不能写到工作区以外',
-      '单轮最多 30 步',
-    ],
-  ),
-  autonomous(
-    id: 'autonomous',
-    label: '自主',
-    summary: '只在危险操作前确认，其余放行',
-    config: PermissionConfigSnapshot(
-      defaultPolicy: 'auto-read',
-      sandboxMode: 'workspace-write',
-      maxSteps: 60,
-      protectGit: false,
-    ),
-    effects: [
-      '只读命令自动放行',
-      '写工作区自动放行；删除、执行脚本等危险操作仍会弹窗',
-      'Git 不再强制保护 —— 允许 agent 自己 commit / push',
-      '单轮最多 60 步，长任务不容易被拦腰截断',
     ],
   ),
   trusted(
     id: 'trusted',
     label: '完全信任',
     summary: '不设防：任何命令都直接执行',
-    config: PermissionConfigSnapshot(
-      defaultPolicy: 'danger-full-access',
-      sandboxMode: 'danger-full-access',
-      maxSteps: 100,
-      protectGit: false,
-    ),
+    config: PermissionConfigSnapshot(defaultPolicy: 'danger-full-access'),
     effects: [
-      '所有命令直接执行，不弹任何确认',
-      '命令可以写到机器上的任何路径，包括工作区之外',
-      'Git 不受保护',
-      '单轮最多 100 步',
+      '所有命令直接执行，不再弹任何确认',
+      '没有二次确认环节 —— 出错时你也没有拦截的机会',
     ],
   );
 
@@ -121,38 +85,21 @@ enum ApprovalPreset {
 /// deliberate per-session settings.
 class PermissionConfigSnapshot {
   final String defaultPolicy;
-  final String sandboxMode;
-  final int maxSteps;
-  final bool protectGit;
 
-  const PermissionConfigSnapshot({
-    required this.defaultPolicy,
-    required this.sandboxMode,
-    required this.maxSteps,
-    required this.protectGit,
-  });
+  const PermissionConfigSnapshot({required this.defaultPolicy});
 
   /// Apply this preset to a live config, leaving per-session overrides alone.
   PermissionConfig applyTo(PermissionConfig base) => base.copyWith(
         defaultPolicy: defaultPolicy,
-        sandboxMode: sandboxMode,
-        maxSteps: maxSteps,
-        protectGit: protectGit,
       );
 
-  /// Which preset (if any) matches this exact set of knobs.
+  /// Which preset (if any) matches this config.
   ///
-  /// Used to show the current selection. Returns null when the config matches
-  /// no preset — which is a real state, not an error: [PermissionConfig] lets
-  /// the user set the knobs individually, and that must still work.
+  /// Returns null when the config matches no preset — which is a real state once
+  /// a custom preset is applied, not an error.
   static ApprovalPreset? matching(PermissionConfig config) {
     for (final p in ApprovalPreset.values) {
-      if (p.config.defaultPolicy == config.defaultPolicy &&
-          p.config.sandboxMode == config.sandboxMode &&
-          p.config.maxSteps == config.maxSteps &&
-          p.config.protectGit == config.protectGit) {
-        return p;
-      }
+      if (p.config.defaultPolicy == config.defaultPolicy) return p;
     }
     return null;
   }
@@ -165,15 +112,6 @@ class PermissionConfigSnapshot {
     if (from.defaultPolicy != to.defaultPolicy) {
       out.add('执行策略：${policyLabel(from.defaultPolicy)} → ${policyLabel(to.defaultPolicy)}');
     }
-    if (from.sandboxMode != to.sandboxMode) {
-      out.add('沙箱模式：${sandboxLabel(from.sandboxMode)} → ${sandboxLabel(to.sandboxMode)}');
-    }
-    if (from.maxSteps != to.maxSteps) {
-      out.add('单轮步数上限：${from.maxSteps} → ${to.maxSteps}');
-    }
-    if (from.protectGit != to.protectGit) {
-      out.add(from.protectGit ? 'Git 保护：开 → 关' : 'Git 保护：关 → 开');
-    }
     return out;
   }
 
@@ -181,13 +119,6 @@ class PermissionConfigSnapshot {
         'ask' => '逐次询问',
         'auto-read' => '只读自动放行',
         'danger-full-access' => '全部放行',
-        _ => v,
-      };
-
-  static String sandboxLabel(String v) => switch (v) {
-        'sandboxed' => '沙箱内',
-        'workspace-write' => '仅工作区可写',
-        'danger-full-access' => '完全开放',
         _ => v,
       };
 }
