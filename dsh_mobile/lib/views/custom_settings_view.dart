@@ -1005,7 +1005,7 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                           Clipboard.setData(const ClipboardData(text: AppVersion.releasesUrl));
                           ScaffoldMessenger.of(context).showSnackBar(
                             SnackBar(
-                              content: Text('已复制: ${AppVersion.releasesUrl}'),
+                              content: const Text('已复制: ${AppVersion.releasesUrl}'),
                               backgroundColor: context.c.accent,
                               behavior: SnackBarBehavior.floating,
                             ),
@@ -1086,13 +1086,15 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
   /// 宁可不猜，也不给出一个可能过期的"已是最新"。
   Future<void> _openDownloadPage(BuildContext context) async {
     final messenger = ScaffoldMessenger.of(context);
+    // 主题色来自 Element（context.c），必须和 messenger 一样在 await 之前取。
+    final warningColor = context.c.warning;
     final ok = await UrlOpener.open(AppVersion.releasesUrl);
     if (!mounted) return;
     if (ok) return;
     await Clipboard.setData(const ClipboardData(text: AppVersion.releasesUrl));
     messenger.showSnackBar(SnackBar(
-      content: Text('打不开浏览器，链接已复制：${AppVersion.releasesUrl}'),
-      backgroundColor: context.c.warning,
+      content: const Text('打不开浏览器，链接已复制：${AppVersion.releasesUrl}'),
+      backgroundColor: warningColor,
       behavior: SnackBarBehavior.floating,
     ));
   }

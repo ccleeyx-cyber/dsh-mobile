@@ -72,8 +72,23 @@ class AttachmentImageTile extends StatelessWidget {
                   url,
                   headers: headers,
                   fit: BoxFit.contain,
+                  // [fix 2026-10-16] 按显示尺寸解码，不按原图尺寸。
+                  // 附件图可能是一张 12MP 照片，而这里最大只显示 320dp；
+                  // 不限制 cacheWidth 就会把整张原图解进内存再缩，
+                  // 一张图白占几十 MB，滚动几条消息就能把 App 顶 OOM。
+                  //
+                  // 倍数用 devicePixelRatio：低于 1x 会发虚，高于 2x 的
+                  // 增益眼看不出来，纯粹是浪费内存。
+                  cacheWidth: (maxWidth * MediaQuery.devicePixelRatioOf(context)).round().clamp(1, 4096),
+                  // [fix 2026-10-16] 不再把 $error 原文丢给用户。
+                  // Flutter 的图片异常 toString() 里带完整请求 URL，
+                  // 对用户是一串无意义的技术噪音；而且图片请求是带
+                  // Authorization 头发出去的，异常文本虽然不含 token
+                  // （token 只在 header，URL 里没有），但把请求细节
+                  // 显示在界面上没有任何好处。区分“网络问题”和“图没了”
+                  // 靠 errorBuilder 被调用这件事本身就够了。
                   errorBuilder: (context, error, stack) =>
-                      _placeholder(Colors.orange.shade700, '图片加载失败\n$error'),
+                      _placeholder(Colors.orange.shade700, '图片加载失败'),
                   loadingBuilder: (context, child, progress) {
                     if (progress == null) return child;
                     return SizedBox(

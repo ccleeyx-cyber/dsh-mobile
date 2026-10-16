@@ -604,10 +604,44 @@ class _ConfigPageState extends State<ConfigPage> {
               // 表单只剩连接真正需要的四项。模型字段保留做旧数据兼容读。
               SwitchListTile(
                 title: const Text('启用 HTTPS / WSS'),
-                subtitle: const Text('如果使用了域名和 SSL 证书请勾选'),
+                subtitle: Text(_useHttps
+                    ? '如果使用了域名和 SSL 证书请勾选'
+                    : '未启用：Token 将以明文在每个请求头里传输'),
                 value: _useHttps,
                 onChanged: (val) => setState(() => _useHttps = val),
               ),
+              // [fix 2026-10-16] 明文告警。
+              //
+              // `useHttps` 默认 false，而不启用时 token 是**明文**塞进
+              // Authorization / x-dsh-token 头发出去的（见 ServerConfig.httpBaseUrl
+              // 与 DshService 的 _authHeaders）。同一 Wi-Fi 下的任何人、链路上
+              // 任何一跳都能直接读走它。
+              //
+              // 真正的修法是把 token 存进 Keystore（flutter_secure_storage），
+              // 但那需要放开 pubspec 里 speech_to_text 6.6.2 的版本钉 —— 它的
+              // js ^0.7.1 与 secure_storage 9.x 需要的 js ^0.6.3 直接冲突，
+              // 而放开那个钉又依赖升级 Flutter / plugin-loader。那是另一件事。
+              //
+              // 在此之前，至少让"不加密"成为一个用户看得见的选择，而不是默认
+              // 悄悄发生的事。
+              if (!_useHttps)
+                Padding(
+                  padding: const EdgeInsets.only(left: 16, right: 16, bottom: 8),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(Icons.warning_amber_rounded, size: 16, color: context.c.warning),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '当前为明文连接：同网络下的其他人可能读到你的 Token。'
+                          '有域名和证书时请启用 HTTPS / WSS。',
+                          style: TextStyle(fontSize: 12, color: context.c.warning, height: 1.4),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               const SizedBox(height: 24),
               OutlinedButton.icon(
                 onPressed: _isTesting ? null : _testConnection,

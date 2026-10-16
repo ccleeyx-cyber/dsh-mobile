@@ -619,10 +619,10 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                 Text(
                   idle
                       ? '没有工具调用或提问正在等待你。'
-                      : [
+                      : '${[
                           if (approvals > 0) '$approvals 个工具授权',
                           if (questions > 0) '$questions 个提问',
-                        ].join(' · ') + '（在对话页处理）',
+                        ].join(' · ')}（在对话页处理）',
                   style: TextStyle(color: context.c.textSecondary, fontSize: 12),
                 ),
               ],

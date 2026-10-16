@@ -794,7 +794,7 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         if (children.isNotEmpty) children.add(const SizedBox(height: 8));
         final source = _changesSourceCaption();
         if (source != null) children.add(_hint(source));
-        for (final change in widget.changes) children.add(_buildChangeRow(change));
+        for (final change in widget.changes) { children.add(_buildChangeRow(change)); }
       }
     }
 

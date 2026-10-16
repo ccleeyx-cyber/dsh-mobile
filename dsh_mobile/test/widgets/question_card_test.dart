@@ -528,6 +528,43 @@ void main() {
       expect(find.textContaining('800×600'), findsOneWidget);
       expect(find.textContaining('KB'), findsOneWidget);
     });
+
+    // [fix 2026-10-16] 附件图必须按显示尺寸解码。
+    //
+    // 不设 cacheWidth 时 Image.network 会按**原图**尺寸解码再缩放：一张 12MP
+    // 照片进内存就是几十 MB，而这个 tile 最大只显示 320dp。滚动几条消息就能
+    // 把 App 顶到 OOM。
+    testWidgets('图片按显示尺寸解码，不按原图尺寸', (tester) async {
+      const maxWidth = 240.0;
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: AttachmentImageTile(
+            ref: AttachmentRef.fromJson({
+              'id': 'att-1',
+              'mimeType': 'image/png',
+              'width': 4000,
+              'height': 3000,
+            }),
+            endpoint: (
+              url: 'https://gw.example.com/api/mobile/attachments/att-1',
+              headers: const {'Authorization': 'Bearer tok'}
+            ),
+            maxWidth: maxWidth,
+          ),
+        ),
+      ));
+      await tester.pump();
+
+      final img = tester.widget<Image>(find.byType(Image));
+      // Image.network 的 cacheWidth 落在它构造的 ImageProvider 上
+      // （ResizeImage 包装），widget 本身不暴露该字段。
+      final provider = img.image;
+      expect(provider, isA<ResizeImage>(),
+          reason: 'cacheWidth 必须显式设置，否则按原图尺寸解码');
+      final target = (provider as ResizeImage).width;
+      expect(target, lessThanOrEqualTo((maxWidth * 4).round()),
+          reason: '解码宽度应贴近显示尺寸（含 devicePixelRatio 余量），而不是原图的 4000px');
+    });
   });
 
   group('QuestionErrorBanner', () {

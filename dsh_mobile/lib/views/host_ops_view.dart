@@ -1526,7 +1526,9 @@ class _ForksTabState extends State<_ForksTab> {
           TextButton.icon(
             onPressed: () async {
               await Clipboard.setData(ClipboardData(text: sessionId));
-              if (!mounted) return;
+              // ctx 是**对话框自己**的 context，它的 mounted 和外层 _ForksTabState
+              // 的 mounted 是两回事，必须各自判断（复制期间用户可能已经划掉对话框）。
+              if (!mounted || !ctx.mounted) return;
               Navigator.pop(ctx);
               ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
                 content: Text('新会话 id 已复制'),

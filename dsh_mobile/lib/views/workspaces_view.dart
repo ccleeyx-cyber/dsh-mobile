@@ -158,7 +158,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
   ///
   /// 失败要如实说（改的是 projcache 标题行，网关读不到缓存文件时会失败），
   /// 不能像删除那样静默乐观。
-  Future<void> _showRenameDialog(BuildContext context, DshService dsh, SessionMeta s) async {
+  Future<void> _showRenameDialog(DshService dsh, SessionMeta s) async {
     final controller = TextEditingController(text: s.title);
     final ok = await showDialog<bool>(
       context: context,
@@ -1098,13 +1098,18 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
               tooltip: s.archived ? '取消归档' : '归档',
               onPressed: () async {
                 HapticFeedback.selectionClick();
+                // 主题色/ScaffoldMessenger 都来自 Element，必须在 await 之前取，
+                // 不能跨异步间隔再读 context。
+                final successColor = context.c.success;
+                final dangerColor = context.c.danger;
+                final messenger = ScaffoldMessenger.of(context);
                 final ok = await dsh.setSessionArchived(s.sessionId, !s.archived);
                 if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                messenger.showSnackBar(SnackBar(
                   content: Text(ok
                       ? (s.archived ? '已取消归档' : '已归档「${s.title}」')
                       : '${s.archived ? '取消归档' : '归档'}失败: ${dsh.lastError}'),
-                  backgroundColor: ok ? context.c.success : context.c.danger,
+                  backgroundColor: ok ? successColor : dangerColor,
                   behavior: SnackBarBehavior.floating,
                 ));
               },
@@ -1112,7 +1117,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
             IconButton(
               icon: Icon(Icons.edit_outlined, size: 18, color: context.c.textTertiary),
               tooltip: '重命名',
-              onPressed: () => _showRenameDialog(context, dsh, s),
+              onPressed: () => _showRenameDialog(dsh, s),
             ),
             IconButton(
               icon: Icon(Icons.delete_outline_rounded, size: 18, color: context.c.textTertiary),

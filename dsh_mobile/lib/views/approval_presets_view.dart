@@ -789,11 +789,11 @@ class _PresetEditorPageState extends State<_PresetEditorPage> {
                     controller: _labelCtrl,
                     maxLength: 24,
                     textInputAction: TextInputAction.next,
-                    decoration: InputDecoration(
+                    decoration: const InputDecoration(
                       labelText: '预设名称（必填）',
                       hintText: '例如：只读巡检',
                       isDense: true,
-                      border: const OutlineInputBorder(),
+                      border: OutlineInputBorder(),
                     ),
                     style: const TextStyle(fontSize: 13.5),
                     validator: _validateLabel,

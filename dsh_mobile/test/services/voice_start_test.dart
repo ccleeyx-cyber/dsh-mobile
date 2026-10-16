@@ -61,7 +61,7 @@ void main() {
               messenger.handlePlatformMessage(
                 channel.name,
                 const StandardMethodCodec().encodeMethodCall(
-                  MethodCall('notifyStatus', 'listening'),
+                  const MethodCall('notifyStatus', 'listening'),
                 ),
                 (_) {},
               );
