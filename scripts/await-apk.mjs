@@ -168,12 +168,12 @@ async function download(run) {
       console.log(`[await-apk]   ${a.f}  ${(a.s / 1048576).toFixed(1)} MB`);
     }
     console.log('');
-    console.log('[await-apk] ⚠️ 安装前请先确认签名：CI 目前没有配置 release keystore，');
-    console.log('[await-apk]    flutter build apk --release 会回退到 debug 签名，导致每次构建');
-    console.log('[await-apk]    签名都不同、手机无法覆盖安装（必须先卸载，连带清空已保存的');
-    console.log('[await-apk]    主机地址与令牌）。校验方法：');
+    console.log('[await-apk] ⚠️ 安装前请先确认签名：发布路径上 build-apk.yml 强制要求');
+    console.log('[await-apk]    secrets.ANDROID_KEYSTORE_BASE64，未配置直接报错退出（不会产出包）；');
+    console.log('[await-apk]    但 PR/分支路径仍会产出 debug 签名的调试包 —— 那种包每次构建签名都不同，');
+    console.log('[await-apk]    手机无法覆盖安装（必须先卸载，连带清空已保存的主机地址与令牌）。校验方法：');
     console.log('[await-apk]    keytool -printcert -jarfile <apk>   ← 看 Owner 是否为 CN=Android Debug');
-    console.log('[await-apk]    修复方案见 ANALYSIS-优化与新增功能.md §1.1');
+    console.log('[await-apk]    签名材料如何注入：.github/workflows/build-apk.yml 的 "Write signing material" 步骤。');
   } catch (e) {
     console.log(`[await-apk] 自动解压失败（${e.message}），压缩包保留在 ${zipPath}`);
     console.log('[await-apk] 手动解压: Expand-Archive -Path apk-artifact.zip -DestinationPath . -Force');

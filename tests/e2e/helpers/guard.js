@@ -16,7 +16,8 @@
  *   3. Restore in a finally, and verify afterwards that it landed.
  *   4. Write test scratch files into a temp dir, not the caller's workspace.
  *
- * See ANALYSIS-优化与新增功能.md §1.14b.
+ * 危险性说明与跑前备份清单见 docs/TESTING.md（原 ANALYSIS-优化与新增功能.md §1.14b，
+ * 该文档已于 2026-10-17 删除）。
  */
 import fs from 'node:fs';
 import os from 'node:os';

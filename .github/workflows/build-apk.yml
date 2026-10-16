@@ -71,19 +71,20 @@ jobs:
           restore-keys: pub-${{ runner.os }}-
 
       # pubspec.yaml is the single source of truth. tag_name / release name /
-      # artifact name below all read from here, so bumping the version is a
-      # one-line change instead of the 13-site hunt described in ANALYSIS §1.8.
+      # artifact name below all read from here, and the build step injects the
+      # same values into the Dart code via --dart-define, so bumping the version
+      # is a one-line change with no second place to keep in sync.
+      #
+      # 解析逻辑只在 scripts/app-version.mjs 里有一份（本地同一个脚本，
+      # `node scripts/app-version.mjs` 就能看版本），不再用 sed 复制一份到这里 ——
+      # 之前 build/release 两个 job 各写了一遍 sed，改一处漏一处是迟早的事。
+      # 它同时解析 android/app/build.gradle 的 applicationId（App 侧用它校验
+      # latest.json 是不是给本应用的），解析不到会**报错退出**而不是吐空串。
       - name: Read version from pubspec.yaml
         id: ver
-        working-directory: ./dsh_mobile
         run: |
-          RAW=$(grep -E '^version:' pubspec.yaml | head -1 | sed 's/^version:[[:space:]]*//')
-          VERSION="${RAW%%+*}"
-          BUILD="${RAW##*+}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "build=$BUILD"     >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION"     >> "$GITHUB_OUTPUT"
-          echo "APK version=$VERSION build=$BUILD tag=v$VERSION"
+          node scripts/app-version.mjs
+          node scripts/app-version.mjs --github-output
 
       - name: Prepare Android Project & Dependencies
         working-directory: ./dsh_mobile
@@ -164,8 +165,18 @@ jobs:
         # roughly a third of that. Output filenames change from
         # app-release.apk to app-<abi>-release.apk, hence the glob in the upload
         # and release steps below.
+        #
+        # 三个 --dart-define 是版本真源链路的最后一跳：App 里的
+        # AppVersion.version / buildNumber / packageName 全部读它们
+        # （lib/models/app_version.dart），所以**这个构建步骤一旦漏传，装出来的
+        # APK 就会带着代码里的兜底默认值**（可能出现"版本号看起来没变"或
+        # packageName 校验永远失败）。以后新增任何 flutter build/run 步骤，
+        # 都要照抄这三个参数（本地：`node scripts/app-version.mjs --defines`）。
         run: |
-          flutter build apk --release --split-per-abi
+          flutter build apk --release --split-per-abi \
+            --dart-define=APP_VERSION=${{ steps.ver.outputs.version }} \
+            --dart-define=APP_BUILD=${{ steps.ver.outputs.build }} \
+            --dart-define=APP_PACKAGE_NAME=${{ steps.ver.outputs.package_name }}
 
       - name: List produced APKs
         working-directory: ./dsh_mobile
@@ -197,12 +208,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 与 build job 同一份解析逻辑（scripts/app-version.mjs），这里只要 version。
       - name: Read version from pubspec.yaml
         id: ver
-        working-directory: ./dsh_mobile
-        run: |
-          RAW=$(grep -E '^version:' pubspec.yaml | head -1 | sed 's/^version:[[:space:]]*//')
-          echo "version=${RAW%%+*}" >> "$GITHUB_OUTPUT"
+        run: node scripts/app-version.mjs --github-output
 
       - name: Download APK artifacts
         uses: actions/download-artifact@v4

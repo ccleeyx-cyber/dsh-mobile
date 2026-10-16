@@ -1,5 +1,7 @@
 # 交付物「点不开」根因定位与修复
 
+> 状态：本报告描述的缺陷已在 2026-10-10 之后修复，本文仅作历史证据。
+
 日期：2026-10-10
 范围：引擎 `deliverables/presented` → 网关 `/api/mobile/deliverables`(+`/download`) → App `http.get` → MethodChannel `dsh_mobile/file` → `MainActivity.openBytes`
 活实例基线：`dsh web` PID 47652，启动 16:03:54；bridge **1.14.0**，监听 `0.0.0.0:3088`，引擎 `127.0.0.1:3080`

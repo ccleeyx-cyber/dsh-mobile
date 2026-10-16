@@ -8,6 +8,7 @@ import 'services/dsh_service.dart';
 import 'services/draft_store.dart';
 import 'services/notification_service.dart';
 import 'services/platform_services.dart';
+import 'services/secure_store.dart';
 import 'services/storage_service.dart';
 import 'theme/app_colors.dart';
 import 'theme/app_spacing.dart';
@@ -39,6 +40,10 @@ void main() async {
       ),
     );
   };
+  // Keystore 通道探测要排在 loadConfig 之前：StorageService 只有确认原生加密
+  // 可用（SecureStore.isPlatformBacked）才敢把 SharedPreferences 里的明文 token
+  // 搬走。探测失败只会降级（明文继续兜底），不会拦启动。
+  await SecureStore.init();
   final savedConfig = await StorageService.loadConfig();
   final savedThemeMode = await StorageService.loadThemeMode();
 

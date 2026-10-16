@@ -63,15 +63,15 @@ apk-artifact.zip
 # 没有文档也没有维护价值 —— 曾经有 18 个躺在工作区里，其中 17 个未跟踪、1 个
 # （download-e2e.mjs）被跟踪，没有任何规则解释这个区别。
 #
-# 例外保留 download-e2e.mjs：它是 patches/README.md:76 记载的"无需重启就能
-# 做的端到端验证"（真实 HTTP server + 真实分发器），有文档价值。
+# 例外保留 download-e2e.mjs：它是"无需重启就能做的端到端验证"（真实 HTTP server +
+# 真实分发器），历史上由 patches/README.md 记载（该目录 2026-10-17 已删除）。
 .probe/*
 !.probe/download-e2e.mjs
 # The E2E memory tests write these into whatever workspacePath they are pointed
 # at. On 2026-10-08 they were found in E:\workspace\个人\ — i.e. OUTSIDE this
 # repo, where gitignore cannot reach them. The real fix is to point those tests
-# at a temp dir (see ANALYSIS-优化与新增功能.md §1.14a); these rules only cover
-# the case where the repo itself is the workspace.
+# at a temp dir (guard.js 现在就是这么做的，见 docs/TESTING.md); these rules only
+# cover the case where the repo itself is the workspace.
 E2E_MEMORY_TEST.MD
 LARGE_MEMORY_TEST.MD
 PROJECT_WORKLOAD_MEMORY.MD

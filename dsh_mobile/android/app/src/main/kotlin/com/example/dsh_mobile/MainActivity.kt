@@ -213,6 +213,21 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // 敏感字段（网关 token / authCode）的落盘：密钥生成并保管在
+        // AndroidKeyStore（不可导出），加解密在这里做；密文仍落在 SharedPreferences。
+        // 加了一把 Keystore 密钥之后，光拿到 SharedPreferences 文件没有意义 ——
+        // 这正是 Keystore 的威胁模型，也是它比「把明文挪个文件」强的地方。
+        //
+        // 刻意**不**引入 flutter_secure_storage：它会把 `js` 拖到 ^0.6.x，与
+        // speech_to_text 6.6.2 钉住的 js ^0.7.1 直接冲突（README §4）。这点需求
+        // 用 MethodChannel 自己写，比放开那个版本钉再连带升级 Flutter 便宜得多。
+        //
+        // 实现放在 SecureStoreBridge：AndroidKeyStore 的 AES 能力要到 API 23
+        // 才齐全，而本项目 minSdk=21，所以入口必须先判版本（见那个类的注释），
+        // 不能把引用这些 API 的代码直接摊在 Activity 里。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_SECURE)
+            .setMethodCallHandler(SecureStoreBridge(this))
+
         // 打开交付物：Dart 侧把字节交过来，这里落盘到缓存 + FileProvider 授权后
         // 交给系统应用。字节由 Dart 读完（带鉴权头），原生不承担网络职责。
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_FILE)
@@ -272,6 +287,9 @@ class MainActivity : FlutterActivity() {
         private const val CHANNEL_SHARE = "dsh_mobile/share"
         private const val CHANNEL_DEEPLINK = "dsh_mobile/deeplink"
         private const val CHANNEL_FILE = "dsh_mobile/file"
+
+        /** 敏感字段加密存取；实现见 SecureStoreBridge。 */
+        private const val CHANNEL_SECURE = "dsh_mobile/secure"
     }
 }
 

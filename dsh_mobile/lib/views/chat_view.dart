@@ -10,6 +10,7 @@ import 'package:intl/intl.dart';
 import '../models/chat_message.dart';
 import '../models/dsh_settings.dart';
 import '../models/approval_request.dart';
+import '../models/trajectory.dart';
 import '../services/dsh_service.dart';
 import '../widgets/thinking_card.dart';
 import '../widgets/tool_call_card.dart';
@@ -23,6 +24,7 @@ import 'widgets/message_search.dart';
 import 'widgets/message_search_panel.dart';
 import 'widgets/session_status_strip.dart';
 import 'widgets/session_info_sheet.dart';
+import 'widgets/trajectory_sheet.dart';
 import 'widgets/deliverable_preview_sheet.dart';
 import 'widgets/turn_output_card.dart';
 import 'widgets/message_list_view.dart';
@@ -83,12 +85,14 @@ class _ComposerNotice {
 
 class ChatView extends StatefulWidget {
   final VoidCallback? onOpenWorkspaces;
-  final VoidCallback? onOpenSecurity;
+
+  // 这里曾经还有 `onOpenSecurity`：安全策略页在一级 tab 时代的跳转回调。
+  // 它从未被任何一处 `widget.onOpenSecurity?.call()` 调用过（死参数），而且安全策略
+  // 现在是设置里的推入页（见 main_shell / custom_settings_view），连语义也不再成立。
 
   const ChatView({
     super.key,
     this.onOpenWorkspaces,
-    this.onOpenSecurity,
   });
 
   @override
@@ -327,25 +331,53 @@ class _ChatViewState extends State<ChatView> {
   void _jumpToHit(SearchHit hit, DshService dsh) {
     final msg = hit.messageIndex < dsh.messages.length ? dsh.messages[hit.messageIndex] : null;
     if (msg == null) return;
+    _highlightAndScrollToMessage(msg.id, index: hit.messageIndex, total: dsh.messages.length);
+  }
+
+  /// 高亮某条消息并滚到它。
+  ///
+  /// 搜索命中与「轨迹」面板的"跳到消息"**共用这一条路径**：两处各写一份的话，
+  /// 任何一处改了滚动对齐或高亮时长，另一处会悄悄不一致，而用户看到的只是
+  /// "有时候跳得准、有时候不准"。
+  void _highlightAndScrollToMessage(String messageId, {int? index, int? total}) {
+    if (!mounted) return;
     setState(() {
       _highlightedMessageIds
         ..clear()
-        ..add(msg.id);
+        ..add(messageId);
     });
-    final key = _messageKeys[msg.id];
-    final ctx = key?.currentContext;
-    if (ctx != null) {
-      Scrollable.ensureVisible(
-        ctx,
-        duration: const Duration(milliseconds: 320),
-        curve: Curves.easeOutCubic,
-        alignment: 0.28,
-      );
+    _scrollToMessageKey(messageId);
+
+    // 消息列表是懒构建的：目标不在当前视野里时，它的 GlobalKey 还没有 context，
+    // `ensureVisible` 会静默什么都不做 —— 用户点了"跳到消息"却停在原地，还以为
+    // 按钮坏了。退一步先按序号比例粗滚一次，下一帧目标被构建出来后再精确定位。
+    if (_messageKeys[messageId]?.currentContext == null &&
+        index != null &&
+        total != null &&
+        total > 1 &&
+        _scrollController.hasClients) {
+      final ratio = (index / (total - 1)).clamp(0.0, 1.0);
+      _scrollController.jumpTo(_scrollController.position.maxScrollExtent * ratio);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _scrollToMessageKey(messageId);
+      });
     }
+
     // 高亮会淡出，所以不必永久留在 _highlightedMessageIds 里。
     Future.delayed(const Duration(seconds: 3), () {
-      if (mounted) setState(() => _highlightedMessageIds.remove(msg.id));
+      if (mounted) setState(() => _highlightedMessageIds.remove(messageId));
     });
+  }
+
+  void _scrollToMessageKey(String messageId) {
+    final ctx = _messageKeys[messageId]?.currentContext;
+    if (ctx == null) return;
+    Scrollable.ensureVisible(
+      ctx,
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+      alignment: 0.28,
+    );
   }
 
   GlobalKey _keyForMessage(String id) => _messageKeys.putIfAbsent(id, () => GlobalKey());
@@ -2004,6 +2036,10 @@ class _ChatViewState extends State<ChatView> {
                 case 'workspaces':
                   widget.onOpenWorkspaces?.call();
                   break;
+                // [feat 2026-10-17] 轨迹面板：本会话「轮 → 事件」的时间线。
+                case 'trajectory':
+                  _openTrajectory(dsh);
+                  break;
                 // [feat 2026-10-13] 运维面板：快捷命令 / 文件浏览 / 目标看板 / 会话分支。
                 // 放在会话菜单里而不是底部导航，是因为这四项都是**会话域**操作
                 // （工作目录、目标 ref、检查点都取自当前会话）。
@@ -2048,6 +2084,16 @@ class _ChatViewState extends State<ChatView> {
                     Icon(Icons.swap_horiz_rounded, color: context.c.accent, size: 18),
                     const SizedBox(width: 10),
                     Text('切换工作区', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'trajectory',
+                child: Row(
+                  children: [
+                    Icon(Icons.timeline_rounded, color: context.c.accent, size: 18),
+                    const SizedBox(width: 10),
+                    Text('运行轨迹', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
                   ],
                 ),
               ),
@@ -3392,6 +3438,47 @@ class _ChatViewState extends State<ChatView> {
   /// 打开时先发一次第三档加载（`jobs` + `schedules` —— 全链路最贵的两个请求，
   /// 只在用户明确要看的时候拉）；面板自己也会在首帧后调一次 `onRefresh`，
   /// 所以这里不重复发，只负责把"看过产出"这件事记下来。
+  /// 打开本会话的轨迹面板（v1.22）：轮 → 事件的时间线。
+  ///
+  /// 数据从 `dsh.messages` **当场重建**，并且让弹层在自己的路由里订阅一次
+  /// DshService —— 正在跑的那一轮会随流式事件推进。这和 `_openSessionInfo`
+  /// 是同一条理由：会话域的数据随时在变，冻住打开那一刻的快照只会让人以为卡死了。
+  ///
+  /// token 传的是 `lastTurnTokens`：引擎只上报**本轮**的增量，历史轮没有数据源，
+  /// 面板对拿不到的那些轮显示 `—`（见 `models/trajectory.dart` 的诚实规则 2）。
+  Future<void> _openTrajectory(DshService dsh) async {
+    // 先取 NavigatorState：下面闭包里 `context` 是弹层自己的，弹层关掉之后它就失效了。
+    final navigator = Navigator.of(context);
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => Consumer<DshService>(
+        builder: (_, d, __) {
+          final messages = d.messages;
+          return TrajectorySheet(
+            trajectory: Trajectory.build(
+              messages,
+              liveTurnTokens: d.lastTurnTokens,
+              running: d.isSending || d.isSessionRunning,
+            ),
+            onJumpToMessage: (id) {
+              // 关掉面板再滚：轨迹与消息流是同一屏的两个视图，留在面板上看不到
+              // 滚动效果，用户会以为"点了没反应"。
+              navigator.pop();
+              final index = messages.indexWhere((m) => m.id == id);
+              _highlightAndScrollToMessage(
+                id,
+                index: index >= 0 ? index : null,
+                total: messages.length,
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+
   Future<void> _openSessionInfo(DshService dsh, {SessionInsightSection section = SessionInsightSection.usage}) async {
     _deliverablesAck[_ackKey(dsh)] = dsh.deliverableCount ?? 0;
     if (mounted) setState(() {});

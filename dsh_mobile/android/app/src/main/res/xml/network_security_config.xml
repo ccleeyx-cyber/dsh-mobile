@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DSH Mobile 的网络安全策略（Task 2）。
+
+  为什么这里**必须**允许明文，而不是照惯例写成 cleartextTrafficPermitted="false"：
+
+  1. 网关本身只有明文 HTTP/WS。仓库根目录的 `lib/core.mjs` 既不监听 TLS 端口，
+     也没有证书配置 —— 客户端把它一刀切禁掉，等于"自建网关的用户全部连不上"，
+     这不是加固，是把功能删了。
+  2. 用户要连的是任意内网 IP（192.168.x.x / 10.x.x.x / 172.16-31.x.x），
+     也可能是 NPS 之类的内网穿透地址。地址在运行期才知道，编译期写不进白名单。
+  3. Android 的 network-security-config **不支持按 CIDR / IP 段放行**：`<domain>`
+     只匹配主机名（也支持少量 IP 字面量），无法表达"允许整个私网段、其余禁止"。
+     既然真正的规则是"用户自己的网段"，用配置去近似它只会得到一份看似更严格、
+     实则随机拒绝一部分用户、又对攻击者毫无作用的策略。
+
+  所以这里做的是**诚实的显式化**，而不是假装封死：
+    * 明文被显式声明为允许（与之前的 `usesCleartextTraffic="true"` 等价，
+      但规则集中在这个文件里、带上下文注释，将来要收紧只改这一处）；
+    * App 内在 `lib/views/config_page.dart` 里，只要用户处于 `http://` / `ws://`
+      （即 `ServerConfig.effectiveUseHttps == false`），就常驻显示一条风险提示，
+      说明 token 会明文过网、仅建议可信局域网使用、远程请用 https/wss；
+    * HTTPS 开关保持可用，用户随时能自己收紧。
+
+  本轮**不做**证书指纹固定（pinning）：自签证书的指纹要按用户自己的网关算，
+  没有可用的分发/更新通道，写死一个指纹只会让换证书的用户彻底连不上。
+  真要做得先有"首次信任 + 指纹变更告警"的完整设计，见交付报告第 5 节的建议。
+-->
+<network-security-config>
+    <!-- 基线策略：允许明文。理由见上 —— 网关只有明文，且目标是任意内网地址。 -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <!-- 系统 CA。刻意不加 <certificates src="user"/>：用户安装的 CA
+                 在本 App 里不获得信任，避免"装一个中间人证书就能读走 token"。 -->
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- 没有 <domain-config>：见上文第 3 条，network-security-config 无法表达
+         "私网段放行、其余禁止"。这条注释本身就是这个决定的一部分，不要删掉。 -->
+</network-security-config>

@@ -29,14 +29,29 @@
     <!-- 息屏后仍要收到推送，需要绕过 Doze 的省电限制 -->
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
+    <!-- 应用内安装更新（v1.22）。Android 8.0 (API 26) 起，拉起系统安装器必须声明它，
+         否则 PackageInstaller 直接抛 SecurityException，安装按钮点了没反应。
+         声明它**不等于**能静默安装：安装确认界面始终由系统托管，用户还要在
+         「安装未知应用」里为本应用授权。没有这一条，更新动线只能回退到打开发布页。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+
     <!-- 允许非加密明文流量(ws:// 和 http://)，方便公网 IP 直接连接。
-         allowBackup=false：网关令牌存在 SharedPreferences 里，云备份会把它
-         带走（Android 12+ 云备份默认开启）。-->
+         allowBackup=false：云备份会把本地数据带走（Android 12+ 云备份默认开启）——
+         网关地址、草稿、会话缓存都在 SharedPreferences 里。凭据（token/authCode）
+         自 v1.22 起已迁到 Android Keystore 并从 SharedPreferences 剥离（见
+         lib/services/secure_store.dart），但其余本地数据仍然不该被备份走。
+
+         networkSecurityConfig（Task 2）：明文规则集中到
+         res/xml/network_security_config.xml，那里写清了"为什么必须允许明文"
+         （网关只有明文 HTTP、目标是任意内网 IP、network-security-config 不支持
+         CIDR 放行）。`usesCleartextTraffic` 保留是为了兼容 API 23 以下 —— 那些
+         版本不读 network-security-config，只认这个属性，两个都要有。 -->
     <application
         android:label="DSH Mobile"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:usesCleartextTraffic="true">
 
         <activity

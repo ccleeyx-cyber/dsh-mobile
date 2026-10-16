@@ -5,10 +5,10 @@ DeepSeek Harness（DSH）的手机端控制台 + 配套网关插件。
 ```
 dsh_mobile/          Flutter Android 客户端（本仓库的主体）
 dsh-server-plugin/   Node.js 网关插件，跑在 DSH 宿主机上
-tests/               网关插件的测试（node --test）
+tests/               网关插件的测试（node --test），分层见 docs/TESTING.md
 scripts/             手动工具：等 APK 构建产物、读 APK 版本号
-patches/             网关的历史补丁（见下方警告）
-reports/             设计与排查记录
+docs/                测试分层说明（TESTING.md）
+docs/archive/        历史设计与排查记录（只作证据，描述的状态可能已修复）
 ```
 
 ---
@@ -18,7 +18,7 @@ reports/             设计与排查记录
 | 项 | 版本 | 说明 |
 |---|---|---|
 | Flutter | 3.24.5 | Dart 3.5.4。`pubspec.yaml` 里 `speech_to_text` 被钉在 6.6.2，原因见该依赖上方的注释 |
-| Node | >= 20 | 跑网关插件和测试 |
+| Node | >= 22.15.0 | 跑网关插件和测试。低版本会让 `sessiontitle` 那批用例在 CI 上 INVALID，见 `package.json` 的 `engines` |
 | Android SDK | 带 Command-line Tools | 只编 APK 时需要 |
 
 ```bash
@@ -41,12 +41,11 @@ npm test                 # 只跑 hermetic 单测，见下
 
 | 命令 | 会碰什么 | 能随手跑吗 |
 |---|---|---|
-| `npm test` / `npm run test:unit` | 全部 hermetic：用 `mkdtempSync` 隔离 `DSH_HOME`，**零次**真实网关调用，不建会话、不打 LLM、不改真实配置 | ✅ 唯一可以随手跑的 |
-| `npm run test:e2e` / `test:tier1..4` | 打真实网关 `:3088`，在真实工作区建会话，消耗真实 LLM token | ⚠️ 显式指名才跑 |
-| `npm run test:challenger*` | 同上，且包含并发压测 | ⚠️ |
-| `npm run test:destructive` | 改你的真实策略（`~/.dsh`）与真实工作区文件，恢复不可靠 | 🛑 跑前备份 `~/.dsh/mobile-access/permissions.json` |
-| `npm run bench` | 30~50 轮反复翻你的真实全局策略，无 before/after 备份 | 🛑 |
-| `npm run probe:dsh` | 绕过网关直连引擎建会话，每次跑必泄漏一个真实会话 | 🛑 |
+| `npm test` / `npm run test:unit` / `verify` | 全部 hermetic：用 `mkdtempSync` 隔离 `DSH_HOME`，**零次**真实网关调用，不建会话、不打 LLM、不改真实配置 | ✅ 唯一可以随手跑的 |
+| `npm run test:e2e` / `test:live` / `test:tier1..4` | 打真实网关 `:3088`，在真实工作区建会话，消耗真实 LLM token | ⚠️ 显式指名才跑 |
+| `npm run test:destructive` | 改你的真实策略（`~/.dsh`）与真实工作区文件；已接入 `tests/e2e/helpers/guard.js` 的快照-恢复，但恢复只覆盖登记过的字段 | 🛑 跑前备份 `~/.dsh/mobile-access/permissions.json` |
+
+完整清单、备份步骤与目录布局见 [docs/TESTING.md](docs/TESTING.md)。
 
 测试跑出的空会话用手动清理：
 
@@ -68,38 +67,79 @@ git tag v1.18.0 && git push origin v1.18.0
 `.github/workflows/build-apk.yml` 会读 pubspec 里的版本、按 ABI 拆分构建、发布到
 GitHub Releases，release notes 取 `CHANGELOG.md` 对应小节的正文。
 
+App 里的版本号**不是手抄的**：CI 解析 pubspec（外加 `android/app/build.gradle` 的
+`applicationId`）后，通过 `--dart-define=APP_VERSION/APP_BUILD/APP_PACKAGE_NAME`
+注入 `flutter build apk`；本地跑同一个脚本，不必记参数：
+
+```bash
+node scripts/app-version.mjs            # 看版本真源
+cd dsh_mobile && flutter run $(node ../scripts/app-version.mjs --defines)
+```
+
+新增任何 `flutter build` / `flutter run` 步骤（含 CI 里按 ABI 拆分的那一步）都要带上
+这三个 `--dart-define`，漏了就会退回 `lib/models/app_version.dart` 里的兜底默认值。
+
 ```bash
 scripts/await-apk.mjs <commit>    # 等 CI 出包并下载
 ```
 
+仓库里**不留历史 APK**：根目录原本堆的 5 个（v1.0.0~v1.3.0，约 112 MiB）与
+`dsh-server-plugin/public/` 里的 6 个（v1.2.1~v1.2.6，约 135 MiB）均已删除，
+只保留 `public/dsh-agent.apk`（网关与 App 都按这个固定名分发；网关的下载路由
+只认这一个位置，缺了直接 404）。历史版本走 GitHub Releases。
+
+注意 APK 被 `.gitignore` 的 `**/*.apk` 排除：**全新克隆上 `public/dsh-agent.apk`
+不存在**，`/dsh-agent.apk` 会是 404，需手动或由 CI 投放。
+
 ---
 
-## 四、已知阻塞：token 还躺在 SharedPreferences 里
+## 四、凭据存储与明文传输（v1.22 起）
 
-网关 token 与 authCode 目前**明文**存在 `SharedPreferences`（`storage_service.dart`，
-JSON 序列化进 `dsh_server_config` / `dsh_server_profiles`）。root 设备或 adb 本地可读。
+网关 token 与 authCode **不再明文存在 SharedPreferences**：v1.22 起改走 Android Keystore
+（`dsh_mobile/lib/services/secure_store.dart` + 原生
+`android/.../SecureStoreBridge.kt`，通道 `dsh_mobile/secure`，密钥别名 `dsh_mobile_master`、
+AES-256/GCM，密钥不可导出，密文落独立 SP 文件 `dsh_secure_store`）。
 
-`AndroidManifest.xml` 已设 `android:allowBackup="false"`，挡住云备份，但挡不住本地文件访问。
+升级是**先迁后删**：首次读取时把旧明文写进 Keystore，**写后读回校验通过才从
+SharedPreferences 删掉明文**；任一步失败就保留明文继续可用（宁可暂时不变好，也不能让人
+连不上），每次启动重试、幂等。没有原生侧（Dart VM / 单元测试）、API 21–22、或 Keystore
+故障时**降级而不抛异常**。
 
-想迁到 `flutter_secure_storage`（Keystore 背书）的话，先解决这个依赖冲突：
+实现刻意**没有**引入 `flutter_secure_storage` —— 那会再次撞上这条依赖冲突：
 
 ```
-speech_to_text 6.6.2  →  js ^0.7.1
-flutter_secure_storage 9.x  →  js ^0.6.3     （8.x 及更早同样冲突）
+speech_to_text 6.6.2         →  js ^0.7.1
+flutter_secure_storage 9.x   →  js ^0.6.3   （8.x 及更早同样冲突）
 ```
 
-即：**必须先放开 `speech_to_text` 的版本钉**，而那又要求升级 Flutter / plugin-loader
-（7.x 的 `compileSdk = flutter.compileSdkVersion` 在 3.24.5 上直接构建失败）。
-这是一条链，不是一行改动。在那之前，配置页至少会在关闭 HTTPS 时给出明文告警。
+它要求先放开 `speech_to_text` 的版本钉，而那又要求升级 Flutter / plugin-loader（7.x 的
+`compileSdk = flutter.compileSdkVersion` 在 3.24.5 上直接构建失败）。一条自己写的
+MethodChannel 就绕开了整条链，所以那个版本钉可以继续留着，直到真要升 Flutter 那天。
+
+剩下的两条风险必须说清：
+
+- **网络仍是明文。** 网关只有明文 HTTP / WS，配置页在使用 `http://` / `ws://` 时常驻提示
+  "Token 会以明文经网络传输……仅建议在可信局域网使用；远程请用 HTTPS / WSS"。
+  `res/xml/network_security_config.xml` 显式允许明文是**刻意**的：目标可能是任意内网 IP，
+  而 network-security-config 不支持按 CIDR 放行，一刀禁掉会让功能直接不可用。
+- **没有做自签证书指纹固定（pinning）。** 缺少指纹的分发/轮换通道，写死一个只会让
+  "换证书 / 重装网关"的用户彻底连不上；要做必须先有 TOFU 首次信任 + 指纹变更告警。
+- **未经真机验证**：本机没有 Android SDK，`SecureStoreBridge.kt` 只经过人工审查，
+  Keystore 的真实行为（密钥生成、GCM、改锁屏密码后密钥失效等）需要在真机上验一次。
 
 ---
 
 ## 五、其他注意事项
 
-- **`patches/` 里的三个补丁已无法 apply。** 插件从单文件 `lib/index.js` 重构成了模块
-  （`core.mjs` / `features.mjs` / …），补丁的 hunk 对着旧单体行号。修复本身都已进
-  `lib/`，这些文件只剩考古价值；`patches/README.md` 里"已验证 `git apply --check`
-  exit 0"的说法已过期，0004–0006 只存在于文字中。
-- **`TEST_READY.md` 已过期**，宣称的用例数与已知失败项都是修复前的状态，引用的两份
-  规格文件也已不存在。
-- `ANALYSIS-优化与新增功能.md` 是追加式工作笔记，不是设计文档。
+- **历史补丁目录 `patches/` 已删除**（原 0001–0003 三个 patch + README）。插件早已从
+  单文件 `lib/index.js` 重构成模块（`core.mjs` / `features.mjs` / …），补丁的 hunk 对着
+  旧单体行号，`git apply --check` 早就失败；修复本身全部在 `lib/` 里，那些文件只剩考古
+  价值。删除记录见 `CHANGELOG.md` 的 `[1.22.0]`。
+- **过期文档已收敛，历史内容进 `docs/archive/`。** 已删除：`TEST_READY.md`（自述过期、
+  引用的两份规格文件根本不存在）、根目录 `ANALYSIS-优化与新增功能.md`（追加式工作笔记）、
+  `TEST_INFRA.md`（目录树与用例数都已过期）。其中仍然成立的部分（hermetic 单测 vs live
+  测试的分层、各 script 会碰什么、跑前备份什么）重写为
+  [docs/TESTING.md](docs/TESTING.md)。
+- **设计与排查记录在 `docs/archive/`**（原仓库根的 `reports/`，2026-10-17 移入）。
+  `implementation-audit.md` 与 `deliverable-open-rootcause.md` 描述的 F1/F2/S1 缺陷
+  **已修复**，两份文件开头已注明"仅作历史证据"。

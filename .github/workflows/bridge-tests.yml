@@ -2,16 +2,16 @@ name: Bridge Tests
 
 # Hermetic gates only.
 #
-# The E2E and challenger suites in this repo talk to a LIVE bridge on
-# 127.0.0.1:3088 backed by a real DSH install. They create real sessions, spend
-# real LLM tokens, and several of them mutate the developer's real
-# ~/.dsh/mobile-access/permissions.json without a reliable restore — they cannot
-# run in CI. `npm test` now runs only tests/unit/**, which is hermetic: each of
-# the three files boots a throwaway bridge on an OS-assigned port with its own
-# mkdtempSync DSH_HOME.
+# The live E2E suites in tests/e2e/** talk to a LIVE bridge on 127.0.0.1:3088
+# backed by a real DSH install. They create real sessions, spend real LLM tokens,
+# and several of them mutate the developer's real
+# ~/.dsh/mobile-access/permissions.json — they cannot run in CI. `npm test` runs
+# only tests/unit/**, which is hermetic: each file boots a throwaway bridge on an
+# OS-assigned port with its own mkdtempSync DSH_HOME, and the two files that need
+# an upstream start a fake engine of their own.
 #
-# See ANALYSIS-优化与新增功能.md §1.14 and §6.10 for the full inventory of what
-# the live suites do to a real environment.
+# 分层、每个 script 会碰什么、跑前要备份什么：见 docs/TESTING.md
+# （原 ANALYSIS-优化与新增功能.md §1.14 / §6.10 已于 2026-10-17 删除）。
 on:
   push:
     branches: [ main, master ]
@@ -103,8 +103,8 @@ jobs:
       - name: Run hermetic unit tests
         # Runs from the repo root; the root package.json has no dependencies of
         # its own and relies on Node resolving `ws` upward out of
-        # dsh-server-plugin/node_modules. That is fragile but intentional — see
-        # ANALYSIS §6.10.
+        # dsh-server-plugin/node_modules. That is fragile but intentional —
+        # documented in docs/TESTING.md.
         run: npm run test:unit
 
   flutter:
@@ -148,16 +148,16 @@ jobs:
         # 现在它会把已提交的 build.gradle / MainActivity.kt / proguard-rules.pro
         # 全部覆盖成模板版本（连带把可覆盖安装的签名配置和后台保活服务抹掉）。
         #
-        # `flutter create .` 曾顺带生成两个不该存在的文件，两者都已从仓库中删除，
-        # 手工再执行一次也不会复活它们：
+        # `flutter create .` 曾顺带生成两个文件，两者都不在仓库里，而这个 step 现在
+        # 只跑 `flutter pub get`，不会再顺手生成它们：
         #
-        #   - analysis_options.yaml。它的存在会激活 pubspec 声明却从未配置过的
-        #     `flutter_lints`，而 `flutter analyze` 默认把 infos 当致命问题。首次
-        #     跑这个门禁时实测到 33 条 prefer_const_constructors 之类，全部致命，
-        #     于是 job 在碰到任何真实问题之前就死了。
-        #   - test/widget_test.dart，模板自带的计数器冒烟测试。本 App 没有计数器，
-        #     这个测试只可能失败；它此前从未暴露，因为没有任何 workflow 跑过
-        #     Dart 测试。
+        #   - analysis_options.yaml —— 现在**有意提交**（`include:
+        #     package:flutter_lints/flutter.yaml`，见 CHANGELOG 1.21.0）。当年它被
+        #     删是因为 `flutter analyze` 默认把 infos 当致命问题，首次跑门禁实测到
+        #     33 条 `prefer_const_constructors` 之类、job 在碰到真实问题前就死了；
+        #     那批 lint 已经清干净，所以这个文件回来了，而且不再被任何 step 删除。
+        #   - test/widget_test.dart —— 模板自带的计数器冒烟测试。本 App 没有计数器，
+        #     这个测试只可能失败，因此至今没有提交。
         #
         # 现在 CI 评判的与本地 `flutter analyze` / `flutter test` 看到的是同一份
         # 已提交源码。
@@ -171,24 +171,15 @@ jobs:
         # now; infos are fatal by default, so the old invocation was actively
         # switching the stricter half off.
         #
-        # This is only survivable because the Prepare step deletes the
-        # analysis_options.yaml that `flutter create .` synthesises — see the
-        # measured 33-info failure documented there.
-        #
-        # Plan from here: (1) commit an analysis_options.yaml that enables
-        # flutter_lints with the high-volume rules explicitly waived and
-        # justified, (2) the deprecated_member_use burn-down is already done —
-        # MaterialStateProperty ×4 in main_shell.dart and
-        # ColorScheme.fromSeed(background:) ×2 in main.dart are gone, and
-        # Radio(activeColor:) turns out not to be flagged on 3.24, (3) then stop
-        # deleting the generated file and let the lints apply for real.
+        # 当年这条门禁之所以能过，是因为 Prepare 会删掉 `flutter create .` 合成的
+        # analysis_options.yaml（那次实测到 33 条 info 全部致命）。现在
+        # analysis_options.yaml 已提交、lint 欠账已清，flag 与注释不再对立。
         run: flutter analyze --fatal-warnings
 
-      # NEW: the repo has 3 Dart test files / 12 tests / 244 lines, and no
-      # workflow ever ran a single one of them. Meanwhile CI was running ~83
-      # JS assertions that merely grep the Dart sources for string literals —
-      # green no matter what the Dart code did, red the moment anyone reformatted
-      # it. These tests are the real thing.
+      # 现在仓库里有 37 个 Dart 测试文件（`test/**/*_test.dart`）/ 约 525 条用例 /
+      # 9100+ 行（2026-10-17 计数），由 `flutter test --coverage` 全部执行。
+      # 此前这里写着"仓库有 3 个 Dart 测试文件 / 12 条用例，而没有任何 workflow 跑过
+      # 其中一条"——那是加这条门禁之前的状态。
       - name: Test
         working-directory: ./dsh_mobile
         run: flutter test --coverage

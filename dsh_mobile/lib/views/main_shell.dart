@@ -4,7 +4,6 @@ import '../services/dsh_service.dart';
 import '../main.dart';
 import 'chat_view.dart';
 import 'workspaces_view.dart';
-import 'security_permissions_view.dart';
 import 'custom_settings_view.dart';
 import 'config_page.dart';
 import '../theme/app_colors.dart';
@@ -78,8 +77,6 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       dsh.fetchWorkspaces();
       dsh.fetchApprovals();
     } else if (index == 2) {
-      dsh.fetchApprovals();
-    } else if (index == 3) {
       dsh.fetchSettings();
     }
   }
@@ -154,10 +151,13 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     //
     // 原来这里是 Provider.of<DshService>(context)（listen: true），意味着
     // DshService 每调一次 notifyListeners() 就重建整个 MainShell —— 而流式输出
-    // 期间它是按 token 触发的。每次重建都会重新构造 IndexedStack 的全部 4 个
-    // 子树（ChatView / WorkspacesView / SecurityPermissionsView /
-    // CustomSettingsView），而这些子页自己本来就在监听 DshService，于是同一份
-    // 数据被重复构建两遍。context.select 只在被选中的值变化时才重建。
+    // 期间它是按 token 触发的。每次重建都会重新构造 IndexedStack 的全部子树
+    // （ChatView / WorkspacesView / CustomSettingsView），而这些子页自己本来就在
+    // 监听 DshService，于是同一份数据被重复构建两遍。context.select 只在被选中的
+    // 值变化时才重建。
+    //
+    // [feat 2026-10-17] 安全策略不再是这里的一级页（它降成了设置里的推入页），
+    // 于是本文件少了一个 IndexedStack 子树、也少了一处重复角标。
     final pendingCount = context.select<DshService, int>((d) => d.pendingApprovals.length);
     // 对话页的徽标要**连提问一起算**：提问同样是"agent 停下来等你"，
     // 而且此前它只在当前会话的输入框上方出现 —— 你在别的会话/别的 tab 时
@@ -196,13 +196,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     // 侧滑返回拦截：MainShell 是 home 路由，没有可 pop 的上一级 —— 系统
     // 预测性返回手势会直接退出 App。用户预期是"回到工作区"（聊天 App 的
     // 常规动线），所以**除对话页之外**的 tab 侧滑 = 切到工作区（index 1）；
-    // 已经在别的 tab（工作区/安全策略/设置）时才放行为真正的退出。
+    // 已经在别的 tab（工作区/设置）时才放行为真正的退出。
     //
     // 这里顺带改了旧代码与它自己的注释不一致的地方：旧条件是
     // `index == 1 || index == 2 || index == 3`（工作区/任务/安全策略），把**设置页**
     // 排除在外，于是从设置页侧滑会跳到工作区而不是退出 —— 与注释描述的意图相反。
-    // 「任务」tab 删掉后索引变成 0 对话 / 1 工作区 / 2 安全策略 / 3 设置，
-    // 直接表达成"不在对话页就可以退出"。
+    // 索引现在是 0 对话 / 1 工作区 / 2 设置，直接表达成"不在对话页就可以退出"。
     final canExit = _currentIndex != 0;
 
     return PopScope(
@@ -252,16 +251,16 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               children: [
                 ChatView(
                   onOpenWorkspaces: () => _setIndex(1),
-                  onOpenSecurity: () => _setIndex(2),
                 ),
                 WorkspacesView(
                   onSwitchToChat: () => _setIndex(0),
-                  // IndexedStack 会保活全部 4 个子页，必须显式告知可见性，
+                  // IndexedStack 会保活全部子页，必须显式告知可见性，
                   // 否则本页的 3 秒轮询会在用户处于其它 tab 时继续跑。
                   active: _currentIndex == 1,
                 ),
-                SecurityPermissionsView(onOpenChat: () => _setIndex(0)),
-                const CustomSettingsView(),
+                // [feat 2026-10-17] 安全策略从一级 tab 降为设置里的推入页；
+                // 它页内的「去处理」需要回对话 tab，只有这里能切，所以传下去。
+                CustomSettingsView(onOpenChat: () => _setIndex(0)),
               ],
             ),
           ),
@@ -310,11 +309,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   selectedIcon: _buildNavBadge(const Icon(Icons.folder_rounded), pendingCount),
                   label: '工作区',
                 ),
-                NavigationDestination(
-                  icon: _buildNavBadge(const Icon(Icons.security_outlined), pendingCount),
-                  selectedIcon: _buildNavBadge(const Icon(Icons.security_rounded), pendingCount),
-                  label: '安全策略',
-                ),
+                // [feat 2026-10-17] 原来这里还有「安全策略」tab，它与「工作区」挂着
+                // **同一个** pendingCount 角标（同一个数字出现两次，反而分散注意力），
+                // 而权限/审批预设是低频配置，不该占一级入口。现在从「设置 → 安全策略
+                // 与授权」推入；待处理数量改由设置页那张卡片承载。
                 const NavigationDestination(
                   icon: Icon(Icons.tune_rounded),
                   selectedIcon: Icon(Icons.tune_rounded),

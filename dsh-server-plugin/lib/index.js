@@ -2798,20 +2798,25 @@ export function apply(ctx, config = {}, internals = {}) {
     }
 
     // 2. APK 客户端静态下载
+    //
+    // [cleanup 2026-10-17] 这里原有一条三候选回退链：
+    //   public/dsh-agent.apk → ../dsh-agent-v1.2.6.apk（插件根）→ ../../dsh-agent-v1.2.0.apk（仓库根）
+    // 后两条是重构前的错位路径（一个指向插件根、一个指向仓库根，都不是 public/），
+    // 且版本早已失效、文件也已从磁盘删除。existsSync 的静默回退意味着"没找到就下
+    // 一个更旧的老包"，用户看不出差别。现在只认 public/dsh-agent.apk 这一个位置
+    // （网关与 App 都按这个固定名分发，见下方 Content-Disposition）；
+    // APK 被 .gitignore 的 `**/*.apk` 排除，全新克隆上本来就没有该文件 → 诚实 404。
     if (pathname === '/dsh-agent.apk' || pathname === '/api/mobile/download/apk') {
-      const candidates = [
-        path.join(import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)), '..', 'public', 'dsh-agent.apk'),
-        path.join(import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)), '..', 'dsh-agent-v1.2.6.apk'),
-        path.join(import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)), '..', '..', 'dsh-agent-v1.2.0.apk')
-      ];
+      const apkPath = path.join(
+        import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)),
+        '..', 'public', 'dsh-agent.apk'
+      );
 
-      let apkPath = '';
-      for (const c of candidates) {
-        if (fs.existsSync(c)) { apkPath = c; break; }
-      }
-
-      if (!apkPath) {
-        sendJson(404, { error: 'APK file not found on server' });
+      if (!fs.existsSync(apkPath)) {
+        sendJson(404, {
+          error: 'APK file not found on server',
+          hint: 'public/dsh-agent.apk 未投放（APK 不入版本库，需手动或 CI 放置）'
+        });
         return;
       }
 

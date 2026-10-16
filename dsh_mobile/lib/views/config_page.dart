@@ -610,21 +610,27 @@ class _ConfigPageState extends State<ConfigPage> {
                 value: _useHttps,
                 onChanged: (val) => setState(() => _useHttps = val),
               ),
-              // [fix 2026-10-16] 明文告警。
+              // [fix 2026-10-16] 明文告警（Task 2 改成常驻提示，措辞覆盖传输面）。
               //
               // `useHttps` 默认 false，而不启用时 token 是**明文**塞进
               // Authorization / x-dsh-token 头发出去的（见 ServerConfig.httpBaseUrl
-              // 与 DshService 的 _authHeaders）。同一 Wi-Fi 下的任何人、链路上
-              // 任何一跳都能直接读走它。
+              // 与 DshService 的 _authHeaders）；WebSocket 也走 ws:// 而不是 wss://。
+              // 同一 Wi-Fi 下的任何人、链路上任何一跳（路由器、代理、AP）都能
+              // 直接读走它，然后在有效期内拿着它冒充这个客户端。
               //
-              // 真正的修法是把 token 存进 Keystore（flutter_secure_storage），
-              // 但那需要放开 pubspec 里 speech_to_text 6.6.2 的版本钉 —— 它的
-              // js ^0.7.1 与 secure_storage 9.x 需要的 js ^0.6.3 直接冲突，
-              // 而放开那个钉又依赖升级 Flutter / plugin-loader。那是另一件事。
+              // 这是"常驻"提示而不是一次性 toast：只要开关处于关闭状态就一直显示。
+              // 一次性提醒关掉就没了，用户第二次进来只看到默认关闭的开关，
+              // 会把"当前是明文"当成正常状态。
               //
-              // 在此之前，至少让"不加密"成为一个用户看得见的选择，而不是默认
-              // 悄悄发生的事。
-              if (!_useHttps)
+              // 真正的修法不是文案，而是让明文在网络层不再必要（网关支持 TLS），
+              // 或至少把凭据从 URL/请求头挪进不可重放的握手（证书固定 + 双向认证）。
+              // 那两件事都要动网关侧，见交付报告第 5 节。
+              //
+              // 本地存储侧已经不用再提"明文存在手机里"：token/authCode 现在走
+              // AndroidKeystore 加密存储（StorageService + SecureStore）。
+              // 条件跟 ServerConfig.effectiveUseHttps 对齐：主机名里已经写了
+              // `https://` 时那一次连接本来就是 TLS，不该再报"明文"。
+              if (!_useHttps && !_hostController.text.trim().startsWith('https://'))
                 Padding(
                   padding: const EdgeInsets.only(left: 16, right: 16, bottom: 8),
                   child: Row(
@@ -634,8 +640,9 @@ class _ConfigPageState extends State<ConfigPage> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-                          '当前为明文连接：同网络下的其他人可能读到你的 Token。'
-                          '有域名和证书时请启用 HTTPS / WSS。',
+                          '当前为明文连接：Token 会以明文经网络传输（http:// 与 ws://），'
+                          '同一网络下的其他人或链路上的任何一跳都可能读到它。'
+                          '仅建议在可信局域网内使用；远程访问请启用 HTTPS / WSS。',
                           style: TextStyle(fontSize: 12, color: context.c.warning, height: 1.4),
                         ),
                       ),

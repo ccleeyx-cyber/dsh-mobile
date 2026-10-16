@@ -1,18 +1,17 @@
 /**
  * Regression tests for the gateway hardening in
- * patches/0001-gateway-p0-security-and-crash-fixes.patch.
+ * `dsh-server-plugin/lib/core.mjs` (`assertSessionId` / `classifyCommand`).
  *
- * These tests AUTO-SKIP until that patch is applied. The skip is deliberate:
- * dsh-server-plugin/lib/ is junction-linked into the running dsh web process
- * (~/.dsh/profiles/web/node_modules/dsh-mobile-bridge), so the hardened code
- * cannot simply be edited in place — it has to be applied at a moment the user
- * chooses. Detecting the new exports keeps `npm test` green today and turns the
- * assertions on automatically the moment the patch lands.
+ * [updated 2026-10-17] This header used to read "auto-skip until patches/0001 is
+ * applied" and pointed at patches/README.md. That directory is gone: its hunks
+ * were written against the old single-file lib/index.js and can no longer apply,
+ * and the fix itself has been in lib/ for a long time. The HARDENED probe below
+ * is kept on purpose — if those exports ever disappear, the suite skips loudly
+ * instead of silently passing.
  *
- * Every bypass pinned here was VERIFIED reachable against the unpatched code by
- * diffing live-vs-patched behaviour; see patches/README.md for the measured
- * before/after table (15 bypasses blocked, 0 remaining, 0 legitimate
- * read-only commands broken, all 2321 real session ids still accepted).
+ * Every bypass pinned here was VERIFIED reachable against the unhardened code by
+ * diffing live-vs-hardened behaviour (15 bypasses blocked, 0 remaining, 0
+ * legitimate read-only commands broken, all 2321 real session ids still accepted).
  */
 
 import { describe, it } from 'node:test';
@@ -28,7 +27,7 @@ const HARDENED = typeof core.assertSessionId === 'function'
 
 const SKIP_MSG = HARDENED
   ? false
-  : 'needs patches/0001-gateway-p0-security-and-crash-fixes.patch (see patches/README.md)';
+  : 'dsh-server-plugin/lib/core.mjs 未导出 assertSessionId/classifyCommand —— 加固代码不在位';
 
 describe('security hardening: auto-read command classifier', { skip: SKIP_MSG }, () => {
   /**

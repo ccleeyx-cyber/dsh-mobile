@@ -7,6 +7,115 @@
 
 ---
 
+## [1.22.0] - 2026-10-17
+
+三件事：**新增「运行轨迹」面板**；**凭据迁进 Android Keystore**、把明文传输的风险说清；
+以及一轮工程卫生（删掉不再成立的历史产物）。版本号从这一版起不再手抄：
+`pubspec.yaml` 是唯一真源，由 `scripts/app-version.mjs` 解析、CI 经 `--dart-define` 注入。
+
+### 新增
+
+- **运行轨迹面板（会话内「轮 → 事件」时间线）。** 入口在对话页右上角「更多 → 运行轨迹」。
+  每一轮列出该轮的**思考 → 工具调用（按调用顺序，可展开看参数与结果）→ 回复**，
+  轮头给耗时与 token；顶部时间概览按各轮耗时占比画一段带子，点事件可「跳到消息」
+  （关掉面板并滚到聊天流里那一条，短暂高亮）。实现分两层：
+  `lib/models/trajectory.dart`（纯模型，可单测）与 `lib/views/widgets/trajectory_sheet.dart`
+  （自包含面板，不读 `DshService`）。
+  三条诚实规则写进了模型并有测试钉住：**耗时只在同一轮里至少有两个不同时刻的事件时才给**
+  （只有一个事件时显示 `—`，因为"首尾差 0"会被读成"瞬间跑完"）；**token 只挂在最后一轮**
+  （引擎只上报本轮增量，历史轮没有数据源，拿不到就是 `—` 而不是 0）；**上下文/记忆块单独
+  归类**，默认折叠，底部给出"已隐藏 N 条"与开关。工具没有独立时间戳，界面底部明说
+  "时间跟随所属消息"。
+- **应用内更新检查与安装**（`lib/models/client_update.dart` + `lib/services/update_service.dart`）：
+  可选读取与发布页同级的 `latest.json`（`schemaVersion/version/versionCode/packageName/
+  downloadUrl/size/sha256/releaseNotes`），安装前校验 `versionCode` 严格递增、
+  `packageName` 与本机一致、`size` 与实际字节数一致、`sha256`（可用时）匹配；
+  清单取不到就**回退到打开发布页**（旧行为），不会因为新源不存在而变差。
+  清单未提供 sha256 时按 `unverified` 档处理并在界面如实标注"未校验哈希"。
+  签名一致性由系统安装器负责，App 侧不假装自己校验了签名。
+  启动仍然静默，只有用户主动点「检查更新」才会发请求。
+- **`REQUEST_INSTALL_PACKAGES` 权限**：API 26+ 拉起系统安装器必须有它，否则点了没反应。
+  声明它不等于能静默安装 —— 确认界面始终由系统托管。
+
+### 安全
+
+- **网关凭据（token / authCode）迁进 Android Keystore。** 新增 `lib/services/secure_store.dart`
+  与原生 `SecureStoreBridge.kt`（`dsh_mobile/secure` 通道，AndroidKeyStore 别名
+  `dsh_mobile_master` + AES-256/GCM），**零新增 pub 依赖** —— 因此不再被
+  `speech_to_text` 与 `flutter_secure_storage` 的 `js` 版本冲突卡住（那正是 README §4 里
+  列了很久的阻塞）。升级时把 SharedPreferences 里的旧明文写进 Keystore、**写后读回校验
+  通过才删明文**；任一步失败就保留明文继续可用（宁可暂时不变好，也不能让人连不上）。
+  无原生侧（Dart VM / 单元测试）或 API 21–22 或 Keystore 故障时**降级不抛异常**。
+  顺带修掉一个静默缺陷：删除当前网关时旧的 `dsh_server_config` 镜像会在下次启动把它
+  **复活**，现在写墓碑并拦截。
+- **明文传输风险显式化**：新增 `res/xml/network_security_config.xml`（只有 system 信任锚，
+  刻意不含 user CA），并在配置页把"Token 会以明文经网络传输（http:// 与 ws://），仅建议在
+  可信局域网使用，远程请用 HTTPS / WSS"改成**常驻**提示。明文没有被一刀禁掉是刻意的：
+  网关目前只有明文 HTTP、目标可能是任意内网 IP，而 network-security-config **不支持按
+  CIDR 放行**；一刀禁会让功能直接不可用。自签证书指纹固定（pinning）本轮**未做**，
+  理由是缺少指纹分发/轮换通道，写死只会让换证书的用户彻底连不上 —— 要做得先有
+  TOFU + 变更告警的完整设计。
+
+### 变更
+
+- **一级导航从 4 个 tab 收敛成 3 个（对话 / 工作区 / 设置）。** 「安全策略」原本与「对话」
+  平级，而它属于低频配置；更糟的是它的角标和「工作区」**挂着同一个待审批计数**，同一个
+  数字在导航上出现两次。现在从「设置 → 安全策略与授权」推入，待处理数量由那张卡片承载
+  （`N 项等待处理`），页内「去处理」会关掉本页并切回对话 tab。
+  顺带删掉 `ChatView.onOpenSecurity` —— 从一级 tab 时代留下的死参数，从未被调用过。
+- **版本号不再是手抄的**：`AppVersion.version/buildNumber/packageName` 改为
+  `String.fromEnvironment`，由 `scripts/app-version.mjs`（唯一一份解析逻辑，pubspec 缺
+  `+n` 或解析不到 applicationId 会直接报错退出）与 CI 的 `--dart-define` 注入；
+  `test/models/client_update_test.dart` 新增一条"兜底默认值必须与 pubspec 一致"的断言，
+  以后改版本号不同步会红，而不是让裸跑的构建悄悄显示旧版本。
+- `reports/` 6 份设计与排查记录 + 1 份 docx 移入 `docs/archive/`，不再占仓库根；
+  其中 `implementation-audit.md`、`deliverable-open-rootcause.md` 开头加注
+  "缺陷已修复，本文仅作历史证据"。
+- 新增 `docs/TESTING.md`：hermetic 单测 vs live 测试的分层、各 npm script 会碰什么、
+  跑 destructive 前要备份什么、当前目录布局。
+- `package.json` 的 `test:live` 不再串联已删除的 `test:challenger`；脚本注释里的
+  `ANALYSIS-…md` 指向改为 `docs/TESTING.md`。
+- `README.md` §2/§3/§5 与 `.github/workflows/bridge-tests.yml` 的陈旧注释改为描述当前
+  状态（Dart 测试文件数、已提交的 `analysis_options.yaml`、已删除的文档/补丁/脚本、
+  App 版本号的注入链路）。
+
+### 修复
+
+- **安全策略页的分区标题在手机上溢出。** `_buildSectionHeader` 的标题 `Text` 直接放在
+  `Row` 里、按固有宽度参与布局，而标题带着括号里的中英全称（「Agent 执行权限与策略
+  (Permission Policy)」）：实测 400×900 溢出 34px / 131px、420×1600 溢出 14px / 111px，
+  屏幕上是 RenderFlex 的黄黑条纹。改为 `Expanded` 包裹，标题换行而不是把整行顶出去。
+  此前没被发现是因为那个页面是底部导航的 tab，而唯一挂着它的测试跑在测试框架默认的
+  800×600 画布上 —— 比任何真机都宽，永远不会溢出。
+
+### 移除
+
+- **历史补丁目录 `patches/`（0001–0003 三个 patch + README）已删除。** 内容早已进
+  `dsh-server-plugin/lib/`，hunk 对着重构前的单体 `lib/index.js` 行号，`git apply --check`
+  早已失败；仓库里没有任何代码读它们（唯一提及是单测注释，已同步改写）。
+- **根目录 5 个历史 APK（v1.0.0~v1.3.0，约 112 MiB）与
+  `dsh-server-plugin/public/` 里 6 个历史 APK（v1.2.1~v1.2.6，约 135 MiB）已删除。**
+  `public/` 只保留版本号最高的 `dsh-agent.apk`（读出其 versionName 为 1.2.9）。
+- **网关的 APK 下载候选链去掉两个已失效回退。** `lib/index.js` 原来依次尝试
+  `public/dsh-agent.apk` → `../dsh-agent-v1.2.6.apk`（插件根）→ `../../dsh-agent-v1.2.0.apk`
+  （仓库根）；后两条是重构留下的错位路径。现在只认 `public/dsh-agent.apk`，缺失时
+  明确 404（附 hint），不再静默回退到不存在的老版本。
+- **危险测试脚本清理**：`bench` / `bench:policy` / `bench:burst`（0 断言、永远 exit 0、
+  waiters 无超时保护、无 before/after 备份）、`probe:dsh`（绕过网关直连引擎建会话，
+  每次必泄漏一个真实会话）、`test:challenger` 一族（`tests/m1~m4_*` 共 10 个平铺在
+  `tests/` 根的文件 + `stress_cancel.mjs` / `r3_adversarial_verify.mjs` 两个裸脚本，
+  它们手写 `fetch`/`WebSocket` 绕过注册路径、创建的会话不进回收表）。
+  `test:destructive` **保留**（已接入 `tests/e2e/helpers/guard.js` 的快照-恢复），
+  风险提示保留在脚本注释与 `docs/TESTING.md`。
+- **同名的重复用例删除一份**：`tests/e2e/tier4-workloads/mobile-approval-flow.test.js`
+  与 `tier1-features/` 那份同名，其断言是 tier1 TC1/TC2-3/TC4/TC6 的严格子集
+  （单条 MW-2 串行旅程，无并发、无新断言），故删 tier4 那份，MW-2 覆盖由 tier1 承担。
+- **过期文档删除**：`TEST_READY.md`（自述过期、引用的 `ORIGINAL_REQUEST.md` /
+  `PROJECT.md` 都不存在）、根目录 `ANALYSIS-优化与新增功能.md`（追加式工作笔记）、
+  `TEST_INFRA.md`（目录树与用例数过期；仍然成立的分层说明重写为 `docs/TESTING.md`）。
+
+---
+
 ## [1.21.0] - 2026-10-16
 
 工程优化一轮，无新功能。

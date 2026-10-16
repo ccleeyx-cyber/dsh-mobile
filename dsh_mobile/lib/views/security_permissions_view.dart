@@ -648,9 +648,21 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
       children: [
         Icon(icon, size: 20, color: color),
         const SizedBox(width: 8),
-        Text(
-          title,
-          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+        // [fix 2026-10-17] 标题必须可收缩。
+        //
+        // 这里的标题带括号里的中英全称（例如「Agent 执行权限与策略
+        // (Permission Policy)」），而 Text 在 Row 里默认按自身固有宽度参与布局：
+        // 实测 400×900 溢出 34px / 131px、420×1600 溢出 14px / 111px，手机上一眼
+        // 就能看到 RenderFlex 的黄黑条纹。Expanded 让它换行，而不是把整行顶出去。
+        //
+        // 之所以一直没被发现：这一页此前是底部导航的一个 tab，而唯一会把它挂起来的
+        // 测试（`input_and_topbar_test.dart`）看的是别的控件，overflow 只在 debug
+        // 断言里报一次错、没人去读。
+        Expanded(
+          child: Text(
+            title,
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+          ),
         ),
       ],
     );
