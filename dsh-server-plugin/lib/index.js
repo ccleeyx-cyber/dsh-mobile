@@ -375,13 +375,51 @@ export function apply(ctx, config = {}, internals = {}) {
    * the sessions where it already worked.
    */
   function readProjectionRecord(sessionId) {
+    // [fix 2026-10-16] 委托给按新鲜度选择的实现。旧循环"命中第一个存在的文件就
+    // 停"在迁移共存期（主域陈旧件 + 归档域鲜活件并存）会让 cwd、交付物清单等
+    // 全部读到 10-11 冻结的旧投影 —— 相对路径交付物因此解析到错误目录。
+    return readFreshestProjection(sessionId);
+  }
+
+  /**
+   * [fix 2026-10-16] 按新鲜度选投影，而不是按候选顺序选。
+   *
+   * 背景：archive-manager v1.0.17（10-13 安装）把投影存储迁到了
+   * `session_projcache_archive_manager_v2`，但旧主域的文件**不删**——迁移共存期
+   * 一个会话在两个域各有一份文件。而 `projectionCacheCandidates()` 的顺序永远
+   * 主域在前，所有旧读取循环都是"命中第一个存在的文件就 break"（列表、历史、
+   * 交付物扫描三处同病），于是主域里那份 10-11 冻结的陈旧投影把 v2 域里秒级
+   * 更新的鲜活投影**永久遮蔽**。实测症状：本机 10-13 后的所有活跃会话在 App
+   * 端被陈旧的 `blank=true, titleInput.count=0` 判成空会话而隐藏（包括诊断用的
+   * 活会话本身：主域件停在 2026-10-11 20:33，v2 件 18:20 仍在更新、title 正常、
+   * count=17）。主域 1908 个文件里 467 个停在同一分钟 —— 那是迁移时刻。
+   *
+   * 修法：两份都在时取 mtime 新的。不带 mtime 的旧循环语义是"顺序即权威"，
+   * 它建立在"一个会话只有一份投影"的前提上；迁移把这个前提打破了。
+   *
+   * 注意 write 路径（session/model 更新，:1255 起）**保持只写主域**不动 ——
+   * 往归档域写会让 archive-manager 与引擎的 domain 记账对不上（那里已有注释
+   * 说明）。读新写旧在共存期是安全的：模型选择写进主域件后它就是两份中较新的
+   * 一份，本函数自然选中它。
+   */
+  function readFreshestProjection(sessionId) {
     const candidates = projectionCacheCandidates(dshHomeDir, sessionId);
-    if (candidates.length === 0) return null;
+    let best = null;
+    let bestMtime = -1;
     for (const cPath of candidates) {
+      let st;
+      try {
+        st = fs.statSync(cPath);
+      } catch {
+        continue; // 该域没这份会话，正常
+      }
       const record = projCacheReader.readJson(cPath);
-      if (record) return record;
+      if (record && st.mtimeMs > bestMtime) {
+        best = record;
+        bestMtime = st.mtimeMs;
+      }
     }
-    return null;
+    return best;
   }
 
   /**
@@ -1343,10 +1381,11 @@ export function apply(ctx, config = {}, internals = {}) {
           if (isArchived && mode === 'exclude') continue;
           if (!isArchived && mode === 'only') continue;
 
-          // [fix 2026-10-15] 候选路径覆盖主域 + 归档域（归档域文件名是
-          // sha256(sessionId)，不是 sessionId —— 之前这里只写死主域两种拼法，
-          // 于是归档过的会话一条都读不到）。
-          const candidates = projectionCacheCandidates(dshHomeDir, sId);
+          // [fix 2026-10-16] 候选路径覆盖主域 + 归档域，且两域都有文件时取 mtime
+          // 新的那份（readFreshestProjection）。旧的"命中第一个存在的就 break"会让
+          // 主域里迁移前冻结的陈旧投影永久遮蔽归档域里的鲜活投影 —— 那正是
+          // "10-13 之后的活跃会话在 App 上不显示"的根因（详见函数头注释）。
+          const cache = readFreshestProjection(sId);
 
           let sessionMeta = {
             sessionId: sId,
@@ -1362,43 +1401,36 @@ export function apply(ctx, config = {}, internals = {}) {
           let isBlankSession = false;
           let isSubagentSession = false;
 
-          for (const cPath of candidates) {
-            // mtime-memoized read: an unchanged cache file costs one statSync
-            // instead of readFileSync + JSON.parse (this loop runs ~1000 times
-            // per workspace poll, every 3 seconds, inside the engine process).
-            const cache = projCacheReader.readJson(cPath);
-            if (cache) {
-              const rows = cache.record?.rows || {};
-              // Web 端 sessionVisible: 排除 blank 会话（未输入任何 prompt 的空会话）
-              if (rows.sessionListMetadata?.val?.blank === true && !rows.titleInput?.val?.first?.text) {
-                isBlankSession = true;
-              }
-              // Web 端 sessionVisible 的**第一条**规则：origin === 'subagent'
-              // 一律隐藏（见 dsh-client-ui-workspace/lib/client.js:358）。
-              //
-              // 判据取自 projcache 的 subagent.identity。权威的 origin 字段在引擎的
-              // session header 里，而网关是直接读 workspace.json + projcache 的，
-              // 读不到那个字段。已验证该信号与
-              // subagentCatalog.inheritedEventCount>0 在 310 条里对齐 309 条，
-              // 且不会命中普通会话（2127 条普通会话全无此字段）。
-              if (rows.subagent?.val?.identity) {
-                isSubagentSession = true;
-              }
-              sessionMeta.title = rows.title?.val || rows.titleInput?.val?.first?.text || '';
-              sessionMeta.firstPrompt = rows.titleInput?.val?.first?.text || '';
-              sessionMeta.lastPromptAt = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
-              sessionMeta.model = rows.modelSelection?.val?.lastUsed?.model || '';
-              const follower = getSessionFollower(sId);
-              // 先跟引擎的投影对账，再算 isRunning：卡死的 running 会在这里被
-              // 纠正（见 reconcileFollowerWithProjection 的注释）。
-              reconcileFollowerWithProjection(follower, rows);
-              const isRecentlyPrompted = activePrompts.has(sId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
-              const lastActivity = sessionMeta.lastPromptAt || 0;
-              const isRecentActivity = (Date.now() - lastActivity) < 45000;
-              const isOpenTurnActive = rows.turnBoundary?.val?.openTurnStartSeq != null && isRecentActivity;
-              sessionMeta.isRunning = (follower && follower.isRunning) || isRecentlyPrompted || isOpenTurnActive;
-              break;
+          if (cache) {
+            const rows = cache.record?.rows || {};
+            // Web 端 sessionVisible: 排除 blank 会话（未输入任何 prompt 的空会话）
+            if (rows.sessionListMetadata?.val?.blank === true && !rows.titleInput?.val?.first?.text) {
+              isBlankSession = true;
             }
+            // Web 端 sessionVisible 的**第一条**规则：origin === 'subagent'
+            // 一律隐藏（见 dsh-client-ui-workspace/lib/client.js:358）。
+            //
+            // 判据取自 projcache 的 subagent.identity。权威的 origin 字段在引擎的
+            // session header 里，而网关是直接读 workspace.json + projcache 的，
+            // 读不到那个字段。已验证该信号与
+            // subagentCatalog.inheritedEventCount>0 在 310 条里对齐 309 条，
+            // 且不会命中普通会话（2127 条普通会话全无此字段）。
+            if (rows.subagent?.val?.identity) {
+              isSubagentSession = true;
+            }
+            sessionMeta.title = rows.title?.val || rows.titleInput?.val?.first?.text || '';
+            sessionMeta.firstPrompt = rows.titleInput?.val?.first?.text || '';
+            sessionMeta.lastPromptAt = rows.sessionListMetadata?.val?.lastPromptAt || cache.record?.identity?.createdAt || 0;
+            sessionMeta.model = rows.modelSelection?.val?.lastUsed?.model || '';
+            const follower = getSessionFollower(sId);
+            // 先跟引擎的投影对账，再算 isRunning：卡死的 running 会在这里被
+            // 纠正（见 reconcileFollowerWithProjection 的注释）。
+            reconcileFollowerWithProjection(follower, rows);
+            const isRecentlyPrompted = activePrompts.has(sId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
+            const lastActivity = sessionMeta.lastPromptAt || 0;
+            const isRecentActivity = (Date.now() - lastActivity) < 45000;
+            const isOpenTurnActive = rows.turnBoundary?.val?.openTurnStartSeq != null && isRecentActivity;
+            sessionMeta.isRunning = (follower && follower.isRunning) || isRecentlyPrompted || isOpenTurnActive;
           }
 
           // [fix 2026-10-15] 标题兜底。候选路径全 miss（会话既不在主投影域也不在
@@ -1490,15 +1522,10 @@ export function apply(ctx, config = {}, internals = {}) {
     const idCheck = assertSessionId(sessionId);
     if (!idCheck.ok) return { messages: [], isRunning: false, model: '', error: idCheck.error };
     const cleanId = sessionId.startsWith('session-') ? sessionId.replace('session-', '') : sessionId;
-    // [fix 2026-10-15] 与 getWorkspacesData 读同一张候选表（含归档域的
-    // sha256 文件名），否则归档会话的 cwd/model/历史水位全部取空。
-    const candidates = projectionCacheCandidates(dshHomeDir, sessionId);
-
-    let cacheData = null;
-    for (const cPath of candidates) {
-      cacheData = projCacheReader.readJson(cPath);
-      if (cacheData) break;
-    }
+    // [fix 2026-10-16] 与 getWorkspacesData 同样按新鲜度选投影（含归档域的
+    // sha256 文件名）。旧循环"命中即停"会让主域的陈旧件遮蔽归档域的鲜活件，
+    // 历史水位（lastSeq）因此停在迁移前 —— 表现为"打开会话只有旧消息"。
+    const cacheData = readFreshestProjection(sessionId);
 
     const messages = [];
     let isRunning = false;
