@@ -69,7 +69,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # 22.15+ 是硬门槛，不是"对齐本地"：网关读会话事件日志要用 Node 内置 zstd
+          # （zlib.zstdDecompressSync），该 API 到 Node v22.15.0 才加入。原来钉 20，
+          # 于是 sessiontitle 那批用例在 CI 上全部 INVALID（zstdCompressSync 不是函数），
+          # 而本机 Node 24 全绿 —— 版本偏差把问题藏住了。同时见 package.json 的 engines。
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: dsh-server-plugin/package-lock.json
 

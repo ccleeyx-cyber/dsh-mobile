@@ -65,6 +65,12 @@
   > 注意**不能**把 glob 当参数传给 `node --test`：glob 展开是 Node 21+ 才有的，CI 的
   > Node 20 会把 `"tests/unit/**/*.test.mjs"` 当字面路径报 `Could not find`（本轮
   > 实测踩到 —— 本机 Node 24 全绿，所以本地测不出来）。默认发现从 Node 18 起就有。
+- **CI 的 Node 从 20 提到 22，`engines.node` 从 `>=20` 修正为 `>=22.15`。** 网关的
+  `sessiontitle.mjs` 读会话事件日志要用 Node 内置 zstd（`zlib.zstdDecompressSync`），
+  该 API 到 **Node v22.15.0** 才加入。原来钉 20 导致 `sessiontitle.test.mjs` 的 7 个
+  用例在 CI 上全部 INVALID（`zstdCompressSync is not a function`），而本机 Node 24
+  全绿 —— 又是一次版本偏差藏住的问题。`engines` 的旧值让"部分功能在该版本不可用"
+  这件事在 CI 里不可见。
 - 新增 `test/models/stream_buffer_test.dart`：钉住流式缓冲的三条契约（flush 前成品
   不可见、flush 后按序写回、streaming 结束必定 flush）。
 - 新增 `AttachmentImageTile` 的 `cacheWidth` 回归测试。

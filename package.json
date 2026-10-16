@@ -43,7 +43,8 @@
 
     "verify": "npm run test:unit"
   },
+  "//engines": "22.15 是硬门槛：网关的 sessiontitle.mjs 读会话事件日志要用 Node 内置 zstd（zlib.zstdDecompressSync / createZstdDecompress），而该 API 到 Node v22.15.0 才加入（v22.x 至今标记 experimental）。低版本上那个功能会走 'zstd unavailable' 的主动降级分支 —— 不是崩溃，但这一层的用例跑不了，CI 也就测不到它。原来的 >=20 是偏低的：它让一部分功能在这台机器上不可用而 CI 看不出来。",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.15.0"
   }
 }
