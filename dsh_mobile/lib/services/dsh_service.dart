@@ -135,8 +135,6 @@ class DshService extends ChangeNotifier {
   /// 用户已关闭失败横幅的会话（规范化 id），持久化到 SharedPreferences。
   final Set<String> _dismissedFailureSessions = {};
   bool _dismissedFailuresLoaded = false;
-  int _reasoningBudget = 8000;
-  double _temperature = 0.7;
   bool _isLoadingHistory = false;
 
   // ---- 会话历史无限上翻（v1.15）[feat 2026-10-12] ----
@@ -408,8 +406,6 @@ class DshService extends ChangeNotifier {
   List<Snippet> get snippets => _snippets;
   String? get activePersonaId => _activePersonaId;
   int get pingMs => _pingMs;
-  int get reasoningBudget => _reasoningBudget;
-  double get temperature => _temperature;
   bool get isLoadingHistory => _isLoadingHistory;
 
   /// 切会话/新建会话时重置上翻分页状态。
@@ -2341,16 +2337,6 @@ class DshService extends ChangeNotifier {
       title: title.isEmpty ? '会话' : title,
     );
     await selectSession(meta);
-  }
-
-  void setReasoningBudget(int tokens) {
-    _reasoningBudget = tokens;
-    notifyListeners();
-  }
-
-  void setTemperature(double temp) {
-    _temperature = temp;
-    notifyListeners();
   }
 
   // Ping

@@ -755,61 +755,6 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                     ),
                   ],
                 ),
-
-                const SizedBox(height: 16),
-                Divider(color: context.c.surfaceMuted),
-                const SizedBox(height: 12),
-
-                // Reasoning Effort Slider
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    // Expanded：左侧标签很长（"深度思考预算 (Reasoning Budget)"），
-                    // spaceBetween 下两个裸 Text 会一起溢出（实测手机宽 97px）。
-                    Expanded(
-                      child: Text('深度思考预算 (Reasoning Budget)', style: TextStyle(color: context.c.textPrimary, fontSize: 13, fontWeight: FontWeight.w500)),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      dsh.reasoningBudget == 0 ? '关闭思考' : '${dsh.reasoningBudget ~/ 1000}k Tokens',
-                      style: TextStyle(color: context.c.accent, fontSize: 13, fontWeight: FontWeight.bold),
-                    ),
-                  ],
-                ),
-                Slider(
-                  value: dsh.reasoningBudget.toDouble(),
-                  min: 0,
-                  max: 32000,
-                  divisions: 8,
-                  activeColor: context.c.accent,
-                  inactiveColor: context.c.border,
-                  onChanged: (v) {
-                    dsh.setReasoningBudget(v.round());
-                  },
-                ),
-
-                // Temperature Slider
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text('采样创造力 (Temperature)', style: TextStyle(color: context.c.textPrimary, fontSize: 13, fontWeight: FontWeight.w500)),
-                    Text(
-                      dsh.temperature.toStringAsFixed(2),
-                      style: TextStyle(color: context.c.accent, fontSize: 13, fontWeight: FontWeight.bold),
-                    ),
-                  ],
-                ),
-                Slider(
-                  value: dsh.temperature,
-                  min: 0.0,
-                  max: 1.0,
-                  divisions: 10,
-                  activeColor: context.c.accent,
-                  inactiveColor: context.c.border,
-                  onChanged: (v) {
-                    dsh.setTemperature(v);
-                  },
-                ),
               ],
             ),
           ),
