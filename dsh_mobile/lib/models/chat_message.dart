@@ -34,7 +34,20 @@ class ChatMessage {
   String content;
   String? thinking; // 深度思考/思维链内容
   List<ToolExecution> tools;
-  bool isStreaming;
+  bool get isStreaming => _isStreaming;
+
+  /// 写入时先 flush 累积槽。
+  ///
+  /// 流式增量先进 buffer（见 [appendStreamDelta]），靠这个 setter 保证
+  /// 「streaming 结束」的所有路径 —— done / error / 取消 / 轮询超时兜底 /
+  /// reconcile / stream_snapshot replay —— 都会把最后一段增量写回成品字段。
+  /// 少了这一步，取消或弱网兜底时最后 100ms 内的内容会凭空消失。
+  set isStreaming(bool value) {
+    if (_isStreaming == value) return;
+    _isStreaming = value;
+    if (!value) flushStreamBuffers();
+  }
+  bool _isStreaming = false;
   final DateTime timestamp;
   final bool isMemory;
   final bool isContext;
@@ -50,19 +63,57 @@ class ChatMessage {
     required this.content,
     this.thinking,
     List<ToolExecution>? tools,
-    this.isStreaming = false,
+    bool isStreaming = false,
     DateTime? timestamp,
     this.isMemory = false,
     this.isContext = false,
     this.seq,
   })  : tools = tools ?? [],
-        timestamp = timestamp ?? DateTime.now();
+        timestamp = timestamp ?? DateTime.now(),
+        _isStreaming = isStreaming;
 
   bool get isUser => role == 'user';
   bool get isAssistant => role == 'assistant';
   bool get isSystem => role == 'system';
   bool get isContextRole => role == 'context';
   bool get isMemoryRole => role == 'memory';
+
+  /// 流式增量累积槽。`content` / `thinking` 是渲染层读的**成品**字段，
+  /// 但增量到达时不能直接 `content += text` —— Dart 的 String 不可变，
+  /// 每次拼接都整体拷贝一次，一条 20 万字符的回复按 4 字符一片进来就是
+  /// O(n²) 次拷贝（实测长回复下流式越来越卡的主因）。
+  ///
+  /// 所以 delta 一律进 buffer，只在 flush 边界写回成品字段。非流式消息
+  /// 永远不碰这两个 buffer。
+  final StringBuffer _contentBuffer = StringBuffer();
+  final StringBuffer _thinkingBuffer = StringBuffer();
+  bool _buffering = false;
+
+  /// 追加一段增量。调用方负责在合适的时机调 [flushStreamBuffers]。
+  void appendStreamDelta({String? content, String? thinking}) {
+    if (content != null && content.isNotEmpty) {
+      _contentBuffer.write(content);
+      _buffering = true;
+    }
+    if (thinking != null && thinking.isNotEmpty) {
+      _thinkingBuffer.write(thinking);
+      _buffering = true;
+    }
+  }
+
+  /// 把累积槽写回 `content` / `thinking`。幂等：没有未 flush 的增量时是 no-op。
+  void flushStreamBuffers() {
+    if (!_buffering) return;
+    if (_contentBuffer.isNotEmpty) {
+      content += _contentBuffer.toString();
+      _contentBuffer.clear();
+    }
+    if (_thinkingBuffer.isNotEmpty) {
+      thinking = (thinking ?? '') + _thinkingBuffer.toString();
+      _thinkingBuffer.clear();
+    }
+    _buffering = false;
+  }
 
   /// Returns true if the message is a carried context, workspace document, runtime instructions, or memory snapshot
   bool get isContextOrMemory {

@@ -25,6 +25,7 @@ import 'widgets/session_status_strip.dart';
 import 'widgets/session_info_sheet.dart';
 import 'widgets/deliverable_preview_sheet.dart';
 import 'widgets/turn_output_card.dart';
+import 'widgets/message_list_view.dart';
 import 'host_ops_view.dart';
 import 'config_page.dart';
 import '../theme/app_colors.dart';
@@ -183,6 +184,10 @@ class _ChatViewState extends State<ChatView> {
   final Map<String, GlobalKey> _messageKeys = {};
   bool _searchOpen = false;
   String _searchQuery = '';
+
+  /// [fix 2026-10-16] `contextMarkers` 扫描结果的记忆化缓存。
+  /// key = `'<message id>@<content length>'`。见 `_buildMessageItem` 里的说明。
+  final Map<String, int> _contextMarkerCache = {};
 
   /// 当前被高亮的命中消息 id。高亮只保留一条 —— 一次跳到第一条就够用户确认
   /// "查找能用了"，剩下的自己点；全部高亮反而让页面变成一片黄。
@@ -2306,28 +2311,47 @@ class _ChatViewState extends State<ChatView> {
                           ),
                         )
                       else
-                        NotificationListener<ScrollNotification>(
-                          onNotification: _onScrollNotification,
-                          child: ListView.builder(
-                            controller: _scrollController,
-                            physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-                            keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                            itemCount: dsh.messages.length + (showTurnOutput ? 1 : 0) + _historyHeaderItemCount(dsh),
-                            itemBuilder: (context, index) {
-                              // 0. [feat 2026-10-12] 上翻头部：加载圈 / 已到开头。
-                              if (index < _historyHeaderItemCount(dsh)) {
-                                return _buildHistoryHeader(dsh);
-                              }
-                              final msgIndex = index - _historyHeaderItemCount(dsh);
-                              // 1. Messages first (historical and streaming assistant response)
-                              if (msgIndex < dsh.messages.length) {
-                                final m = dsh.messages[msgIndex];
+                        // [fix 2026-10-16] 用 Selector 把重建范围收到消息列表。
+                        //
+                        // 这里原来是内联的 ListView.builder，跟着整个
+                        // ChatView.build() 一起重建 —— 而 build() 顶上的
+                        // `Provider.of<DshService>(context)` 是 listen:true，
+                        // 每个流式增量都会通知一次。结果是 AppBar、横幅、
+                        // 输入框、搜索面板全都白重建一遍，只有这一块真的需要变。
+                        //
+                        // 订阅 `streamRevision` 而不是 `messages`：后者返回的是
+                        // 同一个 List 实例（`dsh.messages => _messages`），流式期间
+                        // 只原地改内容，Selector 的 `==` 比较永远判等 → 列表根本
+                        // 不会重建。streamRevision 每个 flush 边界都自增，是这里
+                        // 唯一可靠的"内容变了"信号。
+                        Selector<DshService, int>(
+                          selector: (BuildContext ctx, DshService d) => d.streamRevision,
+                          builder: (BuildContext ctx, _, __) {
+                            final messages = dsh.messages;
+                            final headerCount = _historyHeaderItemCount(dsh);
+                            return MessageListView(
+                              messages: messages,
+                              headerCount: headerCount,
+                              itemCount: messages.length + (showTurnOutput ? 1 : 0) + headerCount,
+                              controller: _scrollController,
+                              onScrollNotification: _onScrollNotification,
+                              buildHeader: () => _buildHistoryHeader(dsh),
+                              buildItem: (ctx, msgIndex) {
+                                final m = messages[msgIndex];
                                 // 附 GlobalKey：会话内查找要靠 ensureVisible 精确滚到
                                 // 命中的那条消息。没有 key 只能按索引估算 offset，而
                                 // 消息高度是可变的，估算必然滚偏。
                                 final highlighted = _highlightedMessageIds.contains(m.id);
                                 Widget built = _buildMessageItem(m, dsh);
+                                // [fix 2026-10-16] 只给正在流式的那条加
+                                // RepaintBoundary。它是唯一逐 chunk 重绘的气泡，
+                                // 里面是 MarkdownBody 重新解析 + 链接化扫描；
+                                // 不给它单独一层，每帧的光栅化会连带波及列表里
+                                // 已经稳定的历史气泡。历史消息包了反而是浪费
+                                // （它们不重绘，多一层 saveLayer）。
+                                if (m.isStreaming) {
+                                  built = RepaintBoundary(child: built);
+                                }
                                 if (highlighted) {
                                   // 高亮放在这里而不是 _buildMessageItem 内部：这样
                                   // 记忆卡、工具卡等所有分支都被同一层覆盖，不必逐个
@@ -2348,27 +2372,28 @@ class _ChatViewState extends State<ChatView> {
                                   key: _keyForMessage(m.id),
                                   child: built,
                                 );
-                              }
+                              },
+                              buildTrailer: () {
+                                // 审批卡片不再挂在消息流末尾（详见 _buildApprovalBlocks 的注释）。
+                                // 这里只剩消息和本轮产出卡。
 
-                              // 审批卡片不再挂在消息流末尾（详见 _buildApprovalBlocks 的注释）。
-                              // 这里只剩消息和本轮产出卡。
-
-                              // 「本轮产出」卡片：事件进流那一半 —— 交付物出现在
-                              // 交付它的那一轮之后（见 build 里锚点的说明）。
-                              //
-                              // 主点击 = 就地预览，长按 = 下载 / 用其它应用打开 ——
-                              // 与信息面板逐字同一套手势。这两处曾经不一致：会话里
-                              // 点一下要下载 + 切应用，面板里点一下只是看一眼。
-                              return TurnOutputCard(
-                                deliverables: dsh.deliverables,
-                                busyPath: _deliverableBusy.value,
-                                errorText: _deliverableError,
-                                onOpen: (item) => _previewDeliverable(dsh, item),
-                                onDownload: (item) => _openDeliverable(dsh, item),
-                                onShowAll: () => _openSessionInfo(dsh, section: SessionInsightSection.deliverables),
-                              );
-                            },
-                          ),
+                                // 「本轮产出」卡片：事件进流那一半 —— 交付物出现在
+                                // 交付它的那一轮之后（见 build 里锚点的说明）。
+                                //
+                                // 主点击 = 就地预览，长按 = 下载 / 用其它应用打开 ——
+                                // 与信息面板逐字同一套手势。这两处曾经不一致：会话里
+                                // 点一下要下载 + 切应用，面板里点一下只是看一眼。
+                                return TurnOutputCard(
+                                  deliverables: dsh.deliverables,
+                                  busyPath: _deliverableBusy.value,
+                                  errorText: _deliverableError,
+                                  onOpen: (item) => _previewDeliverable(dsh, item),
+                                  onDownload: (item) => _openDeliverable(dsh, item),
+                                  onShowAll: () => _openSessionInfo(dsh, section: SessionInsightSection.deliverables),
+                                );
+                              },
+                            );
+                          },
                         ),
 
                       if (_showScrollToBottom)
@@ -2724,14 +2749,32 @@ class _ChatViewState extends State<ChatView> {
       'Contents of ',
     ];
 
-    int earliestMarkerIndex = -1;
-    for (final marker in contextMarkers) {
-      final idx = msg.content.indexOf(marker);
-      if (idx != -1) {
-        if (earliestMarkerIndex == -1 || idx < earliestMarkerIndex) {
-          earliestMarkerIndex = idx;
+    // [fix 2026-10-16] marker 扫描按 (id, content.length) 记忆化。
+    //
+    // 这 9 个 indexOf 是对**整条正文**做的，而 build 每个 flush 边界跑一次。
+    // 流式消息一条回复能到几千字符，等于每个 100ms 窗口白扫 9 × 几千字符。
+    // marker 的位置在内容变长后只会前移或不变（它是正文里的固定字面量），
+    // 所以缓存是安全的：key 里带 content.length，内容一长就重算。
+    //
+    // 用 message id 而不是 index 作 key：翻页 / 删除会让索引错位。
+    final markerCacheKey = '${msg.id}@${msg.content.length}';
+    final cached = _contextMarkerCache[markerCacheKey];
+    int earliestMarkerIndex;
+    if (cached != null) {
+      earliestMarkerIndex = cached;
+    } else {
+      earliestMarkerIndex = -1;
+      for (final marker in contextMarkers) {
+        final idx = msg.content.indexOf(marker);
+        if (idx != -1) {
+          if (earliestMarkerIndex == -1 || idx < earliestMarkerIndex) {
+            earliestMarkerIndex = idx;
+          }
         }
       }
+      // 只保留最近若干条，避免长时间挂机的会话把缓存撑大。
+      if (_contextMarkerCache.length > 64) _contextMarkerCache.clear();
+      _contextMarkerCache[markerCacheKey] = earliestMarkerIndex;
     }
 
     String displayContent = msg.content;
@@ -2819,13 +2862,11 @@ class _ChatViewState extends State<ChatView> {
                             : context.c.border,
                         width: 1.0,
                       ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.02),
-                          blurRadius: 4,
-                          offset: const Offset(0, 1),
-                        ),
-                      ],
+                      // [fix 2026-10-16] 去掉了原来这里的 boxShadow
+                      // （Colors.black 2% + blurRadius 4）。在滚动列表里，
+                      // 每个带阴影的 item 每帧都要一次 saveLayer；而这个
+                      // 阴影黑到肉眼根本分辨不出来。气泡本来就有 1px border
+                      // 和不同的圆角，层次感不靠它。
                     ),
                     child: SafeMarkdown(
                       // 正文里提到本会话声明过的产物时，把它变成可点链接（长按
@@ -3676,7 +3717,7 @@ class _ChatViewState extends State<ChatView> {
                     final stopWidth = (dsh.isSending || dsh.isCanceling) ? 36.0 : 0.0;
                     // [feat 2026-10-12] 新增的 "/" 命令键也占 36，必须计入预留，
                     // 否则 360dp 屏上胶囊把整行顶溢出 1px（queue_steer_impl_test 锁的就是这条）。
-                    final reserved = 36.0 + 36.0 + 44.0 + 44.0 + 6.0 + 47.0 + 4.0;
+                    const reserved = 36.0 + 36.0 + 44.0 + 44.0 + 6.0 + 47.0 + 4.0;
                     final textCap = (box.maxWidth - stopWidth - reserved).clamp(40.0, 104.0);
                     return Row(
                       children: [

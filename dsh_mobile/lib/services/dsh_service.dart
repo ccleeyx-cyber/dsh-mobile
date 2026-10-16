@@ -95,6 +95,33 @@ class DshService extends ChangeNotifier {
   static const double _backoffMultiplier = 1.5;
   static const int _maxJitterMs = 400;
 
+  /// 重连尝试上限。
+  ///
+  /// 没有这个上限时，`_scheduleReconnect` 会以封顶 12s 的间隔**永久**重试：
+  /// 网关半夜重启、笔记本合盖休眠、路由器改端口，手机都会在后台每隔 12 秒
+  /// 醒一次试连，天亮时电量已经烧掉一小块，而用户对这一切一无所知。
+  /// 超过上限就停在 `reconnectExhausted`，等下一次用户主动操作
+  /// （切会话 / 下拉刷新 / App resume）时再 `_scheduleReconnect(immediate: true)`
+  /// 重新武装 —— 见 [armReconnectRetry]。
+  static const int _maxReconnectAttempts = 8;
+
+  /// 心跳判定"半死连接"的两个阈值。
+  ///
+  /// 旧实现只看 `_lastServerFrameAt`（静默超时 45s）：一个"偶尔能收到几帧、
+  /// 但实际投递不了"的连接永远不会触发它。改成**往返**判定：发出 ping 后
+  /// 记 `_lastPingSentAt`，收到任意服务器帧就算应答；连续
+  /// [_maxMissedPings] 个周期收不到应答才判死。
+  static const int _maxMissedPings = 3;
+  DateTime? _lastPingSentAt;
+  int _missedPings = 0;
+
+  /// 重连已耗尽：不再自动重试，直到用户主动操作重新武装。
+  bool _reconnectExhausted = false;
+
+  /// 供 UI 展示"重连已停止，需要手动重试"。
+  /// （`reconnectAttempts` 的 getter 已存在于连接状态那一节，不重复声明。）
+  bool get reconnectExhausted => _reconnectExhausted;
+
   // State
   List<Workspace> _workspaces = [];
 
@@ -157,6 +184,52 @@ class DshService extends ChangeNotifier {
   String? _currentSessionModel;
   int _sessionLoadSeq = 0;
   int _streamRevision = 0;
+
+  /// 流式通知合并窗口。
+  ///
+  /// 网关的 delta 帧可以密到每秒数百片，而 `notifyListeners()` 会让整个
+  /// `ChatView`（含 AppBar / 横幅 / 输入框 / 搜索面板）重建一次。人眼在
+  /// ~60fps 之上看不出区别，所以按窗口节流：窗口内的增量先进 buffer，
+  /// 到边界才 flush + 通知一次。收尾的 flush 是立即的（不等满窗口），
+  /// 否则最后一小段内容会迟一个窗口才显示。
+  static const Duration _streamNotifyInterval = Duration(milliseconds: 100);
+  DateTime? _lastStreamNotifyAt;
+  Timer? _streamFlushTimer;
+
+  /// 累积增量并（可能）延迟通知。由流式帧处理器调用。
+  void _ingestStreamDelta(ChatMessage target, {String? content, String? thinking}) {
+    target.appendStreamDelta(content: content, thinking: thinking);
+    _scheduleStreamFlush();
+  }
+
+  void _scheduleStreamFlush() {
+    final now = DateTime.now();
+    final last = _lastStreamNotifyAt;
+    if (last == null || now.difference(last) >= _streamNotifyInterval) {
+      _flushStreamBuffers();
+      return;
+    }
+    // 窗口内：只挂一个待执行的 flush，重复帧不叠加定时器。
+    _streamFlushTimer ??= Timer(_streamNotifyInterval - now.difference(last), () {
+      _streamFlushTimer = null;
+      _lastStreamNotifyAt = null;
+      _flushStreamBuffers();
+    });
+  }
+
+  /// 立即 flush 所有流式消息的累积槽并通知。
+  void _flushStreamBuffers() {
+    _streamFlushTimer?.cancel();
+    _streamFlushTimer = null;
+    _lastStreamNotifyAt = DateTime.now();
+    // flushStreamBuffers() 自身幂等（没有未成形增量时是 no-op），所以不必
+    // 先判断"有没有内容要刷"再决定是否调用。
+    for (final m in _messages) {
+      if (m.isStreaming) m.flushStreamBuffers();
+    }
+    _streamRevision++;
+    notifyListeners();
+  }
 
   /// 等待本机用户回答的提问（patch 0003）。
   ///
@@ -752,6 +825,9 @@ class DshService extends ChangeNotifier {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _reconnectAttempts = 0;
+    // 主动连接 = 重新武装。上一轮可能已耗尽自动重试上限，此刻用户明确要求
+    // 连一次，没有理由继续端着（见 _maxReconnectAttempts 的注释）。
+    _reconnectExhausted = false;
 
     _status = ConnectionStatus.connecting;
     // 新连接：允许重新发一次订阅。
@@ -1561,7 +1637,7 @@ class DshService extends ChangeNotifier {
 
     // 轮询是 WS 流式的**兜底**，不是主通道。原来恒定 700ms，与 WS 增量流
     // 重复拉同一份内容；2.5s 一次足够核对终态/补漏，省 3.5x 轮询流量。
-    final interval = const Duration(milliseconds: 2500);
+    const interval = Duration(milliseconds: 2500);
     const maxTicks = 100; // max ~250s
 
     _sessionPollTimer = Timer.periodic(interval, (timer) async {
@@ -1689,6 +1765,10 @@ class DshService extends ChangeNotifier {
 
         final localAssistant = _messages.isNotEmpty && _messages.last.isAssistant ? _messages.last : null;
         if (localAssistant != null) {
+          // 先 flush：本地还在流式时，最后 100ms 的增量压在 buffer 里，
+          // 下面两处"本地比服务端长就保留本地"的比较会漏算这段，把本应
+          // 保留的领先量判成落后，进而用滞后的服务端文本盖掉较新的本地内容。
+          localAssistant.flushStreamBuffers();
           // 1. Reconcile thinking: never discard in-flight local thoughts
           if ((localAssistant.thinking != null && localAssistant.thinking!.isNotEmpty) &&
               (serverAssistant.thinking == null || serverAssistant.thinking!.isEmpty ||
@@ -4072,6 +4152,7 @@ class DshService extends ChangeNotifier {
   void _handleRawMessage(dynamic raw) {
     // 任何服务器帧都喂看门狗 —— pong、系统帧、数据帧都算"连接活着"的证据。
     _lastServerFrameAt = DateTime.now();
+    _noteServerFrame();
     if (raw is! String) return;
     if (raw == 'pong') return;
 
@@ -4224,6 +4305,9 @@ class DshService extends ChangeNotifier {
           if (_messages.isNotEmpty && _messages.last.isAssistant && _messages.last.isStreaming) {
             // ⚠️ 不能把已流出的正文覆盖掉 —— 模型出错前吐出的内容对用户仍然有用
             // （旧写法直接 content = '❌ …'，把半截回答整段抹掉了）。
+            // 先 flush 再读：否则 buffer 里最后 100ms 的增量会漏出 partial，
+            // 又被 setter 的 flush 追加到错误行之后，顺序整个错掉。
+            _messages.last.flushStreamBuffers();
             final partial = _messages.last.content;
             _messages.last.content = partial.trim().isEmpty
                 ? '❌ $errStr'
@@ -4278,6 +4362,10 @@ class DshService extends ChangeNotifier {
           final current = _messages.last;
           // 只补不缩：本地内容若是快照的前缀（正常 delta 路径），补齐尾部；
           // 本地比快照长（本地收到过更多 delta），保持本地。
+          // 先 flush 再比对：buffer 里可能还压着未成形的增量，拿半截 content 去
+          // 做 startsWith 前缀判断会把"本来是前缀"判成"不是前缀"，于是快照
+          // 整段被丢弃 —— 那正是这段补发机制要防的丢内容。
+          current.flushStreamBuffers();
           if (snapText.length > current.content.length && snapText.startsWith(current.content)) {
             current.content = snapText;
           }
@@ -4322,14 +4410,10 @@ class DshService extends ChangeNotifier {
 
         if (type == 'thinking' || json.containsKey('thinking')) {
           final text = json['delta'] ?? json['thinking'] ?? '';
-          current.thinking = (current.thinking ?? '') + text.toString();
-          _streamRevision++;
-          notifyListeners();
+          _ingestStreamDelta(current, thinking: text.toString());
         } else {
           final text = json['delta'] ?? json['content'] ?? json['text'] ?? '';
-          current.content += text.toString();
-          _streamRevision++;
-          notifyListeners();
+          _ingestStreamDelta(current, content: text.toString());
         }
         return;
       }
@@ -4643,28 +4727,50 @@ class DshService extends ChangeNotifier {
   void _startHeartbeat() {
     _stopHeartbeat();
     _lastServerFrameAt = DateTime.now();
+    _lastPingSentAt = null;
+    _missedPings = 0;
     _heartbeatTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
       if (_isDisposed) {
         timer.cancel();
         return;
       }
       if (_status == ConnectionStatus.connected) {
-        // 看门狗：超过 45s（3 个心跳周期）没收到任何服务器帧，判定为半死
-        // 连接 —— 写 ping 不报错不代表 socket 还活着（见 _lastServerFrameAt
-        // 的注释）。立即重建连接，而不是等到用户发现"又收不到了"。
-        final last = _lastServerFrameAt;
-        if (last != null && DateTime.now().difference(last).inSeconds > 45) {
-          debugPrint('[DshService] 看门狗：45s 无服务器帧，判定半死连接，强制重连');
-          _status = ConnectionStatus.disconnected;
-          notifyListeners();
-          _scheduleReconnect(immediate: true);
-          return;
+        // 看门狗：连续 3 个周期（45s）发出去的 ping 收不到任何应答，判定为
+        // 半死连接，立即重建。
+        //
+        // [fix 2026-10-16] 判据从"多久没收到服务器帧"改成"ping 有没有应答"。
+        // 旧写法是纯静默超时：一个"偶尔漏几帧下来、但实际投递不了"的连接
+        // （弱网半开、NAT 表项老化）永远满足不了 45s 静默，于是看门狗形同
+        // 虚设，用户看到的是"还显示已连接，但什么都在转圈"。
+        //
+        // 写 ping 不报错同样不代表 socket 活着 —— TCP 写缓冲在连接半开时
+        // 照样接受数据，错误要到重传耗尽才冒出来，那可能是几分钟后。
+        final lastPing = _lastPingSentAt;
+        if (lastPing != null) {
+          _missedPings++;
+          if (_missedPings >= _maxMissedPings) {
+            debugPrint('[DshService] 看门狗：${_missedPings * 15}s ping 无应答，判定半死连接，强制重连');
+            _status = ConnectionStatus.disconnected;
+            notifyListeners();
+            _scheduleReconnect(immediate: true);
+            return;
+          }
         }
         try {
           _channel?.sink.add('ping');
+          _lastPingSentAt = DateTime.now();
         } catch (_) {}
       }
     });
+  }
+
+  /// 收到任意服务器帧时调用：ping 应答计数归零。
+  ///
+  /// 不测具体 RTT 数值 —— 那是 `measurePing()` 的活，而且一次性抖动不该判死。
+  /// 这里只回答"这条连接还在不在回话"这个是非题。
+  void _noteServerFrame() {
+    _missedPings = 0;
+    _lastPingSentAt = null;
   }
 
   void _stopHeartbeat() {
@@ -4699,6 +4805,7 @@ class DshService extends ChangeNotifier {
     if (_isExplicitlyDisconnected || _isDisposed || _isTokenInvalid || _currentConfig == null) {
       return;
     }
+    if (_reconnectExhausted) return;
     if (_isReconnecting || (_reconnectTimer != null && _reconnectTimer!.isActive)) {
       return;
     }
@@ -4708,6 +4815,16 @@ class DshService extends ChangeNotifier {
     if (immediate) {
       _reconnectAttempts = 0;
       _executeReconnect();
+      return;
+    }
+
+    // [fix 2026-10-16] 重连上限。旧逻辑退避封顶 12s 后无限重试，
+    // 网关半夜重启能让手机在后台每隔 12 秒醒一次，天亮烧掉一块电量，
+    // 而用户对此一无所知。到上限就停，等下一次用户主动操作重新武装。
+    if (_reconnectAttempts >= _maxReconnectAttempts) {
+      _reconnectExhausted = true;
+      debugPrint('[DshService] 重连已达上限 $_maxReconnectAttempts 次，停止自动重试');
+      notifyListeners();
       return;
     }
 
@@ -4728,6 +4845,17 @@ class DshService extends ChangeNotifier {
     _reconnectTimer = Timer(Duration(milliseconds: delayMs), () {
       _executeReconnect();
     });
+  }
+
+  /// 重连已耗尽时，由用户主动操作调用以重新武装。
+  ///
+  /// 覆盖：connect() / selectSession() / handleAppResumed() / 下拉刷新。
+  /// 语义是"人又碰了一下手机，值得再试一轮"，所以计数器也一起归零。
+  void armReconnectRetry() {
+    if (!_reconnectExhausted) return;
+    _reconnectExhausted = false;
+    _reconnectAttempts = 0;
+    debugPrint('[DshService] 用户主动操作，重新武装重连');
   }
 
   Future<void> _executeReconnect() async {
@@ -4882,10 +5010,16 @@ class DshService extends ChangeNotifier {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _reconnectAttempts = 0;
+    _reconnectExhausted = false;
     _isReconnecting = false;
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _stopHeartbeat();
+    // [fix 2026-10-16] 流式 flush 定时器也必须停。它持有 Timer，且回调里
+    // 会 notifyListeners() —— 断开后还留着，就是一条通往已 dispose 状态的
+    // 定时回调。
+    _streamFlushTimer?.cancel();
+    _streamFlushTimer = null;
 
     // 先把状态落定、再关底层 socket。
     //
@@ -4917,6 +5051,15 @@ class DshService extends ChangeNotifier {
   void dispose() {
     _isDisposed = true;
     disconnect();
+    // [fix 2026-10-16] 补上两处漏掉的清理。
+    //
+    // ① 共享 http.Client（类顶部持有）从未被关闭：它的 keep-alive 连接会
+    //    活到进程结束。DshService 目前是进程级单例，所以这是潜伏问题；
+    //    但 hot restart / provider 重建时会真的漏 socket。
+    // ② DraftStore 是单例，有防抖写盘。不 flush 就 dispose，最后一次输入
+    //    （600ms 防抖窗口内）直接丢。
+    _httpClient.close();
+    drafts.flushNow();
     super.dispose();
   }
 }
