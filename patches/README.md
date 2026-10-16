@@ -32,6 +32,30 @@ ignored: ["**/node_modules", "**/.*", "cache", "data"]
 
 ### 当前状态
 
+> **[2026-10-16] 这个目录已经死了，别照着做。**
+>
+> 插件后来从单文件 `lib/index.js` 重构成了模块（`core.mjs` / `features.mjs` /
+> `send-file.mjs` / `agentteam.mjs` / `sessiontitle.mjs` / `host-ops.mjs` / `rpc.mjs` /
+> `extensions.mjs` / `store.mjs`），所以下面三个 `.patch` 文件的 hunk 全部对不上行号。
+> 实测：
+>
+> ```
+> git apply --check patches/0001-gateway-p0-security-and-crash-fixes.patch   # 失败
+> git apply --check patches/0002-gateway-archived-session-filter.patch       # 失败
+> git apply --check patches/0003-gateway-event-forwarding.patch              # 失败
+> ```
+>
+> 各节里"已验证 `git apply --check` exit 0"的说法**已过期**，写的是重构前的状态。
+> 下文状态表把 0001–0003 标为"已应用并生效"是对的，但那些修复现在**本来就已在
+> `lib/` 里**（已核对：`assertSessionId` / `classifyCommand` 在 `core.mjs`、
+> `archivedMode` 在 `index.js`、`sendFile(res, …)` 在 `features.mjs:1533`），
+> 补丁文件只剩考古价值。
+>
+> 0004–0006 更尴尬：状态表列了它们，但**从来没有对应的 `.patch` 文件**，只存在于
+> 文字描述里 —— 无法 apply，也无法核对。
+>
+> 另外回滚说明依赖 `$env:TEMP\dsh-plugin-backup-*` 副本，那些临时目录基本已经不在了。
+
 | 补丁 | 状态 |
 |---|---|
 | 0001 安全与崩溃修复 | **已应用并生效** —— 你在 2026-10-08 重启了 dsh web，`core.mjs` 与 `index.js` 均为打过补丁的版本 |

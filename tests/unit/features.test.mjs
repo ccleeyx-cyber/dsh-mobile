@@ -372,9 +372,15 @@ test('deliverNtfy: with no live App the push goes out and the status is recorded
   assert.equal(calls.sent.length, 1, 'exactly one push');
   assert.equal(calls.audit[0].payload.outcome, 'sent');
   assert.equal(calls.audit[0].payload.status, 200);
-  // The URL carries the topic because that is what ntfy requires — the point is
-  // that it never reaches the audit ring or the log.
-  assert.match(calls.sent[0].url, /TOPIC-SECRET/);
+  // [fix 2026-10-12] JSON 发布 POST 到**根路径**，topic 只在 body 里
+  // （ntfy "Publish as JSON"）。断言随之从 URL 挪到 body，并反向钉住
+  // "topic 绝不进 URL / 绝不进 audit" —— 那才是这条用例真正要守的东西。
+  assert.equal(calls.sent[0].body.topic, 'TOPIC-SECRET', 'the topic belongs in the JSON body');
+  assert.equal(calls.sent[0].url, 'https://ntfy.example.com/', 'the URL is the bare root path');
+  assert.ok(!calls.sent[0].url.includes('TOPIC-SECRET'), 'the topic must not leak into the URL');
+  assert.equal(calls.sent[0].headers.Authorization, 'Bearer tk_TOKEN_SECRET', 'the bearer token is carried by header');
+  assert.ok(!JSON.stringify(calls.audit).includes('TOPIC-SECRET'), 'the topic never reaches the audit ring');
+  assert.ok(!JSON.stringify(calls.audit).includes('tk_TOKEN_SECRET'), 'the bearer token never reaches the audit ring');
 });
 
 test('deliverNtfy: a rejected push is audited with its status, never swallowed', async () => {

@@ -1,5 +1,19 @@
 # TEST_READY: DSH Mobile & Server Bridge E2E Test Suite
 
+> **[2026-10-16] 本文档已过期，命令与数字都别信。**
+>
+> - §1 说 `npm test` 跑完整 E2E 套件。**已不是**：`npm test` 现在等于
+>   `npm run test:unit`（只跑 hermetic 单测）。E2E 必须显式指名
+>   `npm run test:e2e`，且会打真实网关、建真实会话、烧真实 LLM token。
+>   分层与危险性说明见根目录 `README.md` §2。
+> - §2 的 "Total Test Cases: 93 / Passing: 89 / Failing: 4" 是修复前的快照。
+>   当前 hermetic 单测是 **375 个用例**（`npm run test:unit`）。
+> - §4 起升级的四个缺陷（raw-string `ping`、whitespace `sessionId` → 500、
+>   workspace memory 路径遍历、audit log 打桩）已由 `patches/0001` / `0002` 修复。
+> - 文中引用的 `ORIGINAL_REQUEST.md` 与 `PROJECT.md` **两个文件都不存在**。
+>
+> §3 的 Feature Coverage Checklist 是这里唯一仍有参考价值的内容。
+
 ## 1. Test Suite Runner Command
 
 ```bash
