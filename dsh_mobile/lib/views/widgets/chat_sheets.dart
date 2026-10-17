@@ -849,10 +849,14 @@ Future<void> showChatSessionInfoSheet(
   /// null 时该项仍可点，只是不显示"当前是哪个工作区"。
   String? workspaceLabel,
 
-  /// 打开运行轨迹面板。**必须由调用方传**：轨迹面板的"跳到消息"需要父级的
-  /// 滚动与高亮能力（`chat_view` 握着 GlobalKey 与滚动控制器），本文件拿不到。
-  /// 为 null 时「运行轨迹」整项不渲染 —— 不给一个点了没反应的入口。
+  /// 打开运行轨迹面板（旧入口，保留给"从消息长按菜单直接看轨迹"那种场景）。
+  /// 为 null 时不影响面板里的「轨迹」tab —— 那是内联渲染的。
   Future<void> Function()? onOpenTrajectory,
+
+  /// 轨迹 tab 里点"跳到消息"时的回调（同 `TrajectorySheet` 的签名）。
+  ///
+  /// 必须由父级传：滚动与高亮能力在 `chat_view` 手里。
+  void Function(String messageId, int? index, int total)? onJumpToMessage,
 }) async {
     // 下面这些动作都在**弹层关掉之后**执行，所以要提前取好 Navigator：弹层的
     // context 在 pop 之后已失效。取外层 `context` 的 Navigator 才是安全的。
@@ -934,6 +938,26 @@ Future<void> showChatSessionInfoSheet(
             onSwitchWorkspace: () async => showChatWorkspaceSwitchSheet(context, d),
             onDeleteSession: () async => showChatDeleteCurrentSessionDialog(context, d),
             onOpenTrajectory: onOpenTrajectory,
+            // [feat 2026-10-17] 轨迹 tab：把 TrajectorySheet 原样嵌进去。
+            //
+            // 复用而不是重写：空态、`—` 规则、进行中不封口、上下文块默认折叠、
+            // 导出 Markdown 全在它里面，重写一份就是第二套会漂移的规则。
+            trajectoryTab: TrajectorySheet(
+              trajectory: Trajectory.build(
+                d.messages,
+                liveTurnTokens: d.lastTurnTokens,
+                running: d.isSending || d.isSessionRunning,
+              ),
+              onJumpToMessage: onJumpToMessage == null
+                  ? null
+                  : (id) {
+                      // 先关面板再滚：轨迹与消息流是同一屏的两个视角，留在面板上
+                      // 看不到滚动效果，用户会以为"点了没反应"。
+                      navigator.pop();
+                      final index = d.messages.indexWhere((m) => m.id == id);
+                      onJumpToMessage(id, index >= 0 ? index : null, d.messages.length);
+                    },
+            ),
             // 运维面板是**推入页**不是弹层：它自己带 Scaffold + 4 个页签，
             // 塞进 bottom sheet 会没有高度可用。用外层 canvas 的 navigator。
             onOpenHostOps: () async => navigator.push(

@@ -3545,7 +3545,10 @@ class DshService extends ChangeNotifier {
       if (_checkResponseAuth(res)) return null;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        final raw = data['entries'];
+        // 键名兼容：网关回的是 `entries`（与历史 HTTP 契约一致），
+        // 也接受 `subagents`（早期草稿的命名）—— 两边都认，避免又一次"字段名
+        // 不一致 → 整块不显示"的静默失败。
+        final raw = data['entries'] ?? data['subagents'];
         _subagents = raw is List
             ? raw
                 .whereType<Map>()

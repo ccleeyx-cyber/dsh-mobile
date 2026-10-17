@@ -59,10 +59,17 @@ class AppColors {
   static const Color accent = Color(0xFF3F5AF0);
   static const Color accentDark = Color(0xFF6E8BFF);
 
-  /// 用户消息气泡底。直接复用品牌色：气泡是消息流里唯一的「实心块」，它天然
-  /// 承担品牌曝光；另外给一个独立色值只会多一处需要与 accent 同步维护的地方。
-  static const Color userBubble = accent;
-  static const Color userBubbleDark = accentDark;
+  /// 用户消息气泡底。
+  ///
+  /// [fix 2026-10-17] 之前直接复用 `accent`（实心蓝）。问题不是好看不好看，而是
+  /// **选中文字看不见**：Flutter 的选区高亮是 accent 的半透明叠色，压在实心 accent
+  /// 底上几乎看不出变化 —— 用户长按选中一句话，屏幕上像没反应，只能靠"复制"
+  /// 按钮亮起来猜自己选中了没有（用户实测反馈）。
+  ///
+  /// 现在改成 accent 的**浅色 tint** + 深色正文：选区高亮压在浅底上对比明显，
+  /// 气泡仍有品牌感，与"裸排版的 AI 正文"也依然一眼可分。
+  static const Color userBubble = Color(0xFFE3EAFE);
+  static const Color userBubbleDark = Color(0xFF1E2B4D);
 
   /// AI 消息气泡底。透明 —— AI 正文裸排在页面底上，不再套卡片（Phase 2.1）。
   ///

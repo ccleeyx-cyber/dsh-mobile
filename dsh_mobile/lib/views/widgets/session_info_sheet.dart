@@ -69,7 +69,15 @@ class SessionInfoSheet extends StatefulWidget {
     this.onDeleteSession,
     this.onOpenTrajectory,
     this.onOpenHostOps,
+    this.trajectoryTab,
   });
+
+  /// 「轨迹」tab 的内容（由宿主构建，本组件不认识 Trajectory 数据模型）。
+  ///
+  /// 为什么传 Widget 而不是数据：轨迹的渲染、空态、耗时/token 的 `—` 规则、
+  /// 跳到消息的回调全部已经有实现（`TrajectorySheet`），再在这里复写一遍就是
+  /// 第二套会漂移的规则。为 null 时不渲染 tab 条（宿主没这个能力）。
+  final Widget? trajectoryTab;
 
   /// 用量 / 上下文 / goal。`null` 表示还没取到。
   final SessionStats? stats;
@@ -245,6 +253,60 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
   final _schedulesKey = GlobalKey();
   final _subagentsKey = GlobalKey();
   final _teamKey = GlobalKey();
+
+  /// 0 = 概览，1 = 轨迹（[feat 2026-10-17] 同级 tab）。
+  int _tab = 0;
+
+  /// 「概览 / 轨迹」切换条。
+  Widget _buildTabs(BuildContext context) {
+    Widget tab(String label, int index, Key key) {
+      final active = _tab == index;
+      return Expanded(
+        child: InkWell(
+          key: key,
+          borderRadius: BorderRadius.circular(8),
+          onTap: () => setState(() => _tab = index),
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 7),
+            decoration: BoxDecoration(
+              color: active ? context.c.surface : Colors.transparent,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: active ? context.c.border : Colors.transparent,
+              ),
+            ),
+            child: Text(
+              label,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: active ? FontWeight.w600 : FontWeight.w500,
+                color: active ? context.c.textPrimary : context.c.textSecondary,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 8, 14, 6),
+      child: Container(
+        padding: const EdgeInsets.all(3),
+        decoration: BoxDecoration(
+          color: context.c.surfaceMuted,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: context.c.border),
+        ),
+        child: Row(
+          children: [
+            tab('概览', 0, const ValueKey('session-info-tab-overview')),
+            tab('轨迹', 1, const ValueKey('session-info-tab-trajectory')),
+          ],
+        ),
+      ),
+    );
+  }
   final _diagnosticsKey = GlobalKey();
   bool _refreshing = false;
   String? _interruptingId;
@@ -525,40 +587,46 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
               ),
             ),
             Divider(height: 1, color: context.c.border),
-            Flexible(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(14, 12, 14, 20),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // 会话操作（v1.27）：原来 AppBar 溢出菜单里的四项。
-                    // 放在**最上面** —— 它是这个面板唯一"会改变什么"的部分，
-                    // 其余区块都是只读的现状描述。
-                    if (_hasSessionActions) _buildSessionActions(),
-                    if (widget.onOpenTrajectory != null ||
-                        widget.onOpenHostOps != null)
-                      _buildShortcuts(),
-                    KeyedSubtree(key: _usageKey, child: _buildUsage()),
-                    KeyedSubtree(
-                        key: _deliverablesKey, child: _buildDeliverables()),
-                    KeyedSubtree(key: _changesKey, child: _buildChanges()),
-                    KeyedSubtree(key: _jobsKey, child: _buildJobs()),
-                    // [feat 2026-10-16] 智能体团队。放在子代理**之前**：团队是更高
-                    // 层的组织视图，用户先想知道"谁在干活"，再看具体委派。
-                    if (widget.team != null || widget.teamUnavailable)
-                      KeyedSubtree(key: _teamKey, child: _buildTeam()),
-                    // [feat 2026-10-12] 子代理区块。引擎没有列出能力/读取失败时
-                    // 返回 null —— 整块隐藏，绝不显示一张假空表。
-                    if (widget.subagents != null)
-                      KeyedSubtree(
-                          key: _subagentsKey, child: _buildSubagents()),
-                    KeyedSubtree(key: _schedulesKey, child: _buildSchedules()),
-                    // [feat 2026-10-12] 一键连接诊断。
-                    KeyedSubtree(
-                        key: _diagnosticsKey, child: _buildDiagnostics()),
-                  ],
-                ),
-              ),
+            // [feat 2026-10-17] 「概览 / 轨迹」同级切换。
+            //
+            // 轨迹以前要经过 面板 → 「运行轨迹」行 → 又一层底部弹层，用户明确说
+            // "入口太深"。它和这一堆状态指标本来就是同一件事的两个视角（一个是
+            // 汇总、一个是逐轮明细），放在同一层做 tab 才对得上心智。
+            if (widget.trajectoryTab != null) _buildTabs(context),            Flexible(
+              child: _tab == 1 && widget.trajectoryTab != null
+                  ? widget.trajectoryTab!
+                  : SingleChildScrollView(
+                      padding: const EdgeInsets.fromLTRB(14, 12, 14, 20),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          // 会话操作（v1.27）：原来 AppBar 溢出菜单里的项。
+                          // 放在**最上面** —— 它是这个面板唯一"会改变什么"的部分，
+                          // 其余区块都是只读的现状描述。
+                          if (_hasSessionActions) _buildSessionActions(),
+                          if (widget.onOpenHostOps != null) _buildShortcuts(),
+                          KeyedSubtree(key: _usageKey, child: _buildUsage()),
+                          KeyedSubtree(
+                              key: _deliverablesKey, child: _buildDeliverables()),
+                          KeyedSubtree(key: _changesKey, child: _buildChanges()),
+                          KeyedSubtree(key: _jobsKey, child: _buildJobs()),
+                          // [feat 2026-10-16] 智能体团队。放在子代理**之前**：团队是更高
+                          // 层的组织视图，用户先想知道"谁在干活"，再看具体委派。
+                          if (widget.team != null || widget.teamUnavailable)
+                            KeyedSubtree(key: _teamKey, child: _buildTeam()),
+                          // [feat 2026-10-12] 子代理区块。引擎没有列出能力/读取失败时
+                          // 返回 null —— 整块隐藏，绝不显示一张假空表。
+                          if (widget.subagents != null)
+                            KeyedSubtree(
+                                key: _subagentsKey, child: _buildSubagents()),
+                          KeyedSubtree(
+                              key: _schedulesKey, child: _buildSchedules()),
+                          // [feat 2026-10-12] 一键连接诊断。
+                          KeyedSubtree(
+                              key: _diagnosticsKey, child: _buildDiagnostics()),
+                        ],
+                      ),
+                    ),
             ),
           ],
         ),
@@ -593,30 +661,10 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
             value: '上下文快满时的出路',
             onTap: widget.onNewSession!,
           ),
-        if (widget.onSwitchModel != null)
-          _actionRow(
-            key: const ValueKey('session-action-model'),
-            icon: Icons.smart_toy_outlined,
-            label: '切换模型',
-            value: widget.modelLabel,
-            onTap: widget.onSwitchModel!,
-          ),
-        if (widget.onEditPermission != null)
-          _actionRow(
-            key: const ValueKey('session-action-permission'),
-            icon: Icons.shield_outlined,
-            label: '对话权限',
-            value: widget.permissionLabel,
-            onTap: widget.onEditPermission!,
-          ),
-        if (widget.onSwitchWorkspace != null)
-          _actionRow(
-            key: const ValueKey('session-action-workspace'),
-            icon: Icons.folder_outlined,
-            label: '切换工作区',
-            value: widget.workspaceLabel,
-            onTap: widget.onSwitchWorkspace!,
-          ),
+        // [fix 2026-10-17] 「切换模型」「对话权限」「切换工作区」三项从这里删除：
+        //   * 模型 / 权限搬进了输入栏（和输入框并排，发之前随手就能确认）；
+        //   * 切换工作区与底部「工作区」tab 的职责重复，用户明确要求去掉。
+        // 面板只留真正"会话级、且不常用"的两件事：新开 / 删除。
         if (widget.onDeleteSession != null)
           _actionRow(
             key: const ValueKey('session-action-delete'),
@@ -630,23 +678,15 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
     );
   }
 
-  /// 「运行轨迹」「运维面板」两个内嵌区块入口。
+  /// 「运维面板」入口。
   ///
-  /// 它们是页面级目的地（`TrajectorySheet` / `HostOpsView`），不是这里能内联
-  /// 渲染的数据，所以只给出口；两个回调都为 null 时整块不渲染。
+  /// [feat 2026-10-17] 「运行轨迹」从这里删掉了 —— 它现在是面板顶部的同级 tab，
+  /// 再留一个"运行轨迹"行等于同一件事两个入口，而且是更深那个。
   Widget _buildShortcuts() {
     return _section(
       title: '入口',
       icon: Icons.open_in_new_rounded,
       children: [
-        if (widget.onOpenTrajectory != null)
-          _actionRow(
-            key: const ValueKey('session-entry-trajectory'),
-            icon: Icons.timeline_rounded,
-            label: '运行轨迹',
-            value: '本轮事件时间线',
-            onTap: widget.onOpenTrajectory!,
-          ),
         if (widget.onOpenHostOps != null)
           _actionRow(
             key: const ValueKey('session-entry-hostops'),

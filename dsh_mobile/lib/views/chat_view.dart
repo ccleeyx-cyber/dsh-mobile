@@ -386,19 +386,36 @@ class _ChatViewState extends State<ChatView> {
     _lastTurnProbe = now;
 
     final dsh = context.read<DshService>();
-    final topEdge = MediaQuery.of(context).padding.top + 84; // 顶栏 + 状态条之下
-    var current = 1;
+    // 判定的锚点是**视口中心**，不是顶边。
+    //
+    // [fix 2026-10-17] 之前是"找最后一条越过顶边的真人消息"，于是有两个抖动源：
+    //   1. 懒列表里视口上方的消息经常没被构建（GlobalKey 拿不到 context），
+    //      循环看不到它们，`current` 会退回默认值 1 —— 用户看到的"乱跳"就是这个；
+    //   2. 一条消息恰好贴在顶边时，±1 像素的滚动就会让它在"越过/没越过"之间来回。
+    // 改成"离视口中心最近的那一轮"之后，距离是连续量，滚过一轮只会切换一次，
+    // 不会来回翻。拿不到任何锚点时**保持现状**，绝不重置。
+    final screenH = MediaQuery.sizeOf(context).height;
+    final anchorY = screenH * 0.42;
+
+    int? best;
+    var bestDistance = double.infinity;
     var turn = 0;
     for (final m in dsh.messages) {
       if (!m.isUser || m.isHarnessNotice || m.isContextOrMemory) continue;
       turn++;
       final ctx = _messageKeys[m.id]?.currentContext;
-      if (ctx == null) continue; // 懒列表：这一轮还没被构建
+      if (ctx == null) continue; // 懒列表：这一条还没被构建
       final box = ctx.findRenderObject();
       if (box is! RenderBox || !box.hasSize) continue;
-      if (box.localToGlobal(Offset.zero).dy <= topEdge) current = turn;
+      final dy = box.localToGlobal(Offset.zero).dy;
+      final distance = (dy - anchorY).abs();
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = turn;
+      }
     }
-    if (current != _visibleTurn) setState(() => _visibleTurn = current);
+    if (best == null) return; // 一个锚点都没有：保持当前高亮，别跳回第 1 轮
+    if (best != _visibleTurn) setState(() => _visibleTurn = best);
   }
 
   /// 跳到第 [turn] 轮：滚到那一轮的第一条真人消息并短暂高亮。
@@ -823,6 +840,10 @@ class _ChatViewState extends State<ChatView> {
             onPickAttach: () => _showAttachSheet(dsh),
             onPickCommand: () => _showCommandSheet(dsh),
             onPickModel: () => showChatModelSwitchSheet(context, dsh),
+            // [feat 2026-10-17] 对话权限搬进输入栏（与模型胶囊并排），
+            // 会话信息面板的「会话操作」里不再重复它。
+            policyLabel: _policyShortLabel(policy),
+            onPickPermission: () => showChatPermissionSheet(context, dsh),
             onToggleQueueExpanded: () =>
                 setState(() => _queueExpanded = !_queueExpanded),
             onEditQueueRow: (row) => _editQueueRow(dsh, row),
@@ -1314,12 +1335,28 @@ class _ChatViewState extends State<ChatView> {
     return messages[index - 1].role != 'assistant';
   }
 
-  /// 实心（品牌色）底上的前景色。
+  /// 权限策略的**短名**（输入栏胶囊用；完整说明在权限弹层里）。
   ///
-  /// 不用 `Colors.white`：深色主题的品牌色是提亮过的 #6E8BFF，白字压在它上面
-  /// 只有约 3:1（低于正文 AA 4.5:1）。`surface` 在浅色下是纯白、深色下是近黑的
-  /// #161B22 —— 同一个 token 在两种主题下都恰好是 accent 的正确前景色。
-  Color get _onSolidBubble => context.c.surface;
+  /// 只有两个字：这一行在 360dp 上要和斜杠、附件、模型、麦克风、发送共用，
+  /// 多一个字就会把模型名挤成 `v4.1-fla…`（用户上一轮刚抱怨过这种截断）。
+  String _policyShortLabel(String policy) {
+    switch (policy) {
+      case 'danger-full-access':
+        return '全信任';
+      case 'auto-read':
+        return '只读';
+      case 'ask':
+      default:
+        return '询问';
+    }
+  }
+
+  /// 用户气泡里的前景色。  ///
+  /// [fix 2026-10-17] 气泡底不再是实心 accent，而是 accent 的浅色 tint
+  /// （见 `AppColors.userBubble`），所以前景改用 `textPrimary` —— 深字压浅底，
+  /// 同时让**选区高亮**（accent 半透明）真正看得出来。之前白字压实心蓝时，
+  /// 选中文字几乎无视觉反馈，用户只能靠"复制"按钮猜。
+  Color get _onSolidBubble => context.c.textPrimary;
 
   /// 用户气泡内的 Markdown 样式。
   ///
@@ -1862,6 +1899,9 @@ class _ChatViewState extends State<ChatView> {
       workspaceLabel: dsh.workspaceOfCurrentSession?.title,
       // 轨迹面板必须由这里传入：它的"跳到消息"要用本页的滚动与高亮能力。
       onOpenTrajectory: () => _openTrajectory(dsh),
+      // 信息面板里的「轨迹」tab 用同一条跳转路径（与搜索、刻度跳转完全一致）。
+      onJumpToMessage: (id, index, total) =>
+          _highlightAndScrollToMessage(id, index: index, total: total),
     );
   }
 

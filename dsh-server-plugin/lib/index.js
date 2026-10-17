@@ -3363,6 +3363,116 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
 
+      // ---- 智能体团队 / 子代理列表（[feat 2026-10-17]）----
+      //
+      // 这两个 GET 以前**根本不存在**：App 侧早就写好了面板（团队 / 子代理两块），
+      // 但请求打过来 404，于是永远显示"状态未知"或整块不渲染 —— 用户实测"我这
+      // 会话明明有 8 个子智能体，App 里一个都没有"。
+      //
+      // 数据源是引擎的**投影缓存**，不额外打引擎 RPC：
+      //   * 团队  → rows.agentTeam.val（members / tasks）
+      //   * 子代理 → rows.subagentCatalog.val.head.values（childId / mode / label）
+      // 两者都是引擎自己写下的快照，所以 `source: 'cache'` 要如实回给客户端。
+      //
+      // ⚠️ 与下面的 `/api/mobile/sessions/` 通配路由抢路径，必须排在它**之前**。
+      if (pathname === '/api/mobile/sessions/team' && req.method === 'GET') {
+        const sessionId = String(parsedUrl.query?.sessionId || '').trim();
+        if (!sessionId) {
+          sendJson(400, { ok: false, error: 'sessionId is required' });
+          return;
+        }
+        const rows = readProjectionRows(sessionId);
+        if (!rows) {
+          // 读不到投影 ≠ 没有团队。503 让客户端说"状态未知"，而不是编一个空团队。
+          sendJson(503, { ok: false, error: '投影缓存里没有这个会话（引擎可能没在跑，或会话未落盘）' });
+          return;
+        }
+        const team = rows.agentTeam && rows.agentTeam.val;
+        if (!team) {
+          // 引擎没启用团队能力：supported=false 让面板说清"不是你没有团队"。
+          sendJson(200, { ok: true, supported: false, members: [], tasks: [], source: 'cache' });
+          return;
+        }
+        const title = (rows.title && rows.title.val) || '';
+        const rawMembers = Array.isArray(team.members) ? team.members : [];
+        const members = [{
+          // Lead 就是当前会话本身。引擎的 agentTeam 只存队友，但 App 的模型是
+          // "Lead + 队友"—— 这条 Lead 不是编的，它就是这个 sessionId。
+          id: sessionId,
+          name: title || 'Lead',
+          role: 'lead',
+          phase: 'active',
+          error: '',
+        }];
+        for (const m of rawMembers) {
+          members.push({
+            id: String(m.id || m.sessionId || ''),
+            name: String(m.name || ''),
+            role: 'teammate',
+            phase: String(m.phase || 'active'),
+            error: String(m.error || ''),
+          });
+        }
+        const rawTasks = Array.isArray(team.tasks) ? team.tasks : [];
+        const tasks = rawTasks.map((t) => ({
+          id: String(t.id || ''),
+          revision: Number(t.revision) || 1,
+          subject: String(t.subject || ''),
+          description: String(t.description || ''),
+          status: String(t.status || 'pending'),
+          blockedBy: Array.isArray(t.blockedBy) ? t.blockedBy.map(String) : [],
+          ownerName: String(t.ownerName || t.owner || ''),
+          ready: t.ready === true,
+        }));
+        sendJson(200, { ok: true, supported: true, source: 'cache', members, tasks });
+        return;
+      }
+
+      if (pathname === '/api/mobile/sessions/subagents' && req.method === 'GET') {
+        const sessionId = String(parsedUrl.query?.sessionId || '').trim();
+        if (!sessionId) {
+          sendJson(400, { ok: false, error: 'sessionId is required' });
+          return;
+        }
+        const rows = readProjectionRows(sessionId);
+        if (!rows) {
+          sendJson(503, { ok: false, error: '投影缓存里没有这个会话' });
+          return;
+        }
+        const catalog = rows.subagentCatalog && rows.subagentCatalog.val;
+        const children = (catalog && catalog.head && Array.isArray(catalog.head.values))
+          ? catalog.head.values
+          : [];
+        const subagents = children
+          .map((c) => {
+            const childId = String(c.childId || '');
+            if (!childId) return null;
+            // activity 只能靠"子会话自己的投影里有没有在跑的回合"来读，读不到就是
+            // 'unknown' —— 绝不默认成 'running'（那会让面板显示一排假的绿点）。
+            let activity = 'unknown';
+            try {
+              const childRows = readProjectionRows(childId);
+              const boundary = childRows && childRows.turnBoundary && childRows.turnBoundary.val;
+              if (boundary && (boundary.running === true || boundary.status === 'running')) {
+                activity = 'running';
+              } else if (childRows) {
+                activity = 'inactive';
+              }
+            } catch (_) { /* 读不到就保持 unknown */ }
+            return {
+              id: childId,
+              kind: 'child',
+              mode: String(c.mode || 'one-shot'),
+              label: String(c.label || ''),
+              activity,
+            };
+          })
+          .filter(Boolean);
+        // 键名是 `entries`：App 侧 `fetchSubagents` 读的就是它（见 dsh_service）。
+        sendJson(200, { ok: true, entries: subagents, source: 'cache' });
+        return;
+      }
+
       // ---- 跨会话搜索（标题 + 首条 prompt）----
       //
       // ⚠️ 必须排在下面的 startsWith('/api/mobile/sessions/') 通配路由之前：

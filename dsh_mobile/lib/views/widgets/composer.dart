@@ -155,6 +155,8 @@ class ChatComposer extends StatefulWidget {
     required this.onSteerQueueRow,
     required this.onNoticeAction,
     this.onRevealBlocked,
+    this.policyLabel,
+    this.onPickPermission,
   });
 
   final DshService dsh;
@@ -181,6 +183,18 @@ class ChatComposer extends StatefulWidget {
   /// **为 null 时胶囊只显示计数、不画按钮。** 这个组件不知道宿主是怎么把 dock
   /// 露出来的（滚动、展开、切 tab 都可能），画一个点了没反应的按钮比不画更糟。
   final VoidCallback? onRevealBlocked;
+
+  /// 当前会话的执行策略短名（「每次询问」/「自动只读」/「全信任」）。
+  ///
+  /// [feat 2026-10-17] 对话权限从会话信息面板搬到输入栏，和模型胶囊并排 ——
+  /// 两件事都是"发出去之前我想确认/切换一下"的即时设置，放在离输入框最近的地方
+  /// 才有意义；埋在信息面板的两层里，用户根本不会想到去那儿切。
+  ///
+  /// 为 null 时**不渲染这个胶囊**（宿主没给能力就不画死按钮）。
+  final String? policyLabel;
+
+  /// 点权限胶囊。为 null 时同样不渲染。
+  final VoidCallback? onPickPermission;
 
   @override
   State<ChatComposer> createState() => _ChatComposerState();
@@ -1321,15 +1335,24 @@ class _ChatComposerState extends State<ChatComposer> {
         // 的模型胶囊会把整行顶出去（实测 317 > 316，溢出 1px）。
         // 所以胶囊的可读宽度按**剩余空间**算，而不是钉死一个常量。
         //
-        // 预留：停止键 36（不显示时 0）+ 斜杠命令键 36 + 附件键 36 +
-        // 麦克风 44 + 发送键 44 + 三处间隔 6 + 胶囊自身装饰（内边距/
-        // 图标/箭头）47 + 4 的安全余量。
+        // 预留：停止键 36（不显示时 0）+ 斜杠 36 + 附件 36 + 麦克风 44 +
+        // 发送键 44 + 两处间隔 6 + 模型胶囊自身装饰 47 + 安全余量 4。
+        //
+        // [feat 2026-10-17] 权限胶囊（80dp）**只在实际放得下时才出现**：
+        // 360dp 屏上再叠一条队列状态时这一行是真的没空间了，硬塞会把整行顶溢出
+        // （`queue_steer_impl_test` 的 360×640 用例量到 16px）。宁可少一个胶囊，
+        // 也不能让输入框那一行破版 —— 权限还能从会话信息面板的旧入口进。
         final stopWidth = (dsh.isSending || dsh.isCanceling) ? 36.0 : 0.0;
-        // [feat 2026-10-12] 新增的 "/" 命令键也占 36，必须计入预留，
-        // 否则 360dp 屏上胶囊把整行顶溢出 1px（queue_steer_impl_test 锁的就是这条）。
-        const reserved = 36.0 + 36.0 + 44.0 + 44.0 + 6.0 + 47.0 + 4.0;
-        final textCap =
-            (box.maxWidth - stopWidth - reserved).clamp(40.0, 104.0);
+        const baseReserved = 36.0 + 36.0 + 44.0 + 44.0 + 6.0 + 47.0 + 4.0;
+        final wantsPolicy =
+            widget.policyLabel != null && widget.onPickPermission != null;
+        const policyWidth = 64.0;
+        final showPolicy = wantsPolicy &&
+            (box.maxWidth - stopWidth - baseReserved - policyWidth) >= 40.0;
+        final reserved = baseReserved + (showPolicy ? policyWidth : 0.0);
+        // 下限取 0 而不是 40：空间实在不够时让模型名整段省略（胶囊只剩图标），
+        // 强行保留 40dp 文字就是上面那个 16px 溢出的来源。
+        final textCap = (box.maxWidth - stopWidth - reserved).clamp(0.0, 104.0);
         return Row(
           children: [
             // 停止键固定在**最左**（v1.14）：它曾经和发送键抢同一个位置，
@@ -1356,6 +1379,15 @@ class _ChatComposerState extends State<ChatComposer> {
               onTap: () => _showAttachSheet(dsh),
             ),
             const Spacer(),
+            // [feat 2026-10-17] 对话权限胶囊：与模型胶囊并排、在它左边。
+            //
+            // 为什么搬到这里：切换模型和切换权限是同一类动作 —— "发出去之前先确认
+            // 这一轮按什么规则跑"。它们埋在会话信息面板里时，用户根本想不起来去那
+            // 儿改；而误发的代价（全信任模式下直接执行）比换模型大得多。
+            if (showPolicy) ...[
+              _buildPolicyPill(),
+              const SizedBox(width: 2),
+            ],
             _buildModelPill(dsh, maxTextWidth: textCap),
             const SizedBox(width: 2),
             _buildMicButton(dsh),
@@ -2006,6 +2038,56 @@ class _ChatComposerState extends State<ChatComposer> {
   ///
   /// [maxTextWidth] 由操作行按剩余空间算出来（见 `_buildInputBar`）：手机上横向
   /// 空间不足时先压缩模型名，而不是把整行顶出屏幕。
+  /// 对话权限胶囊（[feat 2026-10-17] 从会话信息面板搬来）。
+  ///
+  /// 只显示**短名**（每次询问 / 自动只读 / 全信任）：这一行在 360dp 上要和
+  /// 斜杠、附件、模型、麦克风、发送共用，长文案会把模型胶囊挤没。
+  /// 颜色按"松紧"分级 —— 全信任是危险色，自动只读是品牌色，每次询问是警告色，
+  /// 让"我现在是不是把闸门开到最大"在余光里也能看出来。
+  Widget _buildPolicyPill() {
+    final label = widget.policyLabel!;
+    final risky = label.contains('全信任');
+    final readable = label.contains('只读');
+    final color = risky
+        ? context.c.danger
+        : (readable ? context.c.accent : context.c.warning);
+    return Tooltip(
+      message: '对话权限：$label（点按切换）',
+      child: InkWell(
+        key: const ValueKey('composer-policy-pill'),
+        onTap: widget.onPickPermission,
+        borderRadius: BorderRadius.circular(9),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.shield_outlined, size: 14, color: color),
+              const SizedBox(width: 4),
+              // Flexible + 48dp 上限：窄屏（360dp）上这一行本来就没有多少余量，
+              // 硬宽的胶囊会把整行顶溢出（`queue_steer_impl_test` 锁的就是这条）。
+              Flexible(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 34),
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600,
+                      color: color,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildModelPill(DshService dsh, {double maxTextWidth = 104}) {
     final full = dsh.currentModel.replaceFirst('cn:', '');
     // [fix 2026-10-17] 真机上这个胶囊显示成 `deepseek-v4.1-...` —— 被截断的
