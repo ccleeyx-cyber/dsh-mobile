@@ -111,7 +111,7 @@ void main() {
     });
   });
 
-  group('首屏自动回补（ensureHistoryTurns）', () {
+  group('首屏全量补齐（ensureFullHistory）', () {
     test('"真人回合"只数真人：注入通知与上下文块都不算', () {
       final dsh = newService();
       dsh.debugSetMessages([
@@ -164,7 +164,7 @@ void main() {
         ),
       ]);
       // 新服务没有网关配置、也没有更多页 → 必须立刻返回，不抛异常。
-      await dsh.ensureHistoryTurns();
+      await dsh.ensureFullHistory();
       expect(dsh.messages.length, 1);
       expect(dsh.hasMoreHistory, isFalse);
     });

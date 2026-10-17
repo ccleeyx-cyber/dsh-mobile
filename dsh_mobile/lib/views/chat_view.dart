@@ -21,6 +21,7 @@ import '../widgets/harness_notice_card.dart';
 import '../widgets/safe_markdown.dart';
 import 'widgets/question_card.dart';
 import 'widgets/attachment_tile.dart';
+import 'widgets/turn_navigation_rail.dart';
 import 'widgets/message_search.dart';
 import 'widgets/message_search_panel.dart';
 import 'widgets/session_status_strip.dart';
@@ -522,6 +523,10 @@ class _ChatViewState extends State<ChatView> {
           _userScrolledUp = true;
         } else if (distFromBottom < 40) {
           _userScrolledUp = false;
+          // 轮次刻度的"当前轮"是**会话级**状态：切会话必须清空，否则会沿用上一个
+          // 会话的轮号（刻度会高亮到不存在的位置）。
+          _visibleTurn = null;
+          _lastTurnProbe = DateTime.fromMillisecondsSinceEpoch(0);
         }
       }
     } else if (notification is ScrollEndNotification) {
@@ -538,7 +543,88 @@ class _ChatViewState extends State<ChatView> {
         _isUserInteracting = true;
       }
     }
+    // [feat 2026-10-17] 轮次刻度的"当前轮"跟着滚动更新。
+    _probeVisibleTurn();
     return false;
+  }
+
+  // ---- 轮次导航刻度（电脑端同款，v1.26.0）----
+  //
+  // 右边缘一列短刻度：一轮一格，当前那轮更深更长，点某格跳到那一轮。
+  // 电脑端有这个东西，手机上以前只能靠滑 —— 十轮的会话要滑好几屏才回得到某一轮。
+
+  /// 当前可见的是第几轮（1 起）；null = 还没算出来（此时刻度都不高亮）。
+  int? _visibleTurn;
+
+  /// 上次算"当前轮"的时刻，用于节流：滚动通知每帧都有，而这里要遍历一遍消息。
+  DateTime _lastTurnProbe = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 轮次刻度的锚点：**每位真人回话一格**。
+  ///
+  /// 与状态条 `N 轮` 同一口径（注入通知、上下文/记忆块都不算），否则"第 6 轮"在
+  /// 两个地方会指不同的东西。
+  List<TurnMark> _turnMarks(DshService dsh) {
+    final marks = <TurnMark>[];
+    for (final m in dsh.messages) {
+      if (!m.isUser || m.isHarnessNotice || m.isContextOrMemory) continue;
+      marks.add(TurnMark(turn: marks.length + 1, messageId: m.id));
+    }
+    return marks;
+  }
+
+  /// 用 GlobalKey 的**全局位置**判断当前轮，而不是按滚动比例估算。
+  ///
+  /// 消息高度差别巨大（一张工具卡能顶十屏），按比例算出来的"第几轮"经常错一两轮 ——
+  /// 而这条刻度的全部意义就是"我现在在第几轮"。
+  void _probeVisibleTurn() {
+    if (!mounted) return;
+    final now = DateTime.now();
+    if (now.difference(_lastTurnProbe).inMilliseconds < 120) return;
+    _lastTurnProbe = now;
+
+    final dsh = context.read<DshService>();
+    final topEdge = MediaQuery.of(context).padding.top + 84; // 顶栏 + 状态条之下
+    var current = 1;
+    var turn = 0;
+    for (final m in dsh.messages) {
+      if (!m.isUser || m.isHarnessNotice || m.isContextOrMemory) continue;
+      turn++;
+      final ctx = _messageKeys[m.id]?.currentContext;
+      if (ctx == null) continue; // 懒列表：这一轮还没被构建
+      final box = ctx.findRenderObject();
+      if (box is! RenderBox || !box.hasSize) continue;
+      if (box.localToGlobal(Offset.zero).dy <= topEdge) current = turn;
+    }
+    if (current != _visibleTurn) setState(() => _visibleTurn = current);
+  }
+
+  /// 跳到第 [turn] 轮：滚到那一轮的第一条真人消息并短暂高亮。
+  ///
+  /// 复用搜索命中/轨迹面板那条路径（`_highlightAndScrollToMessage`），三处行为一致；
+  /// 目标没被构建时它会先按比例粗滚一次，下一帧再精确对齐。
+  void _jumpToTurn(DshService dsh, int turn) {
+    final marks = _turnMarks(dsh);
+    final idx = marks.indexWhere((m) => m.turn == turn);
+    if (idx < 0) return;
+    final mark = marks[idx];
+    final messageIndex = dsh.messages.indexWhere((m) => m.id == mark.messageId);
+    _highlightAndScrollToMessage(
+      mark.messageId,
+      index: messageIndex >= 0 ? messageIndex : null,
+      total: dsh.messages.length,
+    );
+    setState(() => _visibleTurn = turn);
+  }
+
+  /// 浮在消息流右边缘的刻度层。只有一轮时不显示 —— 一格刻度没有导航价值。
+  Widget _buildTurnRail(DshService dsh) {
+    final marks = _turnMarks(dsh);
+    if (marks.length < 2) return const SizedBox.shrink();
+    return TurnNavigationRail(
+      marks: marks,
+      currentTurn: _visibleTurn,
+      onSelect: (turn) => _jumpToTurn(dsh, turn),
+    );
   }
 
   void _jumpToBottom() {
@@ -2391,6 +2477,9 @@ class _ChatViewState extends State<ChatView> {
                               itemCount: messages.length + (showTurnOutput ? 1 : 0) + headerCount,
                               controller: _scrollController,
                               onScrollNotification: _onScrollNotification,
+                              // [feat 2026-10-17] 电脑端同款轮次刻度：右边缘一列短刻度，
+                              // 点某格直接跳到那一轮（十轮以上的会话靠滑是找不回来的）。
+                              overlay: _buildTurnRail(dsh),
                               buildHeader: () => _buildHistoryHeader(dsh),
                               buildItem: (ctx, msgIndex) {
                                 final m = messages[msgIndex];

@@ -624,26 +624,32 @@ class DshService extends ChangeNotifier {
       .where((m) => m.isUser && !m.isHarnessNotice && !m.isContextOrMemory)
       .length;
 
-  /// 首屏轮数不够时，自动往回补几页（v1.24.1）。
+  /// 首屏之后把**整个会话**的历史补齐（v1.26.0）。
   ///
-  /// **为什么需要**：引擎那份历史窗口的预算是按**消息条数**给的，而一条回合里每个
-  /// step 都算一条消息 —— 步数多的会话（实测 351 步 / 6 轮）一页只覆盖一两轮，用户
-  /// 看到的就是"明明有五轮，只显示两三"轮"。上翻虽然能拿到更早的，但用户不知道要
-  /// 往上滑，也不会觉得"这功能坏了"该去滑。
+  /// **为什么不再"补到 N 轮就停"**：1.25.0 设的门槛是 5 个真人回话，而真实会话里
+  /// 一页常常一条真人消息都不含（整页都是工具调用记录）。实测一个 10 轮 / 3600 seq 的
+  /// 会话要 **7 页 / 1.58 MB** 才完整 —— 门槛卡在 4 页时用户看到的还是"只有两三轮"。
+  /// 所以这个门槛本身就是错的：用户要的是"所有记录"。
   ///
-  /// 上限是硬的：每页实测 200~300 KB，所以最多补 [maxPages] 页；补到 [minTurns] 个
-  /// 真人回话就停（再多用户也没在看）。任何一页没有新增消息就立刻停，避免死循环。
-  Future<void> ensureHistoryTurns({int minTurns = 5, int maxPages = 4}) async {
+  /// 现在的策略：一直翻到引擎说 `hasMore=false`，每页结束通知一次界面（列表可见地
+  /// 长出来），并且：
+  ///   * 会话切走立刻停（`_sessionLoadSeq` 变了就不再为旧会话拉）；
+  ///   * 某页没有新增消息立刻停（网关异常时不死循环）；
+  ///   * 页数上限 [maxPages] 是**安全阀**，不是产品门槛（实测 7 页，40 页到不了）。
+  ///
+  /// 每页 200~300 KB，局域网下 7 页约 1~2 秒；列表按需构建，补进来的旧消息不会一次性
+  /// 全部布局。
+  Future<void> ensureFullHistory({int maxPages = 40}) async {
     final seq = _sessionLoadSeq;
     var pages = 0;
-    while (pages < maxPages && hasMoreHistory && _humanTurnCount < minTurns) {
+    while (hasMoreHistory && pages < maxPages) {
       final before = _messages.length;
       await loadOlderHistory();
-      if (seq != _sessionLoadSeq) return; // 会话已切走：别再为旧会话拉
+      if (seq != _sessionLoadSeq) return; // 会话已切走
       pages++;
-      if (_messages.length <= before) break; // 没有进展（例如网关返回空页）
+      if (_messages.length <= before) break; // 没有进展
+      if (pages > 0) notifyListeners();
     }
-    if (pages > 0) notifyListeners();
   }
 
   bool get isSending => _isSending;
@@ -1121,7 +1127,7 @@ class DshService extends ChangeNotifier {
 
   /// 测试用：当前消息列表里算作"真人回合"的条数。
   ///
-  /// [ensureHistoryTurns] 的补页门槛就用它 —— 而"哪些消息算真人回合"这条口径
+  /// [ensureFullHistory] 的补页口径就用它 —— 而"哪些消息算真人回合"这条口径
   /// （注入通知不算、上下文/记忆块不算）只有在这里能单独观察。
   @visibleForTesting
   int get debugHumanTurnCount => _humanTurnCount;
@@ -1471,9 +1477,9 @@ class DshService extends ChangeNotifier {
         // 上下文压力和队列内容。
         unawaited(fetchSessionOverview());
         // [feat 2026-10-17] 首屏那一页常常只覆盖一两轮（窗口的预算是按消息条数给的，
-        // 而每步都算一条消息）。这里在后台补到 5 个真人回话，用户打开就能看到最近
-        // 几轮，而不是"只有两三轮"。上限硬编码在 ensureHistoryTurns 里（最多 4 页）。
-        unawaited(ensureHistoryTurns());
+        // 而每步都算一条消息）。这里在后台把整个会话补齐（实测 10 轮 / 7 页 / 1.58 MB），
+        // 列表可见地一页页长出来；上翻只是兜底，不再依赖用户手动滑。
+        unawaited(ensureFullHistory());
         // 第二档紧接一次：交付物（一次 MUX RPC）→ 变更（一个 git 子进程）。
         // 两个都决定状态条上的数字，但比第一档贵，所以不参与首帧；里面每一环
         // 都带会话守卫，会话切走就停。

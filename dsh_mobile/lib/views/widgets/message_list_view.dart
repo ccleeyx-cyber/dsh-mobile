@@ -28,6 +28,7 @@ class MessageListView extends StatelessWidget {
     required this.headerCount,
     required this.controller,
     required this.onScrollNotification,
+    this.overlay,
   });
 
   /// 消息列表（已按展示顺序）。空列表时本 widget 不渲染任何东西。
@@ -51,11 +52,18 @@ class MessageListView extends StatelessWidget {
   final ScrollController controller;
   final bool Function(ScrollNotification notification) onScrollNotification;
 
+  /// 浮在列表右边缘的一层（轮次导航刻度，v1.26.0）。
+  ///
+  /// 放在这里而不是 `ChatView` 外层的原因：它必须**贴着消息流**（右侧 4dp、垂直居中），
+  /// 而不是贴着整个页面；由 `ChatView` 构造好组件传进来，本 widget 依旧不认识
+  /// `DshService`。
+  final Widget? overlay;
+
   @override
   Widget build(BuildContext context) {
     if (messages.isEmpty) return const SizedBox.shrink();
 
-    return NotificationListener<ScrollNotification>(
+    final list = NotificationListener<ScrollNotification>(
       onNotification: onScrollNotification,
       child: ListView.builder(
         controller: controller,
@@ -73,6 +81,17 @@ class MessageListView extends StatelessWidget {
           return buildTrailer();
         },
       ),
+    );
+
+    if (overlay == null) return list;
+
+    // 刻度整层 IgnorePointer 之外的部分可点：只让刻度自己吃点击，别挡住气泡上的
+    // 长按/链接。Stack 里 overlay 是独立命中的，所以不需要额外包 IgnorePointer。
+    return Stack(
+      children: [
+        Positioned.fill(child: list),
+        Positioned(right: 4, top: 0, bottom: 0, child: overlay!),
+      ],
     );
   }
 }
