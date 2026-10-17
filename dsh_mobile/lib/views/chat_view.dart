@@ -232,14 +232,18 @@ class _ChatViewState extends State<ChatView> {
     // 消息列表是懒构建的：目标不在当前视野里时，它的 GlobalKey 还没有 context，
     // `ensureVisible` 会静默什么都不做 —— 用户点了"跳到消息"却停在原地，还以为
     // 按钮坏了。退一步先按序号比例粗滚一次，下一帧目标被构建出来后再精确定位。
+    //
+    // [fix 2026-10-18] 列表已 reverse：offset 0 = 最新，越旧 offset 越大。
+    // 正序时代 `maxScrollExtent * ratio`（ratio 按 index/total）滚向的是"旧"
+    // 的一端，翻转后同一个 ratio 要用 `max * (1 - ratio)` 才指向同一条消息。
     if (_messageKeys[messageId]?.currentContext == null &&
         index != null &&
         total != null &&
         total > 1 &&
         _scrollController.hasClients) {
       final ratio = (index / (total - 1)).clamp(0.0, 1.0);
-      _scrollController
-          .jumpTo(_scrollController.position.maxScrollExtent * ratio);
+      _scrollController.jumpTo(
+          _scrollController.position.maxScrollExtent * (1 - ratio));
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _scrollToMessageKey(messageId);
       });

@@ -1,9 +1,9 @@
 /// 消息流的滚动状态机与消息流本体。
 ///
-/// Phase 0 结构拆分（纯剪切）：从 `chat_view.dart` 原样搬出，逻辑与样式一字未改。
+/// Phase 0 结构拆分（纯剪切）：从 `chat_view.dart` 原样搬出。
 ///
 /// 两块：
-/// * [ChatScrollController] —— 原来的滚动字段与 `_onScroll` / `_onScrollNotification` /
+/// * [ChatScrollController] —— 滚动字段与 `_onScroll` / `_onScrollNotification` /
 ///   `_jumpToBottom` / `_scrollToBottom` / `_scheduleAutoScroll` / `_maybeLoadOlder`，
 ///   以及 `build()` 顶部那段「键盘高度 / 消息条数 / 流式版本」diff 状态机。
 /// * [ChatMessageStream] —— 消息列表壳：空态、上翻头部、尾部产出卡、回到最新消息浮钮。
@@ -23,8 +23,20 @@ import 'message_list_view.dart';
 
 /// 消息流的滚动状态机。
 ///
-/// 字段与原来 `_ChatViewState` 里的一一对应（名字只去掉了下划线），
-/// 所以 diff 逻辑可以逐行对照原实现读。
+/// [fix 2026-10-18] 列表已改为 `reverse: true`（见 `message_list_view.dart`），
+/// 滚动语义整体翻转：
+/// * **offset 0 = 视觉底部 = 最新消息**。列表挂载即锚定最新内容，因此
+///   "打开会话先看到顶部再跳到底"不复存在 —— 也不需要 1.32.1 的贴底窗口
+///   （`_pinningToBottom` / `_pinStartedAt` / `_isInitialFill` 全部删除）。
+/// * "离底距离" `distFromBottom = maxScrollExtent - offset` 翻转成
+///   "离最新距离" `= offset`（offset 越大越靠上）。
+/// * "用户在底部" = `offset < 40`；"滚到最顶部（触发上翻）" = `offset >= max - 120`。
+/// * 新消息/流式增长发生在**锚定侧**（offset 0 一端）：用户在上面看历史时
+///   视口天然不被拖走 —— `_userScrolledUp` 的守卫依旧保留，但"追滚动条"
+///   的 `scheduleAutoScroll` 只在用户本来就在最新附近时生效。
+/// * 上翻加载更早历史：旧消息加在**非锚定侧**，现有内容视觉位置天然不动 ——
+///   正序时代那套 `oldMax/newMax` delta 平移补偿（探针用例 3 已证明不需要）
+///   整个删除。
 class ChatScrollController {
   ChatScrollController({
     required this.controller,
@@ -67,81 +79,39 @@ class ChatScrollController {
   int _lastStreamRevision = 0;
   int _lastStreamContentLength = 0;
 
-  /// [fix 2026-10-17 用户反馈] 打开会话期间**瞬时**贴底，不做滚动动画。
-  ///
-  /// 痛点：点开会话时消息是分批到达的（缓存回填 → 首屏 GET → 尾部增量），
-  /// 每一次增长都走一次 300ms 的 `scrollToBottom()` 动画 —— 用户看到的就是
-  /// 列表"从上往下一路滚到底"。打开会话不是"来了新消息"，不需要动画，
-  /// 直接定位即可；动画留给会话内真正新到的消息。
-  bool _pinningToBottom = false;
-
-  /// 浮钮是否该出现（离底超过 160）。
+  /// 浮钮是否该出现（离最新超过 160，reverse 列表里即 offset > 160）。
   bool get showScrollToBottom => _showScrollToBottom;
 
   /// 用户是否主动往上翻了（流式自动滚动据此让位）。
   bool get userScrolledUp => _userScrolledUp;
 
-  /// 滑到顶部自动拉更早历史。列表是正序 ListView.builder（offset 0 = 最旧），
-  /// prepend 之后必须把 offset 平移新增内容的实际高度，否则视觉位置会跳。
+  /// 滑到视觉顶部自动拉更早历史。
   ///
-  /// 时序：loadOlderHistory 返回时 notifyListeners 已发出，但 Provider 的重建
-  /// 发生在**下一帧**；whenComplete 此刻读到的 maxScrollExtent 仍是旧值 ——
-  /// 正好把它当作"prepend 前"的基准。postFrame 回调在重建帧结束后执行，那时
-  /// 的 maxScrollExtent 是新值，两者之差就是新增头部的总高度，把 offset 平移
-  /// 同样的量即可保持视觉位置。
+  /// reverse 列表里"视觉顶部" = `maxScrollExtent` 端：判据
+  /// `maxScrollExtent - offset <= 120`（正序时代是 `offset <= 120`）。
+  /// 加载完成后**不需要任何 offset 平移**：旧历史加在非锚定侧，现有内容
+  /// 的视觉位置天然不变（探针用例 3 验证）。
   void maybeLoadOlder(DshService dsh) {
     if (!dsh.hasMoreHistory || _loadingOlder) return;
     if (!controller.hasClients) return;
-    if (controller.position.pixels > 120) return;
+    if (controller.position.maxScrollExtent - controller.offset > 120) return;
     _loadingOlder = true;
     _suppressTailButtonOnce = true;
-    final beforeCount = dsh.messages.length;
     dsh.loadOlderHistory().whenComplete(() {
       _loadingOlder = false;
-      if (!isMounted() || !controller.hasClients) return;
-      final added = dsh.messages.length - beforeCount;
-      if (added <= 0) return;
-      final oldMax = controller.position.maxScrollExtent; // prepend 前
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!isMounted() || !controller.hasClients) return;
-        final newMax = controller.position.maxScrollExtent; // prepend 后
-        final delta = newMax - oldMax;
-        if (delta > 0) {
-          controller.jumpTo(
-            (controller.offset + delta).clamp(0.0, newMax),
-          );
-        }
-      });
+      // reverse 列表：无需 oldMax/newMax delta 补偿（见类注释）。
     });
-  }
-
-  /// 是否还在"打开会话的初始填充"阶段（缓存/首屏/尾部增量陆续到达）。
-  ///
-  /// 判据：仍在拉历史，或这一批消息是在会话打开后很短的一段时间内到达的。
-  /// 超过窗口就认为用户已经在看这个会话了 —— 之后的新消息恢复滚动动画。
-  bool _isInitialFill(DshService dsh) {
-    if (_pinStartedAt == null) return false;
-    return DateTime.now().difference(_pinStartedAt!).inMilliseconds < 1500;
-  }
-
-  DateTime? _pinStartedAt;
-
-  /// 用户主动滚动时取消贴底窗口：他已经接管了位置，不该再被"拉回底部"。
-  void _cancelPinning() {
-    _pinningToBottom = false;
   }
 
   void onScroll() {
     if (!controller.hasClients) return;
-    final maxScroll = controller.position.maxScrollExtent;
-    final currentOffset = controller.offset;
-    final distFromBottom = maxScroll - currentOffset;
-    final show = distFromBottom > 160;
+    final offset = controller.offset;
+    final show = offset > 160;
     if (show != _showScrollToBottom) {
       _showScrollToBottom = show;
       onStateChanged();
     }
-    if (distFromBottom < 40 && _userScrolledUp) {
+    if (offset < 40 && _userScrolledUp) {
       _userScrolledUp = false;
     }
   }
@@ -151,19 +121,14 @@ class ChatScrollController {
     if (notification is ScrollStartNotification) {
       if (notification.dragDetails != null) {
         _isUserInteracting = true;
-        // [fix 2026-10-17] 用户一上手就不再"贴底"：他已接管位置。
-        _cancelPinning();
       }
     } else if (notification is ScrollUpdateNotification) {
       if (notification.dragDetails != null) {
         _isUserInteracting = true;
-        _cancelPinning();
-        final maxScroll = notification.metrics.maxScrollExtent;
-        final currentOffset = notification.metrics.pixels;
-        final distFromBottom = maxScroll - currentOffset;
-        if (distFromBottom > 120) {
+        final offset = notification.metrics.pixels;
+        if (offset > 120) {
           _userScrolledUp = true;
-        } else if (distFromBottom < 40) {
+        } else if (offset < 40) {
           _userScrolledUp = false;
           // 轮次刻度的"当前轮"是**会话级**状态：切会话必须清空，否则会沿用上一个
           // 会话的轮号（刻度会高亮到不存在的位置）。
@@ -172,9 +137,8 @@ class ChatScrollController {
       }
     } else if (notification is ScrollEndNotification) {
       _isUserInteracting = false;
-      final maxScroll = notification.metrics.maxScrollExtent;
-      final currentOffset = notification.metrics.pixels;
-      if (maxScroll - currentOffset < 40) {
+      final offset = notification.metrics.pixels;
+      if (offset < 40) {
         _userScrolledUp = false;
       }
     } else if (notification is UserScrollNotification) {
@@ -189,21 +153,23 @@ class ChatScrollController {
     return false;
   }
 
+  /// 回到最新消息（reverse 列表：jump 到 offset 0）。
   void jumpToBottom() {
     _userScrolledUp = false;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (controller.hasClients) {
-        controller.jumpTo(controller.position.maxScrollExtent);
+        controller.jumpTo(0);
       }
     });
   }
 
+  /// 平滑滚回最新消息（会话内来了真正的新消息时用；reverse：target = 0）。
   void scrollToBottom({Duration duration = const Duration(milliseconds: 300), Curve curve = Curves.easeOutCubic}) {
     _userScrolledUp = false;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (controller.hasClients) {
         controller.animateTo(
-          controller.position.maxScrollExtent,
+          0,
           duration: duration,
           curve: curve,
         );
@@ -211,6 +177,10 @@ class ChatScrollController {
     });
   }
 
+  /// 流式增长期间的自动贴最新。
+  ///
+  /// reverse 列表锚定底边：用户在最新附近时 offset 本来就接近 0，新内容
+  /// 在锚定侧生长不会推开视口 —— 这里只需把 offset 归零即可"贴住"。
   void scheduleAutoScroll() {
     if (_isAutoScrollScheduled) return;
     _isAutoScrollScheduled = true;
@@ -220,19 +190,16 @@ class ChatScrollController {
       if (_userScrolledUp || _isUserInteracting) return;
       if (!controller.hasClients) return;
 
-      final maxScroll = controller.position.maxScrollExtent;
-      final currentOffset = controller.offset;
-      final diff = maxScroll - currentOffset;
-
-      if (diff > 0) {
-        if (diff > 250) {
+      final offset = controller.offset;
+      if (offset > 0) {
+        if (offset > 250) {
           controller.animateTo(
-            maxScroll,
+            0,
             duration: const Duration(milliseconds: 150),
             curve: Curves.easeOutCubic,
           );
         } else {
-          controller.jumpTo(maxScroll);
+          controller.jumpTo(0);
         }
       }
     });
@@ -241,11 +208,14 @@ class ChatScrollController {
   /// `build()` 顶部那段滚动 diff 状态机（键盘高度 / 流式增长 / 消息条数 / 会话切换）。
   ///
   /// 原实现直接写在 `build()` 里，靠副作用更新字段；搬出来之后调用点在
-  /// `build()` 的第一行，语义完全一致：**仍在 build 期间执行**，因此那些
-  /// `setState` 的时序怪癖（例如"用户在上方时点亮浮钮"）与原来逐字相同。
+  /// `build()` 的第一行，语义完全一致：**仍在 build 期间执行**。
   ///
   /// [onSessionSwitched] 承接会话切换时属于 State 的那部分重置（队列展开态、
   /// 产出卡锚点、交付物未读计数、草稿换槽）—— 这些字段的持有者仍是 `_ChatViewState`。
+  ///
+  /// [fix 2026-10-18] reverse 列表语义：会话切换/历史加载收尾时**不再需要任何
+  /// jumpToBottom** —— 列表天然锚定最新。只有"用户在上方、新一批消息到达"
+  /// 时的浮钮提示逻辑保留。
   void syncBeforeBuild(
     DshService dsh,
     double currentBottomInset, {
@@ -261,7 +231,7 @@ class ChatScrollController {
       if (isKeyboardOpening && _wasNearBottomBeforeKeyboard && !_userScrolledUp) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (controller.hasClients && !_userScrolledUp && !_isUserInteracting) {
-            controller.jumpTo(controller.position.maxScrollExtent);
+            controller.jumpTo(0);
           }
         });
       }
@@ -283,17 +253,16 @@ class ChatScrollController {
       // 会话级的界面状态跟着切：队列展开态、产出卡片锚点、失败提示、草稿换槽。
       // 这一段属于 State，交回给调用方（顺序与原来一致：先清界面态，再换草稿）。
       onSessionSwitched(previousSessionId);
-      // [fix 2026-10-17] 打开会话进入"贴底窗口"：后续几批消息（缓存回填 →
-      // 首屏 GET → 尾部增量）一律 jumpTo 到底，不再逐批做 300ms 动画。
-      _pinningToBottom = true;
-      _pinStartedAt = DateTime.now();
-      jumpToBottom();
+      // reverse 列表天然锚定最新：无需贴底窗口、无需 jumpToBottom。
+      _userScrolledUp = false;
     } else if (_wasLoadingHistory && !dsh.isLoadingHistory) {
       _lastStreamRevision = dsh.streamRevision;
       _userScrolledUp = false;
-      jumpToBottom();
-      // 历史加载收尾：贴底窗口结束（之后新消息恢复动画）。
-      _pinningToBottom = false;
+      // 历史加载收尾：reverse 列表无需归零 —— 但要防住"加载期间列表被
+      // 整体重建、offset 语义漂移"的极端情况：在最新附近就归零贴住。
+      if (controller.hasClients && controller.offset < 40) {
+        jumpToBottom();
+      }
     } else if (dsh.messages.length != _lastMessageCount) {
       final wasNearBottom = !_userScrolledUp;
       final fromPrepend = _suppressTailButtonOnce;
@@ -302,14 +271,9 @@ class ChatScrollController {
       _lastMessageCount = dsh.messages.length;
       _lastStreamRevision = dsh.streamRevision;
       if (wasNearBottom) {
-        // [fix 2026-10-17] 贴底窗口内（刚打开会话）用瞬时定位，避免"一路滚下来"。
-        if (_pinningToBottom &&
-            (dsh.isLoadingHistory || _isInitialFill(dsh))) {
-          jumpToBottom();
-        } else {
-          _pinningToBottom = false;
-          scrollToBottom();
-        }
+        // reverse 列表锚定底边：在最新附近时新内容不会推走视口，
+        // 只需把 offset 归零贴住（消息从缓存回填/首屏到齐时保证贴最新）。
+        jumpToBottom();
       } else if (appendedAtTail) {
         // [feat 2026-10-12] 用户在上方、尾部来了新消息：确保"回到最新消息"
         // 浮钮出现（_onScroll 只在滚动时刷新它，新消息到达不滚动的话浮钮
@@ -327,8 +291,9 @@ class ChatScrollController {
     }
     _wasLoadingHistory = dsh.isLoadingHistory;
 
-    // [feat 2026-10-12] 顶部触发上翻：仅在用户真的滑到顶部（pixels<=120）且
-    // 还有更早历史时拉取。放在会话切换块之后，避免切会话首帧误触发。
+    // [feat 2026-10-12] 顶部触发上翻：仅在用户真的滑到视觉顶部（reverse 列表：
+    // maxScrollExtent - offset <= 120）且还有更早历史时拉取。放在会话切换块
+    // 之后，避免切会话首帧误触发。
     if (!dsh.isLoadingHistory && dsh.messages.isNotEmpty) {
       maybeLoadOlder(dsh);
     }
@@ -506,7 +471,7 @@ class ChatMessageStream extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (dsh.isLoadingHistory) {
+    if (dsh.isLoadingHistory && dsh.messages.isEmpty) {
       return const Center(child: CircularProgressIndicator());
     }
     return Stack(
@@ -524,6 +489,10 @@ class ChatMessageStream extends StatelessWidget {
           // （`dsh.messages => _messages`），流式期间只原地改内容，Selector 的 `==`
           // 比较永远判等 → 列表根本不会重建。streamRevision 每个 flush 边界都自增，
           // 是这里唯一可靠的"内容变了"信号。
+          //
+          // [fix 2026-10-18] isLoadingHistory 但缓存已有内容时不再整屏转圈：
+            // reverse 列表天然锚定最新，缓存回填的内容直接可见，转圈盖住它是
+            // "打开白屏一下"的来源。
           Selector<DshService, int>(
             selector: (BuildContext ctx, DshService d) => d.streamRevision,
             builder: (BuildContext ctx, _, __) {
