@@ -2106,7 +2106,13 @@ export function apply(ctx, config = {}, internals = {}) {
     // 0. One-shot stream bookkeeping (job/list today). Handled before anything
     // else so an `item`, `end`, or `error` frame for a one-shot stream can
     // never fall into the session-follow branches below.
-    if (typeof msg.streamId === 'string' && msg.streamId.startsWith('oneshot-')) {
+    //
+    // [fix 2026-10-17] readStreamFrames 生成的 streamId 前缀是 `collect-`（:767），
+    // 而这里此前只认 `oneshot-` —— collect- 的 opened/output/status 帧永远找
+    // 不到 pendingOneshot 条目被静默丢弃，jobs/follow 只能靠超时返回空。
+    // pendingOneshot 是两者共用的注册表，前缀同时匹配即可。
+    if (typeof msg.streamId === 'string' &&
+        (msg.streamId.startsWith('oneshot-') || msg.streamId.startsWith('collect-'))) {
       const oneshot = pendingOneshot.get(msg.streamId);
       if (!oneshot) return;
       if (msg.type === 'item') oneshot.push(msg.value);
@@ -2854,9 +2860,33 @@ export function apply(ctx, config = {}, internals = {}) {
     // pairSession 体系），绝不内嵌长期 token —— 屏幕上的二维码会被拍照/截图留存，
     // 嵌入长期 token 等于把凭据印在纸上。手机扫到码后仍要走 /__mobile/pair
     // 换取真正的设备 token，5 次错码作废、10 分钟过期逻辑全部沿用。
-    // 该路由在鉴权之前可达（配对前手机没有凭据），与 /__mobile/pair 同级；
-    // 泄露面 = 一枚 10 分钟过期的配对码，与设置页手工生成等价。
+    //
+    // [fix 2026-10-17] 配对码铸造不再零门槛：这两条路由此前在鉴权门前可无限
+    // 自助发码，公网部署下等于"任何能连到网关的人自己发码再自己兑" —— 5 次
+    // 错码锁定保护的是猜码，管不住自助发码。新规则（二选一满足即可）：
+    //   a) 请求带有效 admin/设备 token（电脑端扫码页本来就持有）；
+    //   b) 无 token 时仅当来源是私网（RFC1918/loopback）才放行 —— 局域网
+    //      配对是主用法；公网来源一律 403，提示走设置页生成。
+    const pairMintAllowed = () => {
+      const auth = authenticateRequest(req, parsedUrl);
+      if (auth.ok) return { ok: true };
+      const ip = req.socket?.remoteAddress || '';
+      const isPrivate =
+        ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' ||
+        ip.startsWith('::ffff:10.') || ip.startsWith('10.') ||
+        ip.startsWith('::ffff:192.168.') || ip.startsWith('192.168.') ||
+        /^(::ffff:)?172\.(1[6-9]|2\d|3[01])\./.test(ip);
+      return isPrivate
+        ? { ok: true }
+        : { ok: false, reason: '配对码只对本机/局域网来源开放；远程请先在电脑端 DSH 设置页生成配对码' };
+    };
     if ((pathname === '/pair/qr' || pathname === '/api/mobile/pair/qr') && req.method === 'GET') {
+      const mint = pairMintAllowed();
+      if (!mint.ok) {
+        audit('pair/qr-denied', { ip: req.socket?.remoteAddress });
+        sendJson(403, { ok: false, error: mint.reason });
+        return;
+      }
       // 生成一枚新配对码，等价于设置页点了一次"生成配对码"。
       const code = newPairCode();
       const expiresAt = Date.now() + pairCodeTtlMs();
@@ -2914,6 +2944,13 @@ export function apply(ctx, config = {}, internals = {}) {
     }
 
     if ((pathname === '/pair/info' || pathname === '/api/mobile/pair/info') && req.method === 'GET') {
+      // [fix 2026-10-17] 与 /pair/qr 同一把闸：公网无 token 来源不发码。
+      const mintInfo = pairMintAllowed();
+      if (!mintInfo.ok) {
+        audit('pair/info-denied', { ip: req.socket?.remoteAddress });
+        sendJson(403, { ok: false, error: mintInfo.reason });
+        return;
+      }
       // 兜底：不依赖 qrcode 包的 JSON 形态，App 显示 6 位数字码供手工输入。
       const code = newPairCode();
       const expiresAt = Date.now() + pairCodeTtlMs();
@@ -3087,45 +3124,20 @@ export function apply(ctx, config = {}, internals = {}) {
     // Keep the device's lastSeenAt fresh so the settings page can show real usage.
     if (auth.device?.id && auth.device.id !== 'admin') touchDevice(auth.device.id, req.socket?.remoteAddress || '');
 
-    // Read-only device gate. roleCanWrite() used to be `return true`, so the
-    // role recorded at pairing was decoration. Writes are denied here, once,
-    // instead of being sprinkled through every mutating route.
-    const WRITE_PATHS = [
-      '/api/mobile/upload',
-      '/api/mobile/sessions/prompt',
-      '/api/mobile/sessions/cancel',
-      '/api/mobile/sessions/delete',
-      '/api/mobile/sessions/create',
-      '/api/mobile/sessions/model',
-      '/api/mobile/sessions/archive',
-      '/api/mobile/sessions/rename',
-      '/api/mobile/sessions/permission',
-      '/api/mobile/settings/model',
-      '/api/mobile/permissions',
-      '/api/mobile/approval',
-      '/api/mobile/workspace/memory',
-      '/api/mobile/memory',
-      '/api/mobile/personas',
-      '/api/mobile/snippets',
-      // v1.14：队列插话、定时任务删除、作业终止、推送配置
-      '/api/mobile/sessions/queue',
-      '/api/mobile/schedules/delete',
-      '/api/mobile/jobs/kill',
-      '/api/mobile/push/config',
-      '/api/mobile/push/test',
-      // v1.15：设备撤销（电脑端踢设备）
-      '/api/mobile/devices/revoke',
-      '/__mobile/devices/revoke',
-      // [feat 2026-10-12] 子代理中断与 goal 暂停/继续/完成（真实引擎 RPC 的写操作）
-      '/api/mobile/sessions/subagents/interrupt',
-      '/api/mobile/goals/pause',
-      '/api/mobile/goals/resume',
-      '/api/mobile/goals/complete'
-    ];
-    if (req.method === 'POST' || req.method === 'PUT') {
-      const isWrite = WRITE_PATHS.some((p) => pathname === p) ||
-        (pathname === '/api/mobile/workspace/memory' && req.method === 'POST');
-      if (isWrite && !roleCanWrite(auth.device?.role)) {
+    // Read-only device gate.
+    //
+    // [fix 2026-10-17] **反转为 deny-by-default**。旧模型是 WRITE_PATHS 白名单
+    // 枚举"哪些 POST 是写"，新增路由一旦忘了登记就给 readonly 放行 —— 历史上
+    // 已经漏过三轮（workspaces/create / approval-presets/save|delete /
+    // push/auto-topic / quick-commands/run / goals/create|edit / sessions/fork
+    // 全部在名单外）。新模型：POST/PUT **一律视为写**、拒绝 readonly，除非
+    // 路径在显式的 READONLY_ALLOWED_POST 例外表里（只读的 POST 极少）。
+    const READONLY_ALLOWED_POST = new Set([
+      // 目前确认对只读无害的 POST（逐条审过才加）：
+      // （暂无 —— 全部 POST 路由要么改状态、要么消耗宿主资源。要加先在这里登记理由。）
+    ]);
+    if ((req.method === 'POST' || req.method === 'PUT') && !roleCanWrite(auth.device?.role)) {
+      if (!READONLY_ALLOWED_POST.has(pathname)) {
         sendJson(403, { ok: false, code: 403, error: '该设备为只读角色，无权执行写操作' });
         audit('auth/readonly-denied', { path: pathname, device: auth.device?.id, role: auth.device?.role });
         return;
@@ -3223,7 +3235,25 @@ export function apply(ctx, config = {}, internals = {}) {
     //
     // 引擎的 session/attachment RPC 需要 sessionId 做授权（它只允许读这个会话
     // 真正引用过的图片），因此 App 必须把 sessionId 一起带上。
-    if (pathname === '/api/mobile/attachment' && req.method === 'GET') {
+      if (pathname === '/api/mobile/attachment' && req.method === 'GET') {
+      // [fix 2026-10-17] 频率桶（与 upload 同款）：32MB 附件经 RPC base64 返回，
+      // 峰值内存约 3 倍——已认证客户端无限频循环请求可把 dsh web 堆压向 OOM。
+      // 60s / 30 次：正常图片列表加载绰绰有余，脚本式循环会被 429。
+      {
+        const attachKey = `attachment:${auth.device?.id || req.socket?.remoteAddress || 'anon'}`;
+        const nowMs = Date.now();
+        let bucket = uploadBuckets.get(attachKey);
+        if (!bucket || nowMs - bucket.windowStart > 60000) {
+          bucket = { windowStart: nowMs, count: 0 };
+          uploadBuckets.set(attachKey, bucket);
+        }
+        bucket.count++;
+        if (bucket.count > 30) {
+          sendJson(429, { ok: false, error: '请求过于频繁，稍后再试' });
+          audit('attachment/rate-limited', { device: attachKey });
+          return;
+        }
+      }
       const attId = String(parsedUrl.query?.id || '').trim();
       const attSession = String(parsedUrl.query?.sessionId || '').trim();
       if (!attId) {
@@ -3712,6 +3742,27 @@ export function apply(ctx, config = {}, internals = {}) {
         else if (jsonBody.cwd) requestPayload.cwd = jsonBody.cwd;
 
         const result = await callDshRpc('session/create', { args: { request: requestPayload } });
+
+        // [fix 2026-10-17] 默认模型兜底注入：客户端在 create 后会自己调
+        // sessions/model（主修路径），这里只处理"老客户端 / 客户端没注入"的
+        // 情况 —— 带 model 字段时 create 成功后补一次 selectModel RPC。
+        // 失败不阻塞建会话：引擎侧兜底仍是全局默认。
+        const createModel = String(jsonBody.model || '').trim();
+        if (createModel && result?.sessionId) {
+          try {
+            const resolved = await resolveModelSelection(createModel);
+            if (resolved.ok) {
+              await callDshRpc('session/selectModel', {
+                args: { request: { sessionId: result.sessionId, provider: resolved.provider, model: resolved.model } }
+              });
+            } else {
+              logger.warn('[dsh-mobile-bridge] create 默认模型解析失败 %s: %s', createModel, resolved.error);
+            }
+          } catch (e) {
+            logger.warn('[dsh-mobile-bridge] create 默认模型注入失败: %s', e?.message || e);
+          }
+        }
+
         sendJson(200, { ok: true, code: 0, sessionId: result?.sessionId, session: result });
         return;
       }
@@ -4246,6 +4297,9 @@ export function apply(ctx, config = {}, internals = {}) {
     if (pathname === '/mobile-ws' || pathname === '/api/mobile/ws') {
       const auth = authenticateRequest(req, parsed);
       if (!auth.ok) {
+        // [fix 2026-10-17] upgrade 鉴权失败同样计入爆破退避：此前只回 401 不
+        // noteAuthFailure，走 WS 通道爆破 token 可完全绕开 HTTP 侧的限速。
+        try { noteAuthFailure(req); } catch (_) {}
         socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
         socket.destroy();
         return;

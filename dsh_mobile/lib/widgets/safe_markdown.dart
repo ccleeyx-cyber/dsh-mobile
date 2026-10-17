@@ -5,21 +5,99 @@ import '../theme/app_colors.dart';
 import 'genui/genui_parse.dart';
 import 'genui/genui_view.dart';
 
-String sanitizeMarkdown(String? raw) {
-  if (raw == null || raw.isEmpty) return '';
+/// 按 CommonMark 行首围栏规则切出代码段：代码段内的 `<` **不做**转义
+/// （[fix 2026-10-17] 此前对全文无差别转义，交付物预览里 `if (a < b)`
+/// 被污染成 `if (a &lt; b)`）；闭合判定与 parseGenuiSegments 同步修为
+/// 「长度 ≥ 开启长度」（CommonMark）。
+List<bool> _fenceMask(String text) {
+  final lines = text.split('\n');
+  final mask = List<bool>.filled(lines.length, false);
+  final open = RegExp(r'^\s{0,3}(`{3,}|~{3,})');
+  String? fenceChar;
+  int fenceLen = 0;
+  for (var i = 0; i < lines.length; i++) {
+    if (fenceChar == null) {
+      final m = open.firstMatch(lines[i]);
+      if (m != null) {
+        fenceChar = m.group(1)![0];
+        fenceLen = m.group(1)!.length;
+        // 开启围栏那一行本身不转义（info string 可能含 `<>`）。
+        mask[i] = true;
+      }
+    } else {
+      final close =
+          RegExp('^\\s{0,3}${RegExp.escape(fenceChar)}{$fenceLen,}\\s*\$')
+              .firstMatch(lines[i]);
+      mask[i] = true;
+      if (close != null) {
+        fenceChar = null;
+        fenceLen = 0;
+      }
+    }
+  }
+  // 未闭合：剩下一直到结尾都算代码段（与"自动补围栏"语义一致）。
+  return mask;
+}
+
+String _sanitizeMarkdownOnce(String raw) {
   var text = raw.replaceAll('\u0000', '');
 
-  // 1. Auto-close dangling code fences (odd count of ```)
-  final fenceMatches = RegExp(r'```').allMatches(text);
-  if (fenceMatches.length % 2 != 0) {
-    text = '$text\n```';
+  // 1. Auto-close dangling code fences（按行首围栏计数，不数行中的 ```）。
+  {
+    final lines = text.split('\n');
+    var openFences = 0;
+    String? fenceChar;
+    int fenceLen = 0;
+    final open = RegExp(r'^\s{0,3}(`{3,}|~{3,})');
+    for (final line in lines) {
+      if (fenceChar == null) {
+        final m = open.firstMatch(line);
+        if (m != null) {
+          fenceChar = m.group(1)![0];
+          fenceLen = m.group(1)!.length;
+          openFences++;
+        }
+      } else {
+        final close =
+            RegExp('^\\s{0,3}${RegExp.escape(fenceChar)}{$fenceLen,}\\s*\$')
+                .firstMatch(line);
+        if (close != null) {
+          openFences--;
+          fenceChar = null;
+          fenceLen = 0;
+        }
+      }
+    }
+    if (openFences % 2 != 0) text = '$text\n```';
   }
 
-  // 2. Escape isolated/unmatched angle brackets that would crash XML/HTML tokenizers
-  // Replaces '<' not followed by a letter, '/', or '!' with '&lt;'
-  text = text.replaceAll(RegExp(r'<(?![a-zA-Z/!])'), '&lt;');
+  // 2. Escape isolated/unmatched angle brackets —— **只对非代码段**
+  //（[fix 2026-10-17] 代码块内容在 markdown 里不做实体解码，转义会把
+  // `if (a < b)` 显示成 `if (a &lt; b)`）。
+  final mask = _fenceMask(text);
+  final lines = text.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    if (mask[i]) continue;
+    lines[i] = lines[i].replaceAll(RegExp(r'<(?![a-zA-Z/!])'), '&lt;');
+  }
+  return lines.join('\n');
+}
 
-  return text;
+/// 按文本 memo 的 sanitize（[fix 2026-10-17]）：流式期间每帧全量重跑
+/// 两条正则是长回复卡顿的来源之一。LRU=8 足够覆盖可见消息。
+final Map<String, String> _sanitizeCache = <String, String>{};
+const int _sanitizeCacheLimit = 8;
+
+String sanitizeMarkdown(String? raw) {
+  if (raw == null || raw.isEmpty) return '';
+  final cached = _sanitizeCache[raw];
+  if (cached != null) return cached;
+  final result = _sanitizeMarkdownOnce(raw);
+  if (_sanitizeCache.length >= _sanitizeCacheLimit) {
+    _sanitizeCache.remove(_sanitizeCache.keys.first);
+  }
+  _sanitizeCache[raw] = result;
+  return result;
 }
 
 /// 消息正文的渲染入口：markdown + ```dsh-ui 组件。

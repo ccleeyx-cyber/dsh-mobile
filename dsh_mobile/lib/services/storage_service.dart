@@ -342,6 +342,10 @@ class StorageService {
     // 失败而删不掉网关。
     await SecureStore.delete(_tokenKey(id));
     await SecureStore.delete(_authKey(id));
+    // [fix 2026-10-17] 迁移前的旧槽（_activeSecretScope）也要清：profile 早年
+    // 可能还没分配 id 就把密文写在了 active 槽里，只删主槽会把它留在 Keystore。
+    await SecureStore.delete(_tokenKey(_activeSecretScope));
+    await SecureStore.delete(_authKey(_activeSecretScope));
     final prefs = await SharedPreferences.getInstance();
     if (prefs.getString(_keyActiveId) == id) {
       // 删掉的正是当前网关 → 留一个空墓碑，而不是把键删掉：键一旦不存在，
@@ -396,6 +400,11 @@ class StorageService {
     final values = <String, String>{};
     if (c.token.isNotEmpty) values[_tokenKey(scope)] = c.token;
     if (c.authCode.isNotEmpty) values[_authKey(scope)] = c.authCode;
+    // [fix 2026-10-17] 空字段 = 用户清掉了这个凭据：必须把密文槽一起删掉。
+    // 此前这里只写非空值、从不 delete —— 下次 _resolveSecret 读到旧密文回填，
+    // 用户删除的凭据"复活"，UI 无法摆脱。
+    if (c.token.isEmpty) await SecureStore.delete(_tokenKey(scope));
+    if (c.authCode.isEmpty) await SecureStore.delete(_authKey(scope));
     if (values.isEmpty) return const {};
 
     await SecureStore.writeAll(values);

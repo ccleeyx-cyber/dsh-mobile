@@ -137,8 +137,12 @@ class _ChatViewState extends State<ChatView> {
   ///
   /// 与 `_toast` 分开：`_toast` 走 SnackBar，会被下一条 toast 顶掉且 2 秒消失，
   /// 而"你刚写的一大段话没发出去"这种事必须留在原地让用户看见。
-  late final ValueNotifier<ComposerNotice?> _notice = ValueNotifier(null);
-  Timer? _noticeTimer;
+  ///
+  /// [fix 2026-10-17] 从裸 ValueNotifier + 本地 Timer 改为 [ComposerNoticeBus]：
+  /// 此前父级（5s）与 composer（4s）各持一个 Timer 共用同一个 notifier、互不知晓
+  /// —— 先弹排队回执再弹语音失败，第 5 秒排队的 Timer 会把语音错误提前清空。
+  /// timer 收敛到总线后，任何一侧写入都取消上一条，生命周期只有一份。
+  final ComposerNoticeBus _noticeBus = ComposerNoticeBus();
 
   /// 最近一次「立即插话」成功的那一条（v1.27：3 秒回执里的撤销靠它）。
   ///
@@ -154,22 +158,17 @@ class _ChatViewState extends State<ChatView> {
     String? undoItemId,
     Duration duration = const Duration(seconds: 5),
   }) {
-    _noticeTimer?.cancel();
-    _notice.value = ComposerNotice(
-      text: text,
+    _noticeBus.show(
+      text,
       ok: ok,
       action: action,
       undoItemId: undoItemId,
+      duration: duration,
     );
-    _noticeTimer = Timer(duration, () {
-      if (mounted) _notice.value = null;
-    });
   }
 
   void _clearNotice() {
-    _noticeTimer?.cancel();
-    _noticeTimer = null;
-    _notice.value = null;
+    _noticeBus.clear();
   }
 
   /// 测试用：直接挂一个附件，绕开原生选择器（单测里调不起来）。
@@ -180,7 +179,7 @@ class _ChatViewState extends State<ChatView> {
 
   /// 测试用：读取输入卡片上方那条提示的文案（没有提示时为 null）。
   @visibleForTesting
-  String? get debugNoticeText => _notice.value?.text;
+  String? get debugNoticeText => _noticeBus.notice.value?.text;
 
   void _toggleSearch() {
     setState(() {
@@ -247,10 +246,24 @@ class _ChatViewState extends State<ChatView> {
     }
 
     // 高亮会淡出，所以不必永久留在 _highlightedMessageIds 里。
+    // [fix 2026-10-17] 记 token 防互踩：连续两次跳同一条消息时，第一次的
+    // 3s Timer 到期会把第二次刚设的高亮提前清掉。只有"仍是本次高亮"才清。
+    final highlightToken = ++_highlightToken;
     Future.delayed(const Duration(seconds: 3), () {
-      if (mounted) setState(() => _highlightedMessageIds.remove(messageId));
+      if (!mounted || highlightToken != _highlightToken) return;
+      setState(() => _highlightedMessageIds.remove(messageId));
     });
   }
+
+  int _highlightToken = 0;
+
+  // ---- 会话内查找的记忆化（[fix 2026-10-17]）----
+  String _searchCacheKey = '';
+  List<({SearchHit first, int count})> _searchCacheHits = const [];
+  int _searchCacheTotal = 0;
+
+  /// 展开态命中总数：折叠只在记忆化 miss 时算一次，原始命中数随 miss 一并缓存。
+  int get _searchTotalCount => _searchCacheTotal;
 
   void _scrollToMessageKey(String messageId) {
     final ctx = _messageKeys[messageId]?.currentContext;
@@ -263,8 +276,10 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
-  GlobalKey _keyForMessage(String id) =>
-      _messageKeys.putIfAbsent(id, () => GlobalKey());
+  GlobalKey _keyForMessage(String id) {
+    _messageIdsInCurrentBuild.add(id);
+    return _messageKeys.putIfAbsent(id, () => GlobalKey());
+  }
 
   @override
   void initState() {
@@ -335,8 +350,7 @@ class _ChatViewState extends State<ChatView> {
     _inputFocusNode.removeListener(_onInputFocusChange);
     _scrollController.removeListener(_scroll.onScroll);
 
-    _noticeTimer?.cancel();
-    _notice.dispose();
+    _noticeBus.dispose();
     _deliverableBusy.dispose();
 
     _inputFocusNode.dispose();
@@ -640,12 +654,12 @@ class _ChatViewState extends State<ChatView> {
     final sessionId = currentSession?.sessionId ?? 'default';
     final policy = dsh.getSessionPermission(sessionId);
     final currentSessionId = currentSession?.sessionId;
-    // [fix 2026-10-11] The old second clause compared currentSession with
-    // dsh.currentSession — usually itself — so it carried no information and
-    // the flag degenerated to `isRunning || dsh.isSending`, letting another
-    // session's running turn light up THIS session's stop/queue affordances.
-    // Gate on the service's actual running-session id instead.
-    final dshRunningId = dsh.currentSession?.sessionId;
+    // [fix 2026-10-11 → 2026-10-17 真修] 此前 dshRunningId 取自
+    // dsh.currentSession —— 与 currentSession 自比恒真，修复是空操作：只要
+    // isSending 全局为真，别的会话在跑时本会话也点亮停止键。现在用服务侧
+    // 真正记录的"正在发送的会话 id"（所有 _isSending 置 true 的写入点都会
+    // 在 _setSending 里登记归属）。
+    final dshRunningId = dsh.sendingSessionId;
     final isSessionRunning = (currentSession?.isRunning ?? false) ||
         (dsh.isSending &&
             dshRunningId != null &&
@@ -818,16 +832,27 @@ class _ChatViewState extends State<ChatView> {
           // [fix 2026-10-11] Run the full-text scan exactly once per build.
           // Calling MessageSearch.search twice here meant every streaming
           // rebuild scanned all messages two more times (O(n·len) × 2).
+          //
+          // [fix 2026-10-17] 记忆化：查询与消息条数都没变时沿用上次结果。
+          // 流式期间每个 tick 都重建，而 O(n·len) 全文扫描在长会话 + 打开搜索
+          // 时是最重的路径 —— 输入框打一个字都跟着卡。
           if (_searchOpen)
             Builder(builder: (searchCtx) {
               final q = _searchQuery.trim();
-              final rawHits = q.isEmpty
-                  ? const <SearchHit>[]
-                  : MessageSearch.search(dsh.messages, _searchQuery);
+              final cacheKey = '$q\u0000${dsh.messages.length}\u0000${dsh.streamRevision}';
+              if (q.isNotEmpty && cacheKey != _searchCacheKey) {
+                _searchCacheKey = cacheKey;
+                final raw = MessageSearch.search(dsh.messages, q);
+                _searchCacheTotal = raw.length;
+                _searchCacheHits = MessageSearch.collapse(raw);
+              }
+              final collapsed = q.isEmpty
+                  ? const <({SearchHit first, int count})>[]
+                  : _searchCacheHits;
               return MessageSearchPanel(
                 query: _searchQuery,
-                results: q.isEmpty ? const [] : MessageSearch.collapse(rawHits),
-                totalHits: rawHits.length,
+                results: collapsed,
+                totalHits: q.isEmpty ? 0 : _searchTotalCount,
                 onQueryChanged: _onSearchChanged,
                 onClose: _toggleSearch,
                 onJumpTo: (hit) => _jumpToHit(hit, dsh),
@@ -852,7 +877,7 @@ class _ChatViewState extends State<ChatView> {
             inputController: _inputController,
             inputFocusNode: _inputFocusNode,
             pendingAttachments: _pendingAttachments,
-            notice: _notice,
+            noticeBus: _noticeBus,
             queueExpanded: _queueExpanded,
             onToast: _toast,
             onSend: () => _sendMessage(dsh),
@@ -1518,13 +1543,16 @@ class _ChatViewState extends State<ChatView> {
       key: ValueKey('message-more-$messageId'),
       onTap: onTap,
       radius: 16,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(
-            horizontal: AppSpace.s, vertical: AppSpace.xs),
-        child: Icon(
-          Icons.more_horiz_rounded,
-          size: 15,
-          color: context.c.textTertiary,
+      // [fix 2026-10-17] 命中区补到 32px（此前 ≈24px 含 padding）。
+      child: SizedBox(
+        width: 32,
+        height: 32,
+        child: Center(
+          child: Icon(
+            Icons.more_horiz_rounded,
+            size: 15,
+            color: context.c.textTertiary,
+          ),
         ),
       ),
     );
@@ -1849,7 +1877,20 @@ class _ChatViewState extends State<ChatView> {
     _inputController.text = restored;
     _inputController.selection =
         TextSelection.collapsed(offset: restored.length);
+    // [fix 2026-10-17] 跨会话缓存清理：每条历史消息一个 GlobalKey（注册表
+    // 常驻）、产出已读标记按会话累积 —— 此前只增不减，长会话/频繁切换下
+    // 慢性内存增长。切走时把**上一个会话**的条目清掉（当前会话的消息键由
+    // build 期间的 putIfAbsent 重新登记）。
+    if (previousSessionId != null) {
+      _messageKeys.removeWhere((id, _) => id.startsWith('$previousSessionId#'));
+    }
+    _messageKeys.removeWhere((id, _) => !_messageIdsInCurrentBuild.contains(id));
+    _deliverablesAck.removeWhere((key, _) => !key.contains(dsh.currentSession?.sessionId ?? '\u0000'));
   }
+
+  /// 当前 build 中实际注册过 key 的消息 id（跨会话清理的保留名单，
+  /// 由 `_keyForMessage` 维护）。
+  final Set<String> _messageIdsInCurrentBuild = {};
 
   void _toast(String msg) {
     if (!mounted) return;
@@ -2016,11 +2057,25 @@ class _ChatViewState extends State<ChatView> {
           //   2) 不重新投递、也不进队列 —— 用户必须自己再点发送；
           //   3) 回执 3 秒后消失，`_lastSteered` 并不清空（清空没意义），
           //      所以别把它当"还能撤销"的依据。
-          _inputController.text = steered.text;
-          _inputController.selection =
-              TextSelection.collapsed(offset: _inputController.text.length);
-          dsh.updateDraft(_inputController.text);
-          _toast('网关不支持撤销插队，已把这句话放回输入框（不会自动重发）');
+          //
+          // [fix 2026-10-17] 补草稿保护（与 _resendMessage 同一套标准）：
+          // 用户点撤回时可能正在写新草稿 —— 悄悄替换掉比"撤回不彻底"更糟。
+          // 有草稿时改走追加，既保住新草稿也不丢插队内容。
+          if (_inputController.text.trim().isNotEmpty) {
+            final merged = '${_inputController.text.trimRight()}\n${steered.text}';
+            _inputController.value = TextEditingValue(
+              text: merged,
+              selection: TextSelection.collapsed(offset: merged.length),
+            );
+            dsh.updateDraft(merged);
+            _toast('输入框里已有内容，插队文本已追加在后面（不会自动重发）');
+          } else {
+            _inputController.text = steered.text;
+            _inputController.selection =
+                TextSelection.collapsed(offset: _inputController.text.length);
+            dsh.updateDraft(_inputController.text);
+            _toast('网关不支持撤销插队，已把这句话放回输入框（不会自动重发）');
+          }
           break;
         }
         unawaited(_removeQueued(dsh, id, appliedText: '已撤回'));

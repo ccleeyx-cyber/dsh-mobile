@@ -87,6 +87,49 @@ class ComposerNotice {
   });
 }
 
+/// 提示总线的**单一所有者**（[fix 2026-10-17]）。
+///
+/// 此前父级（chat_view）与 composer 各持一个 Timer 共用同一个 ValueNotifier，
+/// 互不知晓：先弹"已排队"（5s），1 秒后语音失败弹 4s 提示，第 5 秒排队的
+/// Timer 到期把语音错误提前清空。现在 timer 收敛到总线自己 —— 任何一侧
+/// 写入都会取消上一条，生命周期只有一份。
+class ComposerNoticeBus {
+  final ValueNotifier<ComposerNotice?> notice = ValueNotifier(null);
+  Timer? _timer;
+
+  /// [ok] 默认与"失败提示停留更久"的旧语义对齐：成功 5s、失败 4s 由调用方
+  /// 显式给，这里统一成 4s 兜底（原两侧默认不一致：5s vs 4s）。
+  void show(
+    String text, {
+    bool ok = false,
+    NoticeAction action = NoticeAction.none,
+    String? undoItemId,
+    Duration duration = const Duration(seconds: 4),
+  }) {
+    _timer?.cancel();
+    notice.value = ComposerNotice(
+      text: text,
+      ok: ok,
+      action: action,
+      undoItemId: undoItemId,
+    );
+    _timer = Timer(duration, () {
+      notice.value = null;
+    });
+  }
+
+  void clear() {
+    _timer?.cancel();
+    _timer = null;
+    notice.value = null;
+  }
+
+  void dispose() {
+    _timer?.cancel();
+    notice.dispose();
+  }
+}
+
 /// 状态胶囊行里可能出现的待办类型。
 ///
 /// **枚举顺序就是优先级**（声明顺序 = 轮换顺序，见 `_statusRows`）：审批是唯一
@@ -141,7 +184,7 @@ class ChatComposer extends StatefulWidget {
     required this.inputController,
     required this.inputFocusNode,
     required this.pendingAttachments,
-    required this.notice,
+    required this.noticeBus,
     required this.queueExpanded,
     required this.onToast,
     required this.onSend,
@@ -163,7 +206,9 @@ class ChatComposer extends StatefulWidget {
   final TextEditingController inputController;
   final FocusNode inputFocusNode;
   final List<PendingAttachment> pendingAttachments;
-  final ValueNotifier<ComposerNotice?> notice;
+  /// [fix 2026-10-17] 从裸 ValueNotifier 改为总线：timer 归总线所有，
+  /// 父级与 composer 两侧写入不再互踩（双 Timer 竞态修复）。
+  final ComposerNoticeBus noticeBus;
   final bool queueExpanded;
   final void Function(String message) onToast;
   final VoidCallback onSend;
@@ -205,7 +250,7 @@ class _ChatComposerState extends State<ChatComposer> {
   TextEditingController get _inputController => widget.inputController;
   FocusNode get _inputFocusNode => widget.inputFocusNode;
   List<PendingAttachment> get _pendingAttachments => widget.pendingAttachments;
-  ValueNotifier<ComposerNotice?> get _notice => widget.notice;
+  ComposerNoticeBus get _noticeBus => widget.noticeBus;
   bool get _queueExpanded => widget.queueExpanded;
 
   // ---- 父级动作：保持原签名转调，让搬过来的调用点一字不改 ----
@@ -229,10 +274,9 @@ class _ChatComposerState extends State<ChatComposer> {
 
   /// 输入卡片那条提示（`ComposerNotice`）的**本地**写入器（Phase 4.5）。
   ///
-  /// 和上面那些纯转发的动作不同，这里必须自己持一个定时器：父级只把
-  /// `ValueNotifier<ComposerNotice?>` 传下来，**自动消失的那个 Timer 留在
-  /// `ChatView` 里没跟着传**。直接写 `_notice.value = ...` 会得到一条永远挂着的
-  /// 提示（要等父级下一次提示才被顶掉），那比 SnackBar 更糟。
+  /// [fix 2026-10-17] timer 已收敛到 [ComposerNoticeBus]：父级与 composer 共用
+  /// 同一条总线，任何一侧 show() 都取消上一条的定时器 —— 双 Timer 竞态
+  /// （排队回执把语音错误提前抹掉）不再可能。
   ///
   /// 语义统一在这一处：会话链路里的**业务失败**（语音起不来、录音被引擎掐断、
   /// 没听清）全部改走这里 —— 它挨着输入框，用户写的东西还在，失败必须和它并排
@@ -244,25 +288,17 @@ class _ChatComposerState extends State<ChatComposer> {
     String? undoItemId,
     Duration duration = const Duration(seconds: 4),
   }) {
-    // ⚠️ 这个守卫不是防御性摆设，它挡的是一个真的会炸的时序：
-    // `VoiceInputService.start()` 的超时/失败回调（onError、onAutoStopped）会在
-    // 用户已经切走、本 widget 被 dispose **之后**才回来。`_notice` 是父级持有的
-    // `ValueNotifier`，父级此时可能也已析构 —— 直接赋值就是
-    // "A ValueNotifier<ComposerNotice?> was used after being disposed"。
+    // ⚠️ mounted 守卫保留：语音的迟到回调仍会在本 widget dispose 之后到达，
+    // 但 noticeBus 由父级所有，父级 dispose 时总线也随之销毁 —— 守卫仍然必要。
     if (!mounted) return;
-    _noticeTimer?.cancel();
-    _notice.value = ComposerNotice(
-      text: text,
+    _noticeBus.show(
+      text,
       ok: ok,
       action: action,
       undoItemId: undoItemId,
+      duration: duration,
     );
-    _noticeTimer = Timer(duration, () {
-      if (mounted) _notice.value = null;
-    });
   }
-
-  Timer? _noticeTimer;
 
   // ---- 语音输入 (v1.8.0) ----
   // null = 尚未探测；探测结果决定按钮是可用还是禁用。
@@ -415,7 +451,7 @@ class _ChatComposerState extends State<ChatComposer> {
   void dispose() {
     _holdTick?.cancel();
     _holdWatchdog?.cancel();
-    _noticeTimer?.cancel();
+    // notice 的 timer 归总线（父级所有）—— 这里不再持有一个本地副本。
     _fieldLongPressProbe?.cancel();
     // 正在录音时被销毁（切会话/返回）：必须主动取消识别，否则麦克风会被一直
     // 占着，下一次识别会以"被其他应用占用"失败。
@@ -489,10 +525,16 @@ class _ChatComposerState extends State<ChatComposer> {
                   InkWell(
                     onTap: () => _removePendingAttachment(a),
                     borderRadius: BorderRadius.circular(11),
-                    child: Padding(
-                      padding: const EdgeInsets.all(3),
-                      child: Icon(Icons.close_rounded,
-                          size: 15, color: context.c.textTertiary),
+                    // [fix 2026-10-17] 删除是破坏性动作，命中区补到 32px
+                    //（此前 ≈21px，误触率高；再大会挤压附件行布局，
+                    // 44dp 由整行高度兜底）。
+                    child: SizedBox(
+                      width: 32,
+                      height: 32,
+                      child: Center(
+                        child: Icon(Icons.close_rounded,
+                            size: 15, color: context.c.textTertiary),
+                      ),
                     ),
                   ),
                 ],
@@ -638,10 +680,15 @@ class _ChatComposerState extends State<ChatComposer> {
     // 命中"notifyListeners after dispose"。
     if (!mounted) return;
     if (text.trim().isEmpty) return;
-    _inputController.text = text;
-    _inputController.selection = TextSelection.collapsed(offset: text.length);
+    // [fix 2026-10-17] 不再无条件整段替换：用户先打了半句再点听写，草稿不能
+    // 被识别结果静默覆盖。已有内容时以"空格分隔追加"，与长按说话的追加语义
+    // 一致；识别结果为空时什么都不动。
+    final existing = _inputController.text;
+    final merged = existing.trim().isEmpty ? text : '${existing.trimRight()} ${text.trim()}';
+    _inputController.text = merged;
+    _inputController.selection = TextSelection.collapsed(offset: merged.length);
     // 语音内容同样要进草稿，否则进程被杀后说的这段话会丢。
-    dsh.updateDraft(text);
+    dsh.updateDraft(merged);
   }
 
   // ---------------------------------------------------------- 长按说话 --
@@ -667,16 +714,22 @@ class _ChatComposerState extends State<ChatComposer> {
       if (mounted && _holdPhase == _HoldTalkPhase.recording) setState(() {});
     });
     // 兜底看门狗：语音服务挂死时 _endHoldTalk（依赖松手）可能永远不来，
-    // 也可能来了但 stop() 挂在平台回调上。30s 后强制收尾，把输入框还回去。
-    _holdWatchdog?.cancel();
-    _holdWatchdog = Timer(const Duration(seconds: 30), () {
-      if (!mounted || _holdPhase != _HoldTalkPhase.recording) return;
-      _cancelHoldTalk();
-      if (mounted) {
-        // 异常收尾也是失败：留在输入区那条提示里（用户此刻正盯着输入框）。
-        _showNotice('录音 30 秒没有回应，已恢复输入框 · 请再按住 🎤 说一次');
-      }
-    });
+    // 也可能来了但 stop() 挂在平台回调上。30s 内毫无动静才强制收尾，把输入框
+    // 还回去。[fix 2026-10-17] 收到 partial 时顺延（重挂 30s）：正常的长句
+    // 识别会持续吐 partial —— 恒定 30s 会把说到一半的正常录音强切并误报
+    // "没有回应"。看门狗现在只拦"彻底没动静"的服务。
+    void armWatchdog() {
+      _holdWatchdog?.cancel();
+      _holdWatchdog = Timer(const Duration(seconds: 30), () {
+        if (!mounted || _holdPhase != _HoldTalkPhase.recording) return;
+        _cancelHoldTalk();
+        if (mounted) {
+          // 异常收尾也是失败：留在输入区那条提示里（用户此刻正盯着输入框）。
+          _showNotice('录音 30 秒没有回应，已恢复输入框 · 请再按住 🎤 说一次');
+        }
+      });
+    }
+    armWatchdog();
 
     final ok = await VoiceInputService.instance.start(
       // [fix 2026-10-12] 引擎自动结束（时长上限/静音超时/内部断句）：长按模式
@@ -688,6 +741,7 @@ class _ChatComposerState extends State<ChatComposer> {
           : null,
       onPartial: (text, _) {
         if (!mounted) return;
+        armWatchdog(); // [fix 2026-10-17] 有动静就顺延看门狗
         setState(() {
           _holdText = text;
           _holdAwaitingFinal = false;
@@ -1026,8 +1080,12 @@ class _ChatComposerState extends State<ChatComposer> {
               key: row.actionKey,
               onTap: row.onAction,
               borderRadius: BorderRadius.circular(12),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              // [fix 2026-10-17] 触控目标补到 ≥32px 视觉 / 44dp 命中区：
+              // 此前 vertical 4 ≈21px 高，「新开会话」还是不可逆动作。
+              child: Container(
+                constraints: const BoxConstraints(minHeight: 44, minWidth: 44),
+                alignment: Alignment.center,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
                 child: Text(
                   row.actionLabel,
                   maxLines: 1,
@@ -1702,8 +1760,12 @@ class _ChatComposerState extends State<ChatComposer> {
   /// 已经以 `/` 开头时替换命令名而不是叠加，否则会得到 `/a /b`。改一处必须改另一处。
   void _insertSlashCommand(DshService dsh, String name) {
     final current = _inputController.text;
+    // [fix 2026-10-17] 以 `/` 开头但**没有空格**时 indexOf(' ')==-1，
+    // substring(0) 会取回全文，拼出 `/name /ab` 双斜杠残留 —— 无空格时
+    // 整段就是命令名，直接替换。
+    final spaceIdx = current.indexOf(' ');
     _inputController.text = current.startsWith('/')
-        ? '/$name ${current.substring(current.indexOf(' ') + 1)}'
+        ? '/$name ${spaceIdx == -1 ? '' : current.substring(spaceIdx + 1)}'
         : '$current/$name ';
     _inputController.selection =
         TextSelection.collapsed(offset: _inputController.text.length);
@@ -1745,7 +1807,7 @@ class _ChatComposerState extends State<ChatComposer> {
   /// 这条提示承载的是"你刚写的东西去哪了"，必须留在原地、可撤回、可重试。
   Widget _buildNotice(DshService dsh) {
     return ValueListenableBuilder<ComposerNotice?>(
-      valueListenable: _notice,
+      valueListenable: _noticeBus.notice,
       builder: (context, notice, _) {
         if (notice == null) return const SizedBox.shrink();
         final tone = notice.ok ? context.c.textSecondary : context.c.danger;
@@ -2066,9 +2128,12 @@ class _ChatComposerState extends State<ChatComposer> {
               const SizedBox(width: 4),
               // Flexible + 48dp 上限：窄屏（360dp）上这一行本来就没有多少余量，
               // 硬宽的胶囊会把整行顶溢出（`queue_steer_impl_test` 锁的就是这条）。
+              // [fix 2026-10-17] 34 → 46：3 个 11.5px 汉字 ≈34.5px，34dp 下
+              // 「全信任」常态截成「全信…」—— 而这个胶囊的全部意义就是让用户
+              // 看出当前权限档位。46dp 装得下三字 + 余量，仍留 Flexible 兜溢出。
               Flexible(
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 34),
+                  constraints: const BoxConstraints(maxWidth: 46),
                   child: Text(
                     label,
                     maxLines: 1,
@@ -2149,7 +2214,16 @@ class _ChatComposerState extends State<ChatComposer> {
         ),
       );
     }
+    // [fix 2026-10-17] isSending 现在带会话归属（sendingSessionId）：只在本
+    // 会话真的在本机跑着时才出现停止键，别的会话在跑不再点亮。
     if (!dsh.isSending) return const SizedBox.shrink();
+    final runningId = dsh.sendingSessionId;
+    final sessionId = dsh.currentSession?.sessionId;
+    if (runningId != null &&
+        sessionId != null &&
+        !dsh.currentSession!.matchesSessionId(runningId)) {
+      return const SizedBox.shrink();
+    }
     return Tooltip(
       message: '停止本轮',
       child: InkWell(

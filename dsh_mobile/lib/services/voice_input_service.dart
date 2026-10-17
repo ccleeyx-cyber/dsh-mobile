@@ -268,7 +268,10 @@ class VoiceInputService {
       _listening = true;
       _fakeOnFinal = onFinal;
       // 测试钩子同样接上自动结束回调，状态机路径才能在 widget 测试里驱动。
-      onAutoStopped = onAutoStopped;
+      // [fix 2026-10-17] 这里必须是 this.onAutoStopped —— 之前写的是参数自赋值
+      // no-op，导致 init() 的 onStatus 读到的实例字段永远是 null，引擎自动结束
+      // （静音超时/时长上限）永远无法通知 UI，[fix 2026-10-12] 整体失效。
+      this.onAutoStopped = onAutoStopped;
       for (final p in _fakePartials!) {
         onPartial(p, 1.0);
       }
@@ -288,6 +291,10 @@ class VoiceInputService {
       // 笼统的「无法启动语音识别」—— 在任何设备上都必然复现，且完全看不出原因。
       // 这个坑已经踩过一次（v1.8.0 起语音一直不可用，就是这个）。
       //
+      _listening = false;
+      // 真实路径同样要挂上回调（[fix 2026-10-17] 之前只有 fake 分支写了，
+      // 且是自赋值 no-op）：onStatus 在 init() 里就绑定，读到的是这个实例字段。
+      this.onAutoStopped = onAutoStopped;
       // 约定：失败**只通过抛异常**表达；成功与否以 isListening 为准（插件内部
       // 拿到 started 之后也是这么记的）。
       await _speech
@@ -525,6 +532,32 @@ class VoiceInputService {
 
   @visibleForTesting
   bool debugGetListening() => _listening;
+
+  /// 测试钩子：模拟 onStatus(done) 的自动结束路径（[fix 2026-10-17]）。
+  ///
+  /// onAutoStopped 是 init() 时绑定的 onStatus 在内部触发的 —— 测试拿不到
+  /// 平台状态回调，这个钩子直接走同一段逻辑（置监听 false、记原因、触发
+  /// 回调并摘除），让「引擎自动结束 → UI 收尾」这条链可以被钉住。
+  @visibleForTesting
+  void debugFireAutoStopped(String reason) {
+    final wasListening = _listening;
+    _listening = false;
+    if (wasListening) {
+      lastAutoStopAt = DateTime.now();
+      lastAutoStopReason = reason;
+      final cb = onAutoStopped;
+      onAutoStopped = null;
+      cb?.call(reason);
+    }
+  }
+
+  /// 测试钩子：清掉自动结束的记录与回调（用例之间隔离）。
+  @visibleForTesting
+  void debugResetAutoStop() {
+    onAutoStopped = null;
+    lastAutoStopAt = null;
+    lastAutoStopReason = null;
+  }
 
   /// 测试钩子：假识别状态（null = 关闭）。
   ///

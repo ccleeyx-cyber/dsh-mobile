@@ -39,6 +39,10 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
   Timer? _refreshTimer;
   bool _appResumed = true;
 
+  /// [fix 2026-10-17] 用户点了「展开全部」的工作区 id 集合（会话列表默认只
+  /// 渲染最近 50 条，防 1275 条会话的工作区一次性全量构建）。
+  final Set<String> _expandedWorkspaces = {};
+
   @override
   void initState() {
     super.initState();
@@ -919,6 +923,10 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     final pendingCount = ws.sessions.fold<int>(0, (sum, s) => sum + _getSessionPendingCount(s, dsh));
 
     return Container(
+      // [fix 2026-10-17] 卡片必须有稳定 key：3 秒轮询 + 搜索过滤会让列表位置
+      // 变动，无 key 时 Element 复用把 ExpansionTile 的展开状态落到别的
+      // 工作区头上。
+      key: ValueKey('ws-card-${ws.workspaceId}'),
       margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
         color: context.c.surface,
@@ -1130,16 +1138,42 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 ),
               )
             else
-              ListView.builder(
-                shrinkWrap: true,
-                physics: const NeverScrollableScrollPhysics(),
-                itemCount: ws.sessions.length,
-                itemBuilder: (context, sIdx) {
-                  final s = ws.sessions[sIdx];
-                  final isCurrentSession = isCurrent && s.matchesSessionId(dsh.currentSession?.sessionId);
-                  return _buildSessionItem(context, dsh, ws, s, isCurrentSession);
-                },
-              ),
+              Builder(builder: (context) {
+                // [fix 2026-10-17] 会话列表分页：shrinkWrap + NeverScrollable
+                // 会**一次性构建全部子项** —— 注释里自述有 1275 个对话的工作区，
+                // 展开即 build 1275 个 ListTile，卡顿甚至 OOM。默认只渲染最近
+                // 50 条，其余收进「展开全部」。
+                const pageLimit = 50;
+                final sessions = ws.sessions;
+                final visible = _expandedWorkspaces.contains(ws.workspaceId)
+                    ? sessions
+                    : sessions.take(pageLimit).toList(growable: false);
+                final hidden = sessions.length - visible.length;
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (var i = 0; i < visible.length; i++)
+                      _buildSessionItem(
+                        context,
+                        dsh,
+                        ws,
+                        visible[i],
+                        isCurrent && visible[i].matchesSessionId(dsh.currentSession?.sessionId),
+                      ),
+                    if (hidden > 0)
+                      TextButton(
+                        key: ValueKey('ws-expand-${ws.workspaceId}'),
+                        onPressed: () => setState(
+                            () => _expandedWorkspaces.add(ws.workspaceId)),
+                        child: Text(
+                          '展开全部（还有 $hidden 条）',
+                          style: TextStyle(
+                              fontSize: 12, color: context.c.accent),
+                        ),
+                      ),
+                  ],
+                );
+              }),
           ],
         ),
       ),
@@ -1314,49 +1348,76 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
             ),
           ],
         ),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            IconButton(
-              icon: Icon(
-                s.archived ? Icons.unarchive_outlined : Icons.archive_outlined,
-                size: 18,
-                color: context.c.textTertiary,
+        // [fix 2026-10-17] 行尾三个相邻小图标（归档/重命名/删除）+ chevron 约
+        // 160dp：窄屏上标题被挤到不可读，删除还紧邻归档易误触。收进一枚「⋯」
+        // 菜单（44dp 命中区），破坏性动作与常规动作拉开距离。
+        trailing: SizedBox(
+          width: 44,
+          height: 44,
+          child: PopupMenuButton<String>(
+            key: ValueKey('session-more-${s.sessionId}'),
+            icon: Icon(Icons.more_vert_rounded,
+                size: 18, color: context.c.textTertiary),
+            tooltip: '会话操作',
+            onSelected: (action) async {
+              switch (action) {
+                case 'archive':
+                  HapticFeedback.selectionClick();
+                  // 主题色/ScaffoldMessenger 都来自 Element，必须在 await 之前取，
+                  // 不能跨异步间隔再读 context。
+                  final messenger = ScaffoldMessenger.of(context);
+                  final ok = await dsh.setSessionArchived(s.sessionId, !s.archived);
+                  if (!mounted) return;
+                  if (ok) {
+                    setState(() => _actionError = null);
+                    messenger.showSnackBar(SnackBar(
+                      content: Text(s.archived ? '已取消归档' : '已归档「${s.title}」'),
+                      duration: const Duration(milliseconds: 1200),
+                      behavior: SnackBarBehavior.floating,
+                    ));
+                  } else {
+                    setState(() => _actionError = '${s.archived ? '取消归档' : '归档'}失败：${dsh.lastError}');
+                  }
+                  break;
+                case 'rename':
+                  _showRenameDialog(dsh, s);
+                  break;
+                case 'delete':
+                  _showDeleteSessionDialog(context, dsh, ws, s);
+                  break;
+              }
+            },
+            itemBuilder: (_) => [
+              PopupMenuItem(
+                value: 'archive',
+                height: 44,
+                child: Row(children: [
+                  Icon(s.archived ? Icons.unarchive_outlined : Icons.archive_outlined,
+                      size: 18, color: context.c.textSecondary),
+                  const SizedBox(width: 10),
+                  Text(s.archived ? '取消归档' : '归档', style: const TextStyle(fontSize: 13.5)),
+                ]),
               ),
-              tooltip: s.archived ? '取消归档' : '归档',
-              onPressed: () async {
-                HapticFeedback.selectionClick();
-                // 主题色/ScaffoldMessenger 都来自 Element，必须在 await 之前取，
-                // 不能跨异步间隔再读 context。
-                final messenger = ScaffoldMessenger.of(context);
-                final ok = await dsh.setSessionArchived(s.sessionId, !s.archived);
-                if (!mounted) return;
-                if (ok) {
-                  setState(() => _actionError = null);
-                  messenger.showSnackBar(SnackBar(
-                    content: Text(s.archived ? '已取消归档' : '已归档「${s.title}」'),
-                    duration: const Duration(milliseconds: 1200),
-                    behavior: SnackBarBehavior.floating,
-                  ));
-                } else {
-                  // 归档失败时列表行**看起来没变**，用户会以为自己点空了 ——
-                  // 所以错误必须留在页面上，而不是飘 2 秒。
-                  setState(() => _actionError = '${s.archived ? '取消归档' : '归档'}失败：${dsh.lastError}');
-                }
-              },
-            ),
-            IconButton(
-              icon: Icon(Icons.edit_outlined, size: 18, color: context.c.textTertiary),
-              tooltip: '重命名',
-              onPressed: () => _showRenameDialog(dsh, s),
-            ),
-            IconButton(
-              icon: Icon(Icons.delete_outline_rounded, size: 18, color: context.c.textTertiary),
-              tooltip: '删除会话',
-              onPressed: () => _showDeleteSessionDialog(context, dsh, ws, s),
-            ),
-            Icon(Icons.chevron_right_rounded, size: 16, color: context.c.border),
-          ],
+              PopupMenuItem(
+                value: 'rename',
+                height: 44,
+                child: Row(children: [
+                  Icon(Icons.edit_outlined, size: 18, color: context.c.textSecondary),
+                  const SizedBox(width: 10),
+                  const Text('重命名', style: TextStyle(fontSize: 13.5)),
+                ]),
+              ),
+              PopupMenuItem(
+                value: 'delete',
+                height: 44,
+                child: Row(children: [
+                  Icon(Icons.delete_outline_rounded, size: 18, color: context.c.danger),
+                  const SizedBox(width: 10),
+                  Text('删除会话', style: TextStyle(fontSize: 13.5, color: context.c.danger)),
+                ]),
+              ),
+            ],
+          ),
         ),
         onTap: () async {
           HapticFeedback.selectionClick();

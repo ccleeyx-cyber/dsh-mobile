@@ -1091,7 +1091,13 @@ export function createPermissionStore() {
     get globalPolicy() { return global.executionPolicy; },
     forSession(sessionId) {
       if (!sessionId) return global.executionPolicy;
-      return sessions.get(sessionId) || global.executionPolicy;
+      // [fix 2026-10-17] 归一化后再查：全文件其余处（normalizeSessionKey /
+      // sessionIdMatchesSafe）都做 session- 前缀归一，唯独这里用原始串精确
+      // 匹配 —— 写入键与引擎事件拼写不一致（有无前缀）时会话策略静默回落
+      // global，审批 effectivePolicy 随之改变。setSession 同步归一。
+      const key = normalizeSessionKey(String(sessionId));
+      const direct = sessions.get(key) || sessions.get(toFullSessionId(key));
+      return direct || global.executionPolicy;
     },
     apply(patch = {}) {
       const pol = patch.defaultPolicy || patch.executionPolicy;
@@ -1108,7 +1114,8 @@ export function createPermissionStore() {
     },
     setSession(sessionId, policy) {
       if (!sessionId) return payload();
-      sessions.set(sessionId, policy);
+      // 与 forSession 同键：写入统一归一，杜绝两种拼写并存。
+      sessions.set(normalizeSessionKey(String(sessionId)), policy);
       return payload();
     },
     payload,
@@ -1144,13 +1151,26 @@ const AUTH_FAIL_THRESHOLD = 5;             // failures tolerated in a burst
 const AUTH_FAIL_MAX_DELAY_MS = 15 * 60 * 1000;
 const AUTH_FAIL_BLOCK_MS = 15 * 60 * 1000; // hard refusal window
 
+/**
+ * [fix 2026-10-17] XFF 是否可信。
+ *
+ * 只有显式配置了 `BRIDGE_TRUST_PROXY=1`（部署在可信反代之后）才信任
+ * x-forwarded-for。默认**不信**：authFailKey 此前无条件取 XFF 首值做退避键，
+ * 直连场景下攻击者每请求换一个伪造 XFF 就得到一个全新的空计数桶 ——
+ * 退避永不触发，token 爆破完全不受限速（旧注释的威胁方向写反了：
+ * 伪造 XFF 买到的是"无退避"，不是"自己的退避"）。
+ */
+function xffTrusted() {
+  return process.env.BRIDGE_TRUST_PROXY === '1' || process.env.BRIDGE_TRUST_PROXY === 'true';
+}
+
 function authFailKey(req) {
-  // x-forwarded-for is only consulted because this gateway is commonly put
-  // behind nps/another reverse proxy to reach it from outside; a spoofed header
-  // can at worst buy the caller its own backoff, never bypass someone else's.
-  const fwd = req.headers?.['x-forwarded-for'];
-  const first = typeof fwd === 'string' ? fwd.split(',')[0].trim() : '';
-  return first || req.socket?.remoteAddress || 'unknown';
+  if (xffTrusted()) {
+    const fwd = req.headers?.['x-forwarded-for'];
+    const first = typeof fwd === 'string' ? fwd.split(',')[0].trim() : '';
+    if (first) return first;
+  }
+  return req.socket?.remoteAddress || 'unknown';
 }
 
 /** @returns {{blocked: boolean, retryAfterMs: number}} */

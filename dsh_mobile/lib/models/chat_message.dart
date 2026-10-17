@@ -4,6 +4,25 @@ import 'dart:typed_data';
 import 'harness_notice.dart';
 import 'user_question.dart' show AttachmentRef;
 
+/// 网关 wire 格式的工具项解析（服务层的 `_coerceToolInput` 的等价物，
+/// 放在模型层让全部解析点共用 —— 此前三处手写解析已经漂移出过回归）。
+ToolExecution toolExecutionFromWire(dynamic raw) {
+  final m = raw is Map ? raw : const {};
+  return ToolExecution(
+    name: m['name']?.toString() ?? '',
+    input: m['input'],
+    output: m['output'] ?? m['result'] ?? '完成',
+    isRunning: m['isRunning'] == true,
+  );
+}
+
+/// wire 时间戳（毫秒）。
+DateTime? wireTime(dynamic raw) =>
+    raw == null ? null : DateTime.fromMillisecondsSinceEpoch(raw as int);
+
+int? wireSeq(dynamic raw) =>
+    raw is int ? raw : (raw is num ? raw.toInt() : null);
+
 class ToolExecution {
   final String name;
   final String input;
@@ -93,6 +112,36 @@ class ChatMessage {
   /// 用户刚发出去的那张图，字节就在自己手里，没有理由等 2~3 秒的轮询回包才显示；
   /// 服务端版本到达后这条乐观消息会被替换掉，预览也随之让位给真附件。
   final List<Uint8List> localImagePreviews;
+
+  /// 统一的网关 wire 解析工厂（[fix 2026-10-17]）。
+  ///
+  /// 此前三处手写解析（selectSession 首屏 / loadOlderHistory 上翻 /
+  /// _reconcileSessionMessages 轮询对账）各自维护一份字段映射，已经漂移出
+  /// 真实回归：对账路径漏了 attachments / turnTokens / noticeKind 等 6 个字段，
+  /// 跑一轮之后历史图片消失、逐轮 token 回退。**任何 wire 字段变更只改这里。**
+  factory ChatMessage.fromWire(Map<String, dynamic> m, {String Function()? newId}) {
+    final rawTools = m['tools'] as List<dynamic>? ?? [];
+    return ChatMessage(
+      id: m['id']?.toString() ?? (newId?.call() ?? ''),
+      role: m['role']?.toString() ?? 'assistant',
+      content: m['content']?.toString() ?? '',
+      thinking: m['thinking']?.toString(),
+      isMemory: m['isMemory'] == true || m['role'] == 'memory',
+      isContext: m['isContext'] == true || m['role'] == 'context',
+      seq: wireSeq(m['seq']),
+      tools: rawTools.map(toolExecutionFromWire).toList(),
+      timestamp: wireTime(m['time']),
+      // [fix 2026-10-17] 对账路径此前丢失的六个字段 —— 统一工厂的意义所在。
+      noticeKind: m['noticeKind']?.toString(),
+      noticeVariant: m['noticeVariant']?.toString(),
+      noticeChildId: m['noticeChildId']?.toString(),
+      noticeBody: m['noticeBody']?.toString(),
+      turnTokens: m['tokens'] is int
+          ? m['tokens'] as int
+          : (m['tokens'] is num ? (m['tokens'] as num).toInt() : int.tryParse(m['tokens']?.toString() ?? '')),
+      attachments: m['attachments'] as List<dynamic>?,
+    );
+  }
 
   ChatMessage({
     required this.id,

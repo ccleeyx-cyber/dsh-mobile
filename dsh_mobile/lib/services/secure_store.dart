@@ -12,10 +12,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// plugin-loader，代价远大于收益 —— 原生侧真正需要的只是 AndroidKeyStore
 /// 里一把不可导出的密钥 + AES/GCM，几十行 Kotlin 就够。
 ///
-/// 职责边界：**加解密全部在原生**。本层只负责「把一段字符串变成一段不透明
-/// 密文放进 SharedPreferences，再取回来」，密文格式（`iv:ct` 的 Base64）由
-/// Kotlin 自己定义自己解释。这样 AndroidKeyStore 的密钥句柄永远不出原生进程，
-/// Dart 侧拿到的只是密文串。
+/// 职责边界：**加解密全部在原生**。本层只负责「把一段**明文**字符串交给原生、
+/// 由原生加密后落盘，取回时原生解密、Dart 拿到的是**明文**」。密文格式
+/// （`iv:ct` 的 Base64）由 Kotlin 自己定义自己解释，Dart 永远见不到密文 ——
+/// AndroidKeyStore 的密钥句柄不出原生进程。
+/// （[fix 2026-10-17] 旧注释写"返回的密文是不透明字符串"，与实现相反：
+/// Dart 侧收到并使用的正是明文；只是密文本身不出原生。两处实现
+/// （_verifyRoundTrip / StorageService 回填）均按明文语义工作。）
 ///
 /// **降级是契约的一部分，不是补丁。** 单元测试 / widget 测试跑在 Dart VM 上，
 /// 那里没有 MethodChannel 的宿主，任何 `invokeMethod` 都会抛
@@ -32,7 +35,7 @@ class SecureStore {
   SecureStore._();
 
   /// 原生通道。能力：`ping` / `write(key,value)` / `read(key)` / `delete(key)`。
-  /// 返回的密文是不透明字符串，Dart 不解释它的内部结构。
+  /// value 是明文（加密在原生侧完成）；read 返回的也是明文。
   static const MethodChannel _ch = MethodChannel('dsh_mobile/secure');
 
   /// 进程内降级表。SharedPreferences 的读是异步的，而 `StorageService` 的若干

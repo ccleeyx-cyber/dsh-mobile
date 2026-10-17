@@ -54,6 +54,8 @@ class CustomSettingsView extends StatefulWidget {
 
 class _CustomSettingsViewState extends State<CustomSettingsView> {
   bool _isTestingPing = false;
+  /// [fix 2026-10-17] 手动重连进行中（防连点 + 按钮反馈）。
+  bool _reconnecting = false;
 
   /// 检查/下载更新进行中（只有用户主动点才会置位 —— 启动时不查更新）。
   bool _updateBusy = false;
@@ -193,7 +195,15 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     final cfg = dsh.currentConfig;
     if (cfg == null) return;
     if (!dsh.isConnected) {
-      await dsh.connect(cfg);
+      // [fix 2026-10-17] 连接期间给反馈 + 防连点：connect 要几秒，此前按钮
+      // 无任何变化，用户会连点多次触发多次连接。
+      if (_reconnecting || !mounted) return;
+      setState(() => _reconnecting = true);
+      try {
+        await dsh.connect(cfg);
+      } finally {
+        if (mounted) setState(() => _reconnecting = false);
+      }
       return;
     }
     final ok = await showDialog<bool>(
@@ -211,7 +221,15 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
         ],
       ),
     );
-    if (ok == true) await dsh.connect(cfg);
+    if (ok == true) {
+      if (_reconnecting || !mounted) return;
+      setState(() => _reconnecting = true);
+      try {
+        await dsh.connect(cfg);
+      } finally {
+        if (mounted) setState(() => _reconnecting = false);
+      }
+    }
   }
 
   void _showModelSwitchSheet(BuildContext context, DshService dsh) {
@@ -346,9 +364,11 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                                         ScaffoldMessenger.of(context).clearSnackBars();
                                         ScaffoldMessenger.of(context).showSnackBar(
                                           SnackBar(
-                                            // 写明生效范围与生效时机：实测写进 settings.yaml
-                                            // 后，正在运行的会话要到重启 dsh web 才会采用。
-                                            content: Text('已将全局默认模型设为 ${m.name}（新建会话生效；正在运行的会话需重启 dsh web）'),
+                                            // 写明生效范围与生效时机：App 在新会话创建
+                                            // 后按会话级注入默认模型（立即生效）；
+                                            // 引擎全局默认（运行中的会话/电脑端）
+                                            // 要到重启 dsh web 才对齐。
+                                            content: Text('已将全局默认模型设为 ${m.name}（App 新建会话立即生效；引擎全局对齐需重启 dsh web）'),
                                             backgroundColor: context.c.success,
                                             behavior: SnackBarBehavior.floating,
                                             duration: const Duration(seconds: 2),
@@ -1057,6 +1077,10 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                               : () async {
                                   setState(() => _isTestingPing = true);
                                   await dsh.measurePing();
+                                  // [fix 2026-10-17] await 之后先查 mounted：
+                                  // 用户点测速后立刻退出设置页会抛
+                                  // setState-after-dispose。
+                                  if (!mounted) return;
                                   setState(() => _isTestingPing = false);
                                 },
                           child: Container(

@@ -549,31 +549,7 @@ class DshService extends ChangeNotifier {
         if ((seq != null && knownSeqs.contains(seq)) || (id != null && knownIds.contains(id))) {
           continue;
         }
-        final msg = ChatMessage(
-          id: id ?? _uuid.v4(),
-          role: raw['role'] ?? 'assistant',
-          content: raw['content'] ?? '',
-          thinking: raw['thinking'],
-          isMemory: raw['isMemory'] == true || raw['role'] == 'memory',
-          isContext: raw['isContext'] == true || raw['role'] == 'context',
-          seq: seq,
-          tools: (raw['tools'] as List<dynamic>? ?? []).map((t) => ToolExecution(
-            name: t['name'] ?? '',
-            input: _coerceToolInput(t['input']),
-            output: _coerceToolInput(t['output']),
-            isRunning: t['isRunning'] ?? false,
-          )).toList(),
-          timestamp: raw['time'] != null ? DateTime.fromMillisecondsSinceEpoch(raw['time']) : null,
-          // [feat 2026-10-17] 网关标出的"注入通知"（子代理结算等）。没有这几个字段
-          // （老网关）时，ChatMessage 会按锚定文案自己认一次，见 HarnessNotice。
-          noticeKind: raw['noticeKind']?.toString(),
-          noticeVariant: raw['noticeVariant']?.toString(),
-          noticeChildId: raw['noticeChildId']?.toString(),
-          noticeBody: raw['noticeBody']?.toString(),
-          // [feat 2026-10-17] 引擎的权威逐轮用量 + 附件（图片/文件）。
-          turnTokens: _intOrNull(raw['tokens']),
-          attachments: raw['attachments'] as List<dynamic>?,
-        );
+        final msg = ChatMessage.fromWire(raw, newId: _uuid.v4);
         knownSeqs.add(seq ?? -1);
         knownIds.add(msg.id);
         older.add(msg);
@@ -673,6 +649,26 @@ class DshService extends ChangeNotifier {
   bool get isTokenInvalid => _isTokenInvalid;
   bool get hasAuthError => _isTokenInvalid;
 
+  /// 正在发送的那一轮所属的**会话 id**（[fix 2026-10-17]）。
+  ///
+  /// `_isSending` 是全局标志，不看它属于哪个会话 —— 而 UI 的停止键 / 队列
+  /// 入口必须只在本会话真的在跑时出现。此前 chat_view 拿
+  /// `dsh.currentSession?.sessionId` 与自己比较，恒真，别的会话在跑时本会话
+  /// 也会点亮停止键。所有把 `_isSending` 置 true 的写入点必须同步记录这里；
+  /// 置 false 的路径由 `_isSending = false` 统一清空（见 `_setSending`）。
+  String? _sendingSessionId;
+  String? get sendingSessionId => _sendingSessionId;
+
+  /// 统一的发送状态写入点：`running=true` 时记录会话归属，false 时清空。
+  void _setSending(bool running, {String? sessionId}) {
+    _isSending = running;
+    if (running) {
+      _sendingSessionId = sessionId;
+    } else {
+      _sendingSessionId = null;
+    }
+  }
+
   void handleAuthFailure(String reason) {
     _isTokenInvalid = true;
     _lastError = reason;
@@ -683,6 +679,15 @@ class DshService extends ChangeNotifier {
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _stopHeartbeat();
+    // [fix 2026-10-17] 认证失败后旧 socket 此前一直活着并继续喂
+    // _handleRawMessage（401 帧可反复触发 handleAuthFailure），泄漏到下一次
+    // connect/disconnect。做与 disconnect 等价的清理。
+    _channelSubscription?.cancel();
+    _channelSubscription = null;
+    try {
+      _channel?.sink.close(ws_status.normalClosure);
+    } catch (_) {}
+    _channel = null;
     notifyListeners();
   }
 
@@ -710,8 +715,11 @@ class DshService extends ChangeNotifier {
     }
     handleAuthFailure('电脑端已移除此设备');
     _isExplicitlyDisconnected = true;
+    // [fix 2026-10-17] 此前用 goingAway(1001) —— 它是保留码，底层同步抛异常
+    //（见 _cleanTeardownSocket 的注释），close 从未真正发生。改 normalClosure
+    //（handleAuthFailure 里已经关过，这里只是兜底再试一次，幂等）。
     try {
-      await _channel?.sink.close(ws_status.goingAway);
+      await _channel?.sink.close(ws_status.normalClosure);
     } catch (_) {}
     _channel = null;
   }
@@ -755,21 +763,15 @@ class DshService extends ChangeNotifier {
     return raw.toString();
   }
 
-  /// 宽容地读一个整数：网关给 `null` / 字符串数字 / 浮点都要能读出来，
-  /// 读不出来就是 `null`（**绝不回落成 0** —— 0 在用量、附件体积这些地方
-  /// 会被读成"确实是 0"，而真相是"没拿到"）。
-  int? _intOrNull(dynamic raw) {
-    if (raw == null) return null;
-    if (raw is int) return raw;
-    if (raw is num) return raw.toInt();
-    return int.tryParse(raw.toString().trim());
-  }
-
   /// 手动触发网络重连 (F3.4)
   Future<void> retryConnection() async {
     if (_currentConfig == null) return;
     _lastError = '';
     _isTokenInvalid = false;
+    // [fix 2026-10-17] 必须先解除"重连已耗尽"的闸：_scheduleReconnect 入口在
+    // _reconnectExhausted 时直接早退，只重置计数器点不动耗尽后的重试 ——
+    // armReconnectRetry 语义就是"人又碰了一下手机"，这里正是它的调用点。
+    armReconnectRetry();
     _reconnectAttempts = 0;
     _scheduleReconnect(immediate: true);
   }
@@ -900,6 +902,9 @@ class DshService extends ChangeNotifier {
       // 路径提示换 token，不会静默失败。
       _channel = IOWebSocketChannel.connect(
         uri,
+        // [fix 2026-10-17] SYN 黑洞时没有它要挂到 OS 级 TCP 超时（约 2 分钟）。
+        // 与 _executeReconnect 对称。
+        connectTimeout: const Duration(seconds: 10),
         headers: {
           'Authorization': 'Bearer ${config.effectiveToken}',
           'x-dsh-token': config.effectiveToken,
@@ -1157,7 +1162,7 @@ class DshService extends ChangeNotifier {
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _sessionLoadSeq++; // Cancel any pending session loads
-    _isSending = false;
+    _setSending(false);
     _isLoadingHistory = false;
 
     if (autoSelectSession && ws.sessions.isNotEmpty) {
@@ -1303,7 +1308,11 @@ class DshService extends ChangeNotifier {
     }
     if (_subscribeRequested) return;
     _subscribeRequested = true;
-    _subscribeToQuestions();
+    final sent = _subscribeToQuestions();
+    // [fix 2026-10-17] 发送失败时回滚标志：此前 send 静默失败（状态竞态/sink
+    // 异常）后本连接周期内不会再订阅，提问功能整个静默失效，只有 resume 的
+    // resubscribeQuestions 能补救。
+    if (!sent) _subscribeRequested = false;
   }
 
   /// 向网关声明"这台手机愿意回答交互式提问"。
@@ -1316,9 +1325,11 @@ class DshService extends ChangeNotifier {
   /// 没有订阅者就把这次提问留给 Web UI（见 dsh-server-plugin 的
   /// `questionSubscribers.size === 0` 分支）。所以这一步漏了，表现就是
   /// 「agent 弹的选择在手机上完全不显示」—— 不是渲染问题，而是根本没收到。
-  void _subscribeToQuestions() {
+  ///
+  /// 返回是否真的发出去了（调用方据此决定是否回滚 [subscribed] 标志）。
+  bool _subscribeToQuestions() {
     _questionsSubscribed = false;
-    _sendWsJson({'type': 'subscribe_questions'});
+    return _sendWsJson({'type': 'subscribe_questions'});
   }
 
   /// 回前台时的补强：再要一次 pending 重放。
@@ -1352,6 +1363,9 @@ class DshService extends ChangeNotifier {
 
   // Session Management
   Future<void> selectSession(SessionMeta session) async {
+    // [fix 2026-10-17] 用户主动操作 = 重新武装重连（armReconnectRetry 的文档
+    // 承诺覆盖 selectSession，此前从未兑现 —— 8 次耗尽后切会话仍然连不上）。
+    armReconnectRetry();
     final currentSeq = ++_sessionLoadSeq;
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
@@ -1378,7 +1392,7 @@ class DshService extends ChangeNotifier {
     _lastQuestionError = null;
     // 失败横幅同样是会话级的：切走就清，等新会话自己的数据回来再决定。
     _lastTurnFailure = null;
-    _isSending = false; // Reset sending state immediately
+    _setSending(false); // Reset sending state immediately
     _isLoadingHistory = true;
     _lastError = '';
     // 上一个会话的读数（交付物/变更/作业/用量）必须清掉：不清的话新会话的状态条
@@ -1416,41 +1430,20 @@ class DshService extends ChangeNotifier {
         }
 
         _messages = rawMessages.map((m) {
-          final rawTools = m['tools'] as List<dynamic>? ?? [];
-          return ChatMessage(
-            id: m['id'] ?? _uuid.v4(),
-            role: m['role'] ?? 'assistant',
-            content: m['content'] ?? '',
-            thinking: m['thinking'],
-            isMemory: m['isMemory'] == true || m['role'] == 'memory',
-            isContext: m['isContext'] == true || m['role'] == 'context',
-            // [feat 2026-10-12] seq：反向翻页游标 + 实时流去重身份键。
-            seq: m['seq'] is int ? m['seq'] as int : (m['seq'] is num ? (m['seq'] as num).toInt() : null),
-            tools: rawTools.map((t) => ToolExecution(
-              name: t['name'] ?? '',
-              input: _coerceToolInput(t['input']),
-              output: _coerceToolInput(t['output']),
-              isRunning: t['isRunning'] ?? false,
-            )).toList(),
-            timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
-            // [feat 2026-10-17] 网关标出的"注入通知"（子代理结算等）；老网关/本地
-            // 乐观消息没有这几个字段，ChatMessage 会按锚定文案兜底。
-            noticeKind: m['noticeKind']?.toString(),
-            noticeVariant: m['noticeVariant']?.toString(),
-            noticeChildId: m['noticeChildId']?.toString(),
-            noticeBody: m['noticeBody']?.toString(),
-            // [feat 2026-10-17] 引擎的权威逐轮用量 + 附件（图片/文件）。
-            turnTokens: _intOrNull(m['tokens']),
-            attachments: m['attachments'] as List<dynamic>?,
+          // [fix 2026-10-17] 统一走 ChatMessage.fromWire（三处解析收敛，
+          // 防字段漂移）。
+          return ChatMessage.fromWire(
+            Map<String, dynamic>.from(m as Map),
+            newId: _uuid.v4,
           );
         }).toList();
 
         if (isRunning && _messages.isNotEmpty && _messages.last.isAssistant) {
           _messages.last.isStreaming = true;
-          _isSending = true;
+        _setSending(true, sessionId: session.sessionId);
           _startSessionPolling(session.sessionId);
         } else {
-          _isSending = false;
+          _setSending(false);
         }
 
         // [feat 2026-10-12] 首屏历史加载完成后，用最旧一条带 seq 的消息作为
@@ -1489,10 +1482,15 @@ class DshService extends ChangeNotifier {
   }
 
   Future<void> createNewSession([String? workspaceId]) async {
+    // [fix 2026-10-17] 新会话不得继承上一个会话的模型：_currentSessionModel 是
+    // 会话级字段，切到新会话必须重置 —— 否则 temp/real SessionMeta 与首条
+    // 消息都携带上一会话的模型，设置页的默认模型被静默绕过（用户实测报告）。
+    _currentSessionModel = null;
+    armReconnectRetry();
     final currentSeq = ++_sessionLoadSeq; // Invalidate any in-flight session loads
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
-    _isSending = false;
+    _setSending(false);
     // 同 selectSession：只自增，不要跟着把 _cancelledTurnSeq 提上来。
     // 新会话里本来没有在跑的回合，把两者设成相等只是给后面埋下同一个雷。
     _activeTurnSeq++;
@@ -1541,6 +1539,10 @@ class DshService extends ChangeNotifier {
         headers: _authHeaders,
         body: jsonEncode({
           'workspaceId': _currentWorkspace!.workspaceId,
+          // [fix 2026-10-17] 网关 create 后按此字段注入默认模型（兜底路径，
+          // 主路径是下面 selectSessionModel 的显式注入）。
+          if (_settings?.currentModel != null && _settings!.currentModel.isNotEmpty)
+            'model': _settings!.currentModel,
         }),
       ).timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return;
@@ -1552,10 +1554,13 @@ class DshService extends ChangeNotifier {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final realSessionId = data['sessionId']?.toString() ?? data['session']?['sessionId']?.toString();
         if (realSessionId != null && realSessionId.isNotEmpty) {
+          // [fix 2026-10-17] 新会话的模型 = 设置页的默认模型（_currentSessionModel
+          // 已在入口重置为 null，这里必然回落到 settings）。
+          final defaultModel = _settings?.currentModel ?? '';
           final realSession = SessionMeta(
             sessionId: realSessionId,
             title: '新对话',
-            model: _currentSessionModel ?? _settings?.currentModel ?? '',
+            model: defaultModel,
             lastPromptAt: DateTime.now().millisecondsSinceEpoch,
           );
           if (_currentWorkspace != null) {
@@ -1567,6 +1572,15 @@ class DshService extends ChangeNotifier {
             }
           }
           _currentSession = realSession;
+          if (defaultModel.isNotEmpty) {
+            // [fix 2026-10-17] 默认模型按会话级注入：settings.yaml 的
+            // agent-default-model 要重启 dsh web 引擎才被全局采用（代码注释
+            // 实测记录过），而 session/selectModel RPC 立即生效（v1.24 验证）。
+            // 创建成功后立刻注入一次，新会话的第一条消息就跑在用户设定的
+            // 默认模型上。失败不阻塞建会话 —— 引擎侧兜底仍是全局默认。
+            unawaited(selectSessionModel(defaultModel, sessionId: realSessionId)
+                .then((_) => null, onError: (Object _) => null));
+          }
           _messages = []; // Keep strictly empty!
           notifyListeners();
           _sendWsJson({'type': 'follow', 'sessionId': realSessionId});
@@ -1638,7 +1652,7 @@ class DshService extends ChangeNotifier {
     _messages.add(assistantMsg);
 
     final int turnId = ++_activeTurnSeq;
-    _isSending = true;
+    _setSending(true, sessionId: sessionId);
     _streamRevision++;
     // 新的一轮开始：上一次的失败横幅（若有）让位，别再挂着旧错误。
     _lastTurnFailure = null;
@@ -1699,7 +1713,7 @@ class DshService extends ChangeNotifier {
         _lastError = errStr;
         assistantMsg.content = '❌ 发送失败: $errStr';
         assistantMsg.isStreaming = false;
-        _isSending = false;
+        _setSending(false);
         // 正文还回草稿：网关没收到，用户不该只能凭记忆重打。
         // 还回**发起会话**的草稿键，而不是当前的（用户可能已切走）。
         drafts.write(draftKeyAtSend, text);
@@ -1716,7 +1730,7 @@ class DshService extends ChangeNotifier {
       _lastError = '发送指令异常: $e';
       assistantMsg.content = '❌ 发送指令失败: $e';
       assistantMsg.isStreaming = false;
-      _isSending = false;
+      _setSending(false);
       drafts.write(draftKeyAtSend, text);
       _scheduleFailedSendResync(sessionId);
       notifyListeners();
@@ -1750,7 +1764,7 @@ class DshService extends ChangeNotifier {
         timer.cancel();
         _sessionPollTimer = null;
         if (_currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
-          _isSending = false;
+          _setSending(false);
           if (_messages.isNotEmpty && _messages.last.isStreaming) {
             _messages.last.isStreaming = false;
           }
@@ -1765,6 +1779,10 @@ class DshService extends ChangeNotifier {
         return;
       }
 
+      // [fix 2026-10-17] 重叠保护：间隔 2.5s、超时 5s，慢网下两个 tick 并发
+      // 打同一个网关且旧快照可能晚到覆盖新数据。上一个 tick 还在途时跳过本次。
+      if (_sessionPollInFlight) return;
+      _sessionPollInFlight = true;
       try {
         final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$sessionId');
         final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 5));
@@ -1793,9 +1811,14 @@ class DshService extends ChangeNotifier {
         }
       } catch (e) {
         debugPrint('[DshService] session poll tick error: $e');
+      } finally {
+        _sessionPollInFlight = false;
       }
     });
   }
+
+  /// 轮询 tick 的在途标志（重叠保护，见 _startSessionPolling）。
+  bool _sessionPollInFlight = false;
 
   // Active Session State & Pending Stream Chunks Resync (F3.3)
   Future<void> _resyncActiveSession(String sessionId) async {
@@ -1835,33 +1858,34 @@ class DshService extends ChangeNotifier {
     if (_currentSession == null || !_currentSession!.matchesSessionId(targetSessionId)) return;
 
     final serverMessages = rawMessages.map((m) {
-      final rawTools = m['tools'] as List<dynamic>? ?? [];
-      return ChatMessage(
-        id: m['id'] ?? _uuid.v4(),
-        role: m['role'] ?? 'assistant',
-        content: m['content'] ?? '',
-        thinking: m['thinking'],
-        isMemory: m['isMemory'] == true || m['role'] == 'memory',
-        isContext: m['isContext'] == true || m['role'] == 'context',
-        // [feat 2026-10-12] seq：反向翻页游标 + 实时流去重身份键。
-        seq: m['seq'] is int ? m['seq'] as int : (m['seq'] is num ? (m['seq'] as num).toInt() : null),
-        tools: rawTools.map((t) => ToolExecution(
-          name: t['name'] ?? '',
-          input: _coerceToolInput(t['input']),
-          output: _coerceToolInput(t['output']),
-          isRunning: t['isRunning'] ?? false,
-        )).toList(),
-        timestamp: m['time'] != null ? DateTime.fromMillisecondsSinceEpoch(m['time']) : null,
+      // [fix 2026-10-17] 统一走 ChatMessage.fromWire：此前这里手写解析漏了
+      // attachments/turnTokens/noticeKind 等 6 个字段，每 2.5s 轮询整体替换
+      // 后历史图片消失、逐轮 token 回退。三处解析收敛到一个工厂。
+      return ChatMessage.fromWire(
+        Map<String, dynamic>.from(m as Map),
+        newId: _uuid.v4,
       );
     }).toList();
 
     // Turn cancellation sequence fence
+    //
+    // [fix 2026-10-17] 栅栏命中时还要看服务端是否已在新回合里：`_reconcileSessionMessages`
+    // 拿到的 serverMessages 若已包含本地没见过的**新 user 消息**（电脑端发起的
+    // 远端回合），说明取消后的会话已经前进了 —— 栅栏让路，否则远端回合在这里
+    // 被强制 isRunning=false，轮询每 2.5s 都把 UI 拽回"空闲"。
     if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) {
-      isServerRunning = false;
+      final remoteNewTurn = serverMessages.any((m) =>
+          m.role == 'user' &&
+          !_messages.any((local) => local.id == m.id));
+      if (!remoteNewTurn) {
+        isServerRunning = false;
+      } else if (_cancelledTurnSeq >= _activeTurnSeq) {
+        _cancelledTurnSeq = _activeTurnSeq - 1;
+      }
     }
 
     if (isServerRunning) {
-      _isSending = true;
+      _setSending(true, sessionId: targetSessionId);
 
       if (serverMessages.isNotEmpty && serverMessages.last.isAssistant) {
         final serverAssistant = serverMessages.last;
@@ -1894,7 +1918,7 @@ class DshService extends ChangeNotifier {
       }
     } else {
       // Graceful transition to idle when turn finished on server while disconnected
-      _isSending = false;
+      _setSending(false);
       _isCanceling = false;
       _sessionPollTimer?.cancel();
       _sessionPollTimer = null;
@@ -1980,7 +2004,7 @@ class DshService extends ChangeNotifier {
 
     // 2. Synchronous client-side state transition
     _cancelledTurnSeq = _activeTurnSeq;
-    _isSending = false;
+    _setSending(false);
     _isCanceling = true;
 
     // 3. Mark current session as not running locally
@@ -4466,7 +4490,7 @@ class DshService extends ChangeNotifier {
         }
         if (_currentSession != null && _currentSession!.matchesSessionId(sId)) {
           if (!isRunning) {
-            _isSending = false;
+            _setSending(false);
             _isCanceling = false;
             _sessionPollTimer?.cancel();
             _sessionPollTimer = null;
@@ -4478,8 +4502,20 @@ class DshService extends ChangeNotifier {
               }
             }
           } else {
-            if (_activeTurnSeq > _cancelledTurnSeq && !_isCanceling) {
-              _isSending = true;
+            // [fix 2026-10-17] 远端新回合的上升沿要**解除本地取消栅栏**。
+            //
+            // 栅栏的语义是"丢弃本地已取消那一轮的残余帧"，不是"这个会话从此
+            // 哑掉"：电脑端在同一会话发起的新回合，此前会被
+            // `_activeTurnSeq <= _cancelledTurnSeq` 全部丢弃、
+            // `_isSending` 无法点亮（L4491 同条件）、轮询对账又强制
+            // isRunning=false —— 整个远端回合在手机上不可见。多客户端是本
+            // 产品的核心场景，收到 isRunning:true 上升沿就意味着引擎在跑
+            // 一轮我们没发起的回合，栅栏必须让路。
+            if (_cancelledTurnSeq >= _activeTurnSeq) {
+              _cancelledTurnSeq = _activeTurnSeq - 1;
+            }
+            if (!_isCanceling) {
+            _setSending(true, sessionId: sId);
             }
             // 回合开始的**上升沿**：记下"开始前"的累计读数，作为本轮消耗的基线。
             //
@@ -4552,7 +4588,7 @@ class DshService extends ChangeNotifier {
           // （这是用户报的"报错了还一直显示运行中"）。
           _sessionPollTimer?.cancel();
           _sessionPollTimer = null;
-          _isSending = false;
+          _setSending(false);
           _isCanceling = false;
           _streamRevision++;
         }
@@ -4631,7 +4667,7 @@ class DshService extends ChangeNotifier {
 
         final current = _messages.last;
         current.isStreaming = true;
-        _isSending = true;
+        _setSending(true, sessionId: sId);
 
         if (type == 'thinking' || json.containsKey('thinking')) {
           final text = json['delta'] ?? json['thinking'] ?? '';
@@ -4668,7 +4704,7 @@ class DshService extends ChangeNotifier {
         final toolInput = _coerceToolInput(json['input'] ?? json['args']);
         _messages.last.tools.add(ToolExecution(name: toolName, input: toolInput, isRunning: true));
         _messages.last.isStreaming = true;
-        _isSending = true;
+        _setSending(true, sessionId: sId);
         _streamRevision++;
         notifyListeners();
         return;
@@ -4921,7 +4957,7 @@ class DshService extends ChangeNotifier {
         }
         _sessionPollTimer?.cancel();
         _sessionPollTimer = null;
-        _isSending = false;
+        _setSending(false);
         _isCanceling = false;
         _streamRevision++;
         // 回合结束了：本轮的基线使命结束（`_turnRunningSeen` 复位，等下一个回合
@@ -4944,7 +4980,11 @@ class DshService extends ChangeNotifier {
       }
 
     } catch (e) {
-      debugPrint('[DshService] JSON parse error: $e');
+      // [fix 2026-10-17] 日志措辞窄化：此前的 catch 包住整个消息处理（不只
+      // jsonDecode），fromJson 的 TypeError、字段强转失败全被吞成"JSON parse
+      // error"，误导排查。这里带帧首片段，至少能看出是哪一帧。
+      final preview = raw.length > 120 ? '${raw.substring(0, 120)}…' : raw;
+      debugPrint('[DshService] 帧处理失败（type 尚不可知）: $e | 帧: $preview');
     }
   }
 
@@ -5099,8 +5139,12 @@ class DshService extends ChangeNotifier {
       await _cleanTeardownSocket();
 
       final uri = Uri.parse(_currentConfig!.wsUrl);
+      // [fix 2026-10-17] connectTimeout：SYN 黑洞（网关掉线/防火墙丢包）时
+      // 没有它 ready 会挂到 OS 级 TCP 超时（约 2 分钟），期间 _isReconnecting
+      // 锁死一切重连调度。connect() 与本路径必须对称设值。
       _channel = IOWebSocketChannel.connect(
         uri,
+        connectTimeout: const Duration(seconds: 10),
         headers: {
           'Authorization': 'Bearer ${_currentConfig!.effectiveToken}',
           'x-dsh-token': _currentConfig!.effectiveToken,
@@ -5152,7 +5196,26 @@ class DshService extends ChangeNotifier {
         },
       );
 
+      // [fix 2026-10-17] 等连接真正打开再翻状态 —— 与 connect()（L954）对称。
+      // 此前只靠"首条服务器帧"翻 connected，而下面的 ping 因 status 仍是
+      // connecting 被 _sendWsJson 的守卫拦掉（no-op 死代码）；若网关建连后
+      // 不主动推帧，状态永远停在 connecting 且 _isReconnecting=true，
+      // _scheduleReconnect 从此永久阻塞，没有任何自愈路径。
+      try {
+        await _channel!.ready;
+        _status = ConnectionStatus.connected;
+        _reconnectAttempts = 0;
+        _isReconnecting = false;
+        _onReconnected();
+        notifyListeners();
+      } catch (e) {
+        // ready 失败会走 stream 的 onError/onDone，由它们负责重连；这里只记录，
+        // 不重复触发，避免两条路径同时排重连。
+        debugPrint('[DshService] Reconnect WS ready 失败: $e');
+      }
+
       _startHeartbeat();
+      // ready 之后再发 ping（此前这行是死代码：status=connecting 时被守卫拦掉）。
       _sendWsJson({'type': 'ping'});
     } catch (e) {
       debugPrint('[DshService] _executeReconnect failed: $e');
@@ -5185,6 +5248,9 @@ class DshService extends ChangeNotifier {
     }
     _lastResumeCheck = now;
     debugPrint('[DshService] App resumed to foreground');
+    // [fix 2026-10-17] 回前台 = 用户主动操作，重新武装耗尽的重连（与
+    // armReconnectRetry 文档承诺一致，此前从未兑现）。
+    armReconnectRetry();
 
     if (_status != ConnectionStatus.connected || _channel == null) {
       debugPrint('[DshService] Resumed while disconnected/error: triggering immediate reconnect');
@@ -5288,3 +5354,4 @@ class DshService extends ChangeNotifier {
     super.dispose();
   }
 }
+

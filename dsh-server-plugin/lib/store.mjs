@@ -387,12 +387,25 @@ export function maxCustomPresets() {
   return MAX_CUSTOM_PRESETS;
 }
 
-/** Record that a device just talked to the bridge. */
+/**
+ * Record that a device just talked to the bridge.
+ *
+ * [fix 2026-10-17] 30s 节流：客户端 2.5s 一次轮询会把这里变成"每 2.5s 整文件
+ * 重写 devices.json"——写盘放大 + 并发 read-modify-write 互相覆盖丢更新。
+ * lastSeenAt 差 30 秒对设置页的"最近活跃"毫无影响。
+ */
+const TOUCH_THROTTLE_MS = 30 * 1000;
+const _touchState = new Map(); // deviceId -> last written ms
+
 export function touchDevice(deviceId, ip = '') {
+  const now = Date.now();
+  const last = _touchState.get(deviceId);
+  if (last != null && now - last < TOUCH_THROTTLE_MS) return true;
+  _touchState.set(deviceId, now);
   const state = loadDevices();
   const dev = state.devices.find((d) => d.id === deviceId);
   if (!dev) return false;
-  dev.lastSeenAt = Date.now();
+  dev.lastSeenAt = now;
   if (ip) dev.lastIp = ip;
   return saveDevices(state);
 }

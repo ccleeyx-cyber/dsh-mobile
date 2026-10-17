@@ -132,9 +132,13 @@ Future<void> showChatCommandSheet(
   );
   if (picked == null || !context.mounted) return;
   // 点选把 "/name " 插入输入框（保留既有草稿），光标落到底。
+  // [fix 2026-10-17] 与 composer._insertSlashCommand 同一套规则：`/` 开头但
+  // 无空格时 indexOf(' ')==-1，substring(0) 取回全文 → 双斜杠残留。无空格
+  // 时整段就是旧命令名，直接替换。（两处规则必须同步改。）
   final current = inputController.text;
+  final spaceIdx = current.indexOf(' ');
   inputController.text = current.startsWith('/')
-      ? '/${picked.name} ${current.substring(current.indexOf(' ') + 1)}'
+      ? '/${picked.name} ${spaceIdx == -1 ? '' : current.substring(spaceIdx + 1)}'
       : '$current/${picked.name} ';
   inputController.selection = TextSelection.collapsed(offset: inputController.text.length);
   dsh.updateDraft(inputController.text);

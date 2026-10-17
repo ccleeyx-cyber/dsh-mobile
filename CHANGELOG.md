@@ -7,6 +7,87 @@
 
 ---
 
+## [1.31.0] - 2026-10-17
+
+全面代码审查后的第一批修复（方案见 `docs/2026-10-17-审查修复执行方案.md`）。
+本轮重点是四个「注释声称已修、代码未生效」的空操作修复与默认模型链路 ——
+全部附带钉住行为的回归测试（`regression_2026_10_17_test.dart` 等，新增 7 条）。
+
+### 修复（服务层）
+
+- **重连耗尽后手动重试失效**：`retryConnection` 只重置计数器、不解除
+  `_reconnectExhausted` 闸，而承诺"重新武装"的 `armReconnectRetry` 全工程零调用。
+  现在 retryConnection / selectSession / createNewSession / handleAppResumed
+  都会真正重新武装。
+- **`_executeReconnect` 缺 `await ready`**：靠首帧才翻 connected，重连路径发的
+  ping 被状态守卫拦成死代码；网关建连后不主动推帧时永远卡在 connecting 且
+  无自愈。补 await ready + catch，两处 `IOWebSocketChannel.connect` 都加了
+  10s connectTimeout（SYN 黑洞不再挂 2 分钟）。
+- **取消栅栏误伤远端新回合**：手机取消后，电脑端在同一会话发起的新回合会被
+  增量守卫整轮丢弃。现在收到 isRunning 上升沿或对账发现新 user 消息时栅栏让路。
+- **轮询对账丢字段**：三处手写消息解析漂移，对账路径漏了
+  attachments/turnTokens/noticeKind 等 6 个字段（历史图片消失、逐轮 token 回退）。
+  收敛为统一的 `ChatMessage.fromWire` 工厂。
+- **isSessionRunning 恒真**：`dsh.currentSession` 与自身比较，别的会话在跑时
+  本会话也点亮停止键。服务侧新增 `sendingSessionId`，停止键只在"本会话真的在
+  本机跑"时出现。
+- **语音 `onAutoStopped` 自赋值 no-op**：引擎自动结束（静音超时/时长上限）永远
+  无法通知 UI。fake 与真实路径都补挂了实例字段。
+- **清空凭据复活**：`_writeSecrets` 对空字段现在会删掉 Keystore 槽位；
+  `deleteProfile` 补删迁移前的旧槽。SecureStore 的文档注释与实现对齐。
+
+### 修复（默认模型）
+
+- **新建会话不再继承上一会话的模型**：`createNewSession` 重置
+  `_currentSessionModel`，新会话显示并使用设置页的默认模型；创建成功后主动调
+  `session/selectModel` RPC 按会话级注入 —— 这条通道立即生效，不依赖引擎重启。
+  网关 `sessions/create` 接受可选 model 作为老客户端兜底。
+- 设置页提示文案改为「App 新建会话立即生效；引擎全局对齐需重启 dsh web」。
+
+### 修复（UI/UX）
+
+- 弹层内 3 处 SnackBar 改为面板级内联提示（SnackBar 会被 bottom sheet 盖住，
+  用户看不到操作结果）；两处 `_refresh` 补 catch，异常进内联提示。
+- 日志查看器只在"已在底部附近"时才自动跟随 —— 此前每 2 秒无条件拉底，
+  上翻读历史会被反复拽走。
+- 输入区提示（ComposerNotice）收敛为单一所有者 `ComposerNoticeBus`：父级与
+  composer 的双 Timer 不再互踩（排队回执把语音错误提示提前抹掉的问题）。
+- 点按听写改为**追加**而非整段覆盖已打字草稿；「撤回插队」有草稿时也走追加。
+- 斜杠命令在"/ 开头但无空格"时不再产生双斜杠（composer 与 chat_sheets 同步修）。
+- 触控目标：状态胶囊动作按钮 ≥44dp、附件删除 32px、消息「⋯」32px、权限胶囊
+  放宽到 46dp（「全信任」不再截断）。
+- 工作区会话行尾三个相邻小图标收进「⋯」菜单（删除不再紧邻归档）。
+- 工作区卡片加稳定 key（轮询/过滤下展开状态不再错位）；会话列表默认只渲染
+  最近 50 条 +「展开全部」（1275 条会话的工作区不再一次性全量构建）。
+- Ping 测速补 mounted 检查；手动重连有 loading 反馈并防连点。
+- 录音 30s 看门狗随 partial 顺延（正常长句不再被强切误报）。
+- 消息高亮 3s 清除与再次高亮互斥；会话内查找按「查询+条数+流版本」记忆化
+  （流式期间不再每 tick 全文扫描）。
+- 会话切换时清理跨会话的 GlobalKey 注册表与产出已读标记（慢性内存增长）。
+
+### 修复（网关 dsh-server-plugin —— 需重启 dsh web 生效）
+
+- **配对码铸造加闸**：`/pair/qr`、`/pair/info` 此前可无限自助发码（公网部署下
+  等于零门槛换全权限 token）。现在要求有效 token，或来源为本机/私网。
+- **鉴权爆破退避修复**：`X-Forwarded-For` 默认不再作为退避键（直连场景每请求
+  换一个伪造 XFF 即可绕过限速；部署在可信反代后设 `BRIDGE_TRUST_PROXY=1`）；
+  WS upgrade 的 401 同样计入退避。
+- **readonly 反转为 deny-by-default**：POST/PUT 一律拒绝只读设备，不再依赖
+  会漏项的白名单（此前 workspaces/create、quick-commands/run 等 6 条写路由
+  全部在名单外）。
+- **jobs/follow 前缀失配**：`collect-` 流帧此前永远路由不到，后台任务日志
+  实际永远为空。
+- 会话权限策略键归一化（`session-` 前缀两种拼写不再静默回落全局策略）；
+  附件读取加 60s/30 次频率桶；`touchDevice` 30s 节流（不再每 2.5s 重写
+  devices.json）。
+
+### 验证
+
+- `flutter analyze` 无问题；`flutter test` 767 通过（含新增回归 7 条）。
+- `npm test`（hermetic）408 通过。
+
+---
+
 ## [1.30.0] - 2026-10-17
 
 会话页顶栏重做。这一轮**只动顶部**：不碰数据口径、不碰消息流、不碰打包链路。

@@ -281,6 +281,20 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
   String? _jobStopNotice;
   bool _jobStopNoticeError = false;
 
+  /// 面板级内联提示（[fix 2026-10-17]）。此前 _doGoalAction / _explainToolCallRow /
+  /// _confirmInterruptSubagent 三处仍在用 SnackBar —— 会被本弹层盖住，与上面
+  /// 这段自述矛盾。统一改为写这里、在弹层体顶部渲染。
+  String? _inlineNotice;
+  bool _inlineNoticeError = false;
+
+  void _showInlineNotice(String text, {bool error = true}) {
+    if (!mounted) return;
+    setState(() {
+      _inlineNotice = text;
+      _inlineNoticeError = error;
+    });
+  }
+
   @override
   void initState() {
     super.initState();
@@ -352,6 +366,10 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
     setState(() => _refreshing = true);
     try {
       await refresh();
+    } catch (e) {
+      // [fix 2026-10-17] 外部回调的异常此前是 unhandled async error（_refreshing
+      // 被 finally 复位但用户什么都看不到）。写进面板级内联提示。
+      _showInlineNotice('刷新失败：$e');
     } finally {
       if (mounted) setState(() => _refreshing = false);
     }
@@ -542,6 +560,61 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
+                          // [fix 2026-10-17] 面板级内联提示（goal 失败 / 中断失败 /
+                          // 工具行解释）—— 弹层内 SnackBar 会被自己盖住。
+                          if (_inlineNotice != null)
+                            Container(
+                              key: const ValueKey('session-info-inline-notice'),
+                              margin: const EdgeInsets.only(bottom: 10),
+                              padding: const EdgeInsets.all(10),
+                              decoration: BoxDecoration(
+                                color: _inlineNoticeError
+                                    ? context.c.dangerSurface
+                                    : context.c.surfaceMuted,
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: _inlineNoticeError
+                                      ? context.c.danger
+                                      : context.c.border,
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    _inlineNoticeError
+                                        ? Icons.error_outline_rounded
+                                        : Icons.info_outline_rounded,
+                                    size: 15,
+                                    color: _inlineNoticeError
+                                        ? context.c.danger
+                                        : context.c.textSecondary,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      _inlineNotice!,
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: _inlineNoticeError
+                                            ? context.c.danger
+                                            : context.c.textSecondary,
+                                      ),
+                                    ),
+                                  ),
+                                  GestureDetector(
+                                    behavior: HitTestBehavior.opaque,
+                                    onTap: () =>
+                                        setState(() => _inlineNotice = null),
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(6),
+                                      child: Icon(Icons.close_rounded,
+                                          size: 14,
+                                          color: context.c.textTertiary),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
                           // [fix 2026-10-17] 「会话操作」整块删除。
                           //
                           // 用户的原话：这些在工作区页都能点，而且在这里还要多操作
@@ -792,10 +865,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       final ok = await handler(action, goal);
       if (!mounted) return;
       if (!ok) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('引擎拒绝了这次目标操作（$action）——目标可能已被模型侧修改，刷新后重试'),
-          behavior: SnackBarBehavior.floating,
-        ));
+        // [fix 2026-10-17] 弹层内 SnackBar 会被自己盖住 —— 改内联。
+        _showInlineNotice('引擎拒绝了这次目标操作（$action）——目标可能已被模型侧修改，刷新后重试');
       }
     } finally {
       if (mounted) setState(() => _goalActionInProgress = null);
@@ -1150,11 +1221,12 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
 
   /// 点到一条"Agent 写入"行时给出的解释（它没有 git diff 可看）。
   void _explainToolCallRow() {
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-      content: Text('这一行来自本轮 Agent 的文件写入记录，没有对应的 git diff：'
-          '会话日志只记了「哪个文件被写过」，不记行级改动。'),
-      behavior: SnackBarBehavior.floating,
-    ));
+    // [fix 2026-10-17] 弹层内 SnackBar 会被自己盖住 —— 改内联。
+    _showInlineNotice(
+      '这一行来自本轮 Agent 的文件写入记录，没有对应的 git diff：'
+      '会话日志只记了「哪个文件被写过」，不记行级改动。',
+      error: false,
+    );
   }
 
   // --------------------------------------------------------- 作业 ----
@@ -1792,15 +1864,14 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       ),
     );
     if (ok != true) return;
+    if (!mounted) return; // [fix 2026-10-17] dialog await 之后先查 mounted
     setState(() => _interruptingId = sub.id);
     try {
       final done = await handler(sub);
       if (!mounted) return;
       if (!done) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('中断请求被引擎拒绝或未送达'),
-          behavior: SnackBarBehavior.floating,
-        ));
+        // [fix 2026-10-17] 弹层内 SnackBar 会被自己盖住 —— 改内联。
+        _showInlineNotice('中断请求被引擎拒绝或未送达');
       }
     } finally {
       if (mounted) setState(() => _interruptingId = null);
@@ -2139,6 +2210,15 @@ class _JobLogSheetState extends State<_JobLogSheet> {
       });
       if (_settled) _poll?.cancel();
       _autoScroll();
+    } catch (e) {
+      // [fix 2026-10-17] 外部回调抛异常时此前会变成 unhandled async error：
+      // _busy 被 finally 复位但 _error 永不置位，界面停在转圈。写进 _error。
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = '读取异常：$e';
+        });
+      }
     } finally {
       _busy = false;
     }
@@ -2146,9 +2226,18 @@ class _JobLogSheetState extends State<_JobLogSheet> {
 
   void _autoScroll() {
     if (!_scroll.hasClients) return;
-    // 追加后滚到底：看日志的人关心的是最新一行（历史可以往上翻）。
+    // [fix 2026-10-17] 只在用户**已经在底部附近**时才跟随：此前每 2 秒无条件
+    // jumpTo 拉底，用户上翻读历史会被反复拽走，日志查看器基本没法回读。
+    // 追加前判位（postFrame 里位置已经变了，要读追加前的值）。
+    final nearBottom = !_scroll.hasClients ||
+        _scroll.position.maxScrollExtent - _scroll.position.pixels < 80;
+    if (!nearBottom) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scroll.hasClients) return;
+      // postFrame 里再确认一次：用户在这帧之间可能又滚上去了。
+      if (_scroll.position.maxScrollExtent - _scroll.position.pixels > 200) {
+        return;
+      }
       _scroll.jumpTo(_scroll.position.maxScrollExtent);
     });
   }
