@@ -313,8 +313,13 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 // **同一个** pendingCount 角标（同一个数字出现两次，反而分散注意力），
                 // 而权限/审批预设是低频配置，不该占一级入口。现在从「设置 → 安全策略
                 // 与授权」推入；待处理数量改由设置页那张卡片承载。
+                //
+                // [fix] selectedIcon 必须与未选中图标**不同**，否则选中时只有底部
+                // 那枚浅蓝胶囊在变，图标本身毫无变化 —— 另两个 tab（对话/工作区）
+                // 选中都会换成实心图标，反馈不一致。这里用 tune 的 outlined/rounded
+                // 一对补上同样的"变实"效果。
                 const NavigationDestination(
-                  icon: Icon(Icons.tune_rounded),
+                  icon: Icon(Icons.tune_outlined),
                   selectedIcon: Icon(Icons.tune_rounded),
                   label: '设置',
                 ),

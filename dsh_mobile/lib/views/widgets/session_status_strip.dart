@@ -143,6 +143,9 @@ class SessionStatusStrip extends StatelessWidget
 
   static const double _rowHeight = 34;
 
+  /// 状态条右边缘渐隐带的宽度（dp）。见 build 里 ShaderMask 处的说明。
+  static const double _edgeFadeWidth = 14;
+
   /// 有没有任何东西可显示。没有就只留 1px 分隔线，**不留一条空白带**。
   bool get hasContent =>
       isRunning ||
@@ -495,10 +498,39 @@ class SessionStatusStrip extends StatelessWidget
                         ? null
                         : () => onTapSection!(SessionInsightSection.usage),
                     child: Padding(
-                      padding: const EdgeInsets.only(left: 8, right: 10),
-                      child: SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: Row(children: segments),
+                      padding: const EdgeInsets.only(left: 8),
+                      // [fix] 右边缘加一条**渐隐**，替代原来的硬裁切。
+                      //
+                      // 旧实现是 `SingleChildScrollView` 直接被 Expanded 裁掉：内容
+                      // 比屏幕宽时，最后可见的常常正好是段间那个 `·`（截图里
+                      // `… 产出 0 ·` 后面空空如也），看起来像"渲染到一半坏掉了"。
+                      // 渐隐同时表达两件事：后面还有内容、它是被"卷"走的而不是丢了。
+                      //
+                      // **渐隐带只有最后 14dp**（不是整宽的百分比）：内容装得下时
+                      // 这 14dp 落在尾部留白上，不会把真实的最后一个数字变淡。
+                      child: ShaderMask(
+                        shaderCallback: (rect) {
+                          final w = rect.width;
+                          final fadeStart =
+                              w <= _edgeFadeWidth ? 0.0 : (w - _edgeFadeWidth) / w;
+                          return LinearGradient(
+                            begin: Alignment.centerLeft,
+                            end: Alignment.centerRight,
+                            colors: const [
+                              Colors.black,
+                              Colors.black,
+                              Colors.transparent
+                            ],
+                            stops: [0.0, fadeStart, 1.0],
+                          ).createShader(rect);
+                        },
+                        blendMode: BlendMode.dstIn,
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          // 尾部留 8dp：让"最后一个数字"不贴死在渐隐区里。
+                          padding: const EdgeInsets.only(right: 8),
+                          child: Row(children: segments),
+                        ),
                       ),
                     ),
                   ),

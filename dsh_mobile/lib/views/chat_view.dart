@@ -437,15 +437,33 @@ class _ChatViewState extends State<ChatView> {
     setState(() => _visibleTurn = turn);
   }
 
-  /// 浮在消息流右边缘的刻度层。只有一轮时不显示 —— 一格刻度没有导航价值。
+  /// 浮在消息流右边缘的刻度层。
+  ///
+  /// [fix 2026-10-17] 门槛从 8 轮改为**只要有轮就显示**。
+  ///
+  /// 之前提 8 轮的理由是"4 轮会话里这列刻度就是一竖串小点，与 AI 消息左侧那条
+  /// 2px 竖线叠在同一边距上像杂质"。但那个取舍的代价是**用户根本不知道这个功能
+  /// 存在**：绝大多数会话都在 8 轮以内，于是刻度时有时无、看起来像渲染坏了，
+  /// 用户的原话是"为什么有的会话有有的没有显示轮次滑块"。
+  ///
+  /// 现在按用户要求无条件常驻（只要有真人回话）。视觉冲突改用"当前轮是 3×14
+  /// 竖条、其余是 3×3 圆点"来区分，而不是靠"干脆不画"。
   Widget _buildTurnRail(DshService dsh) {
     final marks = _turnMarks(dsh);
-    // [fix 2026-10-17] 门槛提到 8 轮。
-    //
-    // 真机上看：4 轮会话里这列刻度就是左侧一竖串小点，而每条 AI 消息左边本来
-    // 已经有一条 2px 竖线 —— 两列竖排元素叠在同一个边距上，视觉上就是"杂质"。
-    // 它的价值只在"十轮以上、靠滑找不回来"的场景，所以那之前不出现。
-    if (marks.length < 8) return const SizedBox.shrink();
+    // 一条真人消息都没有（空会话 / 只有系统注入）时没有可跳的目标 —— 这是
+    // "没有内容"，不是"轮数不够"，所以仍然整层不画。
+    if (marks.isEmpty) return const SizedBox.shrink();
+
+    // [fix 2026-10-17] 首次进入会话时 `_visibleTurn` 还是 null（它只在滚动通知里
+    // 算出来），于是整条刻度全是灰点 —— 看不出"我现在在第几轮"，而"我在哪"正是
+    // 这列刻度的一半价值。这里补一次首帧后的探测：算出来后 `_visibleTurn` 非空，
+    // 条件不再成立，不会反复触发。
+    if (_visibleTurn == null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _probeVisibleTurn();
+      });
+    }
+
     return TurnNavigationRail(
       marks: marks,
       currentTurn: _visibleTurn,

@@ -460,11 +460,13 @@ void main() {
         const SessionInfoSheet(stats: SessionStats(source: 'live', totalTokens: 1500)),
       );
       expect(find.text('本轮消耗'), findsOneWidget);
-      // 两处未知都显示「—」：本轮消耗（没量到实时读数）与会话累计消耗（该 fixture
-      // 只有 totalTokens、没有分桶，按"未知≠0"的规矩不能拿 totalTokens 冒充）。
-      expect(find.text('—'), findsNWidgets(2));
+      // 本轮消耗（没量到实时读数）显示「统计中…」+ ? 图标（解释收进 Tooltip）；
+      // 会话累计消耗（该 fixture 只有 totalTokens、没有分桶，按"未知≠0"的规矩
+      // 不能拿 totalTokens 冒充）仍显示「—」。
+      expect(find.text('—'), findsOneWidget);
+      expect(find.text('统计中…'), findsOneWidget);
       expect(find.text('0'), findsNothing, reason: '0 会被读成"这轮没花钱"，而真相是"不知道"');
-      expect(find.textContaining('取不到实时读数时显示「—」'), findsOneWidget);
+      expect(find.byIcon(Icons.help_outline_rounded), findsOneWidget);
       expect(find.text('1,500'), findsNothing, reason: 'totalTokens 不是消耗，不得显示');
     });
 
@@ -951,7 +953,7 @@ void main() {
       await teardown(tester);
     });
 
-    testWidgets('一轮结束后的消耗显示真值；没量到就显示「—」，绝不显示 0', (tester) async {
+    testWidgets('一轮结束后的消耗显示真值；没量到就显示「统计中…」，绝不显示 0', (tester) async {
       final dsh = await chatWithSession(tester);
       dsh.debugSetTaskCenter(
         deliverables: const [],
@@ -966,13 +968,79 @@ void main() {
       await tester.pump(const Duration(milliseconds: 400));
       expect(find.byType(SessionInfoSheet), findsOneWidget);
       expect(find.text('本轮消耗'), findsOneWidget);
-      expect(find.text('—'), findsWidgets, reason: '没量到本轮消耗时必须显示「—」');
+      expect(find.text('统计中…'), findsWidgets,
+          reason: '没量到本轮消耗时必须显示「统计中…」（解释在 ? 图标的 Tooltip 里）');
       expect(find.text('0'), findsNothing, reason: '0 会被读成"这轮没花钱"，而真相是"不知道"');
 
       // 量到了就显示真值（含千分位）。
       dsh.debugSetTaskCenter(measuredTurnTokens: 12345);
       await tester.pump();
       expect(find.text('12,345'), findsOneWidget);
+      await teardown(tester);
+    });
+
+    // ============================ 轮次刻度：无条件显示 ====================
+    //
+    // 这里锁的是**一个用户明确要求过的决定**，不是实现细节：
+    // 旧版 `_buildTurnRail` 有 `if (marks.length < 8) return SizedBox.shrink()`，
+    // 于是绝大多数会话都没有刻度，用户看到的是"有的会话有、有的没有"，
+    // 第一反应是"渲染坏了"。用户原话：「不管多少轮，我都要显示轮次」。
+    //
+    // 若这条变红，说明又把门槛加回来了 —— 那就等于把那个 bug 重新引入。
+
+    /// 造 n 轮真人回话（每轮 = 一条 user + 一条 assistant）。
+    void setTurns(DshService dsh, int n) {
+      dsh.debugSetMessages([
+        for (var i = 1; i <= n; i++) ...[
+          ChatMessage(
+            id: 'u$i',
+            role: 'user',
+            content: '第 $i 轮提问',
+            timestamp: DateTime.now(),
+          ),
+          ChatMessage(
+            id: 'a$i',
+            role: 'assistant',
+            content: '第 $i 轮回答',
+            timestamp: DateTime.now(),
+          ),
+        ],
+      ]);
+    }
+
+    for (final rounds in [1, 3, 7, 8]) {
+      testWidgets('$rounds 轮也要显示刻度（8 轮门槛已移除）', (tester) async {
+        final dsh = await chatWithSession(tester);
+        setTurns(dsh, rounds);
+        await tester.pump();
+
+        expect(find.byKey(const ValueKey('turn-nav-rail')), findsOneWidget,
+            reason: '$rounds 轮会话必须有轮次刻度 —— 门槛早就删了');
+        // 每一轮都有一格，一格都不许少。
+        for (var i = 1; i <= rounds; i++) {
+          expect(find.byKey(ValueKey('turn-nav-$i')), findsOneWidget,
+              reason: '第 $i 轮的刻度缺失');
+        }
+        expect(find.byKey(ValueKey('turn-nav-${rounds + 1}')), findsNothing,
+            reason: '不能多画一格');
+        await teardown(tester);
+      });
+    }
+
+    testWidgets('一条真人回话都没有时不画刻度（空会话/只有系统注入）', (tester) async {
+      final dsh = await chatWithSession(tester);
+      dsh.debugSetMessages([
+        ChatMessage(
+          id: 'a-only',
+          role: 'assistant',
+          content: '只有助手消息，没有真人回话',
+          timestamp: DateTime.now(),
+        ),
+      ]);
+      await tester.pump();
+
+      // 这不是"轮数不够"，而是"没有可跳的目标" —— 一格都没有才对。
+      expect(find.byKey(const ValueKey('turn-nav-rail')), findsNothing);
       await teardown(tester);
     });
   });

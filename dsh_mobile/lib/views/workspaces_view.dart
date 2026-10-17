@@ -808,7 +808,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                         if (q.trim().isNotEmpty) _showGlobalSearchSheet(context, dsh, initialQuery: q.trim());
                       },
                       decoration: InputDecoration(
-                        hintText: '搜索会话：本页即时筛选，回车全库搜索',
+                        hintText: '搜索会话…',
                         hintStyle: TextStyle(color: context.c.textTertiary, fontSize: 12.5),
                         prefixIcon: Icon(Icons.search_rounded, size: 19, color: context.c.textTertiary),
                         suffixIcon: _searchFilter.isNotEmpty

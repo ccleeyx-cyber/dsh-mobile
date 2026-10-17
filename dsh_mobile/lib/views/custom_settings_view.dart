@@ -184,6 +184,36 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     ));
   }
 
+  /// 「断线重连」的确认。
+  ///
+  /// 为什么要问一句：重连会断开当前长连接，正在跑的回合可能收不到后续增量
+  /// —— 这不是"刷新一下"那种无害动作，轻点就触发会让用户在一次误触里丢进度。
+  /// 连接本来就断着的时候不问：那时重连是唯一出路，多一步只是添堵。
+  Future<void> _confirmReconnect(BuildContext context, DshService dsh) async {
+    final cfg = dsh.currentConfig;
+    if (cfg == null) return;
+    if (!dsh.isConnected) {
+      await dsh.connect(cfg);
+      return;
+    }
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('现在就重连？'),
+        content: const Text(
+            '会断开当前连接再重新握手。正在执行的回合可能收不到后续增量；'
+            '如果你只是觉得界面卡住，先下拉刷新或稍等几秒通常更安全。'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true), child: const Text('重连')),
+        ],
+      ),
+    );
+    if (ok == true) await dsh.connect(cfg);
+  }
+
   void _showModelSwitchSheet(BuildContext context, DshService dsh) {
     final settings = dsh.settings;
     final currentModel = settings?.currentModel ?? 'cn:deepseek-v4.1-flash';
@@ -1006,11 +1036,16 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                         Text(
                           dsh.pingMs >= 0 ? '${dsh.pingMs} ms' : '未测速',
                           style: TextStyle(
-                            color: dsh.pingMs >= 0 && dsh.pingMs < 100
-                                ? context.c.success
-                                : dsh.pingMs >= 100
-                                    ? context.c.warning
-                                    : context.c.textTertiary,
+                            // 按阈值**单色梯度**：<100 绿 / 100–300 橙 / >300 红。
+                            // 旧实现只有"<100 绿，其余橙"两档，300ms 与 3000ms
+                            // 长得一样，慢到不可用也看不出来。
+                            color: !(dsh.pingMs >= 0)
+                                ? context.c.textTertiary
+                                : dsh.pingMs < 100
+                                    ? context.c.success
+                                    : dsh.pingMs <= 300
+                                        ? context.c.warning
+                                        : context.c.danger,
                             fontWeight: FontWeight.bold,
                             fontSize: 13,
                           ),
@@ -1027,12 +1062,14 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                           child: Container(
                             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                             decoration: BoxDecoration(
-                              color: context.c.success.withOpacity(0.12),
+                              // 测速是一个**动作**，与延迟数值的颜色语义（绿/橙/红=快慢）
+                              // 分开：用主蓝，避免与"延迟低=绿色"撞在一起误读成"状态良好"。
+                              color: context.c.accent.withOpacity(0.12),
                               borderRadius: BorderRadius.circular(6),
                             ),
                             child: _isTestingPing
-                                ? SizedBox(width: 10, height: 10, child: CircularProgressIndicator(strokeWidth: 1.5, color: context.c.success))
-                                : Text('测速', style: TextStyle(color: context.c.success, fontSize: 11, fontWeight: FontWeight.w600)),
+                                ? SizedBox(width: 10, height: 10, child: CircularProgressIndicator(strokeWidth: 1.5, color: context.c.accent))
+                                : Text('测速', style: TextStyle(color: context.c.accent, fontSize: 11, fontWeight: FontWeight.w600)),
                           ),
                         ),
                       ],
@@ -1044,6 +1081,13 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                 const SizedBox(height: 10),
 
                 // Reconnect & Change Server
+                //
+                // [fix] 视觉权重要跟**代价**一致，而不是跟"哪个动作听起来更急"：
+                //  * 「切换服务器」是正常的下一步（改配置、换机器），频繁操作、
+                //    不破坏任何东西 —— 实心主按钮。
+                //  * 「断线重连」会打断正在跑的会话流（重连期间发出的消息可能丢），
+                //    属于"要不要现在做"的决策 —— 描边次按钮 + 确认弹窗。
+                // 旧版刚好相反：破坏性更强的那个更醒目，手指一滑就点了。
                 Row(
                   children: [
                     Expanded(
@@ -1054,14 +1098,9 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                           padding: const EdgeInsets.symmetric(vertical: 10),
                         ),
-                        icon: const Icon(Icons.swap_horiz_rounded, size: 16),
-                        label: const Text('切换服务器', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500)),
-                        onPressed: () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(builder: (_) => const ConfigPage()),
-                          );
-                        },
+                        icon: const Icon(Icons.refresh_rounded, size: 16),
+                        label: const Text('断线重连', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500)),
+                        onPressed: () => _confirmReconnect(context, dsh),
                       ),
                     ),
                     const SizedBox(width: 10),
@@ -1074,12 +1113,13 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                           padding: const EdgeInsets.symmetric(vertical: 10),
                         ),
-                        icon: const Icon(Icons.refresh_rounded, size: 16),
-                        label: const Text('断线重连', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+                        icon: const Icon(Icons.swap_horiz_rounded, size: 16),
+                        label: const Text('切换服务器', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
                         onPressed: () {
-                          if (dsh.currentConfig != null) {
-                            dsh.connect(dsh.currentConfig!);
-                          }
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(builder: (_) => const ConfigPage()),
+                          );
                         },
                       ),
                     ),
@@ -1958,18 +1998,56 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     ));
   }
 
+  /// 小节标题：`中文主标题` + `English (subtitle)`。
+  ///
+  /// [fix] 中英挤在同一行时，窄屏会在括号里那个 `&` 后面断开（
+  /// "网络与网关诊断 (Connectivity &"/"Diagnostics)"），读起来像排版坏了。
+  /// 现在英文单独一行、缩到副标题尺寸：中文优先读，英文作为对照留在原地。
   Widget _buildSectionHeader(String title, IconData icon, Color color) {
+    // 拆 `主标题 (English)`：括号里的那半段是副标题。
+    String primary = title;
+    String? secondary;
+    final open = title.indexOf(' (');
+    if (open > 0 && title.endsWith(')')) {
+      primary = title.substring(0, open);
+      secondary = title.substring(open + 2, title.length - 1);
+    }
     return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Icon(icon, size: 20, color: color),
+        // 图标对齐主标题那一行，而不是整块（含副标题）的垂直中心。
+        Padding(
+          padding: EdgeInsets.only(top: secondary == null ? 0 : 1),
+          child: Icon(icon, size: 20, color: color),
+        ),
         const SizedBox(width: 8),
-        // Expanded: 标题里有"大语言模型与思考引擎 (LLM & Reasoning)"这种长串，
-        // 手机宽度下裸 Text 会把这一行撑爆（实测 420 逻辑宽溢出 67px，屏幕上
-        // 是黄黑斜纹）。给它剩余宽度让它换行，而不是被裁掉。
+        // Expanded: 标题里有"大语言模型与思考引擎"这种长串，手机宽度下裸 Text 会
+        // 把这一行撑爆（实测 420 逻辑宽溢出 67px，屏幕上是黄黑斜纹）。
         Expanded(
-          child: Text(
-            title,
-            style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                primary,
+                style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.bold,
+                    color: context.c.textPrimary),
+              ),
+              if (secondary != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 1),
+                  child: Text(
+                    secondary,
+                    style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w500,
+                        letterSpacing: 0.2,
+                        color: context.c.textTertiary),
+                  ),
+                ),
+            ],
           ),
         ),
       ],

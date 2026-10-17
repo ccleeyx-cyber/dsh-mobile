@@ -22,7 +22,7 @@ import 'turn_output_card.dart';
 /// 三条与"诚实"有关的规则，都有对应测试：
 /// 1. **作业"读不到"≠"没有"**：网关 `jobs` 路由降级时会回 `degraded:
 ///    'jobs-unavailable'`，这是"未知"，必须渲染成"状态未知"而不是"没有后台作业"。
-/// 2. **本轮消耗取不到就显示 `—`**，绝不显示 0。
+/// 2. **本轮消耗取不到就显示「统计中…」**（+ Tooltip 解释口径），绝不显示 0。
 /// 3. **工作区不是 git 仓库 ≠ 没有改动**：不给空清单，给一条说明。
 class SessionInfoSheet extends StatefulWidget {
   const SessionInfoSheet({
@@ -617,7 +617,17 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       children.add(const SizedBox(height: 10));
       // 常驻噪声（缓存读/写、未缓存输入、输出四格）已经砍掉——它们对手机上唯一
       // 的三个决策（继续 / 新开会话 / 放弃）没有可行动价值。这里只留三行。
-      children.add(_metricRow('本轮消耗', _formatTurnBurn(widget.turnBurnTokens)));
+      //
+      // [fix] 「本轮消耗」取不到读数时不再裸显示「—」：那要附一大段解释才读得懂
+      // （"为什么是一根横线"），改成「统计中…」+ 尾部一个可点的 ? 图标，解释收进
+      // Tooltip —— 常态安静，想看的人点一下就有完整口径。
+      children.add(_metricRowPending(
+          '本轮消耗',
+          widget.turnBurnTokens == null
+              ? null
+              : _compact(widget.turnBurnTokens!),
+          pendingTooltip:
+              '本轮消耗取不到实时读数时显示「统计中…」而不是 0：0 会被读成"这轮没花钱"。'));
       // 「消耗」= 未缓存输入 + 输出。**不能**用 totalTokens：它还包含缓存读，
       // 而缓存读是同一段上下文被反复重读，会把数字吹大一个量级（用户实测
       // 11.08M 输入 + 0.34M 输出 + 193.46M 缓存读），显示成 205M 完全不是消耗。
@@ -670,13 +680,6 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
             child: _hint(durations.join(' · ')),
           ));
         }
-      }
-
-      if (widget.turnBurnTokens == null) {
-        children.add(Padding(
-          padding: const EdgeInsets.only(top: 2),
-          child: _hint('本轮消耗取不到实时读数时显示「—」而不是 0：0 会被读成"这轮没花钱"。'),
-        ));
       }
 
       children.add(const SizedBox(height: 6));
@@ -798,8 +801,6 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       if (mounted) setState(() => _goalActionInProgress = null);
     }
   }
-
-  String _formatTurnBurn(int? burn) => burn == null ? '—' : _compact(burn);
 
   /// 短时长：`0.9s` / `45s` / `2m05s`。
   ///
@@ -1008,22 +1009,23 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
     }
   }
 
-  /// 解释性横幅。用 warning 系而不是 danger：这既不是失败也不是错误，只是
-  /// "这里为什么是空的/为什么不完整"。
+  /// 解释性横幅。用 info（中性蓝灰）而不是 warning：这条横幅说的是"清单为什么
+  /// 不完整/来自哪里"，纯属事实陈述，没有任何需要用户去修的事 —— warning 黄
+  /// 应该留给真正要行动的场景，否则整屏黄条会稀释真警告。
   Widget _changesBanner(String text) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
       decoration: BoxDecoration(
-        color: context.c.warningSurface,
+        color: context.c.accentSurface,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: context.c.warningBorder),
+        border: Border.all(color: context.c.border),
       ),
       child: Text(
         text,
         key: const ValueKey('changes-note'),
-        style:
-            TextStyle(fontSize: 11.5, color: context.c.warning, height: 1.35),
+        style: TextStyle(
+            fontSize: 11.5, color: context.c.textSecondary, height: 1.35),
       ),
     );
   }
@@ -1839,6 +1841,58 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
             ...children,
           ],
         ),
+      ),
+    );
+  }
+
+  /// 可取不到值的指标行：值为 null 时显示「统计中…」+ 一个尾部 ? 图标（点一下
+  /// 弹 [pendingTooltip] 的完整口径），而不是一根要配解释文字才读得懂的「—」。
+  Widget _metricRowPending(String label, String? value,
+      {String? pendingTooltip}) {
+    final pending = value == null;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          Expanded(
+              child: Text(label,
+                  style:
+                      TextStyle(fontSize: 12, color: context.c.textSecondary))),
+          if (pending)
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 10,
+                  height: 10,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 1.5, color: context.c.textTertiary),
+                ),
+                const SizedBox(width: 5),
+                Text('统计中…',
+                    style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                        color: context.c.textTertiary)),
+                if (pendingTooltip != null) ...[
+                  const SizedBox(width: 4),
+                  Tooltip(
+                    message: pendingTooltip,
+                    triggerMode: TooltipTriggerMode.tap,
+                    showDuration: const Duration(seconds: 6),
+                    child: Icon(Icons.help_outline_rounded,
+                        size: 13, color: context.c.textTertiary),
+                  ),
+                ],
+              ],
+            )
+          else
+            Text(value,
+                style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.bold,
+                    color: context.c.textPrimary)),
+        ],
       ),
     );
   }
