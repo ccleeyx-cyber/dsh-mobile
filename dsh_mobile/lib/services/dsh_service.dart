@@ -489,6 +489,46 @@ class DshService extends ChangeNotifier {
     _historyExhausted = false;
   }
 
+  /// 会话消息的**进程内缓存**（[fix 2026-10-17 用户反馈]）。
+  ///
+  /// 痛点：每次打开会话都要重拉整个会话（`ensureFullHistory` 实测 10 轮 / 7 页
+  /// / 1.58 MB），来回切几次就会明显卡。缓存让"再打开一次"当帧就有内容。
+  ///
+  /// 三条纪律：
+  /// 1. 缓存只用于**首帧渲染**，不做真相：网络结果回来后整体覆盖缓存，
+  ///    并按历史锚点继续补页（见 selectSession / ensureFullHistory 的写回）。
+  /// 2. 上限 [historyCacheLimit] 条会话（LRU），避免长会话长期驻留把内存吃满。
+  /// 3. 会话被删除 / 会话内消息被清空时主动剔除（见 createNewSession 与
+  ///    session_deleted 分支），否则会拿到一条已不存在的会话的旧内容。
+  static const int historyCacheLimit = 6;
+  final Map<String, _SessionHistorySnapshot> _historyCache = {};
+
+  /// 写回缓存：只在"这份消息比缓存更完整"时更新（条数更多，或已翻到头）。
+  void _cacheSessionHistory(String sessionId, bool exhausted) {
+    if (sessionId.isEmpty || _messages.isEmpty) return;
+    final existing = _historyCache[sessionId];
+    if (existing != null &&
+        existing.messages.length >= _messages.length &&
+        existing.exhausted) {
+      return;
+    }
+    // LRU：先删旧的再插入，让最近使用的留在末尾。
+    _historyCache.remove(sessionId);
+    if (_historyCache.length >= historyCacheLimit) {
+      _historyCache.remove(_historyCache.keys.first);
+    }
+    _historyCache[sessionId] = _SessionHistorySnapshot(
+      messages: List<ChatMessage>.of(_messages),
+      exhausted: exhausted,
+      cachedAt: DateTime.now(),
+    );
+  }
+
+  /// 会话消息被外部改动/删除时清掉它的缓存条目。
+  void _dropHistoryCache(String sessionId) {
+    _historyCache.remove(sessionId);
+  }
+
   /// 从已加载的消息里重算分页锚点（进入会话后调用一次）。
   void _recomputeHistoryAnchor() {
     for (final m in _messages) {
@@ -1382,7 +1422,24 @@ class DshService extends ChangeNotifier {
     // matchesSessionId(sId) 判断负责（见流式块处理的开头）。turn 计数在这里只是
     // 让在途的旧块失效，不该被当成"这一轮已被取消"。
     _activeTurnSeq++;
-    _messages = []; // Clear immediately to prevent cross-contamination
+    // [fix 2026-10-17 用户反馈] 先拿上一次打开过的完整消息做**立即回填**：
+    // 每次打开会话都重拉整个会话（实测 10 轮 / 7 页 / 1.58 MB）是"打开很卡"
+    // 的直接来源。缓存命中时列表当帧就有内容，真正的网络请求只去补尾部增量。
+    final cached = _historyCache[session.sessionId];
+    if (cached != null && cached.messages.isNotEmpty) {
+      _messages = cached.messages.map((m) => m).toList();
+      // 缓存里的"正在流式"标记不能带过来：那条消息是上次看到的中间态，
+      // 现在它可能早已结束，也可能还在跑 —— 由即将到达的数据决定。
+      for (final m in _messages) {
+        m.isStreaming = false;
+      }
+      _recomputeHistoryAnchor();
+      _historyExhausted = cached.exhausted;
+      _hasMoreHistory = !cached.exhausted && _oldestHistorySeq != null;
+      _isLoadingHistory = false;
+    } else {
+      _messages = []; // Clear immediately to prevent cross-contamination
+    }
     // 提问**不跟着清**。这里曾是「点通知进来看不到选项」的真凶：
     // 提问经 WS 订阅重放/实时帧存在内存里，用户点通知 → openSessionById →
     // selectSession 把 _pendingQuestions 整个清空 —— 而网关只在 subscribe 时
@@ -1429,18 +1486,28 @@ class DshService extends ChangeNotifier {
           _currentSessionModel = _settings?.currentModel;
         }
 
-        _messages = rawMessages.map((m) {
-          // [fix 2026-10-17] 统一走 ChatMessage.fromWire（三处解析收敛，
-          // 防字段漂移）。
-          return ChatMessage.fromWire(
-            Map<String, dynamic>.from(m as Map),
-            newId: _uuid.v4,
-          );
-        }).toList();
+        if (cached != null && cached.messages.isNotEmpty) {
+          // 缓存命中：首屏这个 GET 只带**最新一页**，直接整体赋值会把缓存里
+          // 更早的历史冲掉。走轮询用的那套对账合并：窗口内的按服务端替换，
+          // 窗口之前的（更早几轮）按 seq 留着不动。
+          _reconcileSessionMessages(rawMessages, isRunning, session.sessionId);
+          if (isRunning && _messages.isNotEmpty && _messages.last.isAssistant) {
+            _messages.last.isStreaming = true;
+          }
+        } else {
+          _messages = rawMessages.map((m) {
+            // [fix 2026-10-17] 统一走 ChatMessage.fromWire（三处解析收敛，
+            // 防字段漂移）。
+            return ChatMessage.fromWire(
+              Map<String, dynamic>.from(m as Map),
+              newId: _uuid.v4,
+            );
+          }).toList();
+        }
 
         if (isRunning && _messages.isNotEmpty && _messages.last.isAssistant) {
           _messages.last.isStreaming = true;
-        _setSending(true, sessionId: session.sessionId);
+          _setSending(true, sessionId: session.sessionId);
           _startSessionPolling(session.sessionId);
         } else {
           _setSending(false);
@@ -1449,8 +1516,12 @@ class DshService extends ChangeNotifier {
         // [feat 2026-10-12] 首屏历史加载完成后，用最旧一条带 seq 的消息作为
         // 上翻锚点。网关getSessionHistory 已在消息上带 seq。
         _recomputeHistoryAnchor();
-        _historyExhausted = false;
-        _hasMoreHistory = _oldestHistorySeq != null;
+        // 缓存命中时别把"已翻到头"的事实抹掉（上面 reconcile 不碰这个字段，
+        // 这里只在没有缓存时才重置）。
+        if (cached == null) {
+          _historyExhausted = false;
+          _hasMoreHistory = _oldestHistorySeq != null;
+        }
       } else {
         _lastError = '加载历史失败 (HTTP ${res.statusCode})';
         debugPrint('[DshService] $_lastError');
@@ -1469,10 +1540,17 @@ class DshService extends ChangeNotifier {
         // 第一档立刻发：`stats` + `queue` 都是本地投影读，决定状态条首帧有没有
         // 上下文压力和队列内容。
         unawaited(fetchSessionOverview());
-        // [feat 2026-10-17] 首屏那一页常常只覆盖一两轮（窗口的预算是按消息条数给的，
-        // 而每步都算一条消息）。这里在后台把整个会话补齐（实测 10 轮 / 7 页 / 1.58 MB），
-        // 列表可见地一页页长出来；上翻只是兜底，不再依赖用户手动滑。
-        unawaited(ensureFullHistory());
+        // [fix 2026-10-17] 首屏那一页常常只覆盖一两轮（窗口的预算是按消息条数给的，
+        // 而每步都算一条消息）。缓存命中时**不重拉全量** —— 只补尾部增量：
+        // 首屏那一次 GET 已经拿到了最新一页，之前补齐过的完整历史在缓存里。
+        // 缓存未命中才按老办法把整个会话补齐。
+        if (cached != null) {
+          _cacheSessionHistory(session.sessionId, _historyExhausted);
+          // 轻量增量：只拉最新一页核对尾部（不再 7 页地翻）。
+          unawaited(_resyncActiveSession(session.sessionId));
+        } else {
+          unawaited(ensureFullHistory());
+        }
         // 第二档紧接一次：交付物（一次 MUX RPC）→ 变更（一个 git 子进程）。
         // 两个都决定状态条上的数字，但比第一档贵，所以不参与首帧；里面每一环
         // 都带会话守卫，会话切走就停。
@@ -4539,6 +4617,9 @@ class DshService extends ChangeNotifier {
       // 4.1 Session Deleted
       if (type == 'session_deleted') {
         final sId = json['sessionId']?.toString() ?? '';
+        // [fix 2026-10-17] 会话没了，它的消息缓存必须一起删 —— 否则再用同一个
+        // id 打开（或网关重建同 id 会话）会拿回一份"已经不存在"的旧内容。
+        _dropHistoryCache(sId);
         for (final ws in _workspaces) {
           ws.sessions.removeWhere((s) => s.matchesSessionId(sId));
         }
@@ -5351,7 +5432,26 @@ class DshService extends ChangeNotifier {
     //    （600ms 防抖窗口内）直接丢。
     _httpClient.close();
     drafts.flushNow();
+    _historyCache.clear();
     super.dispose();
   }
+}
+
+/// 一次打开过的会话消息快照（供 DshService 的会话消息缓存首帧回填用）。
+///
+/// 只用于"再打开一次时先显示什么"，不是真相：网络结果回来后按对账合并覆盖
+/// （见 selectSession 的缓存命中分支）。
+class _SessionHistorySnapshot {
+  const _SessionHistorySnapshot({
+    required this.messages,
+    required this.exhausted,
+    required this.cachedAt,
+  });
+
+  final List<ChatMessage> messages;
+
+  /// 当时是否已翻到会话开头（决定回填后还要不要继续补页）。
+  final bool exhausted;
+  final DateTime cachedAt;
 }
 

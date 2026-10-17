@@ -174,54 +174,6 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
                   ),
                 ),
               ),
-              // [fix 2026-10-17 用户反馈] 产出从"事件带单独一行胶囊"改成标题行
-              // 右端的一枚紧凑徽标：📦 N。它和会话名同一行、贴着右端，视觉上
-              // 是标题的附属信息而不是一条横带。标题是 Flexible，挤不下时让位
-              // 的是标题文字，绝不会有整行溢出。
-              if ((dsh.deliverableCount ?? 0) > 0) ...[
-                const SizedBox(width: 6),
-                GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: () =>
-                      onOpenSessionInfo(SessionInsightSection.deliverables),
-                  child: Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                    decoration: BoxDecoration(
-                      color: deliverablesUnread
-                          ? context.c.accent.withOpacity(0.12)
-                          : context.c.surfaceMuted,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          Icons.inventory_2_outlined,
-                          size: 11,
-                          color: deliverablesUnread
-                              ? context.c.accent
-                              : context.c.textTertiary,
-                        ),
-                        const SizedBox(width: 3),
-                        Text(
-                          '${dsh.deliverableCount}',
-                          key: const ValueKey('chat-deliverable-count'),
-                          style: TextStyle(
-                            fontSize: AppText.caption,
-                            fontWeight: deliverablesUnread
-                                ? FontWeight.w700
-                                : FontWeight.w500,
-                            color: deliverablesUnread
-                                ? context.c.accent
-                                : context.c.textTertiary,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
             ],
           ),
           const SizedBox(height: 2),
@@ -330,13 +282,53 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
             ),
           ],
         ],
+        // [fix 2026-10-17 用户反馈] 产出徽标放在这一行**最右边**（上下文之后）：
+        // 用户明确要求"放在上下文那个右边"。它属于身份行读数，用 · 接在末尾，
+        // 不单开一条带。未读 = 强调色 + 加粗，读过后弱色；点它进信息面板的
+        // 交付物小节。
+        //
+        // 溢出由工作区名兜住：那一段是 Flexible，挤不下时省略的是它自己。
+        if ((dsh.deliverableCount ?? 0) > 0) ...[
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => onOpenSessionInfo(SessionInsightSection.deliverables),
+            child: Padding(
+              padding: const EdgeInsets.only(left: 3),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.inventory_2_outlined,
+                    size: 10,
+                    color: deliverablesUnread
+                        ? context.c.accent
+                        : context.c.textTertiary,
+                  ),
+                  const SizedBox(width: 1),
+                  Text(
+                    '${dsh.deliverableCount}',
+                    key: const ValueKey('chat-deliverable-count'),
+                    style: base.copyWith(
+                      color: deliverablesUnread ? context.c.accent : null,
+                      fontWeight:
+                          deliverablesUnread ? FontWeight.w700 : null,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ],
     );
   }
 
   Widget _metaDot(BuildContext context) {
+    // [fix 2026-10-17] 横向 padding 5 → 3：这一行在 360dp 上已经没有余量
+    //（长会话名 + 长工作区 + 执行中 + 上下文 + 产出徽标），分隔符少 4px 就是
+    // 不溢出和溢出 7.5px 的区别。
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 5),
+      padding: const EdgeInsets.symmetric(horizontal: 3),
       child: Text('·',
           style: TextStyle(
             fontSize: AppText.subhead,
