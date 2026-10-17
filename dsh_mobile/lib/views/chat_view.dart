@@ -36,6 +36,7 @@ import '../main.dart';
 import '../services/voice_input_service.dart';
 import '../services/platform_services.dart';
 import '../models/pending_attachment.dart';
+import '../models/user_question.dart' show AttachmentRef;
 import '../models/task_center.dart';
 import '../services/attachment_picker.dart';
 
@@ -2709,6 +2710,122 @@ class _ChatViewState extends State<ChatView> {
     return blocks;
   }
 
+  /// 消息里的附件：图片走缩略图，文件走一行文件条。
+  ///
+  /// [fix 2026-10-17] 起因：手机自己发出去的图片**完全不显示**（Web 端有）。两处缺口：
+  /// 网关的历史转换把非 text part 整段丢了（已修），而这里从来没有渲染过消息级附件
+  /// —— 附件只出现在输入框上方那条"本轮附件"里。两个来源都渲染：
+  ///
+  /// * [ChatMessage.attachments] —— 服务端签发的附件（历史与实时帧都带）；
+  /// * [ChatMessage.localImagePreviews] —— 本机刚发出去那张图的字节（只有乐观消息有），
+  ///   让图片在轮询回包之前就已经在屏幕上。
+  Widget _buildMessageAttachments(ChatMessage msg, DshService dsh, bool isUser) {
+    if (!msg.hasAttachments) return const SizedBox.shrink();
+
+    final blocks = <Widget>[
+      for (final bytes in msg.localImagePreviews)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 220, maxHeight: 320),
+              child: Image.memory(
+                bytes,
+                fit: BoxFit.contain,
+                // 与 AttachmentImageTile 同一个理由：按显示尺寸解码，别把整张原图
+                // 解进内存（一张 12MP 照片几十 MB，滚几条消息就能把 App 顶 OOM）。
+                cacheWidth:
+                    (220 * MediaQuery.devicePixelRatioOf(context)).round().clamp(1, 4096),
+                errorBuilder: (_, __, ___) => Container(
+                  width: 180,
+                  height: 90,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: context.c.warningSurface,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: context.c.warningBorder),
+                  ),
+                  child: Text(
+                    '图片预览不可用',
+                    style: TextStyle(fontSize: 11, color: context.c.warning),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      for (final ref in msg.attachments)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: ref.isImage
+              ? AttachmentImageTile(
+                  ref: ref,
+                  // 字节留在宿主机：必须带 Authorization 头去取（见 AttachmentImageTile）。
+                  endpoint: dsh.attachmentUrl(ref),
+                  maxWidth: 220,
+                )
+              : _attachmentFileRow(ref),
+        ),
+    ];
+
+    return Column(
+      crossAxisAlignment: isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+      children: blocks,
+    );
+  }
+
+  /// 文件附件的一行：图标 + 文件名 + MIME/体积。
+  ///
+  /// 刻意**不做**点击打开：下载 + 拉起外部应用那条链路目前只服务于交付物
+  /// （`deliverable_preview_sheet` 里有完整实现）。这里先把"这条消息带了什么文件"
+  /// 如实显示出来，而不是给一个点了报错的按钮。
+  Widget _attachmentFileRow(AttachmentRef ref) {
+    final kb = ref.byteSize == null ? null : '${(ref.byteSize! / 1024).toStringAsFixed(0)} KB';
+    final meta = [ref.mimeType, if (kb != null) kb].join(' · ');
+
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 260),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: context.c.surface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: context.c.border),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.attach_file_rounded, size: 15, color: context.c.textSecondary),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  ref.filename ?? ref.id,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: context.c.textPrimary,
+                  ),
+                ),
+                Text(
+                  meta,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildSuggestionChip(String text, VoidCallback onTap) {
     return InkWell(
       borderRadius: BorderRadius.circular(16),
@@ -2895,6 +3012,13 @@ class _ChatViewState extends State<ChatView> {
                     padding: const EdgeInsets.only(bottom: 6),
                     child: ToolCallCard(tool: tool),
                   ),
+
+                // [fix 2026-10-17] 消息里的附件（图片缩略图 / 文件条）。
+                //
+                // 以前消息流里**完全不渲染附件**：附件只出现在输入框上方那条"本轮
+                // 附件"里，而手机自己发出去的图片连那条都没有（网关的历史转换把
+                // 非 text part 整段丢了），用户看到的就是"我发的图被吞了"。
+                _buildMessageAttachments(msg, dsh, isUser),
 
                 // Content Bubble
                 if (displayContent.isNotEmpty)

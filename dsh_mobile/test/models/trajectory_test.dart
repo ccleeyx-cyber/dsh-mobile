@@ -23,6 +23,7 @@ void main() {
     List<ToolExecution>? tools,
     required DateTime at,
     int? seq,
+    int? turnTokens,
   }) =>
       ChatMessage(
         id: id,
@@ -32,6 +33,7 @@ void main() {
         tools: tools,
         timestamp: at,
         seq: seq,
+        turnTokens: turnTokens,
       );
 
   group('分组：用户消息开新轮', () {
@@ -164,8 +166,21 @@ void main() {
     });
   });
 
-  group('token：只挂在最后一轮', () {
-    test('liveTurnTokens 只给最后一轮，历史轮保持 null', () {
+  group('token：有权威值用权威值，没有才是 —', () {
+    test('引擎给的逐轮用量照实显示（历史轮不再只能是 —）', () {
+      final traj = Trajectory.build([
+        msg(id: 'u1', role: 'user', content: 'a', at: t0, turnTokens: 5521),
+        msg(id: 'a1', role: 'assistant', content: 'b', at: t1),
+        msg(id: 'u2', role: 'user', content: 'c', at: t2, turnTokens: 8888),
+        msg(id: 'a2', role: 'assistant', content: 'd', at: t3),
+      ], liveTurnTokens: 12400);
+
+      expect(traj.turns[0].tokens, 5521);
+      expect(traj.turns[1].tokens, 8888,
+          reason: '网关汇总的引擎权威值优先于调用方传进来的本机相减读数');
+    });
+
+    test('liveTurnTokens 只给没有权威值的那一轮（正在跑的那轮）', () {
       final traj = Trajectory.build([
         msg(id: 'u1', role: 'user', content: 'a', at: t0),
         msg(id: 'a1', role: 'assistant', content: 'b', at: t1),
@@ -173,7 +188,7 @@ void main() {
         msg(id: 'a2', role: 'assistant', content: 'd', at: t3),
       ], liveTurnTokens: 12400);
 
-      expect(traj.turns[0].tokens, isNull, reason: '引擎不提供历史轮用量，不许补 0');
+      expect(traj.turns[0].tokens, isNull, reason: '没有数据源就是 null，不许补 0');
       expect(traj.turns[1].tokens, 12400);
     });
 

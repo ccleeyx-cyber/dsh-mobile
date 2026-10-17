@@ -1,6 +1,8 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'harness_notice.dart';
+import 'user_question.dart' show AttachmentRef;
 
 class ToolExecution {
   final String name;
@@ -69,6 +71,29 @@ class ChatMessage {
   late final String? noticeChildId;
   late final String? noticeBody;
 
+  /// [feat 2026-10-17] 这一轮消耗的 token 数（**引擎的权威读数**）。
+  ///
+  /// 引擎每个 step 的 `assistant/message` 都带 `usage`，网关把它汇总到该轮的那条
+  /// user 消息上。以前只能靠"回合起止两次 stats 读数相减"算，基线一旦没记到
+  /// （切会话、冷启动到一个正在跑的会话、轮末 App 不在前台）就永远显示 `—`。
+  ///
+  /// 只有**已结束**的轮才有值；回合还在跑时是 null（部分和会被读成"这轮就花了这么多"）。
+  final int? turnTokens;
+
+  /// [feat 2026-10-17] 这条消息带的附件（图片 / 文件）。
+  ///
+  /// 引擎的 `user/message` 里附件是独立 content part
+  /// （`{type:'image'|'file', attachment:{attachmentId, mediaType, width, height, bytes, name}}`），
+  /// 而网关以前只把 `text` part 拼进正文 —— 于是手机发出去的图**在历史里彻底消失**
+  /// （Web 端读原始事件所以有）。现在网关把它映射成这个字段，手机照常按需拉字节。
+  final List<AttachmentRef> attachments;
+
+  /// 本地即时预览用的图片字节（**只存在于本机乐观消息上，服务端回包不带**）。
+  ///
+  /// 用户刚发出去的那张图，字节就在自己手里，没有理由等 2~3 秒的轮询回包才显示；
+  /// 服务端版本到达后这条乐观消息会被替换掉，预览也随之让位给真附件。
+  final List<Uint8List> localImagePreviews;
+
   ChatMessage({
     required this.id,
     required this.role,
@@ -84,8 +109,13 @@ class ChatMessage {
     String? noticeVariant,
     String? noticeChildId,
     String? noticeBody,
+    this.turnTokens,
+    List<dynamic>? attachments,
+    List<Uint8List>? localImagePreviews,
   })  : tools = tools ?? [],
         timestamp = timestamp ?? DateTime.now(),
+        attachments = _parseAttachments(attachments),
+        localImagePreviews = localImagePreviews ?? const <Uint8List>[],
         _isStreaming = isStreaming {
     final notice = HarnessNotice.resolve(
       kind: noticeKind,
@@ -183,4 +213,25 @@ class ChatMessage {
   }
 
   bool get isMemoryRecall => isContextOrMemory;
+
+  /// 这条消息有没有附件（图片 / 文件），或本机待展示的即时预览。
+  bool get hasAttachments => attachments.isNotEmpty || localImagePreviews.isNotEmpty;
+
+  /// 把网关给的 `attachments` 解析成 [AttachmentRef]。
+  ///
+  /// 单条坏数据（缺 id 等）只跳过它自己：`AttachmentRef.fromJson` 对缺失 id 会抛，
+  /// 而"一条附件格式不对"不该让整条消息连正文都渲染不出来。
+  static List<AttachmentRef> _parseAttachments(List<dynamic>? raw) {
+    if (raw == null || raw.isEmpty) return const <AttachmentRef>[];
+    final out = <AttachmentRef>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      try {
+        out.add(AttachmentRef.fromJson(Map<String, dynamic>.from(item)));
+      } catch (_) {
+        continue;
+      }
+    }
+    return out;
+  }
 }

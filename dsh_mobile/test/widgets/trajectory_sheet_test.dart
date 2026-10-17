@@ -30,6 +30,7 @@ void main() {
     String? thinking,
     List<ToolExecution>? tools,
     required DateTime at,
+    int? turnTokens,
   }) =>
       ChatMessage(
         id: id,
@@ -38,6 +39,7 @@ void main() {
         thinking: thinking,
         tools: tools,
         timestamp: at,
+        turnTokens: turnTokens,
       );
 
   /// 两轮：第一轮带思考 + 工具 + 回复；第二轮只有一条用户消息（耗时必然是 `—`）。
@@ -109,7 +111,7 @@ void main() {
       expect(textOf(tester, const ValueKey('trajectory-turn-2-duration')), '—');
     });
 
-    testWidgets('token 只给最后一轮，历史轮是 —（不是 0）', (tester) async {
+    testWidgets('没有数据源的轮显示 —，不许是 0', (tester) async {
       await pumpSheet(
         tester,
         TrajectorySheet(trajectory: twoTurns(liveTurnTokens: 12400), now: t5),
@@ -117,6 +119,19 @@ void main() {
 
       expect(textOf(tester, const ValueKey('trajectory-turn-1-tokens')), '—');
       expect(textOf(tester, const ValueKey('trajectory-turn-2-tokens')), '12.4k');
+    });
+
+    testWidgets('引擎给的逐轮用量：每一轮都显示自己的读数', (tester) async {
+      final traj = Trajectory.build([
+        msg(id: 'u1', role: 'user', content: '第一轮', at: t0, turnTokens: 5521),
+        msg(id: 'a1', role: 'assistant', content: '回复', at: t3),
+        msg(id: 'u2', role: 'user', content: '第二轮', at: t4, turnTokens: 8888),
+        msg(id: 'a2', role: 'assistant', content: '回复', at: t5),
+      ]);
+      await pumpSheet(tester, TrajectorySheet(trajectory: traj, now: t5));
+
+      expect(textOf(tester, const ValueKey('trajectory-turn-1-tokens')), '5.5k');
+      expect(textOf(tester, const ValueKey('trajectory-turn-2-tokens')), '8.9k');
     });
 
     testWidgets('运行中的轮标"进行中"，且耗时按"到现在"算', (tester) async {

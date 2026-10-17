@@ -1000,3 +1000,280 @@ test('convertSessionRecordsToMessages: 通知带标记、真人消息不带，�
   assert.equal(messages[1].noticeChildId, '915eb2f4-0d12-4b86-8922-b2b26cfc3ecc');
   assert.ok(messages[1].noticeBody.startsWith('2026-10-06'));
 });
+
+/* ------------------------------------------------------------------ *
+ * convertSessionRecordsToMessages: 附件回传（缺陷 A）  [feat 2026-10-17]
+ *
+ * 事故现象：手机发出去的图片"被吞"——循环只拼 text part，所有 image/file part
+ * 被丢掉，而 Web 端读原始事件所以看得到。实测用户发的截图 sha256:d4ca… 在会话
+ * 日志里，网关返回的历史里连字段都没有。
+ *
+ * 下面的样本形状都是实测抄下来的（同一条 user/message 的 file part 没有 mediaType）。
+ * ------------------------------------------------------------------ */
+
+const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+test('convertSessionRecordsToMessages: image/file part 归一成 attachments，且不回传内联字节', () => {
+  // 实测形状：file part 只有 attachmentId/name/bytes，image part 还带 mediaType/width/height。
+  const INLINE = 'JVBERi0xLjQKJcOkw7zDtsO2';   // 内联 base64 的样本片段
+  const records = [
+    {
+      event: {
+        type: 'user/message',
+        seq: 340,
+        time: 1000,
+        data: {
+          source: { kind: 'user' },
+          content: [
+            { type: 'file', attachment: { attachmentId: 'sha256:16bb0000', name: '工作日报.xlsx', bytes: 21769, data: INLINE } },
+            {
+              type: 'image',
+              attachment: {
+                attachmentId: 'sha256:d4ca0000',
+                mediaType: 'image/jpeg',
+                width: 736,
+                height: 1600,
+                bytes: 229795,
+                name: 'scaled_7125.jpg'
+              }
+            },
+            { type: 'text', text: '现在我要你帮我把这个工作日报的内容…' }
+          ]
+        }
+      }
+    }
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].content, '现在我要你帮我把这个工作日报的内容…', '文字照旧拼在一起');
+  assert.deepEqual(messages[0].attachments, [
+    // file：没有 mediaType、没有 width/height → 只出现有的键（推断值见下一个用例）。
+    { id: 'sha256:16bb0000', mimeType: 'application/octet-stream', bytes: 21769, filename: '工作日报.xlsx' },
+    // image：图片与文件同一形状，App 用 mimeType.startsWith('image/') 分流渲染。
+    {
+      id: 'sha256:d4ca0000',
+      mimeType: 'image/jpeg',
+      width: 736,
+      height: 1600,
+      bytes: 229795,
+      filename: 'scaled_7125.jpg'
+    }
+  ]);
+  // 正文里绝不能夹 base64：字节由手机走已认证的 /api/mobile/attachment 按需取。
+  assert.ok(!JSON.stringify(messages).includes(INLINE), '内联 base64 不能被回传');
+  assert.equal(messages[0].attachments[0].data, undefined);
+});
+
+test('convertSessionRecordsToMessages: mediaType 缺失时按扩展名推断，再不行 octet-stream', () => {
+  const records = [
+    {
+      event: {
+        type: 'user/message',
+        seq: 1,
+        data: {
+          content: [
+            { type: 'file', attachment: { attachmentId: 'a1', name: 'SHOT.PNG' } },
+            { type: 'file', attachment: { attachmentId: 'a2', name: 'report.xlsx' } },
+            { type: 'file', attachment: { attachmentId: 'a3', name: 'noext' } },
+            { type: 'file', attachment: { attachmentId: 'a4', name: 'x.webp', width: '736' } },
+            { type: 'text', text: '四个文件' }
+          ]
+        }
+      }
+    }
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  const atts = messages[0].attachments;
+  assert.equal(atts.length, 4);
+  assert.equal(atts[0].mimeType, 'image/png', '扩展名大小写不敏感');
+  assert.equal(atts[1].mimeType, 'application/octet-stream', 'xlsx 不在图片表里，不猜');
+  assert.equal(atts[2].mimeType, 'application/octet-stream');
+  assert.equal(atts[3].mimeType, 'image/webp');
+  assert.equal(atts[3].width, undefined, '非数字尺寸要省略，不能塞 "736" 或 null');
+  assert.deepEqual(atts[3], { id: 'a4', mimeType: 'image/webp', filename: 'x.webp' });
+});
+
+test('convertSessionRecordsToMessages: 没有 attachmentId 的 part 跳过，附件只出现在有附件的消息上', () => {
+  const records = [
+    {
+      event: {
+        type: 'user/message',
+        seq: 1,
+        data: {
+          content: [
+            // 老/发信形状（没有 attachment 对象）与"有 attachment 却没有 id"都要跳过。
+            { type: 'image', mediaType: 'image/png' },
+            { type: 'file', attachment: { name: 'a.bin', bytes: 3 } },
+            { type: 'text', text: '只有文字' }
+          ]
+        }
+      }
+    },
+    { event: { type: 'user/message', seq: 2, data: { content: '下一条纯文字' } } },
+    { event: { type: 'user/message', seq: 3, data: { content: [{ type: 'text', text: '也没有附件' }] } } }
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  assert.equal(messages.length, 3);
+  assert.deepEqual(messages[0].attachments, undefined, '没造出空壳时这个键根本不该出现');
+  assert.equal(messages[1].attachments, undefined, '老形状消息不带 attachments 键');
+  assert.equal(messages[2].attachments, undefined);
+});
+
+test('convertSessionRecordsToMessages: 只有附件、没有文字的消息也要产出（否则截图永远挂不上）', () => {
+  const records = [
+    {
+      event: {
+        type: 'user/message',
+        seq: 7,
+        data: { source: { kind: 'user' }, content: [{ type: 'image', attachment: { attachmentId: 'sha256:beef', mediaType: 'image/png', bytes: 12, name: 'p.png' } }] }
+      }
+    },
+    { event: { type: 'turn/end', seq: 9, data: { turn: 1, reason: { kind: 'completed' } } } }
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  assert.equal(messages.length, 1, '纯附件消息必须留下宿主，否则附件没有挂载点');
+  assert.equal(messages[0].role, 'user');
+  assert.equal(messages[0].content, '', '没有文字就是空串');
+  assert.deepEqual(messages[0].attachments, [
+    { id: 'sha256:beef', mimeType: 'image/png', bytes: 12, filename: 'p.png' }
+  ]);
+});
+
+test('convertSessionRecordsToMessages: 真的什么都没有仍然是原来的 drop + 留痕', () => {
+  const dropped = [];
+  const records = [
+    // 没有 attachmentId 的 image part：连附件都拿不到 → 仍然算空文本丢
+    { event: { type: 'user/message', seq: 42, data: { content: [{ type: 'image', mediaType: 'image/png' }] } } }
+  ];
+  const { messages } = convertSessionRecordsToMessages(records, { auditDropped: (info) => dropped.push(info) });
+  assert.equal(messages.length, 0);
+  assert.equal(dropped.length, 1);
+  assert.equal(dropped[0].why, 'empty-user-text');
+});
+
+/* ------------------------------------------------------------------ *
+ * convertSessionRecordsToMessages: 逐轮用量（缺陷 B）  [feat 2026-10-17]
+ *
+ * 事故现象："本轮用量"经常显示 —：引擎每个 step 的 assistant/message 都带 usage，
+ * 而网关把这份数据扔了，App 只能靠两次 stats 读数相减，基线没记到就永远 —。
+ * 注意 `inputTokens` 是"未缓存输入"、`totalTokens` 是**累计**值，所以逐 step 只能加
+ * inputTokens + outputTokens。
+ * ------------------------------------------------------------------ */
+
+const usageOf = (inputTokens, outputTokens, totalTokens) => ({ inputTokens, outputTokens, totalTokens, cacheReadTokens: 35584 });
+
+test('convertSessionRecordsToMessages: 一轮两个 assistant 的 usage 相加（input+output）', () => {
+  const records = [
+    { event: { type: 'user/message', seq: 10, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '跑一下' }] } } },
+    { event: { type: 'assistant/message', seq: 11, data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'A' }] }, usage: usageOf(282, 312, 36178) } } },
+    { event: { type: 'assistant/message', seq: 12, data: { turn: 1, step: 2, message: { content: [{ type: 'text', text: 'B' }] }, usage: usageOf(1000, 500, 42000) } } },
+    { event: { type: 'turn/end', seq: 13, data: { turn: 1, reason: { kind: 'completed' } } } }
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  const user = messages.find((m) => m.role === 'user');
+  assert.equal(user.tokens, 282 + 312 + 1000 + 500);
+});
+
+test('convertSessionRecordsToMessages: totalTokens 是累计值，绝不能被计入', () => {
+  // 实测样本：input 282 / output 312 / total 36178 / cacheRead 35584。
+  // 若把 totalTokens 加进去，这一轮会从 594 被吹成 36772（差一个量级）。
+  const records = [
+    { event: { type: 'user/message', seq: 1, data: { content: 'x' } } },
+    { event: { type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'text', text: 'a' }] }, usage: usageOf(282, 312, 36178) } } },
+    { event: { type: 'assistant/message', seq: 3, data: { message: { content: [{ type: 'text', text: 'b' }] }, usage: usageOf(400, 100, 999999) } } },
+    { event: { type: 'turn/end', seq: 4, data: { turn: 1, reason: { kind: 'completed' } } } }
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  assert.equal(messages[0].tokens, 282 + 312 + 400 + 100);
+  assert.notEqual(messages[0].tokens, 282 + 312 + 36178 + 400 + 100 + 999999);
+});
+
+test('convertSessionRecordsToMessages: 未结束的轮 tokens 必须是 null（不是部分和、不是 0）', () => {
+  const records = [
+    { event: { type: 'user/message', seq: 1, data: { content: '还在跑' } } },
+    { event: { type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'text', text: 'a' }] }, usage: usageOf(282, 312, 36178) } } }
+    // 没有 turn/end：回合还在跑
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  assert.equal(messages[0].tokens, null, '中途值会被读成"这轮就花了这么多"，宁可不给');
+  assert.ok('tokens' in messages[0], '字段要在（值为 null），App 才能区分"未知"与"老网关没有这个字段"');
+});
+
+test('convertSessionRecordsToMessages: 一条 usage 都没有的轮 → null，缺 usage 的工具步不影响整轮', () => {
+  const noUsage = [
+    { event: { type: 'user/message', seq: 1, data: { content: '嗨' } } },
+    { event: { type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'text', text: '在' }] } } } },
+    { event: { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'completed' } } } }
+  ];
+  assert.equal(convertSessionRecordsToMessages(noUsage).messages[0].tokens, null, '全员缺 usage → null，绝不写 0');
+
+  // 工具步（无 usage）夹在两个有 usage 的 step 之间：0 贡献，但整轮仍然成立。
+  const mixed = [
+    { event: { type: 'user/message', seq: 10, data: { content: '查一下' } } },
+    { event: { type: 'assistant/message', seq: 11, data: { message: { content: [{ type: 'text', text: 'A' }] }, usage: usageOf(100, 10, 5000) } } },
+    { event: { type: 'tool/call', seq: 12, data: { name: 'gtw', arguments: {}, callId: 'c1' } } },
+    { event: { type: 'assistant/message', seq: 13, data: { message: { content: [] } } } },   // 工具步：没有 usage
+    { event: { type: 'assistant/message', seq: 14, data: { message: { content: [{ type: 'text', text: 'B' }] }, usage: usageOf(200, 20, 8000) } } },
+    { event: { type: 'turn/end', seq: 15, data: { turn: 2, reason: { kind: 'completed' } } } }
+  ];
+  assert.equal(convertSessionRecordsToMessages(mixed).messages[0].tokens, 100 + 10 + 200 + 20);
+});
+
+test('convertSessionRecordsToMessages: 多轮各自结算，跑到一半的那轮是 null', () => {
+  const records = [
+    // 第一轮：已结束
+    { event: { type: 'user/message', seq: 10, data: { content: '问题一' } } },
+    { event: { type: 'assistant/message', seq: 11, data: { message: { content: [{ type: 'text', text: '答一' }] }, usage: usageOf(100, 50, 3000) } } },
+    { event: { type: 'turn/end', seq: 12, data: { turn: 1, reason: { kind: 'completed' } } } },
+    // 第二轮：还在跑（没有 turn/end）
+    { event: { type: 'user/message', seq: 20, data: { content: '问题二' } } },
+    { event: { type: 'assistant/message', seq: 21, data: { message: { content: [{ type: 'text', text: '答二' }] }, usage: usageOf(700, 70, 9000) } } }
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  const users = messages.filter((m) => m.role === 'user');
+  assert.equal(users.length, 2);
+  assert.equal(users[0].tokens, 150, '第一轮已见到 turn/end → 结算');
+  assert.equal(users[1].tokens, null, '第二轮没有 turn/end → null');
+});
+
+test('convertSessionRecordsToMessages: 分页从轮中间切进来时，前面无主的 usage 不计到别人头上', () => {
+  // 一页从轮中间开始：assistant 先到（它们的 user/message 在上一页），随后才是新的提问。
+  const records = [
+    { event: { type: 'assistant/message', seq: 100, data: { message: { content: [{ type: 'text', text: '上半轮' }] }, usage: usageOf(9999, 9999, 99999) } } },
+    { event: { type: 'turn/end', seq: 101, data: { turn: 4, reason: { kind: 'completed' } } } },
+    { event: { type: 'user/message', seq: 110, data: { content: '新问题' } } },
+    { event: { type: 'assistant/message', seq: 111, data: { message: { content: [{ type: 'text', text: '答' }] }, usage: usageOf(100, 20, 4000) } } },
+    { event: { type: 'turn/end', seq: 112, data: { turn: 5, reason: { kind: 'completed' } } } }
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  const user = messages.find((m) => m.role === 'user');
+  assert.equal(user.tokens, 120, '只算本页真正属于这一轮的 usage');
+});
+
+test('convertSessionRecordsToMessages: 注入通知仍然保持既有语义，并同样带上 tokens', () => {
+  const records = [
+    { event: { type: 'user/message', seq: 1, time: 1000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '帮我改一下登录' }] } } },
+    { event: { type: 'user/message', seq: 2, time: 2000, data: { content: [{ type: 'text', text: SETTLEMENT_TEXT }] } } }
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0].role, 'user');
+  assert.equal(messages[0].noticeKind, undefined, '真人消息不该带任何通知字段');
+  assert.equal(messages[0].tokens, null);
+  assert.equal(messages[0].attachments, undefined);
+  assert.equal(messages[1].role, 'user', 'role 保持 user：老 App 的渲染行为不能变');
+  assert.equal(messages[1].noticeKind, 'subagent-settlement');
+  assert.equal(messages[1].tokens, null, '被过滤掉的轮没有产出，用量不挪给别人');
+  assert.equal(messages[1].attachments, undefined);
+});
+

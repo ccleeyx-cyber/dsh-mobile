@@ -351,6 +351,68 @@ export async function collectSessionRecords({ callDshRpc, sessionId, maxPages = 
  * ------------------------------------------------------------------ */
 
 /**
+ * 会话事件里附件的 `mediaType` 缺失时，按文件名扩展名推断的对照表。
+ *
+ * 实测的两种 part 形状（2026-10-17 活数据，同一条 user/message 的两个 part）：
+ *   image: { type:'image', attachment:{ attachmentId:'sha256:d4ca…', mediaType:'image/jpeg',
+ *                                        width:736, height:1600, bytes:229795, name:'scaled_7125.jpg' } }
+ *   file : { type:'file',  attachment:{ attachmentId:'sha256:16bb…', name:'工作日报.xlsx', bytes:21769 } }
+ * file part **没有** mediaType，所以这里必须兜底；只覆盖常见图片扩展名，其它一律
+ * application/octet-stream —— App 靠 `mimeType.startsWith('image/')` 决定把附件渲染成
+ * 缩略图还是文件行，猜错会把一个 xlsx 当图片去拉字节。
+ */
+const ATTACHMENT_IMAGE_MIME_BY_EXT = new Map([
+  ['png', 'image/png'],
+  ['jpg', 'image/jpeg'],
+  ['jpeg', 'image/jpeg'],
+  ['gif', 'image/gif'],
+  ['webp', 'image/webp'],
+  ['bmp', 'image/bmp']
+]);
+
+/** 只有有限数字才算数（尺寸 / 字节 / usage 字段同用）；其它一律 null，好让调用方省略而不是塞垃圾值。 */
+function finiteNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * 一个非 text part → App 侧 `AttachmentRef` 需要的字段
+ * （见 dsh_mobile 的 `lib/models/user_question.dart` 里 `AttachmentRef.fromJson`：
+ * 它读的正是 id / mimeType / width / height / bytes / filename）。
+ *
+ * 没有 `attachmentId` 的 part **直接返回 null**：日志里还存在老/发信形状的
+ * `{ type:'image', mediaType:'image/png' }`（没有 attachment 对象），造一个 id 为空串的
+ * 空壳会被 App 端的 `AttachmentRef.fromJson` 抛 FormatException 整条丢掉 —— 一样看不见，
+ * 却多一层"看起来有数据"的假象。
+ *
+ * 字节**绝不回传**（`attachment.data` 的内联 base64 可能几十 MB，会把 MUX 打爆）：
+ * 手机拿 id 走已认证的 `GET /api/mobile/attachment?id=…&sessionId=…` 按需取
+ * （见 index.js 的附件读取分支，它转调引擎的 session/attachment RPC）。
+ */
+function toAttachmentRef(part) {
+  const att = part?.attachment;
+  const id = typeof att?.attachmentId === 'string' ? att.attachmentId.trim() : '';
+  if (!id) return null;
+
+  const name = typeof att.name === 'string' && att.name.length > 0 ? att.name : null;
+  const declared = typeof att.mediaType === 'string' ? att.mediaType.trim() : '';
+  const ext = name ? (/\.([A-Za-z0-9]+)$/.exec(name.trim())?.[1] || '').toLowerCase() : '';
+  const ref = {
+    id,
+    mimeType: declared || ATTACHMENT_IMAGE_MIME_BY_EXT.get(ext) || 'application/octet-stream'
+  };
+
+  const width = finiteNumber(att.width);
+  const height = finiteNumber(att.height);
+  const bytes = finiteNumber(att.bytes);
+  if (width !== null) ref.width = width;
+  if (height !== null) ref.height = height;
+  if (bytes !== null) ref.bytes = bytes;
+  if (name) ref.filename = name;
+  return ref;
+}
+
+/**
  * Convert `session/page` records into the same chat-message shape
  * `getSessionHistory` in lib/index.js has always returned, so the phone can
  * render a history page and the live tail with one renderer.
@@ -365,23 +427,77 @@ export async function collectSessionRecords({ callDshRpc, sessionId, maxPages = 
  *   - `turn/end` is ignored here: lastTurn is a tail concern owned by
  *     getSessionHistory, not something a deep-history page should report.
  *
+ * [feat 2026-10-17] 两个字段是给手机补的，老 App 多收字段无害：
+ *
+ * 1) `attachments` —— 修"手机发出去的图片被吞"。此前这个循环只拼 `part.type === 'text'`
+ *    的文本，**所有 image/file part 被直接丢弃**，而 Web 端读的是原始事件所以看得到。
+ *    实测：用户发的截图 `sha256:d4ca…` 在会话日志里，网关返回的历史里连字段都没有，
+ *    手机于是永远看不到附件。现在非 text part 归一成
+ *    `[{ id, mimeType, width, height, bytes, filename }]` 挂在同一条消息上；图片与文件同一
+ *    形状，App 用 `mimeType.startsWith('image/')` 分流渲染（缩略图 / 文件行）。
+ *    **只有真的有附件时才加这个键**（没有就完全不加），老形状原样保留。
+ *
+ * 2) `tokens` —— 修"本轮用量经常显示 —"。引擎**每个 step 的 `assistant/message` 都带
+ *    `usage`**（`inputTokens/outputTokens/totalTokens/cacheReadTokens`），而网关以前把这份
+ *    数据整个扔掉，App 只能靠"两次 stats 读数相减"，基线没记到就永远是 —。
+ *    这里从每条 user/message 起累加**属于这一轮**的 assistant usage，落在该条消息上。
+ *
+ *    为什么只加 `inputTokens + outputTokens`：`inputTokens` 是"未缓存输入"，
+ *    `totalTokens` 是**跨 step 累计**值（实测一条 assistant 是 input 282 / output 312 /
+ *    total 36178 / cacheRead 35584）——逐 step 累加 totalTokens 会把数字吹大一个量级，
+ *    还会把前面 step 的量重复计很多遍。
+ *
+ *    为什么未结束的轮不给值：回合还在跑时写一个中途和，App 会把它读成"这轮就花了这么多"。
+ *    所以规则是"窗口内出现过 turn/end（`data.reason.kind` 是权威的回合结束信号）**且**
+ *    至少见过一条 usage"才写和，否则写 `null` —— **绝不写 0**（0 会被渲染成
+ *    "真的花了 0 token"，那是另一种谎）。依据：index.js 的 follower 用 `turn/start` 置
+ *    turnOpen、`turn/end` 清 turnOpen（单开单闭），extractCheckpoints 也是"一个 turn/end
+ *    一个检查点"，所以窗口内出现 turn/end 就等于该轮闭合；万一真有重复，最后一个也必然
+ *    落在同一窗口内，结论不变（这里只记布尔 `ended`，天然兼容两种）。
+ *
+ *    边界：窗口内缺 usage 的 assistant（工具步）只是 0 贡献，**不会**把整轮判成 null；
+ *    反过来，一条 usage 都没有的轮（含被 carried-context 过滤掉、没有产出消息的轮）是
+ *    null；分页把一轮切在两页上时也只是 null —— 宁可空着也不错填。
+ *
  * @param records - `session/page` records (`{ event }` entries), ascending.
- * @returns `{ messages }` — ascending, same fields as getSessionHistory plus seq.
+ * @returns `{ messages }` — ascending, same fields as getSessionHistory plus seq
+ *   (and, for user messages, `tokens` always; `attachments` only when present).
  */
 export function convertSessionRecordsToMessages(records, opts = {}) {
   const messages = [];
   const auditDropped = typeof opts.auditDropped === 'function' ? opts.auditDropped : null;
   let currentAssistantMsg = null;
+
+  // 逐轮用量累加器（见上面第 2 条）。`msg` 指向这一轮 user/message 产出的消息对象，
+  // 该条被过滤掉时为 null（那一轮的用量就没有承载对象，直接丢弃而不是挪给别人）。
+  let currentTurn = null;
+  const settleTurn = () => {
+    if (currentTurn?.msg) {
+      currentTurn.msg.tokens = currentTurn.ended && currentTurn.sawUsage ? currentTurn.sum : null;
+    }
+    currentTurn = null;
+  };
+
   for (const record of Array.isArray(records) ? records : []) {
     const ev = record?.event;
     if (!ev) continue;
 
     if (ev.type === 'user/message') {
+      // 上一条 user/message 起的轮到此为止：结算它，再开新轮。
+      settleTurn();
       currentAssistantMsg = null;
+      currentTurn = { msg: null, sum: 0, sawUsage: false, ended: false };
+      const attachments = [];
       let text = '';
       if (Array.isArray(ev.data?.content)) {
         for (const part of ev.data.content) {
-          if (part.type === 'text' && part.text) text += part.text;
+          if (part?.type === 'text') {
+            if (part.text) text += part.text;
+            continue;
+          }
+          // 非 text part：图片/文件/将来别的种类都走同一条归一（没有 attachmentId 的跳过）。
+          const ref = toAttachmentRef(part);
+          if (ref) attachments.push(ref);
         }
       } else if (typeof ev.data?.content === 'string') {
         text = ev.data.content;
@@ -403,16 +519,22 @@ export function convertSessionRecordsToMessages(records, opts = {}) {
         continue;
       }
 
-      if (text.trim()) {
+      if (text.trim() || attachments.length > 0) {
         // [feat 2026-10-17] 注入通知带标记。role 仍然是 'user'（老 App 行为不变），
         // 新 App 见到 noticeKind 就渲染成通知卡而不是"你说的话"。
+        // [feat 2026-10-17] 只有附件、没有文字的消息**也要产出**：截图配一句话是常态，
+        // 但"只发一张图"以前整条消失（text.trim() 为空 → 连宿主消息都不建），附件于是
+        // 永远没有挂载点。content 允许为空串，App 靠 attachments 渲染附件气泡。
         const notice = classifyHarnessNotice(text, ev);
-        messages.push({
+        const message = {
           id: `hist_${typeof ev.seq === 'number' ? ev.seq : messages.length}`,
           role: 'user',
           content: text.trim(),
           time: ev.time || Date.now(),
           seq: typeof ev.seq === 'number' ? ev.seq : null,
+          // 逐轮用量先占位为 null，扫描到下一条 user/message 时由 settleTurn 结算。
+          tokens: null,
+          ...(attachments.length > 0 ? { attachments } : {}),
           ...(notice
             ? {
                 noticeKind: notice.kind,
@@ -421,13 +543,33 @@ export function convertSessionRecordsToMessages(records, opts = {}) {
                 noticeBody: notice.body
               }
             : {})
-        });
+        };
+        messages.push(message);
+        currentTurn.msg = message;
       } else if (auditDropped && typeof ev.seq === 'number') {
         // [fix 2026-10-14] 纯附件/空文本用户消息以前是静默消失；现在留痕
         //（是否生成占位消息由 App 端显示层决定，网关至少不能无声吞掉）。
+        // [feat 2026-10-17] "纯附件"已不再走这里 —— 带 attachmentId 的 part 会产出消息；
+        // 能落到这一支的是真的什么都没有（或只有没有 attachmentId 的老形状 part）。
         auditDropped({ seq: ev.seq, why: 'empty-user-text', length: 0 });
       }
     } else if (ev.type === 'assistant/message') {
+      // [feat 2026-10-17] 引擎每个 step 的 assistant/message 都带 usage，而它以前被整个
+      // 扔掉（手机只能靠"两次 stats 相减"，基线没记到就永远显示 —）。这里把**属于当前
+      // 这一轮**的量累加进 currentTurn。只加 inputTokens + outputTokens：inputTokens 是
+      // 未缓存输入，totalTokens 是跨 step 的累计值（实测每条 assistant 都重复带着前面的
+      // 总量），加它会把整轮吹大一个量级。缺 usage / 字段不是数字 → 0 贡献，**不**把整轮
+      // 判成 null（工具步没有 usage 是常态）。currentTurn 为 null（分页从轮中间切进来）
+      // 时这轮没有承载消息，直接不计。
+      if (currentTurn) {
+        const usage = ev.data?.usage;
+        if (usage && typeof usage === 'object') {
+          currentTurn.sawUsage = true;
+          const input = finiteNumber(usage.inputTokens) ?? 0;
+          const output = finiteNumber(usage.outputTokens) ?? 0;
+          currentTurn.sum += input + output;
+        }
+      }
       const msgObj = ev.data?.message;
       let reasoning = '';
       let text = '';
@@ -486,9 +628,18 @@ export function convertSessionRecordsToMessages(records, opts = {}) {
           id: callData.callId
         });
       }
+    } else if (ev.type === 'turn/end') {
+      // [feat 2026-10-17] 回合结束的**权威**信号（`data.reason.kind`，见 index.js 的
+      // follower 用 turn/start 置 turnOpen、turn/end 清 turnOpen）。窗口内出现它就说明
+      // 这一轮已经跑完，可以结算 tokens；只记布尔而不记次数，重复的 turn/end 也落在同一
+      // 窗口内，结论一样（详见本函数头部的"为什么未结束的轮不给值"）。
+      // 它本身不是聊天消息，不产出任何 message。
+      if (currentTurn) currentTurn.ended = true;
     }
-    // turn/end and every other event type: not a chat message.
+    // Every other event type: not a chat message.
   }
+  // 最后一条 user/message 起的轮在这里结算（分页结束时它还没有下一条 user/message 可切）。
+  settleTurn();
   return { messages };
 }
 

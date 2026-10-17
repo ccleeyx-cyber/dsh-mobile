@@ -570,6 +570,9 @@ class DshService extends ChangeNotifier {
           noticeVariant: raw['noticeVariant']?.toString(),
           noticeChildId: raw['noticeChildId']?.toString(),
           noticeBody: raw['noticeBody']?.toString(),
+          // [feat 2026-10-17] 引擎的权威逐轮用量 + 附件（图片/文件）。
+          turnTokens: _intOrNull(raw['tokens']),
+          attachments: raw['attachments'] as List<dynamic>?,
         );
         knownSeqs.add(seq ?? -1);
         knownIds.add(msg.id);
@@ -714,6 +717,16 @@ class DshService extends ChangeNotifier {
       }
     }
     return raw.toString();
+  }
+
+  /// 宽容地读一个整数：网关给 `null` / 字符串数字 / 浮点都要能读出来，
+  /// 读不出来就是 `null`（**绝不回落成 0** —— 0 在用量、附件体积这些地方
+  /// 会被读成"确实是 0"，而真相是"没拿到"）。
+  int? _intOrNull(dynamic raw) {
+    if (raw == null) return null;
+    if (raw is int) return raw;
+    if (raw is num) return raw.toInt();
+    return int.tryParse(raw.toString().trim());
   }
 
   /// 手动触发网络重连 (F3.4)
@@ -1064,6 +1077,18 @@ class DshService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 测试用：把一份"服务端快照"直接喂给 reconcile，不联网。
+  ///
+  /// 存在的理由是 2026-10-17 那个缺陷：reconcile 曾经整体替换 `_messages`，于是
+  /// 每 2.5 秒一次的轮询会把用户上翻加载出来的更早几轮**全部抹掉**（"明明有五轮，
+  /// 只显示三轮"）。这条路径平时只由轮询驱动，没有这个缝就只能靠人眼在真机上撞。
+  @visibleForTesting
+  void debugReconcileServerMessages(List<Map<String, dynamic>> raw, {bool isRunning = false}) {
+    final sid = _currentSession?.sessionId;
+    if (sid == null) return;
+    _reconcileSessionMessages(raw, isRunning, sid);
+  }
+
   /// 测试用：直接设定待授权列表，不联网。
   ///
   /// 审批只由 fetchApprovals() 和 WebSocket 帧写入，两者都要真网关。审批卡的
@@ -1371,6 +1396,9 @@ class DshService extends ChangeNotifier {
             noticeVariant: m['noticeVariant']?.toString(),
             noticeChildId: m['noticeChildId']?.toString(),
             noticeBody: m['noticeBody']?.toString(),
+            // [feat 2026-10-17] 引擎的权威逐轮用量 + 附件（图片/文件）。
+            turnTokens: _intOrNull(m['tokens']),
+            attachments: m['attachments'] as List<dynamic>?,
           );
         }).toList();
 
@@ -1526,11 +1554,28 @@ class DshService extends ChangeNotifier {
         : (text.trim().isEmpty
             ? '📎 ${attachments.map((a) => a.name).join('、')}'
             : '$text\n\n📎 ${attachments.map((a) => a.name).join('、')}');
+    // [feat 2026-10-17] 图片的字节就在本机，先渲染出来。
+    //
+    // 以前只把文件名拼进正文、等引擎的 attachment 事件回来才有缩略图 —— 而那条链路
+    // 在"手机自己发的图"上根本没到达，用户看到的是发出去的图**完全不显示**。
+    // 这里先给一份本地预览，等服务端历史到了（带服务端签发的 attachmentId）再把
+    // 这条乐观消息换成带真附件的那条。
+    final localPreviews = <Uint8List>[];
+    for (final a in attachments) {
+      if (a is PendingImage) {
+        try {
+          localPreviews.add(base64Decode(a.base64Data));
+        } catch (_) {
+          // 预览解不出来不影响发送本身；服务端版本到了照常显示
+        }
+      }
+    }
     final userMsg = ChatMessage(
       id: _uuid.v4(),
       role: 'user',
       content: displayText,
       timestamp: DateTime.now(),
+      localImagePreviews: localPreviews,
     );
     _messages.add(userMsg);
 
@@ -1823,6 +1868,18 @@ class DshService extends ChangeNotifier {
       }
     }
 
+    // [fix 2026-10-17] 服务端这份快照只覆盖**最新一页**（引擎按消息数给的窗口），
+    // 而用户在会话里往上翻时加载出来的更早消息**不在这份快照里**。原来下面整体替换
+    // （`_messages = serverMessages`），于是每 2.5 秒一次的轮询/重连都会把翻出来的旧轮
+    // 抹掉 —— 用户看到的就是"明明有五轮，只显示三轮"。
+    //
+    // 窗口边界先算出来，下面两处都要用：比它更早的消息一律按 seq 保留，并且**不再**
+    // 走"最近本地提问"那条补插逻辑（否则同一条会被补插一次、被保留一次 → 重复两遍）。
+    final oldestServerSeq = serverMessages
+        .map((m) => m.seq)
+        .whereType<int>()
+        .fold<int?>(null, (min, s) => min == null || s < min ? s : min);
+
     // 3. Preserve recent local user prompts without duplicating or inversing order
     // [fix 2026-10-14] 服务端快照缺最新一问一答的窗口远大于 45 秒：网关投影缓存
     // 可能滞后数小时（实测事故：日志 seq 794 vs 投影 723，隔天都没追上）。
@@ -1835,6 +1892,10 @@ class DshService extends ChangeNotifier {
       return idx >= 0 ? s.substring(0, idx) : s;
     }
     for (final localMsg in _messages.where((m) => m.isUser)) {
+      // 已经在窗口之前、下面会原样保留的那批：不要在这里再补插一次。
+      if (localMsg.seq != null && oldestServerSeq != null && localMsg.seq! < oldestServerSeq) {
+        continue;
+      }
       final localCore = stripAttachmentLabel(localMsg.content);
       final matchedOnServer = localCore.isNotEmpty && serverUserTexts.any((s) {
         if (s == localMsg.content) return true;
@@ -1852,7 +1913,14 @@ class DshService extends ChangeNotifier {
       }
     }
 
-    _messages = serverMessages;
+    // [fix 2026-10-17] 窗口之前那批（用户上翻加载出来的更早几轮）原样保留在头部。
+    // 只用 seq 比较（严格小于窗口内最旧的 seq），不会与窗口内容重复；本地乐观消息
+    // 没有 seq，不受这里影响，仍由上面的"保留最近本地提问"负责。
+    final olderKept = oldestServerSeq == null
+        ? const <ChatMessage>[]
+        : _messages.where((m) => m.seq != null && m.seq! < oldestServerSeq).toList();
+
+    _messages = [...olderKept, ...serverMessages];
     _streamRevision++;
     notifyListeners();
   }
@@ -2381,6 +2449,12 @@ class DshService extends ChangeNotifier {
           }
         }
         notifyListeners();
+        // [fix 2026-10-17] 翻转本地标志**不足以**让列表正确：工作区视图渲染的是
+        // 网关按 `archived` 过滤后的那份列表，而"未归档"视图里被归档的那一行还在
+        // 手上的数组里，于是点了归档行照旧挂在那儿 —— 用户看到的就是"归档没生效"。
+        // （实测网关侧是对的：归档后再查 exclude 清单里已经没有它、only/include 里有。）
+        // 这里主动重拉一次，让列表回到服务端的事实。
+        unawaited(fetchWorkspaces());
         return true;
       }
       return false;
@@ -2707,10 +2781,30 @@ class DshService extends ChangeNotifier {
   /// 3. `total - baseline == 0` 与"没量到"在界面上无法区分，而 0 会被读成
   ///    "这轮没花钱"——这是面板最不能显示的一个值，所以按未知处理。
   int? get lastTurnTokens {
+    // [fix 2026-10-17] 先用引擎的**权威读数**：网关把该轮每个 step 的 usage 汇总到
+    // 那一轮的 user 消息上（`ChatMessage.turnTokens`）。它不依赖"回合开始时 App 手里
+    // 正好有一份实时基线"这个前提 —— 而那个前提一旦缺失（切会话、冷启动到一个正在
+    // 跑的会话、轮末 App 不在前台），下面这套"两次读数相减"就永远出不来值，用户看到
+    // 的是本轮消耗恒为 `—`。
+    final authoritative = _authoritativeLastTurnTokens;
+    if (authoritative != null && authoritative > 0) return authoritative;
+
     if (!_hasMeasuredTurn) return null;
     final burn = _measuredTurnTokens;
     if (burn == null || burn <= 0) return null;
     return burn;
+  }
+
+  /// 从消息里取最近一次**跑完的轮**的权威用量。
+  ///
+  /// 取最后一条带 `turnTokens` 的消息（不是"最后一条消息"）：当前这一轮还在跑时
+  /// 没有值，面板该显示的是上一次跑完的读数，而不是一个中途的部分和。
+  int? get _authoritativeLastTurnTokens {
+    for (var i = _messages.length - 1; i >= 0; i--) {
+      final tokens = _messages[i].turnTokens;
+      if (tokens != null) return tokens;
+    }
+    return null;
   }
 
   /// 回合开始时记下"开始前"的累计读数。
@@ -4234,6 +4328,32 @@ class DshService extends ChangeNotifier {
       if (type == 'permission_updated' && json['permissions'] != null) {
         _permissions = PermissionConfig.fromJson(json['permissions'] as Map<String, dynamic>);
         notifyListeners();
+        return;
+      }
+
+      // 4.b [feat 2026-10-17] 归档状态变化。
+      //
+      // 网关在归档成功后会广播这两帧（自己点的、或电脑端/另一台手机改的都算）。
+      // 以前 App 完全不认识它们：自己点的时候靠本地翻转"看着像生效了"，可一旦
+      // 电脑端改了归档状态，手机上的列表永远不会跟着变。
+      if (type == 'session_archived' || type == 'session_unarchived') {
+        final sId = json['sessionId']?.toString() ?? '';
+        final archived = type == 'session_archived';
+        bool changed = false;
+        for (final ws in _workspaces) {
+          for (var i = 0; i < ws.sessions.length; i++) {
+            final s = ws.sessions[i];
+            if (s.matchesSessionId(sId) && s.archived != archived) {
+              ws.sessions[i] = s.copyWith(archived: archived);
+              changed = true;
+            }
+          }
+        }
+        if (_currentSession != null && _currentSession!.matchesSessionId(sId)) {
+          _currentSession = _currentSession!.copyWith(archived: archived);
+          changed = true;
+        }
+        if (changed) notifyListeners();
         return;
       }
 

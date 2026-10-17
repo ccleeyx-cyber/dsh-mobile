@@ -13,8 +13,10 @@
 // 1. 耗时只在同一轮内至少有两个带时间的不同事件时才给出；只有一个事件的轮
 //    （用户刚发出去、还没有回复）一律 null，界面显示 `—`。一个事件的"首尾差"
 //    恒为 0，把它显示成 `0s` 等于声称"这轮瞬间跑完了"。
-// 2. token 只给最后一轮。引擎只在回合结束时上报本轮的增量，历史轮的用量没有
-//    数据源；拿不到就是 null，绝不补 0。
+// 2. token 只认有数据源的那一个：优先用引擎的权威值（网关把该轮各 step 的 usage
+//    汇总到那条 user 消息上 → ChatMessage.turnTokens），只有当前正在跑的那一轮才退
+//    回调用方传进来的 liveTurnTokens。两者都没有就是 null，界面显示 `—`，绝不补 0
+//    —— 0 会被读成"这轮没花钱"。
 // 3. 上下文/记忆块单独归类（TrajectoryEventKind.context）。它们不是用户
 //    或 Agent 的动作，默认在时间线里隐藏，但要能被计数 —— 隐藏不等于不存在。
 
@@ -191,7 +193,8 @@ class Trajectory {
   /// 从消息列表重建轨迹。
   ///
   /// [liveTurnTokens] 传当前会话"本轮已消耗"的读数（`DshService.lastTurnTokens`），
-  /// 只挂在最后一轮上；为 null 时所有轮的 token 都是 null。
+  /// 用来补**最后一轮**的 token —— 只在它还没有引擎权威值时才补（正在跑的那轮网关
+  /// 给不出值，已经跑完的那轮有）。为 null 时各轮按各自的数据源显示。
   ///
   /// [running] 表示最后一轮仍在执行 —— 这时它不封口，界面显示"进行中"。
   static Trajectory build(
@@ -284,6 +287,9 @@ class Trajectory {
         t.events.add(e);
         t.startedAt = e.at;
         t.endedAt = e.at;
+        // [feat 2026-10-17] 引擎的权威逐轮用量（网关把该轮各 step 的 usage 汇总到
+        // 这条 user 消息上）。有它就不必再靠"本机两次读数相减"，历史轮也能显示真值。
+        if (m.turnTokens != null) t.tokens = m.turnTokens;
         continue;
       }
 
@@ -346,7 +352,12 @@ class Trajectory {
       final last = turns.last;
       last.running = running;
       if (running) last.endedAt = null;
-      if (liveTurnTokens != null && liveTurnTokens > 0) last.tokens = liveTurnTokens;
+      // [fix 2026-10-17] 本机读数**只补空**，不覆盖引擎的权威值：最后一轮已经跑完
+      // 时它必然带着网关汇总的 `tokens`，而 `liveTurnTokens` 是"两次 stats 读数相减"，
+      // 精度更差。以前这里无条件覆盖，等于把更准的那个扔掉。
+      if (last.tokens == null && liveTurnTokens != null && liveTurnTokens > 0) {
+        last.tokens = liveTurnTokens;
+      }
     }
 
     return Trajectory._(turns, contextCount);
