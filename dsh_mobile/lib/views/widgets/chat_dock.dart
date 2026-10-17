@@ -106,8 +106,6 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
   /// `kToolbarHeight`，而 `bottom` 另外又长了 34dp）。
   SessionStatusStrip _eventStrip(BuildContext? context) {
     return SessionStatusStrip(
-      deliverableCount: dsh.deliverableCount,
-      deliverablesUnread: deliverablesUnread,
       liveJobCount: liveJobCount,
       runningElsewhereCount: _runningElsewhere(dsh, currentSession?.sessionId),
       onTapSection: (section) => onOpenSessionInfo(section),
@@ -176,6 +174,54 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
                   ),
                 ),
               ),
+              // [fix 2026-10-17 用户反馈] 产出从"事件带单独一行胶囊"改成标题行
+              // 右端的一枚紧凑徽标：📦 N。它和会话名同一行、贴着右端，视觉上
+              // 是标题的附属信息而不是一条横带。标题是 Flexible，挤不下时让位
+              // 的是标题文字，绝不会有整行溢出。
+              if ((dsh.deliverableCount ?? 0) > 0) ...[
+                const SizedBox(width: 6),
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () =>
+                      onOpenSessionInfo(SessionInsightSection.deliverables),
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: deliverablesUnread
+                          ? context.c.accent.withOpacity(0.12)
+                          : context.c.surfaceMuted,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.inventory_2_outlined,
+                          size: 11,
+                          color: deliverablesUnread
+                              ? context.c.accent
+                              : context.c.textTertiary,
+                        ),
+                        const SizedBox(width: 3),
+                        Text(
+                          '${dsh.deliverableCount}',
+                          key: const ValueKey('chat-deliverable-count'),
+                          style: TextStyle(
+                            fontSize: AppText.caption,
+                            fontWeight: deliverablesUnread
+                                ? FontWeight.w700
+                                : FontWeight.w500,
+                            color: deliverablesUnread
+                                ? context.c.accent
+                                : context.c.textTertiary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
           const SizedBox(height: 2),

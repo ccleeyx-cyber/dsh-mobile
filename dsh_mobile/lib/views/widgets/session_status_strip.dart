@@ -51,22 +51,12 @@ class SessionStatusStrip extends StatelessWidget
     implements PreferredSizeWidget {
   const SessionStatusStrip({
     super.key,
-    this.deliverableCount,
-    this.deliverablesUnread = false,
     this.liveJobCount,
     this.runningElsewhereCount,
     this.onTapSection,
     this.onTapRunningElsewhere,
     this.connection,
   });
-
-  /// 本会话声明过的交付物数量；`null` = 未知。
-  ///
-  /// `0` 是**已知真值**，但它不是事件 —— 不渲染（见类注释规则 2）。
-  final int? deliverableCount;
-
-  /// 有尚未被用户看过的产出时才把「产出 N」摆上来。
-  final bool deliverablesUnread;
 
   /// 仍在跑的后台作业数；`null` / `0` = 不渲染。
   final int? liveJobCount;
@@ -117,16 +107,16 @@ class SessionStatusStrip extends StatelessWidget
 
   bool get _showConnection => connection == SessionConnectionState.reconnecting;
 
-  /// 只有**未读**的产出才是事件。读过之后这一段的使命就结束了。
-  bool get _showDeliverables => deliverablesUnread && (deliverableCount ?? 0) > 0;
-
   bool get _showJobs => (liveJobCount ?? 0) > 0;
 
   bool get _showOthers => (runningElsewhereCount ?? 0) > 0;
 
   /// 有没有任何事件可报。没有就只留 1dp 分隔线，**不留一条空白带**。
-  bool get hasContent =>
-      _showConnection || _showDeliverables || _showJobs || _showOthers;
+  ///
+  /// [fix 2026-10-17 用户反馈] 「产出 N」不再是这一带的一段：它曾被摆成顶栏下方
+  /// 单独一行的胶囊，用户的原话是"产出单独一行太突兀"。现在它作为一枚紧凑徽标
+  /// 挂在 `ChatAppBar` 的**标题行右端**，这条带只保留真正需要当场反应的临时事件。
+  bool get hasContent => _showConnection || _showJobs || _showOthers;
 
   @override
   Size get preferredSize => Size.fromHeight(hasContent ? rowHeight : 1);
@@ -212,20 +202,6 @@ class SessionStatusStrip extends StatelessWidget
         // "正在连"，用户不会以为它卡死了。
         onTap: null,
         leading: _ConnectingDot(color: context.c.warning),
-      ));
-    }
-
-    if (_showDeliverables) {
-      addChip(_pill(
-        context,
-        key: const ValueKey('strip-segment-deliverables'),
-        label: '产出 ${deliverableCount!}',
-        foreground: context.c.accent,
-        background: context.c.accent.withOpacity(0.12),
-        onTap: onTapSection == null
-            ? null
-            : () => onTapSection!(SessionInsightSection.deliverables),
-        fontWeight: FontWeight.w700,
       ));
     }
 

@@ -182,24 +182,19 @@ void main() {
       expect(find.textContaining('产出'), findsNothing);
     });
 
-    testWidgets('未读产出才上带；读过之后整条消失', (tester) async {
-      const unread =
-          SessionStatusStrip(deliverableCount: 3, deliverablesUnread: true);
-      expect(unread.preferredSize.height, SessionStatusStrip.rowHeight);
-      await pump(tester, unread);
-      expect(find.text('产出 3'), findsOneWidget);
-
-      // 读过的产出是**状态**，不是事件 —— 它该在信息面板里，不该继续占领顶部。
-      await pump(tester, const SessionStatusStrip(deliverableCount: 3));
-      expect(find.byKey(const ValueKey('session-status-strip')), findsNothing);
+    testWidgets('产出不再是事件带的一段（已并入顶栏第二行）', (tester) async {
+      // [fix 2026-10-17 用户反馈] 「产出 N」从事件带（单独一行胶囊）移到
+      // ChatAppBar 第二行 —— 它和"执行中/工作区/上下文"同属身份类读数。
+      // 旧的 strip 参数已删除，这里钉住"带子里不再出现产出"。
+      await pump(tester, const SessionStatusStrip(liveJobCount: 1));
       expect(find.textContaining('产出'), findsNothing);
+      expect(find.byKey(const ValueKey('strip-segment-deliverables')), findsNothing);
+      // 带子仍然给真正的事件（后台作业）留着。
+      expect(find.text('运行中 1'), findsOneWidget);
     });
 
-    testWidgets('已知 0 个产出不渲染：0 没有可反应的', (tester) async {
-      await pump(
-        tester,
-        const SessionStatusStrip(deliverableCount: 0, deliverablesUnread: true),
-      );
+    testWidgets('空带：没有任何事件时只留 1dp 分隔线', (tester) async {
+      await pump(tester, const SessionStatusStrip());
       expect(find.textContaining('产出'), findsNothing);
       expect(find.byKey(const ValueKey('session-status-strip')), findsNothing);
     });
@@ -258,35 +253,25 @@ void main() {
       expect(opened, 1, reason: '这一段去的是会话选择器，不是信息面板');
     });
 
-    testWidgets('每一段都点得开对应小节', (tester) async {
+    testWidgets('剩下的每一段都点得开对应小节', (tester) async {
       SessionInsightSection? tapped;
       await pump(
         tester,
         SessionStatusStrip(
-          deliverableCount: 3,
-          deliverablesUnread: true,
           liveJobCount: 1,
           onTapSection: (s) => tapped = s,
         ),
       );
 
-      await tester.tap(find.byKey(const ValueKey('strip-segment-deliverables')));
-      await tester.pump();
-      expect(tapped, SessionInsightSection.deliverables);
-
-      tapped = null;
       await tester.tap(find.byKey(const ValueKey('strip-segment-jobs')));
       await tester.pump();
       expect(tapped, SessionInsightSection.jobs);
     });
 
     testWidgets('热区：整颗胶囊 36dp 高都可点（旧版约 20dp）', (tester) async {
-      await pump(
-        tester,
-        const SessionStatusStrip(deliverableCount: 1, deliverablesUnread: true),
-      );
+      await pump(tester, const SessionStatusStrip(liveJobCount: 1));
       final rect =
-          tester.getRect(find.byKey(const ValueKey('strip-segment-deliverables')));
+          tester.getRect(find.byKey(const ValueKey('strip-segment-jobs')));
       expect(rect.height, greaterThanOrEqualTo(36));
     });
   });
@@ -811,9 +796,11 @@ void main() {
       );
       await tester.pump();
 
-      // 未读产出 = 事件 → 上带。
+      // [fix 2026-10-17 用户反馈] 未读产出不再占事件带的一行，改成标题行右端的
+      // 紧凑徽标（📦 1）—— 同一张截图里用户说"产出单独一行太突兀"。
       expect(find.byType(SessionStatusStrip), findsOneWidget);
-      expect(find.text('产出 1'), findsOneWidget);
+      expect(find.byKey(const ValueKey('chat-deliverable-count')), findsOneWidget);
+      expect(find.text('1'), findsOneWidget);
       // 上下文是"这个会话是什么"，常驻在标题第二行，不进事件带（它天天在变，
       // 却不是需要你反应的事）。
       expect(find.text('上下文 50%'), findsOneWidget);
@@ -935,7 +922,8 @@ void main() {
           reason: '顶栏总高 = 主栏 + 事件带，多出来的高度全是消息流被吃掉的部分');
       expect(find.text('执行中'), findsOneWidget);
       expect(find.text('上下文 75%'), findsOneWidget);
-      expect(find.text('产出 2'), findsOneWidget);
+      // 产出是标题行右端的小徽标（不是一条带）。
+      expect(find.byKey(const ValueKey('chat-deliverable-count')), findsOneWidget);
       await teardown(tester);
     });
 
@@ -972,7 +960,7 @@ void main() {
       await teardown(tester);
     });
 
-    testWidgets('点状态条那一段能从会话里打开信息面板（不留二级页面）', (tester) async {
+    testWidgets('点顶栏第二行的「产出 N」能从会话里打开信息面板', (tester) async {
       final dsh = await chatWithSession(tester);
       dsh.debugSetTaskCenter(
         deliverables: const [
@@ -986,7 +974,9 @@ void main() {
       );
       await tester.pump();
 
-      await tester.tap(find.byKey(const ValueKey('strip-segment-deliverables')));
+      // [fix 2026-10-17 用户反馈] 入口从事件带的胶囊改为顶栏第二行的「产出 1」。
+      expect(find.byKey(const ValueKey('strip-segment-deliverables')), findsNothing);
+      await tester.tap(find.byKey(const ValueKey('chat-deliverable-count')));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
 
