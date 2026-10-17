@@ -719,7 +719,9 @@ class _ChatViewState extends State<ChatView> {
         liveJobCount: _liveJobCount(dsh),
         onOpenSessionInfo: (section) => _openSessionInfo(dsh, section: section),
         onToggleSearch: _toggleSearch,
-        onScrollToBottom: _scroll.scrollToBottom,
+        // 与 `main_shell` 里 PopScope 的侧滑返回同一条动线：离开会话 = 回工作区 tab。
+        // 之前这条路径只存在于手势里，界面上没有可见入口。
+        onBackToWorkspaces: () => widget.onOpenWorkspaces?.call(),
       ),
       body: Column(
         children: [

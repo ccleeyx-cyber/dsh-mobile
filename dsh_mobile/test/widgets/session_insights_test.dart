@@ -9,6 +9,7 @@ import 'package:dsh_mobile/models/workspace.dart';
 import 'package:dsh_mobile/services/dsh_service.dart';
 import 'package:dsh_mobile/theme/app_colors.dart';
 import 'package:dsh_mobile/views/chat_view.dart';
+import 'package:dsh_mobile/views/widgets/chat_dock.dart';
 import 'package:dsh_mobile/views/widgets/session_info_sheet.dart';
 import 'package:dsh_mobile/views/widgets/session_status_strip.dart';
 import 'package:dsh_mobile/views/widgets/turn_output_card.dart';
@@ -160,53 +161,47 @@ void main() {
     });
   });
 
-  // ======================================================== 状态条 =====
+  // ====================================================== 会话事件带 =====
+  //
+  // 2026-10-17（方案 A）：这条带从「数字清单」改成了「事件带」。判据不再是"能不能
+  // 读到"，而是"**要不要你当场反应**"：
+  //   * 未读产出 → 是事件；读过的产出 → 不是（总数在信息面板里）；
+  //   * 已知 0 个产出 → 不是事件（没有可反应的）；
+  //   * 轮/步、tok/s、累计 tok、缓存命中、改动数、上下文 → 全部离开这里：
+  //     前三组进信息面板，工作区与上下文进顶栏第二行。
+  //
+  // 所以下面这些用例盯的主要是"**什么时候不渲染**"和"热区够不够"，而不是
+  // 数字格式 —— 数字格式的归宿已经是信息面板。
 
-  group('会话状态条：未知即隐藏', () {
-    testWidgets('什么都读不到时只留 1px 分隔线，不显示"产出 0 / 改动 0"', (tester) async {
+  group('会话事件带：只报需要当场反应的事', () {
+    testWidgets('什么都没发生时只留 1px 分隔线，不留一条空白带', (tester) async {
       const strip = SessionStatusStrip();
       expect(strip.preferredSize.height, 1);
       await pump(tester, const SessionStatusStrip());
-      expect(find.textContaining('产出'), findsNothing);
-      expect(find.textContaining('改动'), findsNothing);
-      expect(find.textContaining('上下文'), findsNothing);
       expect(find.byKey(const ValueKey('session-status-strip')), findsNothing);
+      expect(find.textContaining('产出'), findsNothing);
     });
 
-    testWidgets('已知为 0 要显示：0 是"确实没有"，与"读不到"长得不一样', (tester) async {
-      const strip = SessionStatusStrip(deliverableCount: 0, changeCount: 0);
-      expect(strip.preferredSize.height, 34);
-      await pump(tester, const SessionStatusStrip(deliverableCount: 0, changeCount: 0));
-      expect(find.text('产出 0'), findsOneWidget);
-      expect(find.text('改动 0'), findsOneWidget);
+    testWidgets('未读产出才上带；读过之后整条消失', (tester) async {
+      const unread =
+          SessionStatusStrip(deliverableCount: 3, deliverablesUnread: true);
+      expect(unread.preferredSize.height, SessionStatusStrip.rowHeight);
+      await pump(tester, unread);
+      expect(find.text('产出 3'), findsOneWidget);
+
+      // 读过的产出是**状态**，不是事件 —— 它该在信息面板里，不该继续占领顶部。
+      await pump(tester, const SessionStatusStrip(deliverableCount: 3));
+      expect(find.byKey(const ValueKey('session-status-strip')), findsNothing);
+      expect(find.textContaining('产出'), findsNothing);
     });
 
-    testWidgets('非 git 仓库时"改动"整段隐藏（不是显示 0）', (tester) async {
+    testWidgets('已知 0 个产出不渲染：0 没有可反应的', (tester) async {
       await pump(
         tester,
-        const SessionStatusStrip(deliverableCount: 1, changeCount: 0, changesUnavailable: true),
+        const SessionStatusStrip(deliverableCount: 0, deliverablesUnread: true),
       );
-      expect(find.text('产出 1'), findsOneWidget);
-      expect(find.textContaining('改动'), findsNothing);
-    });
-
-    testWidgets('上下文百分比 + 只在超过阈值时出现进度线', (tester) async {
-      await pump(tester, const SessionStatusStrip(contextFraction: 0.62));
-      expect(find.text('上下文 62%'), findsOneWidget);
-      expect(find.byKey(const ValueKey('strip-context-bar')), findsNothing);
-
-      await pump(tester, const SessionStatusStrip(contextFraction: 0.70));
-      expect(find.byKey(const ValueKey('strip-context-bar')), findsNothing, reason: '阈值不包含于触发条件');
-
-      await pump(tester, const SessionStatusStrip(contextFraction: 0.72));
-      final bar = tester.widget<LinearProgressIndicator>(find.byKey(const ValueKey('strip-context-bar')));
-      expect(bar.value, closeTo(0.72, 0.001));
-    });
-
-    testWidgets('缓存快照必须看得出来，不能当实时值展示', (tester) async {
-      await pump(tester, const SessionStatusStrip(contextFraction: 0.5, contextIsSnapshot: true));
-      expect(find.byKey(const ValueKey('strip-context-snapshot')), findsOneWidget);
-      expect(find.byTooltip('会话不在内存中，这是最后一次上报的快照'), findsOneWidget);
+      expect(find.textContaining('产出'), findsNothing);
+      expect(find.byKey(const ValueKey('session-status-strip')), findsNothing);
     });
 
     testWidgets('后台作业：未知隐藏、0 隐藏、>0 显示', (tester) async {
@@ -220,90 +215,79 @@ void main() {
       expect(find.text('运行中 2'), findsOneWidget);
     });
 
-    // ---- 电脑端风格的两组用量数字（2026-10-17）----
-    //
-    // 用户的原话："用量信息我想和电脑端的这样显示"，截图里是
-    // `6 轮 351 步 · 210 tok/s  |  113M tok · 缓存命中 99%  |  21%`。
-    // 三组分别对应：sessionStats 投影、tokenUsage 投影、上下文压力。
-    testWidgets('轮/步 + tok/s：与电脑端同一条文案', (tester) async {
-      await pump(tester, const SessionStatusStrip(turns: 6, steps: 351, tokensPerSecond: 210.4));
-      expect(find.text('6 轮 351 步 · 210 tok/s'), findsOneWidget);
+    testWidgets('只有"正在重连"在这里报；正常与已断开都不占位', (tester) async {
+      await pump(
+        tester,
+        const SessionStatusStrip(connection: SessionConnectionState.connected),
+      );
+      expect(find.byKey(const ValueKey('strip-connection')), findsNothing);
+
+      // 已断开由顶部横幅承载（横幅有完整的动作和解释）；这里再说一遍就是
+      // 同一条事实说两遍 —— 真机截图里曾经就是这样重复的。
+      await pump(
+        tester,
+        const SessionStatusStrip(connection: SessionConnectionState.disconnected),
+      );
+      expect(find.byKey(const ValueKey('strip-connection')), findsNothing);
+
+      await pump(
+        tester,
+        const SessionStatusStrip(connection: SessionConnectionState.reconnecting),
+      );
+      expect(find.text('连接中…'), findsOneWidget);
     });
 
-    testWidgets('速度取不到时只省略这一段，不写 0 tok/s（那读起来像卡住了）', (tester) async {
-      await pump(tester, const SessionStatusStrip(turns: 6, steps: 351));
-      expect(find.text('6 轮 351 步'), findsOneWidget);
-      expect(find.textContaining('tok/s'), findsNothing);
-    });
+    testWidgets('别处执行中：未知/0 隐藏，>0 显示且通向会话选择器', (tester) async {
+      await pump(tester, const SessionStatusStrip(runningElsewhereCount: null));
+      expect(find.byKey(const ValueKey('strip-other-running')), findsNothing);
 
-    testWidgets('没跑过（steps == 0）不显示"0 轮 0 步"', (tester) async {
-      await pump(tester, const SessionStatusStrip(turns: 0, steps: 0));
-      expect(find.textContaining('步'), findsNothing);
-    });
+      await pump(tester, const SessionStatusStrip(runningElsewhereCount: 0));
+      expect(find.byKey(const ValueKey('strip-other-running')), findsNothing);
 
-    testWidgets('累计 tok + 缓存命中：截断口径与电脑端一致（113M 不是 114M）', (tester) async {
-      await pump(tester, const SessionStatusStrip(totalTokens: 113704827, cacheHitPercent: 99));
-      expect(find.text('113M tok · 缓存命中 99%'), findsOneWidget);
-    });
-
-    testWidgets('缓存命中率未知时只显示累计，不编一个 0%', (tester) async {
-      await pump(tester, const SessionStatusStrip(totalTokens: 12345));
-      // 与 M 同一套截断规则：满 10 个单位就取整（12.345k → 12k），否则保留一位。
-      expect(find.text('12k tok'), findsOneWidget);
-      expect(find.textContaining('缓存命中'), findsNothing);
-    });
-
-    testWidgets('两组用量都能点开用量小节', (tester) async {
-      SessionInsightSection? tapped;
+      var opened = 0;
       await pump(
         tester,
         SessionStatusStrip(
-          turns: 6,
-          steps: 351,
-          totalTokens: 1000,
-          onTapSection: (s) => tapped = s,
+          runningElsewhereCount: 2,
+          onTapRunningElsewhere: () => opened++,
         ),
       );
-      await tester.tap(find.byKey(const ValueKey('strip-segment-counts')));
+      expect(find.text('2 个在跑'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('strip-other-running')));
       await tester.pump();
-      expect(tapped, SessionInsightSection.usage);
-
-      tapped = null;
-      await tester.tap(find.byKey(const ValueKey('strip-segment-tokens')));
-      await tester.pump();
-      expect(tapped, SessionInsightSection.usage);
+      expect(opened, 1, reason: '这一段去的是会话选择器，不是信息面板');
     });
 
-    testWidgets('执行中徽标 + 点某一段回调对应小节', (tester) async {
+    testWidgets('每一段都点得开对应小节', (tester) async {
       SessionInsightSection? tapped;
       await pump(
         tester,
         SessionStatusStrip(
-          isRunning: true,
           deliverableCount: 3,
-          contextFraction: 0.4,
+          deliverablesUnread: true,
+          liveJobCount: 1,
           onTapSection: (s) => tapped = s,
         ),
       );
-      expect(find.text('执行中'), findsOneWidget);
 
       await tester.tap(find.byKey(const ValueKey('strip-segment-deliverables')));
       await tester.pump();
       expect(tapped, SessionInsightSection.deliverables);
 
-      await tester.tap(find.byKey(const ValueKey('strip-segment-context')));
+      tapped = null;
+      await tester.tap(find.byKey(const ValueKey('strip-segment-jobs')));
       await tester.pump();
-      expect(tapped, SessionInsightSection.usage);
+      expect(tapped, SessionInsightSection.jobs);
     });
 
-    testWidgets('未读产出用强调色，读过之后回落普通色', (tester) async {
-      await pump(tester, const SessionStatusStrip(deliverableCount: 2, deliverablesUnread: true));
-      final unread = tester.widget<Text>(find.text('产出 2'));
-      expect(unread.style?.fontWeight, FontWeight.w700);
-
-      await pump(tester, const SessionStatusStrip(deliverableCount: 2));
-      final read = tester.widget<Text>(find.text('产出 2'));
-      expect(read.style?.fontWeight, FontWeight.w500);
+    testWidgets('热区：整颗胶囊 36dp 高都可点（旧版约 20dp）', (tester) async {
+      await pump(
+        tester,
+        const SessionStatusStrip(deliverableCount: 1, deliverablesUnread: true),
+      );
+      final rect =
+          tester.getRect(find.byKey(const ValueKey('strip-segment-deliverables')));
+      expect(rect.height, greaterThanOrEqualTo(36));
     });
   });
 
@@ -813,7 +797,7 @@ void main() {
       await teardown(tester);
     });
 
-    testWidgets('状态条挂在 AppBar 下方，显示上下文与产出，不是一条空白带', (tester) async {
+    testWidgets('事件带挂在 AppBar 下方；上下文与工作区在标题第二行', (tester) async {
       final dsh = await chatWithSession(tester);
       dsh.debugSetTaskCenter(
         deliverables: const [
@@ -824,13 +808,71 @@ void main() {
       );
       await tester.pump();
 
+      // 未读产出 = 事件 → 上带。
       expect(find.byType(SessionStatusStrip), findsOneWidget);
       expect(find.text('产出 1'), findsOneWidget);
+      // 上下文是"这个会话是什么"，常驻在标题第二行，不进事件带（它天天在变，
+      // 却不是需要你反应的事）。
       expect(find.text('上下文 50%'), findsOneWidget);
-      // 位置：状态条必须在消息流上方（AppBar 之内），不能跑到别处去。
+      // 位置：事件带必须在消息流上方（AppBar 之内），不能跑到别处去。
       final stripRect = tester.getRect(find.byType(SessionStatusStrip));
       final inputRect = tester.getRect(find.byKey(const ValueKey('chat-input-bar')));
       expect(stripRect.bottom, lessThan(inputRect.top));
+      await teardown(tester);
+    });
+
+    testWidgets('「执行中」全页面只出现一次（曾经顶栏与状态条各渲染一枚）', (tester) async {
+      final dsh = await chatWithSession(tester);
+      dsh.debugSetCurrentSession(
+        SessionMeta(sessionId: 'session-a', title: '测试会话', isRunning: true),
+      );
+      await tester.pump();
+
+      expect(find.byKey(const ValueKey('chat-running-badge')), findsOneWidget);
+      expect(find.text('执行中'), findsOneWidget,
+          reason: '同一个事实说两遍：两条徽标样式还不一样，用户会以为是两种状态');
+      await teardown(tester);
+    });
+
+    testWidgets('顶栏不再常驻用量数字：轮/步、tok/s、累计 tok、改动都在信息面板里', (tester) async {
+      final dsh = await chatWithSession(tester);
+      dsh.debugSetTaskCenter(
+        deliverables: const [],
+        changes: const [WorkspaceChange(path: 'src/a.ts', status: 'M', added: 3, deleted: 1)],
+        changesAvailable: true,
+        stats: const SessionStats(
+          source: 'live',
+          totalTokens: 113704827,
+          pressureTokens: 64000,
+          contextWindow: 128000,
+        ),
+      );
+      await tester.pump();
+
+      // 这些数字此前挤在 34dp 的横滑带里，360dp 屏必然溢出（被裁在「改动」）。
+      expect(find.textContaining('tok/s'), findsNothing);
+      expect(find.textContaining('缓存命中'), findsNothing);
+      expect(find.textContaining('113M'), findsNothing);
+      expect(find.textContaining('改动'), findsNothing);
+      // 但上下文占用仍然一眼可见 —— 它在标题第二行。
+      expect(find.text('上下文 50%'), findsOneWidget);
+      await teardown(tester);
+    });
+
+    testWidgets('已知 0 个交付物不占事件带（0 没有可反应的），面板里仍然看得到', (tester) async {
+      final dsh = await chatWithSession(tester);
+      dsh.debugSetTaskCenter(deliverables: const []);
+      await tester.pump();
+
+      // 旧版把 `0` 当"已知真值"渲染成「产出 0」。新的判据是"要不要你当场反应"，
+      // 而 0 个产出没有任何可反应的东西 —— 总数由信息面板负责。
+      expect(find.text('产出 0'), findsNothing);
+      expect(find.byKey(const ValueKey('session-status-strip')), findsNothing);
+
+      await tester.tap(find.byKey(const ValueKey('chat-open-session-info')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(find.byType(SessionInfoSheet), findsOneWidget);
       await teardown(tester);
     });
 
@@ -845,11 +887,52 @@ void main() {
       await teardown(tester);
     });
 
-    testWidgets('真正拉到 0 个交付物时才显示"产出 0"', (tester) async {
+    testWidgets('真正拉到 0 个交付物时事件带不出现，也不显示「产出 0」', (tester) async {
       final dsh = await chatWithSession(tester);
       dsh.debugSetTaskCenter(deliverables: const []);
       await tester.pump();
-      expect(find.text('产出 0'), findsOneWidget, reason: '0 是已知真值，与"未知"必须长得不一样');
+      expect(find.text('产出 0'), findsNothing,
+          reason: '0 是已知真值，但它不是事件 —— 顶部只报需要反应的事');
+      await teardown(tester);
+    });
+
+    testWidgets('360dp 最挤的一帧也不溢出：长会话名 + 长工作区 + 执行中 + 75% 上下文', (tester) async {
+      // 旧版在这里是必爆的：13pt 标题 + 执行中徽标 + 工作区后缀 + 6 组数字挤在
+      // 90dp 里，真机上被硬裁在「改动」处。新版的判据是"一屏放不放得下 + 谁先被
+      // 省略" —— 省略的永远是工作区名，会话名和上下文必须完整。
+      final dsh = await pumpChat(tester, size: const Size(360, 740));
+      dsh.debugSetCurrentSession(
+        SessionMeta(
+          sessionId: 'session-a',
+          title: '会话界面顶部布局改造方案验证',
+          isRunning: true,
+        ),
+      );
+      dsh.debugSetWorkspaces([
+        ws('w1', '一个特别长的工作区名称用来挤压顶栏', ['session-a']),
+      ]);
+      dsh.debugSetTaskCenter(
+        deliverables: const [
+          DeliverableItem(path: '/w/out/a.docx', display: 'out/a.docx', description: 'a'),
+          DeliverableItem(path: '/w/out/b.docx', display: 'out/b.docx', description: 'b'),
+        ],
+        deliverableEvents: 1,
+        stats: const SessionStats(
+          source: 'live',
+          totalTokens: 10,
+          pressureTokens: 96000,
+          contextWindow: 128000,
+        ),
+      );
+      await tester.pump();
+
+      expect(tester.takeException(), isNull, reason: '渲染异常（溢出）会让整个顶栏错位');
+      final bar = tester.getRect(find.byType(ChatAppBar));
+      expect(bar.height, lessThanOrEqualTo(ChatAppBar.toolbarHeight + 36),
+          reason: '顶栏总高 = 主栏 + 事件带，多出来的高度全是消息流被吃掉的部分');
+      expect(find.text('执行中'), findsOneWidget);
+      expect(find.text('上下文 75%'), findsOneWidget);
+      expect(find.text('产出 2'), findsOneWidget);
       await teardown(tester);
     });
 
@@ -913,11 +996,12 @@ void main() {
     testWidgets('jobsDegraded 非空：面板说"作业状态未知"，不说"没有后台作业"', (tester) async {
       final dsh = await chatWithSession(tester);
       // 网关在取不到 job/list 帧时会回 degraded:'jobs-unavailable' —— 这是"读不到"。
-      // 同时给一个已知为 0 的产出段，让状态条有可点的那一段（面板入口就是它）。
       dsh.debugSetTaskCenter(deliverables: const [], jobs: const [], jobsDegraded: 'jobs-unavailable');
       await tester.pump();
 
-      await tester.tap(find.byKey(const ValueKey('strip-segment-deliverables')));
+      // 入口是顶栏那个 48dp 的「会话信息」按钮。旧版靠事件带上「产出 0」
+      // 那一段当入口 —— 而 0 个产出现在不渲染，这也正是它不该当作入口的理由。
+      await tester.tap(find.byKey(const ValueKey('chat-open-session-info')));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
 
@@ -963,7 +1047,7 @@ void main() {
         statsBaselineTokens: 1500,
       );
       await tester.pump();
-      await tester.tap(find.byKey(const ValueKey('strip-segment-deliverables')));
+      await tester.tap(find.byKey(const ValueKey('chat-open-session-info')));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
       expect(find.byType(SessionInfoSheet), findsOneWidget);

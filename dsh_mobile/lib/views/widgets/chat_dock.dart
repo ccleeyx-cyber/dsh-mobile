@@ -3,7 +3,7 @@
 /// Phase 0 结构拆分（纯剪切）：从 `chat_view.dart` 原样搬出，逻辑与样式一字未改。
 ///
 /// 这里装的是三块**不属于消息流、也不属于输入区**的东西：
-/// * `ChatAppBar` —— 顶栏 + 会话状态条 + 会话信息入口；
+/// * `ChatAppBar` —— 顶栏（双行身份）+ 事件带 + 会话信息入口；
 /// * `ChatTopBanners` —— 断线/错误/别处提问/待授权四条横幅；
 /// * `ChatBlockerDock` —— 审批卡与提问卡的固定 dock（带显式限高）。
 /// 它们的共同点：都是"要用户当场决策或当场知情"的固定层，位置与消息流的滚动无关。
@@ -15,6 +15,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../models/approval_request.dart';
+import '../../models/task_center.dart';
 import '../../models/workspace.dart';
 import '../../services/dsh_service.dart';
 import '../../services/notification_service.dart';
@@ -38,7 +39,29 @@ import 'session_status_strip.dart';
 /// 一张完整审批卡，多出来的内容交给 dock 自己的滚动。
 const double _dockMaxHeightFraction = 0.45;
 
-/// 顶栏：会话标题 + 归属工作区 + 状态条 + 三个高频按钮（新建 / 查找 / 更多）。
+/// 顶栏：会话身份（名称 + 权限 + 工作区 + 上下文）+ 两个高频动作。
+///
+/// ## 2026-10-17 改版（方案 A）
+///
+/// 旧版是「56dp 单行标题（13pt）+ 34dp 状态数字条」，合计 91dp 常驻。真机上那条
+/// 数字带**必然溢出**：360dp 屏被硬裁在「改动」处，只能靠一条 14dp 渐隐去遮掩。
+/// 而会话名只比这些数字大 1.5pt —— 整个顶部没有主次，用户的第一反应是"看着不
+/// 对劲"，却说不清哪里不对。
+///
+/// 现在换成**双行身份栏 52dp + 按需出现的事件带**：
+///
+/// * 第一行：会话名 15pt/w600（`AppText.heading`）—— 这才是这一页的主标识；
+/// * 第二行：`●执行中 · 📁工作区 · 上下文 62%`（11.5pt），都是"这个会话是什么"
+///   的一部分，常驻、不横滑、不换行（挤不下时优先省略工作区名）；
+/// * 第三行（`bottom`）：事件带，只有需要当场反应的事才出现（见
+///   `SessionStatusStrip`）。常态高度 1dp。
+///
+/// 高度账：常态 52 + 1 = 53dp（旧版 90dp，省 37dp）；执行中或有未读产出时
+/// 52 + 36 = 88dp。
+///
+/// 数量类读数的去向也写死：轮/步、tok/s、累计 tok、缓存命中、改动数、产出总数
+/// 全部进会话信息面板 —— 它们本来就是"翻明细"才看的东西。顶部只留**会变、且
+/// 需要你反应**的那几样，否则永远是在 34dp 里塞 8 组数字。
 class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
   const ChatAppBar({
     super.key,
@@ -52,7 +75,7 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
     required this.liveJobCount,
     required this.onOpenSessionInfo,
     required this.onToggleSearch,
-    required this.onScrollToBottom,
+    required this.onBackToWorkspaces,
   });
 
   final DshService dsh;
@@ -65,215 +88,226 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
   final int? liveJobCount;
   final ValueChanged<SessionInsightSection> onOpenSessionInfo;
   final VoidCallback onToggleSearch;
-  final VoidCallback onScrollToBottom;
 
-  /// AppBar 的默认高度。工具栏高度由框架的 `kToolbarHeight` 决定，
-  /// `SessionStatusStrip` 自己实现 `PreferredSizeWidget`，高度在 AppBar 内部消化。
-  /// 顶栏高度。标题现在是**单行**（会话名 + 工作区后缀），所以回到标准 56。
+  /// 回到会话列表（工作区 tab）。
   ///
-  /// [fix 2026-10-17] 中间一度是 60（为了塞下"会话名/工作区"两行）—— 那 60dp
-  /// 加上下面 34dp 的状态条，顶部固定带就吃掉 94dp。单行化之后 56 足够，
-  /// 省下的高度全归消息流。
-  static const double _toolbarHeight = kToolbarHeight;
+  /// 这个动作**早就存在**了：`main_shell.dart` 的 `PopScope` 把"对话页侧滑返回"
+  /// 映射成切到工作区 tab。只是界面上从来没有可见入口 —— 用户能做的事，看不见。
+  /// 现在它是顶栏左侧那个 48dp 按钮，与侧滑返回是同一件事。
+  final VoidCallback onBackToWorkspaces;
+
+  /// 工具栏高度。
+  ///
+  /// 52 = 两行身份（15pt 行 ≈ 19 + 2 间距 + 11.5pt 行 ≈ 15 = 36）上下各留 8。
+  static const double toolbarHeight = 52;
+
+  /// 事件带。`preferredSize` 与 `build` 用的必须是**同一套入参**，否则 Scaffold
+  /// 给顶栏的高度会和实际渲染不一致（旧版正是把 `preferredSize` 写死成
+  /// `kToolbarHeight`，而 `bottom` 另外又长了 34dp）。
+  SessionStatusStrip _eventStrip(BuildContext? context) {
+    return SessionStatusStrip(
+      deliverableCount: dsh.deliverableCount,
+      deliverablesUnread: deliverablesUnread,
+      liveJobCount: liveJobCount,
+      runningElsewhereCount: _runningElsewhere(dsh, currentSession?.sessionId),
+      onTapSection: (section) => onOpenSessionInfo(section),
+      onTapRunningElsewhere:
+          context == null ? null : () => _showOtherRunningSheet(context, dsh),
+      // 连接状态：连上时**不渲染**（沿用「未知即隐藏」的同一原则 —— "一切正常"
+      // 不需要占一行像素）。只有真正在重连时才出现，因为那时用户发消息会石沉
+      // 大海，而界面上此前没有任何提示。
+      connection: dsh.isConnected
+          ? SessionConnectionState.connected
+          : (dsh.isReconnecting ||
+                  (dsh.reconnectAttempts > 0 && !dsh.reconnectExhausted))
+              ? SessionConnectionState.reconnecting
+              : SessionConnectionState.disconnected,
+    );
+  }
 
   @override
-  Size get preferredSize => const Size.fromHeight(_toolbarHeight);
+  Size get preferredSize =>
+      Size.fromHeight(toolbarHeight + _eventStrip(null).preferredSize.height);
 
   @override
   Widget build(BuildContext context) {
-    // 提到本地：`if (workspaceTitle != null)` 只对本地变量做类型提升。
-    final workspaceTitle = this.workspaceTitle;
+    final stats = dsh.sessionStats;
+
     return AppBar(
       backgroundColor: context.c.surface,
-      toolbarHeight: _toolbarHeight,
+      toolbarHeight: toolbarHeight,
       elevation: 0,
       scrolledUnderElevation: 0,
-      // 顶部那两行（1px 分隔线）整体换成会话状态条（v1.14）。
-      //
-      // 它自己实现 `PreferredSizeWidget`，所以高度由它内部算：有内容 34dp、
-      // 什么都不显示时只留那条 1px 分隔线 —— 不需要这里手工算高度，也就不会
-      // 出现"顶部留了一条空白带"这种布局残留。
-      //
-      // 为什么状态放**顶部**而不是输入框上方：键盘弹起时输入框上方那块空间被
-      // 压到最紧，而这里不参与压缩，打字时"执行中 / 产出 / 上下文"依然可读。
-      bottom: SessionStatusStrip(
-        isRunning: isSessionRunning,
-        // [feat 2026-10-17] Phase 5.2：当前会话之外还有几个在跑。
-        //
-        // 数据来源：`dsh.workspaces[].sessions[].isRunning`。这是**工作区列表
-        // 的快照**，不是实时事件流 —— 所以：
-        //   * 工作区列表还没拉到（首次进 App / 刚从通知跳进来）时，
-        //     `_runningElsewhere()` 返回 null → 整段隐藏，绝不显示 0；
-        //   * 会话正在跑的集合可能比真实情况晚几秒，因此这里只承诺"有几个"，
-        //     不承诺"哪一个"，点进去的列表同样以 isRunning 为准。
-        runningElsewhereCount: _runningElsewhere(dsh, currentSession?.sessionId),
-        onTapRunningElsewhere: () => _showOtherRunningSheet(context, dsh),
-        // [feat 2026-10-17] 连接状态：最左一段，连上时**不渲染**（沿用「未知即隐藏」
-        // 的同一原则 —— "一切正常"不需要占一行像素）。只有真的在重连或已断开时
-        // 才出现，因为那两种状态下用户发消息会石沉大海，而此前界面上没有任何提示。
-        connection: dsh.isConnected
-            ? SessionConnectionState.connected
-            : (dsh.isReconnecting ||
-                    (dsh.reconnectAttempts > 0 && !dsh.reconnectExhausted))
-                ? SessionConnectionState.reconnecting
-                : SessionConnectionState.disconnected,
-        // 只在断开态可点：重连中是退避等待，重复点只会多打一次握手请求。
-        onReconnect: dsh.isConnected
-            ? null
-            : () {
-                // 先解除「已达上限」的封存，否则 retryConnection 会被
-                // _reconnectExhausted 直接挡回来（点一下没反应）。
-                dsh.armReconnectRetry();
-                dsh.retryConnection();
-              },
-        // [feat 2026-10-17] 电脑端风格的那两组数字：`N 轮 M 步 · X tok/s`、
-        // `113M tok · 缓存命中 99%`。轮/步必须来自引擎的 sessionStats 投影 ——
-        // 手机只加载了窗口内的消息，自己数会把 6 轮算成 1 轮。
-        turns: dsh.sessionStats?.turns,
-        steps: dsh.sessionStats?.steps,
-        tokensPerSecond: dsh.sessionStats?.tokensPerSecond,
-        totalTokens: dsh.sessionStats?.totalTokens,
-        cacheHitPercent: dsh.sessionStats?.cacheHitPercent,
-        deliverableCount: dsh.deliverableCount,
-        deliverablesUnread: deliverablesUnread,
-        changeCount: dsh.changeCount,
-        changesUnavailable: dsh.changesUnavailable,
-        contextFraction: dsh.sessionStats?.contextFraction,
-        contextIsSnapshot: dsh.sessionStats?.isSnapshot ?? false,
-        liveJobCount: liveJobCount,
-        onTapSection: (section) => onOpenSessionInfo(section),
+      // 48 而不是默认 56：给标题再多 8dp，而 48 已经满足最小触控。
+      leadingWidth: 48,
+      leading: IconButton(
+        key: const ValueKey('chat-back-to-sessions'),
+        tooltip: '会话列表',
+        iconSize: 22,
+        padding: EdgeInsets.zero,
+        icon: const Icon(Icons.arrow_back_rounded),
+        // 与 PopScope 同一条动线：离开会话 = 回工作区 tab。
+        onPressed: onBackToWorkspaces,
       ),
-      titleSpacing: 12,
-      // 会话标题 + 它所属的工作区（两行）。
-      //
-      // 为什么需要工作区这一行：不同工作区可以有**同名会话**，而从通知/深链接/
-      // 搜索结果跳进来时（`openSessionById`），界面上原本完全看不出这是哪个工作区
-      // 的会话。放在顶栏标题的第二行而不是状态条里 —— 状态条回答的是"现在在干
-      // 什么"（产出/改动/上下文），工作区回答的是"这个会话在哪"，混在一起会把
-      // "点某一段展开对应信息"的语义弄浑。
-      //
-      // 工作区判定不出来时**整行隐藏**（见 `workspaceOfCurrentSession`）：
-      // 那一行宁可没有，也不能显示一个可能是"隔壁工作区"的名字。
+      titleSpacing: 8,
       title: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
           Row(
             children: [
-              // 当前权限状态色点。它原本是顶栏那个盾牌按钮的一部分；盾牌移进
-              // 「更多」菜单后，用这个 7px 的点保住「当前是什么权限」的一眼信息，
-              // 否则用户必须打开菜单才知道。
-              Container(
-                width: 7,
-                height: 7,
-                margin: const EdgeInsets.only(right: 5),
-                decoration: BoxDecoration(color: _getPolicyColor(context, policy), shape: BoxShape.circle),
-              ),
-              // 会话名吃掉剩余宽度（Flexible）：它比工作区名重要得多，被挤压时
-              // 该省略的是后者。原来的 ConstrainedBox(160) 是硬上限，遇到长名字
-              // 会和后面的徽章、工作区一起把这一行顶溢出。
+              // 权限状态。旧版是个 7px 实心点、只有三种颜色 —— 全权执行和每次
+              // 询问在色觉障碍用户眼里是同一个点，而那两件事的后果天差地别。
+              // 现在加了**形状**这一路编码（实心＝不再询问，空心＝还在问），
+              // 颜色只是第二通道。
+              _PolicyRing(policy: policy),
+              const SizedBox(width: 7),
+              // 会话名吃掉剩余宽度；挤不下时省略的是工作区名，不是它。
               Flexible(
                 child: Text(
                   currentSession?.title ?? '新会话',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: context.c.textPrimary),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: AppText.heading,
+                    fontWeight: FontWeight.w600,
+                    height: 1.2,
+                    color: context.c.textPrimary,
+                  ),
                 ),
               ),
-              if (isSessionRunning) ...[
-                const SizedBox(width: 6),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                  decoration: BoxDecoration(
-                    color: context.c.accent.withOpacity(0.12),
-                    borderRadius: BorderRadius.circular(4),
-                    border: Border.all(color: context.c.accent.withOpacity(0.3)),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      SizedBox(
-                        width: 8,
-                        height: 8,
-                        child: CircularProgressIndicator(strokeWidth: 1.5, color: context.c.accent),
-                      ),
-                      const SizedBox(width: 4),
-                      Text('执行中', style: TextStyle(color: context.c.accent, fontSize: 9.5, fontWeight: FontWeight.bold)),
-                    ],
-                  ),
-                ),
-              ],
-              // [fix 2026-10-17] 工作区名从"第二行"改为**同一行的后缀**。
-              //
-              // 顶栏原本是两行（会话名 / 归属工作区），加上下面 34dp 的状态条，
-              // 顶部固定带一共 94dp。改成一行 + 一个 `/ 工作区` 的小后缀之后，
-              // 工具栏回到 56dp，省下的 38dp 全归消息流 —— 手机上这是能多读半条
-              // 回复的量。
-              //
-              // 放进 Tooltip：手机上工作区名常常比会话名还长，硬塞会把会话名挤成
-              // 省略号（那才是真正要一眼看到的东西）。
-              if (workspaceTitle != null) ...[
-                Padding(
-                  padding: const EdgeInsets.only(left: 6),
-                  child: Tooltip(
-                    message: '归属工作区：$workspaceTitle',
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.folder_outlined, size: 10, color: context.c.textTertiary),
-                        const SizedBox(width: 2),
-                        ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 72),
-                          child: Text(
-                            workspaceTitle,
-                            style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
             ],
           ),
+          const SizedBox(height: 2),
+          _metaRow(context, stats),
         ],
       ),
-      // [feat 2026-10-17] 顶栏从「新建 / 查找 / 更多」收敛到「查找 / 信息面板」两个。
+      // 顶栏从「新建 / 查找 / 更多」收敛到「查找 / 信息面板」两个（2026-10-17）。
       //
-      // 为什么砍掉「更多」这整块：它当时装着 8 项（切换模型 / 对话权限 / 切换工作区 /
-      // 运行轨迹 / 运维面板 / 工作区与会话 / 切换主题 / 删除会话），其中
-      //   * 「切换工作区」和「工作区与会话」是同一件事的两种叫法（重复项）；
-      //   * 「切换主题」是全局偏好，本来就该待在设置页（那里有完整的三选一分段控件）；
-      //   * 其余全是**会话域**操作，而会话域操作的归属方本来就是信息面板。
-      // 8 项塞进一个弹层的结果是：找一个低频动作要先读完 8 行，而真正高频的
-      // 「看一眼这个会话现在什么样」反而没有常驻入口。现在信息面板成为唯一的
-      // 会话级总入口（它内部有「会话操作」分区），顶栏只留两个 icon。
-      //
-      // 「新建对话」也一起移进信息面板的「会话操作」分区：它是低频动作，且和信息
-      // 面板里其它会话级动作属于同一类。移走后顶栏在 360dp 上不再挤。
+      // 「新建对话」与其余会话域动作都在信息面板里：它们同属一类，且低频。
+      // 图标从 `tune_rounded` 换成 `info_outline_rounded` —— 它打开的确实是
+      // "会话现在是什么样"的面板，调节滑块的语义会让人以为要改什么设置。
       actions: [
-        // 会话内查找
         IconButton(
           tooltip: '在当前会话中查找',
+          iconSize: 22,
           icon: Icon(
             searchOpen ? Icons.search_off_rounded : Icons.search_rounded,
             color: searchOpen ? context.c.accent : context.c.textPrimary,
-            size: 22,
           ),
           onPressed: onToggleSearch,
         ),
-
-        // 会话信息与操作（唯一的会话级总入口）
         IconButton(
           key: const ValueKey('chat-open-session-info'),
           tooltip: '会话信息与操作',
-          icon: Icon(Icons.tune_rounded, color: context.c.textPrimary, size: 22),
+          iconSize: 22,
+          icon: Icon(Icons.info_outline_rounded, color: context.c.textPrimary),
           onPressed: () => onOpenSessionInfo(SessionInsightSection.usage),
         ),
       ],
+      bottom: _eventStrip(context),
     );
+  }
+
+  /// 第二行：这个会话"是什么" —— 运行态 + 归属工作区 + 上下文占用。
+  ///
+  /// 为什么工作区必须常驻而不是收进面板：不同工作区可以有**同名会话**，
+  /// 而从通知/深链接/搜索结果跳进来时（`openSessionById`），界面上原本完全看不出
+  /// 这是哪个工作区的会话。查不到归属时**整段不渲染**（见
+  /// `workspaceOfCurrentSession`）—— 宁可没有，也不能显示一个可能是"隔壁工作区"的名字。
+  ///
+  /// 为什么上下文放在这里而不是事件带：它天天在变，却不是"需要你反应"的事；
+  /// 只有越过 70% / 85% 两档时才换色（橙 / 红），那时它自己会跳出来。
+  Widget _metaRow(BuildContext context, SessionStats? stats) {
+    final ctx = stats?.contextFraction;
+    final base = TextStyle(
+      fontSize: AppText.subhead,
+      color: context.c.textTertiary,
+      height: 1.3,
+    );
+
+    return Row(
+      children: [
+        if (isSessionRunning) ...[
+          SizedBox(
+            width: 7,
+            height: 7,
+            child: CircularProgressIndicator(
+              strokeWidth: 1.4,
+              color: context.c.accent,
+            ),
+          ),
+          const SizedBox(width: 4),
+          // 全页面**只有这一处**说"执行中"。旧版顶栏徽标和状态条各渲染一次，
+          // 同一个事实说两遍（两条的样式还不一样）。
+          Text(
+            '执行中',
+            key: const ValueKey('chat-running-badge'),
+            style: base.copyWith(
+              color: context.c.accent,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          if (workspaceTitle != null || ctx != null) _metaDot(context),
+        ],
+        if (workspaceTitle != null) ...[
+          Icon(Icons.folder_outlined, size: 10, color: context.c.textTertiary),
+          const SizedBox(width: 3),
+          Flexible(
+            child: Text(
+              workspaceTitle!,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: base,
+            ),
+          ),
+        ],
+        if (ctx != null) ...[
+          if (workspaceTitle != null) _metaDot(context),
+          Text(
+            '上下文 ${(ctx * 100).round()}%',
+            key: const ValueKey('chat-context-usage'),
+            style: base.copyWith(color: _contextColor(context, ctx)),
+          ),
+          if (stats?.isSnapshot ?? false) ...[
+            const SizedBox(width: 3),
+            // 快照必须看得出来：把几小时前的读数当实时值，用户会据此做出
+            // "还能不能接着跑"的错误判断。
+            Tooltip(
+              message: '会话不在内存中，这是最后一次上报的快照',
+              child: Icon(
+                Icons.history_rounded,
+                key: const ValueKey('strip-context-snapshot'),
+                size: 12,
+                color: context.c.textTertiary,
+              ),
+            ),
+          ],
+        ],
+      ],
+    );
+  }
+
+  Widget _metaDot(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 5),
+      child: Text('·',
+          style: TextStyle(
+            fontSize: AppText.subhead,
+            color: context.c.textTertiary.withOpacity(0.55),
+          )),
+    );
+  }
+
+  /// 上下文占用越高越显眼：≥85% 危险红、>70% 警告橙、其余中性。
+  Color _contextColor(BuildContext context, double fraction) {
+    if (fraction >= SessionStatusStrip.pressureCriticalThreshold) {
+      return context.c.danger;
+    }
+    if (fraction > SessionStatusStrip.pressureLineThreshold) {
+      return context.c.warning;
+    }
+    return context.c.textTertiary;
   }
 
   /// 当前会话之外还有几个会话在跑；**未知返回 null**（工作区列表还没拉到）。
@@ -414,16 +448,46 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
   }
 }
 
-/// 当前会话的执行策略色：一眼看出"现在是哪种权限"。
-Color _getPolicyColor(BuildContext context, String policy) {
-  switch (policy) {
-    case 'danger-full-access':
-      return context.c.success;
-    case 'auto-read':
-      return context.c.accent;
-    case 'ask':
-    default:
-      return context.c.warning;
+/// 当前权限状态：环 + 实心/空心双通道。
+///
+/// 旧版是 `_getPolicyColor` + 一个 7px **实心**圆点，只靠三种颜色区分
+/// `danger-full-access` / `auto-read` / `ask`。问题不是好不好看：全权执行和
+/// 每次询问在色觉障碍用户眼里是同一个点，而这两件事的后果天差地别。
+/// 现在加了一路**形状**编码（实心＝不再询问，空心＝还在问），颜色退为第二通道；
+/// Tooltip / Semantics 也给完整文案，不再需要用户猜。
+class _PolicyRing extends StatelessWidget {
+  const _PolicyRing({required this.policy});
+
+  final String policy;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = switch (policy) {
+      'danger-full-access' => context.c.success,
+      'auto-read' => context.c.accent,
+      _ => context.c.warning,
+    };
+    final label = switch (policy) {
+      'danger-full-access' => '完全访问（不再询问）',
+      'auto-read' => '只读自动执行',
+      _ => '每次询问',
+    };
+    final filled = policy == 'danger-full-access';
+    return Tooltip(
+      message: '当前权限：$label',
+      child: Semantics(
+        label: '当前权限：$label',
+        child: Container(
+          width: 10,
+          height: 10,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: filled ? color : Colors.transparent,
+            border: Border.all(color: color, width: 2),
+          ),
+        ),
+      ),
+    );
   }
 }
 
