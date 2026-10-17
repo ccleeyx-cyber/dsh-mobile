@@ -156,9 +156,14 @@ class SessionStatusStrip extends StatelessWidget
       totalTokens != null ||
       (liveJobCount != null && liveJobCount! > 0);
 
-  /// 连接状态段只在"非正常"时出现：连上 = 隐藏，未知 = 隐藏。
+  /// 连接状态段只在"**正在恢复**"时出现。
+  ///
+  /// [fix 2026-10-17] 原先"已断开"也在这里报一次，真机截图里就变成了同一条事实
+  /// 说两遍：状态条一行 `● 已断开 · 点击重连`，紧接着 `ChatTopBanners` 又给一条
+  /// 大横幅 `网络连接已断开 + 点击重试`。横幅有完整的动作和解释，才是那句话该待
+  /// 的地方；而"正在重连"是横幅表达不了的（它只会说"断了"），所以留在这里。
   bool get _showConnection =>
-      connection != null && connection != SessionConnectionState.connected;
+      connection == SessionConnectionState.reconnecting;
 
   /// 紧凑数字：与电脑端一致（`113M tok` / `12.4k`）。
   ///
@@ -257,41 +262,6 @@ class SessionStatusStrip extends StatelessWidget
     }
 
     final segments = <Widget>[];
-
-    // [feat 2026-10-17] Phase 5.2：当前会话之外还有会话在跑。
-    //
-    // 放在**最左**：它是"这台手机之外还有人/还有活在跑"的警示，比用量明细更该
-    // 先被看到。用 accent 而不是 danger —— 别处有活在跑不是错误，只是用户可能
-    // 想切过去看一眼（尤其是等结果的时候）。
-    //
-    // 数字来源是工作区列表里的 isRunning 聚合（见 `chat_dock.dart`）。那是个
-    // 可能过期的快照，所以这里只做"有/没有 + 几个"的粗粒度提示，不做精确进度。
-    final others = runningElsewhereCount;
-    if (others != null && others > 0) {
-      segments.add(InkWell(
-        key: const ValueKey('strip-other-running'),
-        borderRadius: BorderRadius.circular(6),
-        onTap: onTapRunningElsewhere,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.bolt_rounded, size: 12, color: context.c.accent),
-              const SizedBox(width: 2),
-              Text(
-                '另外 $others 个会话执行中',
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontWeight: FontWeight.w600,
-                  color: context.c.accent,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ));
-    }
 
     void addSegment(
         {required Key key,
@@ -427,6 +397,50 @@ class SessionStatusStrip extends StatelessWidget
           style: TextStyle(fontSize: 11.5, color: context.c.accent),
         ),
       );
+    }
+
+    // [feat 2026-10-17] Phase 5.2：当前会话之外还有会话在跑（排在**最后**）。
+    //
+    // [fix 2026-10-17] 一开始把它放在最左，真机截图立刻暴露问题：这一行本来就
+    // 塞了 4 组数字，新增一段 14 个字直接把「缓存命中 99%」顶出屏幕 —— 右侧被
+    // 硬裁成一个「缓」字，看起来像渲染坏掉。排到最后之后，被裁掉的只会是这一
+    // 段（次要信息），用量数字回到视野里；文案也从「另外 N 个会话执行中」压到
+    // 「N 个在跑」，省下的宽度正好给「缓存命中」。
+    //
+    // 用 accent 而不是 danger：别处有活在跑不是错误，只是想让你知道有这么回事。
+    final others = runningElsewhereCount;
+    if (others != null && others > 0) {
+      // 不用 addSegment：那个帮手把点击绑到"打开信息面板"，而这一段要打开的是
+      // 会话选择器 —— 两者是不同的目的地，共用一个 helper 只会互相抢状态。
+      if (segments.isNotEmpty) {
+        segments.add(Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6),
+          child: Text('·', style: TextStyle(fontSize: 11, color: context.c.textTertiary)),
+        ));
+      }
+      segments.add(InkWell(
+        key: const ValueKey('strip-other-running'),
+        onTap: onTapRunningElsewhere,
+        borderRadius: BorderRadius.circular(6),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.bolt_rounded, size: 12, color: context.c.accent),
+              const SizedBox(width: 2),
+              Text(
+                '$others 个在跑',
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                  color: context.c.accent,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ));
     }
 
     return Container(

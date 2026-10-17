@@ -387,7 +387,16 @@ class CodeBlockOpenBuilder extends MarkdownElementBuilder {
     return Stack(
       children: [
         Padding(
-          padding: padding,
+          // [fix 2026-10-17] 右侧给"全屏阅读"按钮留出 30dp：按钮是盖在代码块上的
+          // 浮层，不留位的话代码第一行会被它压住（真机截图里 `--no-fatal-inf…`
+          // 正好被那枚 ↗ 盖掉）。这里让**视口**提前收窄，而不是给内容加 padding
+          // —— 内容仍然可以横向滚到按钮下面，但默认位置不会重叠。
+          padding: EdgeInsets.only(
+            left: padding.left,
+            top: padding.top,
+            bottom: padding.bottom,
+            right: padding.right + 30,
+          ),
           child: SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: SelectableText.rich(

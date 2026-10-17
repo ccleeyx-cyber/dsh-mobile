@@ -92,7 +92,7 @@ class ComposerNotice {
 /// **枚举顺序就是优先级**（声明顺序 = 轮换顺序，见 `_statusRows`）：审批是唯一
 /// 阻塞着 agent 的东西，排在最前；"本轮执行中"只是背景说明，排在最后。同一时刻
 /// 只显示一个 —— 一排胶囊又会变回改造前那堆层。
-enum _StatusKind { approval, contextPressure, question, queue, running }
+enum _StatusKind { contextPressure, question, queue, running }
 
 /// 状态胶囊行里的一条待办。
 ///
@@ -855,41 +855,21 @@ class _ChatComposerState extends State<ChatComposer> {
 
   // -------------------------------------------------------- 状态胶囊行 --
 
-  /// 当前会话里"agent 停下来等你"的审批有多少条。
-  ///
-  /// 判据必须与 `chat_view.dart` 的 `activeApprovals` 一致（同一条会话、丢掉
-  /// sessionId 归属不明的那些）——否则会出现"胶囊说有 2 个待审批、dock 里却是
-  /// 空的"，用户会以为界面坏了。
-  int _sessionApprovalCount(DshService dsh) {
-    final current = dsh.currentSession?.sessionId;
-    if (current == null || current.isEmpty) return 0;
-    final cleanCurrent = current.replaceFirst('session-', '');
-    return dsh.pendingApprovals.where((a) {
-      if (a.sessionId.isEmpty || a.sessionId == 'default') return false;
-      return a.sessionId == current ||
-          a.sessionId.replaceFirst('session-', '') == cleanCurrent;
-    }).length;
-  }
-
   /// 按优先级算出当前所有待办（**顺序即优先级**）。
   ///
   /// 空列表 = 输入卡片上方一行都不占（正常态就该是安静的）。
   List<_StatusRow> _statusRows(DshService dsh) {
     final rows = <_StatusRow>[];
 
-    // 1) 待审批：唯一能卡住 agent 的东西，颜色用 danger 而不是 warning ——
-    //    它不是一个"提醒"，是一个正在倒计时的阻塞。
-    final approvals = _sessionApprovalCount(dsh);
-    if (approvals > 0) {
-      rows.add(_StatusRow(
-        kind: _StatusKind.approval,
-        icon: Icons.gavel_rounded,
-        label: approvals == 1 ? '有 1 个操作在等你批准' : '有 $approvals 个操作在等你批准',
-        tone: context.c.danger,
-        actionLabel: widget.onRevealBlocked == null ? '' : '去处理',
-        onAction: widget.onRevealBlocked,
-      ));
-    }
+    // 1) 待审批：**不再进胶囊行**（[fix 2026-10-17]）。
+    //
+    //    审批卡是钉在输入框正上方的固定 dock，它本来就一直可见；胶囊再报一遍
+    //    "有 1 个操作在等你批准 · 去处理"，加上（已删掉的）顶部横幅，同一件事
+    //    在一屏里出现了三次。真机截图里那排红色胶囊看起来像输入框的一部分，
+    //    反而让人以为输入框坏了。
+    //
+    //    审批的可见性交给卡片本身；胶囊行留给**不会常驻在屏幕上**的东西：
+    //    上下文告警、待回答提问、排队消息、以及"正在跑"。
 
     // 2) 上下文告警：**只在跨过阈值、且是实时读数时**出现。
     //
@@ -1309,13 +1289,23 @@ class _ChatComposerState extends State<ChatComposer> {
         style: TextStyle(color: context.c.textPrimary, fontSize: 14.5),
         maxLines: 5,
         minLines: 1,
-        decoration: const InputDecoration(
-          // 录音入口写在提示语里：麦克风按钮是唯一入口，而"按住说话"这个手势
-          // 没有任何视觉线索，不说出来就等于不存在。
-          hintText: '发消息，或按住 🎤 说话',
+        decoration: InputDecoration(
+          // [fix 2026-10-17] 真机截图里 placeholder 是深色、还比正文大一号，
+          // 看起来像"已经输入了内容"。原因是没有给 hintStyle，Flutter 就回落到
+          // textTheme.titleMedium（≈16sp + onSurface）—— 空输入框于是长得像满的。
+          //
+          // 另外去掉了文案里的 🎤 emoji：紧挨着就有一个 Material 麦克风按钮，
+          // emoji 既重复又和图标风格打架。"按住麦克风说话"这件事交给两条正式
+          // 通道：按钮 tooltip + 首次长按输入框的一次性引导（`dsh_hint_hold_mic_v1`）。
+          hintText: '发消息…',
+          hintStyle: TextStyle(
+            color: context.c.textTertiary,
+            fontSize: 13.5,
+            fontWeight: FontWeight.w400,
+          ),
           border: InputBorder.none,
           isDense: true,
-          contentPadding: EdgeInsets.fromLTRB(6, 4, 6, 8),
+          contentPadding: const EdgeInsets.fromLTRB(6, 4, 6, 8),
         ),
         onChanged: (v) => dsh.updateDraft(v),
         onSubmitted: (_) => _sendMessage(dsh),
@@ -2017,8 +2007,14 @@ class _ChatComposerState extends State<ChatComposer> {
   /// [maxTextWidth] 由操作行按剩余空间算出来（见 `_buildInputBar`）：手机上横向
   /// 空间不足时先压缩模型名，而不是把整行顶出屏幕。
   Widget _buildModelPill(DshService dsh, {double maxTextWidth = 104}) {
-    final name = dsh.currentModel.replaceFirst('cn:', '');
-    return InkWell(
+    final full = dsh.currentModel.replaceFirst('cn:', '');
+    // [fix 2026-10-17] 真机上这个胶囊显示成 `deepseek-v4.1-...` —— 被截断的
+    // 恰好是唯一有信息量的那半截（flash / pro）。`deepseek-` 是全部模型共有的
+    // 前缀，占位却不区分任何东西，所以显示层去掉它；完整名放进 tooltip。
+    final name = full.startsWith('deepseek-') ? full.substring('deepseek-'.length) : full;
+    return Tooltip(
+      message: full,
+      child: InkWell(
       onTap: () => _showModelSwitchSheet(context, dsh),
       borderRadius: BorderRadius.circular(9),
       child: Padding(
@@ -2042,6 +2038,7 @@ class _ChatComposerState extends State<ChatComposer> {
                 size: 16, color: context.c.textTertiary),
           ],
         ),
+      ),
       ),
     );
   }

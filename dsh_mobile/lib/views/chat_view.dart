@@ -422,7 +422,10 @@ class _ChatViewState extends State<ChatView> {
   /// 浮在消息流右边缘的刻度层。只有一轮时不显示 —— 一格刻度没有导航价值。
   Widget _buildTurnRail(DshService dsh) {
     final marks = _turnMarks(dsh);
-    if (marks.length < 2) return const SizedBox.shrink();
+    // [fix 2026-10-17] 门槛从"<2"提到"<3"：两轮的会话里，这条 rail 只有两个
+    // 3dp 的点，正好和消息左侧那道 2px 竖线并排 —— 真机上看起来就是两个悬浮的
+    // 杂质，而它带来的导航价值是零（两轮一屏就看得完）。
+    if (marks.length < 3) return const SizedBox.shrink();
     return TurnNavigationRail(
       marks: marks,
       currentTurn: _visibleTurn,
@@ -1137,21 +1140,10 @@ class _ChatViewState extends State<ChatView> {
               ),
             ),
             const SizedBox(width: AppSpace.m),
-            // 用户头像保留：右对齐气泡需要一个人格锚点。引擎注入的通知走
-            // HarnessNoticeCard，不会到这里（见本方法第 0 条分支）。
-            Container(
-              width: 30,
-              height: 30,
-              decoration: BoxDecoration(
-                color: context.c.userBubble,
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Icon(
-                Icons.person_rounded,
-                color: _onSolidBubble,
-                size: 17,
-              ),
-            ),
+            // [fix 2026-10-17] 用户头像已删除。真机上它是一个 30×30 的**实心
+            // accent 方块 + 白色人形**，紧贴在彩色气泡右侧：既和气泡抢视觉重量，
+            // 又在"AI 消息没有头像"的对照下显得只对用户特殊。右对齐 + 填色气泡
+            // 本身已经足够说明"这是我说的"。
           ],
         ),
       );
@@ -1373,6 +1365,27 @@ class _ChatViewState extends State<ChatView> {
         borderRadius: BorderRadius.circular(6),
         border: Border.all(color: context.c.border),
       ),
+      // [fix 2026-10-17] 标题/表格的默认尺度是给桌面端宽屏准备的：h3 默认 20sp+
+      // 比正文（13.5）大一档半，一屏里出现两个小标题就把正文压成注脚；表格默认
+      // 单元格内边距 8，三行表格能吃掉半屏。这里按"手机上一屏要看完一段"重新定。
+      h1: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: context.c.textPrimary, height: 1.4),
+      h2: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w700, color: context.c.textPrimary, height: 1.4),
+      h3: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600, color: context.c.textPrimary, height: 1.4),
+      h4: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: context.c.textPrimary, height: 1.4),
+      h5: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: context.c.textPrimary, height: 1.4),
+      h6: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: context.c.textTertiary, height: 1.4),
+      // 段落之间的呼吸：默认 blockSpacing 是 8，但标题上下没有额外留白，
+      // 于是一个标题会和它上面的正文粘在一起。14 让"标题开始新的一段"可读。
+      blockSpacing: 14,
+      listIndent: 18,
+      listBullet: TextStyle(fontSize: AppText.title, color: context.c.textPrimary, height: 1.5),
+      // 表格：细边框 + 紧凑单元格。手机宽度下表格本来就挤，单元格内边距必须小，
+      // 否则两列就会有一列被压成每行两个字。
+      tableHead: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: context.c.textPrimary),
+      tableBody: TextStyle(fontSize: 13, color: context.c.textPrimary, height: 1.45),
+      tableBorder: TableBorder.all(color: context.c.border, width: 0.8),
+      tableCellsPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      tablePadding: const EdgeInsets.only(top: AppSpace.s, bottom: AppSpace.s),
     );
   }
 

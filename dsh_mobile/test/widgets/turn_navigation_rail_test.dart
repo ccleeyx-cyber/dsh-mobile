@@ -74,14 +74,19 @@ void main() {
         ),
       );
       final deco = box.decoration! as BoxDecoration;
-      return '${(box.constraints?.maxWidth ?? -1)}|${deco.color}';
+      return '${(box.constraints?.maxWidth ?? -1)}|${(box.constraints?.maxHeight ?? -1)}|${deco.color}';
     }
 
-    // 当前轮 17dp 细条、其余 6dp 圆点（v1.27：其余刻度从 10dp 收到 6dp 圆点，
-    // 解决"14 轮以后间距压到 2dp、点不中"那件事）。宽度差仍然是"我在哪一轮"
-    // 的一眼可读化。
-    expect(description(2).split('|').first, '17.0');
-    expect(description(1).split('|').first, '6.0');
+    // [v1.28 修正] 真机截图里刻度是"半透明白底胶囊 + 17dp 横条"，挂在左边缘时
+    // 把每行正文的头几个字盖掉了（「资产时间戳」变成「  产时间戳」）。所以形状改成
+    // **无底色的细刻度**：当前轮 = 3×14 的竖条（accent），其余 = 3×3 的点。
+    // 竖向差（高度）承担"我在哪一轮"，不再靠横向长度去顶正文。
+    final cur = description(2).split('|');
+    expect(cur[0], '3.0', reason: '当前轮竖条宽度');
+    expect(cur[1], '14.0', reason: '当前轮靠高度区分，不靠横向长度');
+    final other = description(1).split('|');
+    expect(other[0], '3.0');
+    expect(other[1], '3.0');
   });
 
   testWidgets('没有轮次时整条不渲染（不留空白浮层）', (tester) async {
@@ -112,14 +117,15 @@ void main() {
       TurnNavigationRail(marks: marks(60), currentTurn: 5, onSelect: (_) {}),
     );
 
-    // 相邻两格的垂直中心距 = 3(刻度高) + 5(间距)。第一格仍然在屏上，可以直接量。
+    // 相邻两格的中心距 = 14(格高) + 5(间距)。第一格仍然在屏上，可以直接量。
     final a = tester.getCenter(find.byKey(const ValueKey('turn-nav-1')));
     final b = tester.getCenter(find.byKey(const ValueKey('turn-nav-2')));
-    expect(b.dy - a.dy, closeTo(8.0, 0.01), reason: '间距必须恒为 5，不随轮数压紧');
+    expect(b.dy - a.dy, closeTo(19.0, 0.01), reason: '间距必须恒为 5，不随轮数压紧');
 
-    // 视口高 900 → 滚动区上限 360，加上容器自身 padding 8×2 与 1px 边框 ×2。
+    // 视口高 900 → 滚动区上限 360。容器现在**没有内边距也没有边框**
+    // （v1.28：去掉那层半透明胶囊，否则它压住正文），所以不再加 16+2。
     final rail = tester.getSize(find.byKey(const ValueKey('turn-nav-rail')));
-    expect(rail.height, lessThanOrEqualTo(360.0 + 16.0 + 2.0),
+    expect(rail.height, lessThanOrEqualTo(360.0 + 1.0),
         reason: '超过 10 轮要交给内部滚动，而不是拉成一条顶出屏幕的长条');
     expect(tester.takeException(), isNull);
   });

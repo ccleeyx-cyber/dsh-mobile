@@ -141,10 +141,19 @@ void main() {
       expect(find.text('引擎注入的通知（不是你说的话）'), findsOneWidget);
       expect(find.text('子代理完成'), findsOneWidget);
 
-      // 真人消息仍然是气泡（能读到原文；人像图标只应该有一个 —— 属于真人那条）。
+      // 真人消息仍然是气泡（能读到原文）。
       expect(find.text('这是我自己打的字'), findsOneWidget);
-      expect(find.byIcon(Icons.person_rounded), findsOneWidget,
-          reason: '通知占一个气泡就会多出一个人像图标');
+      // [v1.28 修正] 用户头像（`Icons.person_rounded`）已删除 —— 真机上它是
+      // 一个实心 accent 方块，紧贴彩色气泡，既抢视觉重量又在"AI 没有头像"的
+      // 对照下显得只对用户特殊。右对齐 + 填色气泡已足够区分。
+      //
+      // 原来这里靠"人像图标只有一个"来判断"通知没有混进用户气泡"，现在改用
+      // **通知卡的标题不该出现在任何气泡里**来钉同一件事：通知卡必须自带那句
+      // 免责说明，而用户气泡里只有原文。
+      expect(find.byIcon(Icons.person_rounded), findsNothing,
+          reason: '头像已移除，回来一个就是回归');
+      expect(find.text('子代理完成'), findsOneWidget,
+          reason: '同一条消息里：通知只以卡片形式出现一次');
 
       await teardown(tester);
     });

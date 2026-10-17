@@ -514,10 +514,16 @@ void main() {
       ]);
       await tester.pump();
 
-      expect(find.textContaining('在等你批准'), findsOneWidget);
-      expect(find.textContaining('条排队中'), findsNothing, reason: '队列让位给审批');
-      expect(
-          find.byKey(const ValueKey('composer-status-more')), findsOneWidget);
+      // [v1.28 修正] 审批**不再进胶囊行**：审批卡是钉在输入框上方的固定 dock，
+      // 一直可见；胶囊再报一遍（加上顶部横幅）会让同一件事在一屏里出现三次
+      // —— 真机截图里那排红色胶囊看起来像输入框的一部分。
+      //
+      // 现在这条用例钉的是新契约：审批在 dock 里（卡片在），胶囊行让位给
+      // 队列 / 运行中这类**不会常驻在屏幕上**的信号。
+      expect(find.textContaining('在等你批准'), findsNothing,
+          reason: '审批不占胶囊行，它由 dock 里的卡片本身表达');
+      expect(find.textContaining('条排队中'), findsOneWidget,
+          reason: '审批不再抢位，队列回到胶囊行');
       await teardown(tester);
     });
   });

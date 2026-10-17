@@ -93,22 +93,27 @@ class TurnNavigationRail extends StatelessWidget {
               key: ValueKey('turn-nav-${mark.turn}'),
               onTap: () => onSelect(mark.turn),
               borderRadius: BorderRadius.circular(3),
-              // 点击热区比刻度本身大：3dp 高的细线直接点很费劲，而"点不中"
-              // 在用户看来就是"这功能没反应"。横向 20 是还看得见、又不至于
-              // 骑到气泡文字上的宽度。
+              // 点击热区比刻度本身大：3dp 宽的细线直接点很费劲，而"点不中"
+              // 在用户看来就是"这功能没反应"。
+              //
+              // [fix 2026-10-17] 热区宽度从 20 收到 18，而且**整条 rail 不再有
+              // 底色和边框**：它挂在消息流的左边缘，而每一行正文都是从左边开始的
+              // —— 一块半透明白底胶囊压在那里，实际效果是把每行的前几个字擦掉
+              // （真机截图里「资产时间戳」「上传的」都被盖住）。刻度只该是刻度。
               child: SizedBox(
-                width: 20,
-                height: 3 + _gap,
+                width: 18,
+                height: 14 + _gap,
                 child: Center(
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 140),
-                    // 当前轮 17×3 细条，其余 6×3 圆点：形状差就是"我在哪一轮"
-                    // 的一眼可读化，比只换颜色更容易在余光里分辨。
-                    width: mark.turn == currentTurn ? 17 : 6,
-                    height: 3,
+                    // 当前轮 = 3×14 的竖条，其余 = 3×3 圆点。形状差是"我在哪一轮"
+                    // 的一眼可读化；用竖条而不是 17 宽的横线，是因为横线会伸进
+                    // 正文的起始位置（18 宽的热区装得下横线，但视觉上仍会顶到字）。
+                    width: 3,
+                    height: mark.turn == currentTurn ? 14 : 3,
                     decoration: BoxDecoration(
                       color: mark.turn == currentTurn
-                          ? context.c.textPrimary
+                          ? context.c.accent
                           : context.c.textTertiary.withOpacity(0.45),
                       borderRadius: BorderRadius.circular(2),
                     ),
@@ -129,13 +134,9 @@ class TurnNavigationRail extends StatelessWidget {
         onLongPress: onLongPress ?? () => _openTurnPicker(context),
         child: Container(
           key: const ValueKey('turn-nav-rail'),
-          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 8),
-          decoration: BoxDecoration(
-            // 半透明底：刻度要能被看见，但不能盖住气泡里的字。
-            color: context.c.surface.withOpacity(0.82),
-            borderRadius: BorderRadius.circular(9),
-            border: Border.all(color: context.c.border.withOpacity(0.6)),
-          ),
+          // 无底色、无边框、无内边距：这层只是"把刻度排成一列"的容器。
+          // 它左边是屏幕边缘（left: 2），右边 4dp 之外就是正文起点。
+          padding: EdgeInsets.zero,
           child: marks.length > _scrollFrom
               ? ConstrainedBox(
                   constraints: BoxConstraints(

@@ -30,9 +30,13 @@ import 'session_status_strip.dart';
 ///
 /// 这些卡片会一起涨：多张审批、多个提问、几张附件，再乘上系统字号。超过这个
 /// 比例就把剩余空间让回消息流和输入栏 —— 输入栏必须始终可见可点，那是唯一
-/// 能发消息的地方。0.55 是权衡值：够放下最常见的「一张审批 + 一个提问」，
-/// 又不会把聊天区挤没。
-const double _dockMaxHeightFraction = 0.55;
+/// 能发消息的地方。
+///
+/// [fix 2026-10-17] 从 0.55 收到 0.45。真机上（851dp 高）叠上顶栏 60 + 状态条 34
+/// + 断线横幅 70 之后，0.55 会让消息流只剩不到 200dp —— 一张审批卡就把"我刚在
+/// 看的那段回复"挤出屏幕，而审批恰恰是让你**边看边决定**的东西。0.45 仍然放得下
+/// 一张完整审批卡，多出来的内容交给 dock 自己的滚动。
+const double _dockMaxHeightFraction = 0.45;
 
 /// 顶栏：会话标题 + 归属工作区 + 状态条 + 三个高频按钮（新建 / 查找 / 更多）。
 class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
@@ -65,8 +69,15 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
 
   /// AppBar 的默认高度。工具栏高度由框架的 `kToolbarHeight` 决定，
   /// `SessionStatusStrip` 自己实现 `PreferredSizeWidget`，高度在 AppBar 内部消化。
+  /// 顶栏高度。取 60 而不是默认的 56：标题是**两行**（会话名 + 归属工作区），
+  /// 60 才让第二行完整落在工具栏里。
+  ///
+  /// [fix 2026-10-17] 之前用默认 56，真机截图里第二行（工作区名）被下方的状态条
+  /// 压掉下半截 —— 只剩几个字的上半部分悬在那里，看着像渲染坏了。
+  static const double _toolbarHeight = 60;
+
   @override
-  Size get preferredSize => const Size.fromHeight(kToolbarHeight);
+  Size get preferredSize => const Size.fromHeight(_toolbarHeight);
 
   @override
   Widget build(BuildContext context) {
@@ -74,6 +85,7 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
     final workspaceTitle = this.workspaceTitle;
     return AppBar(
       backgroundColor: context.c.surface,
+      toolbarHeight: _toolbarHeight,
       elevation: 0,
       scrolledUnderElevation: 0,
       // 顶部那两行（1px 分隔线）整体换成会话状态条（v1.14）。
@@ -493,7 +505,15 @@ class ChatTopBanners extends StatelessWidget {
           ),
 
         // Pending Tool Approvals Banner
-        if (dsh.pendingApprovals.isNotEmpty)
+        //
+        // [fix 2026-10-17] 只在**审批不属于当前会话**时出现。
+        //
+        // 真机截图暴露的问题：当前会话的审批卡本来就钉在输入框上方的 dock 里、
+        // 一直可见，而这条横幅又用几乎同样的文案再说一遍（还带一个"滚动查看"
+        // 按钮）。于是一屏里同一件事出现三次：横幅、审批卡、输入框里的待办胶囊。
+        // 横幅真正不可替代的场景是"别的会话在等你" —— 那批卡片不在这个屏上，
+        // 不说用户就永远不知道。
+        if (dsh.pendingApprovals.isNotEmpty && activeApprovals.isEmpty)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
             decoration: BoxDecoration(
@@ -520,20 +540,16 @@ class ChatTopBanners extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        activeApprovals.isNotEmpty
-                            ? '当前会话有 ${activeApprovals.length} 个工具操作等待授权'
-                            : '其他会话有 ${dsh.pendingApprovals.length} 个工具操作等待授权',
+                        // 走到这里时 activeApprovals 必为空（见上面那条 if），
+                        // 所以文案固定是"其他会话"——当前会话的审批由 dock 里的
+                        // 卡片本身表达，不需要第二份说明。
+                        '其他会话有 ${dsh.pendingApprovals.length} 个工具操作等待授权',
                         style: TextStyle(
                           color: context.c.warning,
                           fontSize: 12.5,
                           fontWeight: FontWeight.bold,
                         ),
                       ),
-                      if (activeApprovals.isNotEmpty)
-                        Text(
-                          '工具: ${activeApprovals.first.toolName}',
-                          style: TextStyle(color: context.c.warning, fontSize: 11),
-                        ),
                     ],
                   ),
                 ),
@@ -546,16 +562,10 @@ class ChatTopBanners extends StatelessWidget {
                   // 审批属于其他会话时，直接跳到那个会话去处理 —— 此前是
                   // 跳去安全策略页，而安全页 v1.11.4 起只留摘要、其"去处理"
                   // 又跳回当前会话，形成谁也到不了审批卡片的死循环。
-                  onPressed: activeApprovals.isNotEmpty
-                      ? onScrollToBottom
-                      : () => _jumpToApprovalSession(dsh),
-                  icon: Icon(
-                    activeApprovals.isNotEmpty ? Icons.arrow_downward_rounded : Icons.shield_rounded,
-                    size: 14,
-                    color: context.c.warning,
-                  ),
+                  onPressed: () => _jumpToApprovalSession(dsh),
+                  icon: Icon(Icons.shield_rounded, size: 14, color: context.c.warning),
                   label: Text(
-                    activeApprovals.isNotEmpty ? '滚动查看' : '前往审核',
+                    '前往审核',
                     style: TextStyle(color: context.c.warning, fontWeight: FontWeight.bold, fontSize: 12),
                   ),
                 ),
@@ -1033,16 +1043,19 @@ class _ChatBlockerDockState extends State<ChatBlockerDock> {
       blocks.add(_BatchApproveBar(dsh: dsh, approvals: visible));
     }
     blocks.add(
-      ConstrainedBox(
-        constraints: const BoxConstraints(maxHeight: 300),
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.only(bottom: 8),
-          child: ApprovalCard(
-            request: visible.first,
-            onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
-            // 「稍后」：本地收起 15 分钟，**不**向网关表达任何决定。
-            onSnooze: () => _snooze(visible.first),
-          ),
+      // [fix 2026-10-17] 去掉了这里原先的 `maxHeight: 300 + 内部滚动`。
+      //
+      // 真机截图里它的表现是：审批卡在 300dp 处被硬切一刀，卡片的圆角和底部
+      // 内边距都看不到，只剩内容悬在那里 —— 看起来像渲染坏了，而"批准/拒绝"
+      // 两个按钮刚好落在切口上。外层 dock 本身已经有 0.55 屏高的上限和滚动，
+      // 这里再套一层限高只会把一张卡切成两半。
+      Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: ApprovalCard(
+          request: visible.first,
+          onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
+          // 「稍后」：本地收起 15 分钟，**不**向网关表达任何决定。
+          onSnooze: () => _snooze(visible.first),
         ),
       ),
     );

@@ -177,7 +177,9 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.byKey(const ValueKey('strip-other-running')), findsOneWidget);
-      expect(find.textContaining('另外 2 个会话执行中'), findsOneWidget);
+      // [v1.28] 文案从「另外 N 个会话执行中」压到「N 个在跑」：真机上原来那 14 个字
+      // 把「缓存命中 99%」顶出屏幕、右侧被硬裁成一个「缓」字。语义不变，只是更短。
+      expect(find.textContaining('2 个在跑'), findsOneWidget);
 
       await settle(tester);
     });
