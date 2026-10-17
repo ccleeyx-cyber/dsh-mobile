@@ -7,6 +7,7 @@ import '../models/permission_config.dart';
 import '../services/dsh_service.dart';
 import 'approval_presets_view.dart';
 import '../theme/app_colors.dart';
+import '../widgets/inline_error_bar.dart';
 
 class SecurityPermissionsView extends StatefulWidget {
   /// 「去处理」跳回对话页 —— 审批与提问都必须在对话流里完成。
@@ -26,6 +27,13 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
   /// 全量重算，实测整 App 掉帧。这里改为"先渲 20 条 + 点按追加"，
   /// 数据仍在服务端内存里，展开只是本地切片，无额外请求。
   int _auditLimit = 20;
+
+  /// 策略写入失败的常驻错误（Phase 4.5）。
+  ///
+  /// 这一页的开关是**乐观渲染**：用户一点，UI 立刻切过去，然后才发请求。
+  /// 失败时开关会弹回原位 —— 但没有任何持续提示的话，用户只会看到"我点了一下，
+  /// 它自己变回去了"，然后反复再点。以前那 4 处都是 2 秒 SnackBar。
+  String? _actionError;
 
   @override
   void initState() {
@@ -97,6 +105,12 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
       body: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         children: [
+          if (_actionError != null)
+            InlineErrorBar(
+              key: const ValueKey('security-action-error'),
+              message: _actionError!,
+              onDismiss: () => setState(() => _actionError = null),
+            ),
           // 1. 待审批状态 —— 只做摘要，不再重复渲染审批卡片（v1.11.4）
           //
           // 审批卡片是"某事停下来等一个人点一下"，它的正确位置是**对话流里**：
@@ -151,16 +165,8 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                     if (val == null) return;
                     final updated = permissions.copyWith(defaultPolicy: val);
                     final ok = await dsh.updatePermissions(updated);
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).clearSnackBars();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text(ok ? '已切换默认策略为: 每次询问' : '切换失败: ${dsh.lastError}'),
-                          duration: const Duration(seconds: 2),
-                          behavior: SnackBarBehavior.floating,
-                        ),
-                      );
-                    }
+                    if (!mounted) return;
+                    _reportPolicyWrite(ok, '每次询问');
                   },
                 ),
 
@@ -174,16 +180,8 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                     if (val == null) return;
                     final updated = permissions.copyWith(defaultPolicy: val);
                     final ok = await dsh.updatePermissions(updated);
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).clearSnackBars();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text(ok ? '已切换默认策略为: 自动放行只读' : '切换失败: ${dsh.lastError}'),
-                          duration: const Duration(seconds: 2),
-                          behavior: SnackBarBehavior.floating,
-                        ),
-                      );
-                    }
+                    if (!mounted) return;
+                    _reportPolicyWrite(ok, '自动放行只读');
                   },
                 ),
 
@@ -197,16 +195,8 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
                     if (val == null) return;
                     final updated = permissions.copyWith(defaultPolicy: val);
                     final ok = await dsh.updatePermissions(updated);
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).clearSnackBars();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text(ok ? '已切换默认策略为: 全信任全自动' : '切换失败: ${dsh.lastError}'),
-                          duration: const Duration(seconds: 2),
-                          behavior: SnackBarBehavior.floating,
-                        ),
-                      );
-                    }
+                    if (!mounted) return;
+                    _reportPolicyWrite(ok, '全信任全自动');
                   },
                 ),
 
@@ -560,21 +550,56 @@ class _SecurityPermissionsViewState extends State<SecurityPermissionsView> {
     }
 
     final ok = await dsh.updatePermissions(preset.config.applyTo(permissions));
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(context).clearSnackBars();
-    ScaffoldMessenger.of(context).showSnackBar(
+    // 这个方法是带 `BuildContext context` 形参的（上面弹确认框用的是它），
+    // 而 await 之后能安全用的是 **State 的** context —— 所以这里两个都要判：
+    // 前者防"对话框所在子树已销毁"，后者防"整个页面已销毁"。
+    if (!context.mounted || !mounted) return;
+    if (!ok) {
+      // 套用失败：四个开关会弹回原值，必须有一个留在屏幕上的解释，
+      // 否则用户看到的是"我套用了，但什么都没变"。
+      setState(() => _actionError = '套用「${preset.label}」失败：${dsh.lastError}');
+      return;
+    }
+    setState(() => _actionError = null);
+    final messenger = ScaffoldMessenger.of(this.context);
+    messenger.clearSnackBars();
+    messenger.showSnackBar(
       SnackBar(
         content: Text(
-          ok
-              ? (diff.isEmpty
-                  ? '已套用「${preset.label}」（配置无变化）'
-                  : '已套用「${preset.label}」，改动 ${diff.length} 项')
-              : '套用失败: ${dsh.lastError}',
+          diff.isEmpty
+              ? '已套用「${preset.label}」（配置无变化）'
+              : '已套用「${preset.label}」，改动 ${diff.length} 项',
         ),
-        duration: const Duration(seconds: 3),
+        duration: const Duration(milliseconds: 1600),
         behavior: SnackBarBehavior.floating,
       ),
     );
+  }
+
+  /// 策略写入的统一回执（Phase 4.5）：成功短提示，失败留常驻错误条。
+  ///
+  /// 为什么合并成一个方法：这三处原本是逐字复制的三段 SnackBar（只差一句文案），
+  /// 于是"改一处忘两处"是必然的。现在文案与判定只有一个入口。
+  void _reportPolicyWrite(bool ok, String policyLabel) {
+    if (!mounted) return;
+    if (!ok) {
+      setState(() => _actionError = '切换默认策略为「$policyLabel」失败：${dshErrorText()}');
+      return;
+    }
+    setState(() => _actionError = null);
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.clearSnackBars();
+    messenger.showSnackBar(SnackBar(
+      content: Text('已切换默认策略为：$policyLabel'),
+      duration: const Duration(milliseconds: 1200),
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
+
+  /// 失败原因兜底：网关可能返回空字符串，直接拼进 UI 会得到"失败："这种半句话。
+  String dshErrorText() {
+    final err = Provider.of<DshService>(context, listen: false).lastError;
+    return err.isEmpty ? '请检查网络与网关状态' : err;
   }
 
   /// 待处理摘要：审批与提问的计数 + 一键回对话页处理。

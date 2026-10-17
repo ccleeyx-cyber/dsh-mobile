@@ -3,88 +3,38 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter/rendering.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import '../models/chat_message.dart';
-import '../models/dsh_settings.dart';
 import '../models/approval_request.dart';
-import '../models/trajectory.dart';
 import '../services/dsh_service.dart';
 import '../widgets/thinking_card.dart';
 import '../widgets/tool_call_card.dart';
-import '../widgets/approval_card.dart';
 import '../widgets/memory_card.dart';
 import '../widgets/inline_file_links.dart';
 import '../widgets/harness_notice_card.dart';
 import '../widgets/safe_markdown.dart';
-import 'widgets/question_card.dart';
 import 'widgets/attachment_tile.dart';
 import 'widgets/turn_navigation_rail.dart';
 import 'widgets/message_search.dart';
 import 'widgets/message_search_panel.dart';
 import 'widgets/session_status_strip.dart';
-import 'widgets/session_info_sheet.dart';
-import 'widgets/trajectory_sheet.dart';
 import 'widgets/deliverable_preview_sheet.dart';
 import 'widgets/turn_output_card.dart';
-import 'widgets/message_list_view.dart';
-import 'host_ops_view.dart';
-import 'config_page.dart';
+import 'widgets/chat_dock.dart';
+import 'widgets/chat_scroll_controller.dart';
+import 'widgets/chat_sheets.dart';
+import 'widgets/composer.dart';
+import 'widgets/message_action_sheet.dart';
+import 'code_viewer_page.dart';
 import '../theme/app_colors.dart';
-import '../main.dart';
-import '../services/voice_input_service.dart';
+import '../theme/app_spacing.dart';
 import '../services/platform_services.dart';
 import '../models/pending_attachment.dart';
 import '../models/user_question.dart' show AttachmentRef;
 import '../models/task_center.dart';
 import '../services/attachment_picker.dart';
-
-/// 长按说话的三个状态（v1.12.0）。
-enum _HoldTalkPhase {
-  /// 平时：点按打字，长按开始说话。
-  idle,
-
-  /// 正在录音：整块输入区换成"正在聆听"，松手结束。
-  recording,
-
-  /// 已识别、等确认：文本在输入框里（可改），下方是「重录 / 发送」。
-  confirm,
-}
-
-/// 输入卡片上方那条提示上附带的动作。
-///
-/// 只有"安全方向"的动作才在这里：撤回刚排进去的那条（一次点击即撤，不需要
-/// 二次确认 —— 撤回是往回收，多余的一次确认只会让人撤回不掉）、以及失败后重试。
-enum _NoticeAction {
-  none,
-
-  /// 「撤回」：把刚排队的那一条从队列里删掉。需要该提示的 `undoItemId`。
-  undoQueue,
-
-  /// 「重试」：正文已经被放回输入框，重试即再发一次。
-  retrySend,
-}
-
-/// 输入卡片上方的一条提示（v1.14）。
-///
-/// 排队回执 / 插话结果 / 失败回滚说明共用这一处：它们表达的永远是同一件事
-/// ——"刚才那次投递发生了什么"，同一时刻只可能有一件。放在输入卡片**顶部**
-/// 而不是 SnackBar：失败时用户写的内容还在输入框里，提示必须和它挨着。
-class _ComposerNotice {
-  final String text;
-  final bool ok;
-  final _NoticeAction action;
-  final String? undoItemId;
-
-  const _ComposerNotice({
-    required this.text,
-    this.ok = true,
-    this.action = _NoticeAction.none,
-    this.undoItemId,
-  });
-}
 
 class ChatView extends StatefulWidget {
   final VoidCallback? onOpenWorkspaces;
@@ -103,61 +53,25 @@ class ChatView extends StatefulWidget {
 }
 
 class _ChatViewState extends State<ChatView> {
-  /// dock（审批卡 / 提问卡 / TODO / 附件）最多占屏幕高度的多少。
-  ///
-  /// 这些卡片会一起涨：多张审批、多个提问、几张附件，再乘上系统字号。超过这个
-  /// 比例就把剩余空间让回消息流和输入栏 —— 输入栏必须始终可见可点，那是唯一
-  /// 能发消息的地方。0.55 是权衡值：够放下最常见的「一张审批 + 一个提问」，
-  /// 又不会把聊天区挤没。
-  static const double _dockMaxHeightFraction = 0.55;
-
   final TextEditingController _inputController = TextEditingController();
   final FocusNode _inputFocusNode = FocusNode();
   final ScrollController _scrollController = ScrollController();
-  String? _lastSessionId;
-  bool _showScrollToBottom = false;
-  int _lastMessageCount = 0;
-  bool _wasLoadingHistory = false;
 
-  // ---- 会话历史无限上翻（v1.15）[feat 2026-10-12] ----
-  bool _loadingOlder = false;
-  /// 一次性的"这次长度增长来自 prepend"标记（见 build 里的浮钮抑制）。
-  bool _suppressTailButtonOnce = false;
-
-  /// 滑到顶部自动拉更早历史。列表是正序 ListView.builder（offset 0 = 最旧），
-  /// prepend 之后必须把 offset 平移新增内容的实际高度，否则视觉位置会跳。
+  /// 消息流的滚动状态机（键盘 diff / 流式自动滚 / 上翻历史 / 浮钮可见性）。
   ///
-  /// 时序：loadOlderHistory 返回时 notifyListeners 已发出，但 Provider 的重建
-  /// 发生在**下一帧**；whenComplete 此刻读到的 maxScrollExtent 仍是旧值 ——
-  /// 正好把它当作"prepend 前"的基准。postFrame 回调在重建帧结束后执行，那时
-  /// 的 maxScrollExtent 是新值，两者之差就是新增头部的总高度，把 offset 平移
-  /// 同样的量即可保持视觉位置。
-  void _maybeLoadOlder(DshService dsh) {
-    if (!dsh.hasMoreHistory || _loadingOlder) return;
-    if (!_scrollController.hasClients) return;
-    if (_scrollController.position.pixels > 120) return;
-    _loadingOlder = true;
-    _suppressTailButtonOnce = true;
-    final beforeCount = dsh.messages.length;
-    dsh.loadOlderHistory().whenComplete(() {
-      _loadingOlder = false;
-      if (!mounted || !_scrollController.hasClients) return;
-      final added = dsh.messages.length - beforeCount;
-      if (added <= 0) return;
-      final oldMax = _scrollController.position.maxScrollExtent; // prepend 前
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted || !_scrollController.hasClients) return;
-        final newMax = _scrollController.position.maxScrollExtent; // prepend 后
-        final delta = newMax - oldMax;
-        if (delta > 0) {
-          _scrollController.jumpTo(
-            (_scrollController.offset + delta).clamp(0.0, newMax),
-          );
-        }
-      });
-    });
-  }
-
+  /// 字段与逻辑都在 `chat_scroll_controller.dart`；这里只把"需要 State 做的事"
+  /// 以回调形式接进来 —— `setState`、`mounted`、当前轮重算、会话切换时属于
+  /// State 的那部分重置。
+  late final ChatScrollController _scroll = ChatScrollController(
+    controller: _scrollController,
+    onStateChanged: () => setState(() {}),
+    isMounted: () => mounted,
+    onProbeVisibleTurn: _probeVisibleTurn,
+    onResetVisibleTurn: () {
+      _visibleTurn = null;
+      _lastTurnProbe = DateTime.fromMillisecondsSinceEpoch(0);
+    },
+  );
 
   // ---- 会话洞察（v1.14）：状态条 / 信息面板 / 本轮产出卡片 ----
 
@@ -202,30 +116,6 @@ class _ChatViewState extends State<ChatView> {
 
   // ---- 离线草稿 (v1.4.2) ----
 
-  // ---- 语音输入 (v1.8.0) ----
-  // null = 尚未探测；探测结果决定按钮是可用还是禁用。
-  bool? _voiceSupported;
-  bool _voiceListening = false;
-
-  // ---- 长按说话 (v1.12.0) ----
-  //
-  // 交互：**长按输入框**开始说话 → **松开**停止并把识别文本填进输入框 →
-  // 出现「重录 / 发送」两个按钮等你确认。**点按输入框**仍是原来的打字。
-  // 为什么要有"确认"这一步：语音识别在嘈杂环境/口音下会出错，直接发出去的
-  // 代价是 agent 立刻按错误指令动手（可能是删除或部署）。多一次确认，
-  // 用户有机会看一眼、改一下。
-  _HoldTalkPhase _holdPhase = _HoldTalkPhase.idle;
-  /// 识别中的当前文本（累积的，整段替换 —— 见 VoiceInputService.start 的注释）。
-  String _holdText = '';
-  DateTime? _holdStartedAt;
-  Timer? _holdTick;
-  /// 松手后的收尾保护：stop() 之后 onFinal 可能还会到，用来把最终文本补进输入框。
-  bool _holdAwaitingFinal = false;
-  /// 录音态兜底超时：语音服务挂死（listen 超时、平台不回调）时 _holdPhase
-  /// 会卡在 recording，手势层吞掉一切点击 —— 表现为"输入框点不动"。
-  /// 30s 强制回 idle；正常说话远短于这个上限，到点即视为异常。
-  Timer? _holdWatchdog;
-
   // ---- 附件 (v1.10.0) ----
   /// 已挂载、等待随下一条消息发出去的附件。
   final List<PendingAttachment> _pendingAttachments = [];
@@ -246,28 +136,25 @@ class _ChatViewState extends State<ChatView> {
   ///
   /// 与 `_toast` 分开：`_toast` 走 SnackBar，会被下一条 toast 顶掉且 2 秒消失，
   /// 而"你刚写的一大段话没发出去"这种事必须留在原地让用户看见。
-  late final ValueNotifier<_ComposerNotice?> _notice = ValueNotifier(null);
+  late final ValueNotifier<ComposerNotice?> _notice = ValueNotifier(null);
   Timer? _noticeTimer;
 
-  /// 已武装（等第二次点击确认）的队列条目 id。非空 = 该行按钮显示「确认插话？」。
-  String? _armedSteerItemId;
-  Timer? _steerArmTimer;
-
-  /// 「立即插话」的第二次点击等待时长。
+  /// 最近一次「立即插话」成功的那一条（v1.27：3 秒回执里的撤销靠它）。
   ///
-  /// 2.5 秒：够完成"看一眼按钮变了、再点一次"的确认动作，又短到不会一直挂着
-  /// 一个危险状态。超时自动还原，不产生任何副作用。
-  static const Duration _steerConfirmWindow = Duration(milliseconds: 2500);
+  /// 为什么需要记着它：插队成功后条目会被引擎**立刻领走**，队列里已经没有这条了
+  /// —— 光靠回执上的 `itemId` 无法还原它的正文，而"放回输入框"正是唯一的降级
+  /// 撤销手段（见 `_onNoticeAction` 里那段说明）。
+  QueueItem? _lastSteered;
 
   void _showNotice(
     String text, {
     bool ok = true,
-    _NoticeAction action = _NoticeAction.none,
+    NoticeAction action = NoticeAction.none,
     String? undoItemId,
     Duration duration = const Duration(seconds: 5),
   }) {
     _noticeTimer?.cancel();
-    _notice.value = _ComposerNotice(
+    _notice.value = ComposerNotice(
       text: text,
       ok: ok,
       action: action,
@@ -284,15 +171,6 @@ class _ChatViewState extends State<ChatView> {
     _notice.value = null;
   }
 
-  /// 退出"待确认插话"状态（超时、点了别处、或已真正执行）。
-  void _disarmSteer() {
-    _steerArmTimer?.cancel();
-    _steerArmTimer = null;
-    if (_armedSteerItemId != null) {
-      setState(() => _armedSteerItemId = null);
-    }
-  }
-
   /// 测试用：直接挂一个附件，绕开原生选择器（单测里调不起来）。
   @visibleForTesting
   void debugAddPendingAttachment(PendingAttachment attachment) {
@@ -302,10 +180,6 @@ class _ChatViewState extends State<ChatView> {
   /// 测试用：读取输入卡片上方那条提示的文案（没有提示时为 null）。
   @visibleForTesting
   String? get debugNoticeText => _notice.value?.text;
-
-  /// 测试用：当前处于"待确认插话"的条目 id。
-  @visibleForTesting
-  String? get debugArmedSteerItemId => _armedSteerItemId;
 
   void _toggleSearch() {
     setState(() {
@@ -332,9 +206,12 @@ class _ChatViewState extends State<ChatView> {
 
   /// 跳到命中的消息并短暂高亮。
   void _jumpToHit(SearchHit hit, DshService dsh) {
-    final msg = hit.messageIndex < dsh.messages.length ? dsh.messages[hit.messageIndex] : null;
+    final msg = hit.messageIndex < dsh.messages.length
+        ? dsh.messages[hit.messageIndex]
+        : null;
     if (msg == null) return;
-    _highlightAndScrollToMessage(msg.id, index: hit.messageIndex, total: dsh.messages.length);
+    _highlightAndScrollToMessage(msg.id,
+        index: hit.messageIndex, total: dsh.messages.length);
   }
 
   /// 高亮某条消息并滚到它。
@@ -342,7 +219,8 @@ class _ChatViewState extends State<ChatView> {
   /// 搜索命中与「轨迹」面板的"跳到消息"**共用这一条路径**：两处各写一份的话，
   /// 任何一处改了滚动对齐或高亮时长，另一处会悄悄不一致，而用户看到的只是
   /// "有时候跳得准、有时候不准"。
-  void _highlightAndScrollToMessage(String messageId, {int? index, int? total}) {
+  void _highlightAndScrollToMessage(String messageId,
+      {int? index, int? total}) {
     if (!mounted) return;
     setState(() {
       _highlightedMessageIds
@@ -360,7 +238,8 @@ class _ChatViewState extends State<ChatView> {
         total > 1 &&
         _scrollController.hasClients) {
       final ratio = (index / (total - 1)).clamp(0.0, 1.0);
-      _scrollController.jumpTo(_scrollController.position.maxScrollExtent * ratio);
+      _scrollController
+          .jumpTo(_scrollController.position.maxScrollExtent * ratio);
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _scrollToMessageKey(messageId);
       });
@@ -383,32 +262,14 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
-  GlobalKey _keyForMessage(String id) => _messageKeys.putIfAbsent(id, () => GlobalKey());
-
-  // Keyboard & viewport avoidance state
-  double _lastBottomInset = 0.0;
-  bool _wasNearBottomBeforeKeyboard = true;
-
-  // User interaction & streaming auto-scroll state
-  bool _userScrolledUp = false;
-  bool _isUserInteracting = false;
-  bool _isAutoScrollScheduled = false;
-  int _lastStreamRevision = 0;
-  int _lastStreamContentLength = 0;
+  GlobalKey _keyForMessage(String id) =>
+      _messageKeys.putIfAbsent(id, () => GlobalKey());
 
   @override
   void initState() {
     super.initState();
-    _scrollController.addListener(_onScroll);
+    _scrollController.addListener(_scroll.onScroll);
     _inputFocusNode.addListener(_onInputFocusChange);
-
-    // 探测语音识别能力（含麦克风权限）。放在 initState 而不是 build：这是
-    // 一次性异步探测，挂在 build 上会每次重建都重跑一遍。
-    //
-    // 刻意**不阻塞界面**：探测慢或失败都不该挡住聊天，失败时按钮显示为禁用。
-    VoiceInputService.instance.init().then((ok) {
-      if (mounted) setState(() => _voiceSupported = ok);
-    });
 
     // 分享接收：从系统分享（SEND intent）进来的内容。文字填进输入框，
     // 图片挂成附件（原生侧已经把 content:// 流抄进缓存、必要时缩小过 ——
@@ -422,9 +283,10 @@ class _ChatViewState extends State<ChatView> {
 
     if (shared.text.isNotEmpty) {
       final cur = _inputController.text;
-      _inputController.text = cur.isEmpty ? shared.text : '$cur\n${shared.text}';
+      _inputController.text =
+          cur.isEmpty ? shared.text : '$cur\n${shared.text}';
       setState(() {});
-      _jumpToBottom();
+      _scroll.jumpToBottom();
     }
 
     if (shared.imagePath.isNotEmpty) {
@@ -444,10 +306,13 @@ class _ChatViewState extends State<ChatView> {
         return;
       }
       final bytes = await file.readAsBytes();
-      final name = shared.imageName.isNotEmpty ? shared.imageName : file.uri.pathSegments.last;
+      final name = shared.imageName.isNotEmpty
+          ? shared.imageName
+          : file.uri.pathSegments.last;
       final media = PickedMedia(
         bytes: bytes,
-        name: name.toLowerCase().endsWith('.jpg') || name.toLowerCase().endsWith('.jpeg')
+        name: name.toLowerCase().endsWith('.jpg') ||
+                name.toLowerCase().endsWith('.jpeg')
             ? name
             : '$name.jpg',
         mimeType: 'image/jpeg',
@@ -456,7 +321,7 @@ class _ChatViewState extends State<ChatView> {
       if (!mounted) return;
       setState(() => _pendingAttachments.add(pending));
       _toast('已从分享挂上 1 张图片');
-      _jumpToBottom();
+      _scroll.jumpToBottom();
     } on AttachmentError catch (e) {
       if (mounted) _toast(e.message);
     } catch (e) {
@@ -467,18 +332,12 @@ class _ChatViewState extends State<ChatView> {
   @override
   void dispose() {
     _inputFocusNode.removeListener(_onInputFocusChange);
-    _scrollController.removeListener(_onScroll);
-    _holdTick?.cancel();
-    _holdWatchdog?.cancel();
+    _scrollController.removeListener(_scroll.onScroll);
+
     _noticeTimer?.cancel();
-    _steerArmTimer?.cancel();
     _notice.dispose();
     _deliverableBusy.dispose();
-    // 正在录音时被销毁（切会话/返回）：必须主动取消识别，否则麦克风会被一直
-    // 占着，下一次识别会以"被其他应用占用"失败。
-    if (_holdPhase != _HoldTalkPhase.idle) {
-      VoiceInputService.instance.cancel();
-    }
+
     _inputFocusNode.dispose();
     _inputController.dispose();
     _searchController.dispose();
@@ -487,65 +346,9 @@ class _ChatViewState extends State<ChatView> {
   }
 
   void _onInputFocusChange() {
-    if (_inputFocusNode.hasFocus && !_userScrolledUp) {
-      _scrollToBottom();
+    if (_inputFocusNode.hasFocus && !_scroll.userScrolledUp) {
+      _scroll.scrollToBottom();
     }
-  }
-
-  void _onScroll() {
-    if (!_scrollController.hasClients) return;
-    final maxScroll = _scrollController.position.maxScrollExtent;
-    final currentOffset = _scrollController.offset;
-    final distFromBottom = maxScroll - currentOffset;
-    final show = distFromBottom > 160;
-    if (show != _showScrollToBottom) {
-      setState(() {
-        _showScrollToBottom = show;
-      });
-    }
-    if (distFromBottom < 40 && _userScrolledUp) {
-      _userScrolledUp = false;
-    }
-  }
-
-  bool _onScrollNotification(ScrollNotification notification) {
-    if (notification is ScrollStartNotification) {
-      if (notification.dragDetails != null) {
-        _isUserInteracting = true;
-      }
-    } else if (notification is ScrollUpdateNotification) {
-      if (notification.dragDetails != null) {
-        _isUserInteracting = true;
-        final maxScroll = notification.metrics.maxScrollExtent;
-        final currentOffset = notification.metrics.pixels;
-        final distFromBottom = maxScroll - currentOffset;
-        if (distFromBottom > 120) {
-          _userScrolledUp = true;
-        } else if (distFromBottom < 40) {
-          _userScrolledUp = false;
-          // 轮次刻度的"当前轮"是**会话级**状态：切会话必须清空，否则会沿用上一个
-          // 会话的轮号（刻度会高亮到不存在的位置）。
-          _visibleTurn = null;
-          _lastTurnProbe = DateTime.fromMillisecondsSinceEpoch(0);
-        }
-      }
-    } else if (notification is ScrollEndNotification) {
-      _isUserInteracting = false;
-      final maxScroll = notification.metrics.maxScrollExtent;
-      final currentOffset = notification.metrics.pixels;
-      if (maxScroll - currentOffset < 40) {
-        _userScrolledUp = false;
-      }
-    } else if (notification is UserScrollNotification) {
-      if (notification.direction == ScrollDirection.idle) {
-        _isUserInteracting = false;
-      } else {
-        _isUserInteracting = true;
-      }
-    }
-    // [feat 2026-10-17] 轮次刻度的"当前轮"跟着滚动更新。
-    _probeVisibleTurn();
-    return false;
   }
 
   // ---- 轮次导航刻度（电脑端同款，v1.26.0）----
@@ -627,55 +430,6 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
-  void _jumpToBottom() {
-    _userScrolledUp = false;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
-        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
-      }
-    });
-  }
-
-  void _scrollToBottom({Duration duration = const Duration(milliseconds: 300), Curve curve = Curves.easeOutCubic}) {
-    _userScrolledUp = false;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: duration,
-          curve: curve,
-        );
-      }
-    });
-  }
-
-  void _scheduleAutoScroll() {
-    if (_isAutoScrollScheduled) return;
-    _isAutoScrollScheduled = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _isAutoScrollScheduled = false;
-      if (!mounted) return;
-      if (_userScrolledUp || _isUserInteracting) return;
-      if (!_scrollController.hasClients) return;
-
-      final maxScroll = _scrollController.position.maxScrollExtent;
-      final currentOffset = _scrollController.offset;
-      final diff = maxScroll - currentOffset;
-
-      if (diff > 0) {
-        if (diff > 250) {
-          _scrollController.animateTo(
-            maxScroll,
-            duration: const Duration(milliseconds: 150),
-            curve: Curves.easeOutCubic,
-          );
-        } else {
-          _scrollController.jumpTo(maxScroll);
-        }
-      }
-    });
-  }
-
   void _sendMessage(DshService dsh) {
     final text = _inputController.text.trim();
     // 允许"只有附件、没有文字"（引擎的准入规则是"文字或附件"）。
@@ -692,7 +446,13 @@ class _ChatViewState extends State<ChatView> {
           behavior: SnackBarBehavior.floating,
           action: SnackBarAction(
             label: '点击重试',
-            textColor: const Color(0xFF60A5FA),
+            // 这里要的是"深底上的强调色"，不能直接用 `context.c.accent`：
+            // SnackBar 在两种主题下都是深底，而浅色主题的 accent 是深蓝
+            // （#3F5AF0），压在深灰 SnackBar 上对比度比原来的浅蓝更低。
+            // `colorScheme.inversePrimary` 正是 Flutter 为"反色场景"预留的
+            // 槽位（浅色方案下它是 primary 的提亮版），两套主题都成立，
+            // 也就不需要再写一个硬编码色值字面量。
+            textColor: Theme.of(context).colorScheme.inversePrimary,
             onPressed: () => dsh.retryConnection(),
           ),
         ),
@@ -717,7 +477,7 @@ class _ChatViewState extends State<ChatView> {
     } else {
       dsh.sendChatMessage(text, attachments: outgoing);
     }
-    _scrollToBottom();
+    _scroll.scrollToBottom();
   }
 
   /// 运行中投递（恒为排队）：失败必须把内容还回来。
@@ -741,13 +501,14 @@ class _ChatViewState extends State<ChatView> {
       // 新增的那一条就是刚落进队列的这条消息。取不到（比如它已被瞬间领取、
       // 或队列暂时读不到）就不显示「撤回」—— 宁可不给这个按钮，也不能让用户
       // 撤回掉另一条别人的消息。
-      final added = dsh.queueItems.where((q) => !before.contains(q.id)).toList();
+      final added =
+          dsh.queueItems.where((q) => !before.contains(q.id)).toList();
       _showNotice(
         '已排队 · 本轮结束后自动发送',
-        action: added.isEmpty ? _NoticeAction.none : _NoticeAction.undoQueue,
+        action: added.isEmpty ? NoticeAction.none : NoticeAction.undoQueue,
         undoItemId: added.isEmpty ? null : added.last.id,
       );
-      _scrollToBottom();
+      _scroll.scrollToBottom();
       return;
     }
     _inputController.text = text;
@@ -755,7 +516,7 @@ class _ChatViewState extends State<ChatView> {
     setState(() => _pendingAttachments
       ..clear()
       ..addAll(attachments));
-    _showNotice('排队失败，内容已放回输入框', ok: false, action: _NoticeAction.retrySend);
+    _showNotice('排队失败，内容已放回输入框', ok: false, action: NoticeAction.retrySend);
   }
 
   /// 选取并挂载附件（§4.2）。
@@ -780,7 +541,8 @@ class _ChatViewState extends State<ChatView> {
       if (asFile || !media.isImage) {
         // 文件：先上传换凭据。这一步可能耗时，给个进度提示。
         _toast('正在上传 ${media.name}…');
-        final receiptId = await dsh.uploadAttachment(name: media.name, bytes: media.bytes);
+        final receiptId =
+            await dsh.uploadAttachment(name: media.name, bytes: media.bytes);
         attachment = PendingFile(
           localId: _nextAttachmentId(),
           name: media.name,
@@ -813,116 +575,6 @@ class _ChatViewState extends State<ChatView> {
 
   /// 选择入口：图片 / 文件。做成底部弹窗而不是两个按钮，是因为输入栏的横向
   /// 空间已经很紧（输入框 + 麦克风 + 发送），再加两个图标会挤。
-  Future<void> _showAttachSheet(DshService dsh) async {
-    if (!dsh.isConnected) {
-      _toast('网络已断开，请先重试连接');
-      return;
-    }
-    final choice = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: context.c.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: Icon(Icons.image_outlined, color: context.c.accent),
-              title: Text('图片', style: TextStyle(color: context.c.textPrimary, fontSize: 14)),
-              subtitle: Text('自动压缩到 1600px，agent 能直接看到',
-                  style: TextStyle(color: context.c.textTertiary, fontSize: 11.5)),
-              onTap: () => Navigator.pop(ctx, 'image'),
-            ),
-            ListTile(
-              leading: Icon(Icons.attach_file_rounded, color: context.c.accent),
-              title: Text('文件', style: TextStyle(color: context.c.textPrimary, fontSize: 14)),
-              subtitle: Text('任意文件，上限 32MB',
-                  style: TextStyle(color: context.c.textTertiary, fontSize: 11.5)),
-              onTap: () => Navigator.pop(ctx, 'file'),
-            ),
-          ],
-        ),
-      ),
-    );
-    if (choice == null || !mounted) return;
-    await _attach(dsh, asFile: choice == 'file');
-  }
-
-  // ---- 斜杠命令 / 技能菜单 [feat 2026-10-12] ----
-  //
-  // 命令清单来自网关透传的引擎 `commands/list` RPC；引擎没有/失败时网关回空表，
-  // 这里直接不弹 sheet（提示一句话），绝不用硬编码命令名伪造菜单 —— 菜单里
-  // 出现引擎不认的名字等于教用户输错命令。
-
-  Future<void> _showCommandSheet(DshService dsh) async {
-    if (!dsh.isConnected) {
-      _toast('网络已断开，请先重试连接');
-      return;
-    }
-    final commands = await dsh.fetchCommands();
-    if (!mounted) return;
-    if (commands.isEmpty) {
-      _toast('当前会话没有可用的斜杠命令');
-      return;
-    }
-    final picked = await showModalBottomSheet<SlashCommand>(
-      context: context,
-      backgroundColor: context.c.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
-      ),
-      builder: (sheetCtx) => SafeArea(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: MediaQuery.of(sheetCtx).size.height * 0.6),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
-                child: Text('命令',
-                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: sheetCtx.c.textPrimary)),
-              ),
-              Flexible(
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: commands.length,
-                  itemBuilder: (_, i) {
-                    final c = commands[i];
-                    return ListTile(
-                      dense: true,
-                      title: Text('/${c.name}',
-                          style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: sheetCtx.c.textPrimary)),
-                      subtitle: c.description.isEmpty
-                          ? null
-                          : Text(c.description,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 11.5, color: sheetCtx.c.textTertiary)),
-                      onTap: () => Navigator.pop(sheetCtx, c),
-                    );
-                  },
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-    if (picked == null || !mounted) return;
-    // 点选把 "/name " 插入输入框（保留既有草稿），光标落到底。
-    final current = _inputController.text;
-    _inputController.text = current.startsWith('/')
-        ? '/${picked.name} ${current.substring(current.indexOf(' ') + 1)}'
-        : '$current/${picked.name} ';
-    _inputController.selection = TextSelection.collapsed(offset: _inputController.text.length);
-    dsh.updateDraft(_inputController.text);
-    _inputFocusNode.requestFocus();
-  }
-
-
   String _formatTime(DateTime? dt) {
     if (dt == null) return '';
     final now = DateTime.now();
@@ -933,864 +585,6 @@ class _ChatViewState extends State<ChatView> {
   }
 
   // Session Permission Dialog / BottomSheet
-  void _showSessionPermissionSheet(BuildContext context, DshService dsh) {
-    final currentSession = dsh.currentSession;
-    final sessionId = currentSession?.sessionId ?? 'default';
-    final currentPolicy = dsh.getSessionPermission(sessionId);
-    String selectedPolicy = currentPolicy;
-    // 这里曾有一个「单轮迭代步数上限 (Max Steps)」滑块：它改写 `maxSteps`，而那个
-    // 字段全链路无人消费（详见 PermissionConfig 的说明），所以滑块动了也不影响
-    // 任何行为，已移除。本弹窗只负责本会话的执行策略 —— 那也是唯一真的生效的旋钮。
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: context.c.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (context, setModalState) {
-            return SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Center(
-                      child: Container(
-                        width: 40,
-                        height: 4,
-                        decoration: BoxDecoration(
-                          color: context.c.border,
-                          borderRadius: BorderRadius.circular(2),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    Row(
-                      children: [
-                        Container(
-                          padding: const EdgeInsets.all(8),
-                          decoration: BoxDecoration(
-                            color: context.c.accent.withOpacity(0.1),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: context.c.accent.withOpacity(0.2)),
-                          ),
-                          child: Icon(Icons.shield_outlined, color: context.c.accent, size: 20),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                '对话权限与执行策略',
-                                style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: context.c.textPrimary),
-                              ),
-                              Text(
-                                '当前对话: ${currentSession?.title ?? sessionId}',
-                                style: TextStyle(fontSize: 12, color: context.c.textSecondary),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 20),
-                    Text(
-                      '终端命令执行策略 (Execution Policy)',
-                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: context.c.textPrimary),
-                    ),
-                    const SizedBox(height: 10),
-
-                    // Policy Option: Ask
-                    _buildPolicyOption(
-                      title: '🛡️ 每次询问 (Ask Every Time)',
-                      subtitle: '最安全。任何 Shell / 脚本执行都需在手机端审批确认',
-                      value: 'ask',
-                      groupValue: selectedPolicy,
-                      onChanged: (val) {
-                        setModalState(() => selectedPolicy = val!);
-                      },
-                    ),
-
-                    // Policy Option: Auto Read-Only
-                    _buildPolicyOption(
-                      title: '🔍 自动放行只读 (Auto Read-Only)',
-                      subtitle: '推荐。ls, grep, cat, git status 等只读指令直接运行，写操作拦截确认',
-                      value: 'auto-read',
-                      groupValue: selectedPolicy,
-                      onChanged: (val) {
-                        setModalState(() => selectedPolicy = val!);
-                      },
-                    ),
-
-                    // Policy Option: Danger Full Access
-                    _buildPolicyOption(
-                      title: '⚡ 完全信任模式 (Danger Full Access)',
-                      subtitle: '全自动无阻塞运行。所有命令免审批执行，适合无人值守任务',
-                      value: 'danger-full-access',
-                      groupValue: selectedPolicy,
-                      onChanged: (val) {
-                        setModalState(() => selectedPolicy = val!);
-                      },
-                    ),
-
-                    const SizedBox(height: 20),
-                    SizedBox(
-                      width: double.infinity,
-                      height: 44,
-                      child: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: context.c.accent,
-                          foregroundColor: Colors.white,
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                          elevation: 0,
-                        ),
-                        onPressed: () async {
-                          // 危险档（完全信任）二次确认：与安全页的危险预设保持
-                          // 一致。它会让本会话的工具调用**全部免审批**，而这在
-                          // 聊天流里只是一次点击的距离 —— 值得多问一句。
-                          if (selectedPolicy == 'danger-full-access') {
-                            final confirmed = await showDialog<bool>(
-                              context: context,
-                              builder: (ctx) => AlertDialog(
-                                backgroundColor: context.c.surface,
-                                title: Row(
-                                  children: [
-                                    Icon(Icons.warning_amber_rounded, color: context.c.danger, size: 22),
-                                    const SizedBox(width: 8),
-                                    Text('确认开启完全信任？', style: TextStyle(color: context.c.textPrimary, fontSize: 16, fontWeight: FontWeight.bold)),
-                                  ],
-                                ),
-                                content: Text(
-                                  '本会话后续的工具调用将不再逐条请求你的授权，包括删除文件、执行脚本等写操作。\n\n只在无人值守、且你清楚后果时使用。',
-                                  style: TextStyle(color: context.c.textSecondary, fontSize: 13, height: 1.5),
-                                ),
-                                actions: [
-                                  TextButton(
-                                    onPressed: () => Navigator.pop(ctx, false),
-                                    child: Text('取消', style: TextStyle(color: context.c.textSecondary)),
-                                  ),
-                                  FilledButton(
-                                    style: FilledButton.styleFrom(backgroundColor: context.c.danger),
-                                    onPressed: () => Navigator.pop(ctx, true),
-                                    child: const Text('仍要开启', style: TextStyle(fontWeight: FontWeight.bold)),
-                                  ),
-                                ],
-                              ),
-                            );
-                            if (confirmed != true || !context.mounted) return;
-                          }
-                          final currentSessions = Map<String, String>.from(dsh.permissions.sessionPolicies);
-                          currentSessions[sessionId] = selectedPolicy;
-                          final updatedPerms = dsh.permissions.copyWith(
-                            sessionPolicies: currentSessions,
-                          );
-                          if (context.mounted) {
-                            Navigator.pop(context);
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text('已更新会话权限策略: ${_getPolicyLabel(selectedPolicy)}'),
-                                duration: const Duration(seconds: 2),
-                                behavior: SnackBarBehavior.floating,
-                              ),
-                            );
-                          }
-                          await dsh.updatePermissions(updatedPerms);
-                        },
-                        child: const Text('保存权限策略', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            );
-          },
-        );
-      },
-    );
-  }
-
-  Widget _buildPolicyOption({
-    required String title,
-    required String subtitle,
-    required String value,
-    required String groupValue,
-    required ValueChanged<String?> onChanged,
-  }) {
-    final isSelected = value == groupValue;
-    return GestureDetector(
-      onTap: () => onChanged(value),
-      child: Container(
-        margin: const EdgeInsets.only(bottom: 8),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: isSelected ? context.c.accent.withOpacity(0.08) : context.c.surface,
-          border: Border.all(
-            color: isSelected ? context.c.accent : context.c.border,
-            width: isSelected ? 1.5 : 1.0,
-          ),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Row(
-          children: [
-            Radio<String>(
-              value: value,
-              groupValue: groupValue,
-              onChanged: onChanged,
-              activeColor: context.c.accent,
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: TextStyle(
-                      fontSize: 14,
-                      fontWeight: FontWeight.bold,
-                      color: isSelected ? context.c.accent : context.c.textPrimary,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    subtitle,
-                    style: TextStyle(fontSize: 12, color: context.c.textSecondary),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  String _getPolicyLabel(String policy) {
-    switch (policy) {
-      case 'danger-full-access':
-        return '⚡ 完全放行';
-      case 'auto-read':
-        return '🔍 只读放行';
-      case 'ask':
-      default:
-        return '🛡️ 每次询问';
-    }
-  }
-
-  Color _getPolicyColor(String policy) {
-    switch (policy) {
-      case 'danger-full-access':
-        return context.c.success;
-      case 'auto-read':
-        return context.c.accent;
-      case 'ask':
-      default:
-        return context.c.warning;
-    }
-  }
-
-  // Quick Model Selector Sheet
-  void _showModelSwitchSheet(BuildContext context, DshService dsh) {
-    if (dsh.settings == null || dsh.settings!.availableModels.isEmpty) {
-      dsh.fetchSettings();
-    }
-    final settings = dsh.settings;
-    final currentSession = dsh.currentSession;
-    final activeModel = dsh.currentModel;
-    final modelList = (settings != null && settings.availableModels.isNotEmpty)
-        ? settings.availableModels
-        : [
-            ModelItem(id: 'cn:deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1000000, maxTokens: 16384),
-            ModelItem(id: 'cn:deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1000000, maxTokens: 32768),
-            ModelItem(id: 'cn:kimi-k3-1', name: 'Kimi K3.1', contextWindow: 1000000, maxTokens: 32768),
-          ];
-
-    String filter = '';
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: context.c.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Center(
-                  child: Container(
-                    width: 40,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: context.c.border,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: context.c.accent.withOpacity(0.1),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Icon(Icons.smart_toy_outlined, color: context.c.accent, size: 20),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            '切换大语言模型',
-                            style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: context.c.textPrimary),
-                          ),
-                          Text(
-                            '选择要在此会话中使用的 AI 模型',
-                            style: TextStyle(fontSize: 12, color: context.c.textSecondary),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                if (currentSession != null)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 8, bottom: 4),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: context.c.surfaceMuted,
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: Text(
-                        '当前生效会话: ${currentSession.title}',
-                        style: TextStyle(fontSize: 12, color: context.c.textPrimary),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ),
-                const SizedBox(height: 6),
-                Text(
-                  '切换只对本次会话生效，立即生效；全局默认模型在「设置」页修改。',
-                  style: TextStyle(fontSize: 11.5, color: context.c.textTertiary),
-                ),
-                const SizedBox(height: 12),
-                StatefulBuilder(
-                  builder: (context, setModalState) {
-                    final filtered = modelList.where((m) {
-                      if (filter.isEmpty) return true;
-                      return m.name.toLowerCase().contains(filter) || m.id.toLowerCase().contains(filter);
-                    }).toList();
-
-                    return Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        TextField(
-                          decoration: InputDecoration(
-                            hintText: '搜索模型 (如 deepseek, glm, gpt, qwen...)',
-                            hintStyle: TextStyle(fontSize: 13, color: context.c.textTertiary),
-                            prefixIcon: Icon(Icons.search, size: 20, color: context.c.textSecondary),
-                            filled: true,
-                            fillColor: context.c.surfaceMuted,
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(8),
-                              borderSide: BorderSide.none,
-                            ),
-                          ),
-                          onChanged: (val) {
-                            setModalState(() {
-                              filter = val.trim().toLowerCase();
-                            });
-                          },
-                        ),
-                        const SizedBox(height: 10),
-                        ConstrainedBox(
-                          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.45),
-                          child: filtered.isEmpty
-                              ? Padding(
-                                  padding: const EdgeInsets.symmetric(vertical: 24),
-                                  child: Center(
-                                    child: Text('未找到匹配的模型', style: TextStyle(color: context.c.textTertiary)),
-                                  ),
-                                )
-                              : ListView.separated(
-                                  shrinkWrap: true,
-                                  separatorBuilder: (_, __) => const SizedBox(height: 6),
-                                  itemCount: filtered.length,
-                                  itemBuilder: (itemCtx, index) {
-                                    final m = filtered[index];
-                      final isSelected = m.id == activeModel || (m.id.replaceFirst('cn:', '') == activeModel.replaceFirst('cn:', ''));
-                      return InkWell(
-                        borderRadius: BorderRadius.circular(10),
-                        onTap: () async {
-                          Navigator.pop(ctx);
-                          HapticFeedback.selectionClick();
-                          // 只切本会话。以前这里调的是 switchModel，它除了写会话级
-                          // 还顺手把全局默认也改了 —— 一个"给这个会话换模型"的动作
-                          // 不该影响别的会话。现在全局默认只在设置页改。
-                          final ok = await dsh.selectSessionModel(m.id, sessionId: currentSession?.sessionId);
-                          // [fix 2026-10-11] Guard the OUTER sheet/chat context,
-                          // not the list item's: after Navigator.pop the item
-                          // context is unmounted, so the SnackBar here was dead
-                          // code and a failed switch showed no feedback at all.
-                          if (!itemCtx.mounted) return;
-                          if (ok) {
-                            ScaffoldMessenger.of(itemCtx).showSnackBar(
-                              SnackBar(
-                                content: Text('本会话模型已切换为: ${m.name}（立即生效）'),
-                                backgroundColor: itemCtx.c.success,
-                                behavior: SnackBarBehavior.floating,
-                              ),
-                            );
-                          } else {
-                            ScaffoldMessenger.of(itemCtx).showSnackBar(
-                              SnackBar(
-                                content: Text('模型切换失败: ${dsh.lastError.isNotEmpty ? dsh.lastError : "请检查网络或授权码"}'),
-                                backgroundColor: itemCtx.c.danger,
-                                behavior: SnackBarBehavior.floating,
-                              ),
-                            );
-                          }
-                        },
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                          decoration: BoxDecoration(
-                            color: isSelected ? context.c.accent.withOpacity(0.08) : context.c.surface,
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(
-                              color: isSelected ? context.c.accent : context.c.border,
-                              width: isSelected ? 1.5 : 1.0,
-                            ),
-                          ),
-                          child: Row(
-                            children: [
-                              Icon(
-                                isSelected ? Icons.radio_button_checked : Icons.radio_button_off,
-                                color: isSelected ? context.c.accent : context.c.textTertiary,
-                                size: 18,
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      m.name,
-                                      style: TextStyle(
-                                        color: isSelected ? context.c.accent : context.c.textPrimary,
-                                        fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
-                                        fontSize: 14,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      '${m.id} | 上下文: ${(m.contextWindow ?? 0) ~/ 1000}k',
-                                      style: TextStyle(fontSize: 11.5, color: context.c.textSecondary),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                              if (isSelected)
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                                  decoration: BoxDecoration(
-                                    color: context.c.accent.withOpacity(0.12),
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: Text('使用中', style: TextStyle(color: context.c.accent, fontSize: 11, fontWeight: FontWeight.w600)),
-                                ),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                ),
-              ],
-            );
-          },
-        ),
-      ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  // Delete Current Session Dialog
-  void _showDeleteCurrentSessionDialog(BuildContext context, DshService dsh) {
-    final currentSession = dsh.currentSession;
-    if (currentSession == null) return;
-
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: context.c.surface,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-          side: BorderSide(color: context.c.border),
-        ),
-        title: Row(
-          children: [
-            Icon(Icons.delete_outline_rounded, color: context.c.danger, size: 22),
-            const SizedBox(width: 8),
-            Text('删除当前会话', style: TextStyle(color: context.c.textPrimary, fontSize: 17, fontWeight: FontWeight.bold)),
-          ],
-        ),
-        content: Text(
-          '确定要删除会话「${currentSession.title}」吗？\n删除后该会话的历史记录和上下文将不可恢复。',
-          style: TextStyle(color: context.c.textPrimary, fontSize: 13, height: 1.5),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: Text('取消', style: TextStyle(color: context.c.textSecondary)),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: context.c.danger,
-              foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-              elevation: 0,
-            ),
-            onPressed: () async {
-              Navigator.pop(ctx);
-              final ok = await dsh.deleteSession(
-                currentSession.sessionId,
-                dsh.currentWorkspace?.workspaceId,
-              );
-              if (context.mounted) {
-                ScaffoldMessenger.of(context).clearSnackBars();
-                if (ok) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('已删除会话: ${currentSession.title}'),
-                      behavior: SnackBarBehavior.floating,
-                      duration: const Duration(seconds: 2),
-                    ),
-                  );
-                } else {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('删除会话失败: ${dsh.lastError}'),
-                      backgroundColor: context.c.danger,
-                      behavior: SnackBarBehavior.floating,
-                      duration: const Duration(seconds: 3),
-                    ),
-                  );
-                }
-              }
-            },
-            child: const Text('确认删除'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // Quick Workspace Switcher Sheet
-  void _showWorkspaceSwitchSheet(BuildContext context, DshService dsh) {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: context.c.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Center(
-                  child: Container(
-                    width: 40,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: context.c.border,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  children: [
-                    Icon(Icons.folder_open_rounded, color: context.c.accent, size: 20),
-                    const SizedBox(width: 8),
-                    Text(
-                      '选择工作区 (Select Workspace)',
-                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: context.c.textPrimary),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 14),
-                ConstrainedBox(
-                  constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.5),
-                  child: ListView.builder(
-                    shrinkWrap: true,
-                    itemCount: dsh.workspaces.length,
-                    itemBuilder: (context, index) {
-                      final ws = dsh.workspaces[index];
-                      final isSelected = ws.workspaceId == dsh.currentWorkspace?.workspaceId;
-                      return ListTile(
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                        tileColor: isSelected ? context.c.accent.withOpacity(0.08) : null,
-                        title: Text(
-                          ws.title,
-                          style: TextStyle(
-                            color: isSelected ? context.c.accent : context.c.textPrimary,
-                            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                          ),
-                        ),
-                        subtitle: Text(
-                          ws.path,
-                          style: TextStyle(fontSize: 11, color: context.c.textSecondary),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        trailing: Text(
-                          '${ws.sessionCount} 会话',
-                          style: TextStyle(color: context.c.textTertiary, fontSize: 12),
-                        ),
-                        onTap: () {
-                          HapticFeedback.selectionClick();
-                          Navigator.pop(ctx);
-                          dsh.selectWorkspace(ws);
-                        },
-                      );
-                    },
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  /// 离线 / 正在重连状态横幅 (F3.4, F4.3)
-  Widget _buildOfflineBanner(BuildContext context, DshService dsh) {
-    if (dsh.isTokenInvalid) {
-      return Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
-        decoration: BoxDecoration(
-          color: context.c.dangerSurface,
-          border: Border(bottom: BorderSide(color: context.c.dangerBorder, width: 1.0)),
-        ),
-        child: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(5),
-              decoration: BoxDecoration(
-                color: context.c.danger.withOpacity(0.12),
-                shape: BoxShape.circle,
-              ),
-              child: Icon(Icons.key_off_rounded, size: 15, color: context.c.danger),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    '访问令牌已失效 (HTTP 401)',
-                    style: TextStyle(color: context.c.danger, fontSize: 12.5, fontWeight: FontWeight.bold),
-                  ),
-                  Text(
-                    '服务器拒绝访问，已暂停自动重连。请前往重新配置令牌。',
-                    style: TextStyle(color: context.c.danger, fontSize: 11),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 8),
-            InkWell(
-              onTap: () {
-                HapticFeedback.lightImpact();
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const ConfigPage()),
-                );
-              },
-              borderRadius: BorderRadius.circular(6),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                decoration: BoxDecoration(
-                  color: context.c.surface,
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: const Color(0xFFFCA5A5)),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.settings_outlined, size: 13, color: context.c.danger),
-                    const SizedBox(width: 4),
-                    Text('前往配置', style: TextStyle(fontSize: 11.5, color: context.c.danger, fontWeight: FontWeight.bold)),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
-    final isConnecting = dsh.status == ConnectionStatus.connecting;
-
-    final bgColor = isConnecting ? context.c.warningSurface : context.c.dangerSurface;
-    final borderColor = isConnecting ? context.c.warningBorder : context.c.dangerBorder;
-    final textColor = isConnecting ? context.c.warning : context.c.danger;
-    final accentColor = isConnecting ? context.c.warning : context.c.danger;
-
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      decoration: BoxDecoration(
-        color: bgColor,
-        border: Border(
-          bottom: BorderSide(color: borderColor, width: 1.0),
-        ),
-      ),
-      child: Row(
-        children: [
-          // Visual Status Indicator
-          Container(
-            padding: const EdgeInsets.all(5),
-            decoration: BoxDecoration(
-              color: accentColor.withOpacity(0.12),
-              shape: BoxShape.circle,
-            ),
-            child: isConnecting
-                ? SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2.0,
-                      color: accentColor,
-                    ),
-                  )
-                : Icon(
-                    Icons.wifi_off_rounded,
-                    size: 15,
-                    color: accentColor,
-                  ),
-          ),
-          const SizedBox(width: 10),
-
-          // Status Information
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  isConnecting ? '网络已断开，正在尝试重连...' : '网络连接已断开',
-                  style: TextStyle(
-                    color: textColor,
-                    fontSize: 12.5,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                if (!isConnecting && dsh.lastError.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 1),
-                    child: Text(
-                      dsh.lastError,
-                      style: TextStyle(
-                        color: textColor.withOpacity(0.85),
-                        fontSize: 11,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-              ],
-            ),
-          ),
-
-          const SizedBox(width: 8),
-
-          // Manual Retry Button ("点击重试")
-          InkWell(
-            onTap: () async {
-              HapticFeedback.lightImpact();
-              ScaffoldMessenger.of(context).removeCurrentSnackBar();
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('正在尝试重新连接服务器...'),
-                  duration: Duration(seconds: 1),
-                  behavior: SnackBarBehavior.floating,
-                ),
-              );
-              await dsh.retryConnection();
-            },
-            borderRadius: BorderRadius.circular(6),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-              decoration: BoxDecoration(
-                color: isConnecting ? Colors.white.withOpacity(0.7) : Colors.white,
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(
-                  color: isConnecting ? context.c.warningBorder : const Color(0xFFFCA5A5),
-                  width: 1.0,
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.04),
-                    blurRadius: 2,
-                    offset: const Offset(0, 1),
-                  ),
-                ],
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    Icons.refresh_rounded,
-                    size: 13,
-                    color: accentColor,
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    isConnecting ? '重连中...' : '点击重试',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                      color: accentColor,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -1828,95 +622,15 @@ class _ChatViewState extends State<ChatView> {
       return a.sessionId == currentSessionId || cleanReq == cleanCurrent;
     }).toList();
 
-    // Keyboard height transitions
-    final currentBottomInset = MediaQuery.of(context).viewInsets.bottom;
-    if (currentBottomInset != _lastBottomInset) {
-      final isKeyboardOpening = currentBottomInset > _lastBottomInset;
-      if (isKeyboardOpening && _lastBottomInset == 0) {
-        _wasNearBottomBeforeKeyboard = !_userScrolledUp;
-      }
-      if (isKeyboardOpening && _wasNearBottomBeforeKeyboard && !_userScrolledUp) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_scrollController.hasClients && !_userScrolledUp && !_isUserInteracting) {
-            _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
-          }
-        });
-      }
-      _lastBottomInset = currentBottomInset;
-    }
-
-    // Stream content growth detection (fallback alongside streamRevision)
-    final lastMsg = dsh.messages.isNotEmpty ? dsh.messages.last : null;
-    final isStreaming = lastMsg != null && lastMsg.isStreaming;
-    final currentContentLen = (lastMsg?.content.length ?? 0) + (lastMsg?.thinking?.length ?? 0);
-    final hasStreamContentGrowth = isStreaming && currentContentLen != _lastStreamContentLength;
-    _lastStreamContentLength = currentContentLen;
-
-    if (currentSessionId != _lastSessionId) {
-      final previousSessionId = _lastSessionId;
-      _lastSessionId = currentSessionId;
-      _lastMessageCount = dsh.messages.length;
-      _lastStreamRevision = dsh.streamRevision;
-      _userScrolledUp = false;
-      // 会话级的界面状态跟着切：队列展开态、产出卡片锚点、失败提示。
-      _queueExpanded = false;
-      _outputCardAnchorIndex = -1;
-      _lastSeenDeliverableEvents = dsh.deliverableEventCount;
-      _deliverableBusy.value = null;
-      _deliverableError = null;
-      // 切会话时换草稿（v1.4.2）。
-      //
-      // ⚠️ 两个坑，改动前都真实存在（v1.14 修）：
-      //
-      // 1) **不能**在这里调 `dsh.updateDraft(...)`。它的键是"当前会话"，而此刻
-      //    `_currentSession` 已经是**新**会话了 —— 等于把旧会话的正文写进新会话的
-      //    草稿槽。后果是：切回旧会话时输入框被它自己的旧草稿（往往是空的）覆盖，
-      //    用户刚打的字凭空消失；而那半句话则悄悄出现在新会话的输入框里。
-      //    所以这里按**上一个会话的 id** 显式写回它自己的槽位。
-      // 2) **首次进入不能写**。`_lastSessionId` 从 null 变成首个会话时，输入框
-      //    必然是空的，写进去等于把这个会话已存的草稿用空串清掉（`DraftStore.write`
-      //    收到空串就是删除）。
-      if (previousSessionId != null && previousSessionId != currentSessionId) {
-        dsh.drafts.write(previousSessionId, _inputController.text);
-      }
-      final restored = dsh.currentDraft;
-      _inputController.text = restored;
-      _inputController.selection = TextSelection.collapsed(offset: restored.length);
-      _jumpToBottom();
-    } else if (_wasLoadingHistory && !dsh.isLoadingHistory) {
-      _lastStreamRevision = dsh.streamRevision;
-      _userScrolledUp = false;
-      _jumpToBottom();
-    } else if (dsh.messages.length != _lastMessageCount) {
-      final wasNearBottom = !_userScrolledUp;
-      // [feat 2026-10-12] prepend（上翻）也使长度增长，但它不是"尾部新消息"，
-      // 不能点亮"回到最新消息"浮钮 —— _maybeLoadOlder 置一次抑制位。
-      final fromPrepend = _suppressTailButtonOnce;
-      _suppressTailButtonOnce = false;
-      final appendedAtTail = dsh.messages.length > _lastMessageCount && !fromPrepend;
-      _lastMessageCount = dsh.messages.length;
-      _lastStreamRevision = dsh.streamRevision;
-      if (wasNearBottom) {
-        _scrollToBottom();
-      } else if (appendedAtTail) {
-        // [feat 2026-10-12] 用户在上方、尾部来了新消息：确保"回到最新消息"
-        // 浮钮出现（_onScroll 只在滚动时刷新它，新消息到达不滚动的话浮钮
-        // 不会亮）。
-        if (!_showScrollToBottom) setState(() => _showScrollToBottom = true);
-      }
-    } else if (dsh.streamRevision != _lastStreamRevision || hasStreamContentGrowth) {
-      _lastStreamRevision = dsh.streamRevision;
-      if (!_userScrolledUp && !_isUserInteracting) {
-        _scheduleAutoScroll();
-      }
-    }
-    _wasLoadingHistory = dsh.isLoadingHistory;
-
-    // [feat 2026-10-12] 顶部触发上翻：仅在用户真的滑到顶部（pixels<=120）且
-    // 还有更早历史时拉取。放在会话切换块之后，避免切会话首帧误触发。
-    if (!dsh.isLoadingHistory && dsh.messages.isNotEmpty) {
-      _maybeLoadOlder(dsh);
-    }
+    // 滚动 diff 状态机（键盘高度 / 流式增长 / 消息条数 / 会话切换）整体在
+    // `ChatScrollController` 里；这里只剩调用。它必须在 build 期间跑完 —— 原因见
+    // 那边的说明（有几处 setState 的时序与老实现逐字相同）。
+    _scroll.syncBeforeBuild(
+      dsh,
+      MediaQuery.of(context).viewInsets.bottom,
+      onSessionSwitched: (previousSessionId) =>
+          _onScrollSessionSwitched(dsh, previousSessionId),
+    );
 
     // 「本轮产出」卡片（v1.14）：**由事件驱动**，不是由"清单里有东西"驱动。
     //
@@ -1930,8 +644,11 @@ class _ChatViewState extends State<ChatView> {
     final deliverableEvents = dsh.deliverableEventCount;
     if (deliverableEvents != _lastSeenDeliverableEvents) {
       _lastSeenDeliverableEvents = deliverableEvents;
-      _outputCardAnchorIndex = dsh.messages.isEmpty ? -1 : dsh.messages.length - 1;
+      _outputCardAnchorIndex =
+          dsh.messages.isEmpty ? -1 : dsh.messages.length - 1;
     }
+    final lastMsg = dsh.messages.isNotEmpty ? dsh.messages.last : null;
+    final isStreaming = lastMsg != null && lastMsg.isStreaming;
     // 卡片只在"那条 assistant 消息仍然是最后一条"时显示：用户一旦发出下一条
     // 消息（乐观插入用户气泡），锚点就对不上，卡片自动消失 —— 那时它已经不是
     // "刚刚发生的事"，常驻记录在信息面板里。
@@ -1943,634 +660,113 @@ class _ChatViewState extends State<ChatView> {
 
     return Scaffold(
       backgroundColor: context.c.surfaceMuted,
-      appBar: AppBar(
-        backgroundColor: context.c.surface,
-        elevation: 0,
-        scrolledUnderElevation: 0,
-        // 顶部那两行（1px 分隔线）整体换成会话状态条（v1.14）。
-        //
-        // 它自己实现 `PreferredSizeWidget`，所以高度由它内部算：有内容 34dp、
-        // 什么都不显示时只留那条 1px 分隔线 —— 不需要这里手工算高度，也就不会
-        // 出现"顶部留了一条空白带"这种布局残留。
-        //
-        // 为什么状态放**顶部**而不是输入框上方：键盘弹起时输入框上方那块空间被
-        // 压到最紧，而这里不参与压缩，打字时"执行中 / 产出 / 上下文"依然可读。
-        bottom: SessionStatusStrip(
-          isRunning: isSessionRunning,
-          // [feat 2026-10-17] 电脑端风格的那两组数字：`N 轮 M 步 · X tok/s`、
-          // `113M tok · 缓存命中 99%`。轮/步必须来自引擎的 sessionStats 投影 ——
-          // 手机只加载了窗口内的消息，自己数会把 6 轮算成 1 轮。
-          turns: dsh.sessionStats?.turns,
-          steps: dsh.sessionStats?.steps,
-          tokensPerSecond: dsh.sessionStats?.tokensPerSecond,
-          totalTokens: dsh.sessionStats?.totalTokens,
-          cacheHitPercent: dsh.sessionStats?.cacheHitPercent,
-          deliverableCount: dsh.deliverableCount,
-          deliverablesUnread: _deliverablesUnread(dsh),
-          changeCount: dsh.changeCount,
-          changesUnavailable: dsh.changesUnavailable,
-          contextFraction: dsh.sessionStats?.contextFraction,
-          contextIsSnapshot: dsh.sessionStats?.isSnapshot ?? false,
-          liveJobCount: _liveJobCount(dsh),
-          onTapSection: (section) => _openSessionInfo(dsh, section: section),
-        ),
-        titleSpacing: 12,
-        // 会话标题 + 它所属的工作区（两行）。
-        //
-        // 为什么需要工作区这一行：不同工作区可以有**同名会话**，而从通知/深链接/
-        // 搜索结果跳进来时（`openSessionById`），界面上原本完全看不出这是哪个工作区
-        // 的会话。放在顶栏标题的第二行而不是状态条里 —— 状态条回答的是"现在在干
-        // 什么"（产出/改动/上下文），工作区回答的是"这个会话在哪"，混在一起会把
-        // "点某一段展开对应信息"的语义弄浑。
-        //
-        // 工作区判定不出来时**整行隐藏**（见 `workspaceOfCurrentSession`）：
-        // 那一行宁可没有，也不能显示一个可能是"隔壁工作区"的名字。
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Row(
-              children: [
-                // 当前权限状态色点。它原本是顶栏那个盾牌按钮的一部分；盾牌移进
-                // 「更多」菜单后，用这个 7px 的点保住「当前是什么权限」的一眼信息，
-                // 否则用户必须打开菜单才知道。
-                Container(
-                  width: 7,
-                  height: 7,
-                  margin: const EdgeInsets.only(right: 5),
-                  decoration: BoxDecoration(color: _getPolicyColor(policy), shape: BoxShape.circle),
-                ),
-                ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 160),
-                  child: Text(
-                    currentSession?.title ?? '新会话',
-                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: context.c.textPrimary),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                if (isSessionRunning) ...[
-                  const SizedBox(width: 6),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                    decoration: BoxDecoration(
-                      color: context.c.accent.withOpacity(0.12),
-                      borderRadius: BorderRadius.circular(4),
-                      border: Border.all(color: context.c.accent.withOpacity(0.3)),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        SizedBox(
-                          width: 8,
-                          height: 8,
-                          child: CircularProgressIndicator(strokeWidth: 1.5, color: context.c.accent),
-                        ),
-                        const SizedBox(width: 4),
-                        Text('执行中', style: TextStyle(color: context.c.accent, fontSize: 9.5, fontWeight: FontWeight.bold)),
-                      ],
-                    ),
-                  ),
-                ],
-              ],
-            ),
-            if (workspaceTitle != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 1.5),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.folder_outlined, size: 10.5, color: context.c.textTertiary),
-                    const SizedBox(width: 3),
-                    Flexible(
-                      child: Text(
-                        workspaceTitle,
-                        style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-          ],
-        ),
-        // 顶栏只保留 3 个高频按钮（新建 / 查找 / 更多）。
-        //
-        // 原先有 5 个：权限、新建、主题、查找、更多。再叠加两行标题（句柄选择 +
-        // 模型胶囊 / 会话名 + 执行中徽标），在 360dp 宽的手机上必然挤成一团。
-        // 而且其中两个功能本来就是重复的 ——「对话权限」在「更多」菜单里已有
-        // 同名项，「切换模型」既在标题的胶囊上、又在菜单里。
-        //
-        // 处理：权限与主题移进「更多」菜单；权限状态改用会话名旁边的一个小色点
-        // 表示，这样「当前是什么权限」这个一眼信息没有丢。
-        actions: [
-          // New Session Button
-          IconButton(
-            tooltip: '新建对话',
-            icon: Icon(Icons.add_comment_outlined, color: context.c.textPrimary, size: 22),
-            onPressed: () async {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('正在新建对话...'),
-                  duration: Duration(milliseconds: 1000),
-                  behavior: SnackBarBehavior.floating,
-                ),
-              );
-              await dsh.createNewSession();
-              _scrollToBottom();
-            },
-          ),
-
-          // 会话内查找
-          IconButton(
-            tooltip: '在当前会话中查找',
-            icon: Icon(
-              _searchOpen ? Icons.search_off_rounded : Icons.search_rounded,
-              color: _searchOpen ? context.c.accent : context.c.textPrimary,
-              size: 22,
-            ),
-            onPressed: _toggleSearch,
-          ),
-
-          // More Options Popup Menu
-          PopupMenuButton<String>(
-            icon: Icon(Icons.more_vert_rounded, color: context.c.textPrimary),
-            color: context.c.surface,
-            elevation: 4,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(8),
-              side: BorderSide(color: context.c.border),
-            ),
-            onSelected: (value) {
-              switch (value) {
-                case 'model':
-                  _showModelSwitchSheet(context, dsh);
-                  break;
-                case 'permission':
-                  _showSessionPermissionSheet(context, dsh);
-                  break;
-                case 'theme':
-                  // 从顶栏移进菜单后，必须回显切换结果 —— 原先按钮的颜色/图标
-                  // 本身就是反馈，菜单项点击后菜单就关了，不给提示会让人不确定。
-                  final theme = context.read<ThemeController>();
-                  theme.cycle();
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('主题：${theme.label}'),
-                      duration: const Duration(seconds: 1),
-                      behavior: SnackBarBehavior.floating,
-                    ),
-                  );
-                  break;
-                case 'switchWorkspace':
-                  // 顶栏那个工作区胶囊被去掉后（它占了约 156px，而 AppBar 只有
-                  // 188px 可用），这里必须保留同一个能力 —— 否则用户就没法在
-                  // 对话过程中切换工作区了。只是把入口从"常驻胶囊"换成"菜单项"。
-                  _showWorkspaceSwitchSheet(context, dsh);
-                  break;
-                case 'workspaces':
-                  widget.onOpenWorkspaces?.call();
-                  break;
-                // [feat 2026-10-17] 轨迹面板：本会话「轮 → 事件」的时间线。
-                case 'trajectory':
-                  _openTrajectory(dsh);
-                  break;
-                // [feat 2026-10-13] 运维面板：快捷命令 / 文件浏览 / 目标看板 / 会话分支。
-                // 放在会话菜单里而不是底部导航，是因为这四项都是**会话域**操作
-                // （工作目录、目标 ref、检查点都取自当前会话）。
-                case 'hostOps':
-                  Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const HostOpsView()),
-                  );
-                  break;
-                case 'clear':
-                  dsh.createNewSession();
-                  break;
-                case 'delete':
-                  _showDeleteCurrentSessionDialog(context, dsh);
-                  break;
-              }
-            },
-            itemBuilder: (ctx) => [
-              PopupMenuItem(
-                value: 'model',
-                child: Row(
-                  children: [
-                    Icon(Icons.smart_toy_outlined, color: context.c.accent, size: 18),
-                    const SizedBox(width: 10),
-                    Text('切换模型', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
-                  ],
-                ),
-              ),
-              PopupMenuItem(
-                value: 'permission',
-                child: Row(
-                  children: [
-                    Icon(Icons.shield_outlined, color: context.c.accent, size: 18),
-                    const SizedBox(width: 10),
-                    Text('对话权限', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
-                  ],
-                ),
-              ),
-              PopupMenuItem(
-                value: 'switchWorkspace',
-                child: Row(
-                  children: [
-                    Icon(Icons.swap_horiz_rounded, color: context.c.accent, size: 18),
-                    const SizedBox(width: 10),
-                    Text('切换工作区', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
-                  ],
-                ),
-              ),
-              PopupMenuItem(
-                value: 'trajectory',
-                child: Row(
-                  children: [
-                    Icon(Icons.timeline_rounded, color: context.c.accent, size: 18),
-                    const SizedBox(width: 10),
-                    Text('运行轨迹', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
-                  ],
-                ),
-              ),
-              PopupMenuItem(
-                value: 'hostOps',
-                child: Row(
-                  children: [
-                    Icon(Icons.terminal_rounded, color: context.c.accent, size: 18),
-                    const SizedBox(width: 10),
-                    Text('运维面板', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
-                  ],
-                ),
-              ),
-              PopupMenuItem(
-                value: 'workspaces',
-                child: Row(
-                  children: [
-                    Icon(Icons.folder_outlined, color: context.c.accent, size: 18),
-                    const SizedBox(width: 10),
-                    Text('工作区与会话', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
-                  ],
-                ),
-              ),
-              PopupMenuItem(
-                value: 'theme',
-                child: Row(
-                  children: [
-                    Icon(Icons.brightness_6_outlined, color: context.c.accent, size: 18),
-                    const SizedBox(width: 10),
-                    Text('切换主题', style: TextStyle(color: context.c.textPrimary, fontSize: 13)),
-                  ],
-                ),
-              ),
-              const PopupMenuDivider(height: 1),
-              PopupMenuItem(
-                value: 'delete',
-                child: Row(
-                  children: [
-                    Icon(Icons.delete_outline_rounded, color: context.c.danger, size: 18),
-                    const SizedBox(width: 10),
-                    Text('删除当前会话', style: TextStyle(color: context.c.danger, fontSize: 13)),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ],
+      // [v1.27] 键盘 inset 只由**输入栏自己**抬升（见 composer 的
+      // `_buildInputBar`：外层 `Padding(bottom: viewInsets.bottom)`）。
+      //
+      // 关掉 Scaffold 的自动 resize 是因为内外两层 Scaffold 各抬一次会相互博弈
+      // （外层 `main_shell` 已经按 `keyboardOpen ? null : bottomNavigationBar` 让位）：
+      // 内层再按完整键盘高度抬一次，输入框下方就会空出一条与导航栏等高的空白。
+      resizeToAvoidBottomInset: false,
+      appBar: ChatAppBar(
+        dsh: dsh,
+        currentSession: currentSession,
+        policy: policy,
+        isSessionRunning: isSessionRunning,
+        workspaceTitle: workspaceTitle,
+        searchOpen: _searchOpen,
+        deliverablesUnread: _deliverablesUnread(dsh),
+        liveJobCount: _liveJobCount(dsh),
+        onOpenSessionInfo: (section) => _openSessionInfo(dsh, section: section),
+        onToggleSearch: _toggleSearch,
+        onScrollToBottom: _scroll.scrollToBottom,
       ),
       body: Column(
         children: [
-          // 1. Offline & Reconnecting Status Banner (F3.4)
-          if (!dsh.isConnected)
-            _buildOfflineBanner(context, dsh),
-
-          // Global Error Alert Bar (Only when connected, preventing duplicate red alerts)
-          if (dsh.lastError.isNotEmpty && dsh.isConnected)
-            Container(
-              margin: const EdgeInsets.fromLTRB(14, 8, 14, 0),
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              decoration: BoxDecoration(
-                color: context.c.dangerSurface,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: const Color(0xFFFCA5A5)),
-              ),
-              child: Row(
-                children: [
-                  Icon(Icons.error_outline_rounded, color: context.c.danger, size: 18),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      dsh.lastError,
-                      style: TextStyle(color: context.c.danger, fontSize: 12),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  GestureDetector(
-                    onTap: () => dsh.clearError(),
-                    child: Padding(
-                      padding: const EdgeInsets.only(left: 6),
-                      child: Icon(Icons.close_rounded, color: context.c.textSecondary, size: 16),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-
-          // 其他会话的提问横幅（v1.11.4）。
-          //
-          // 提问卡片只渲染**当前会话**的（否则会把别的会话的问题挂到你面前）。
-          // 但那带来一个死角：agent 在会话 B 停下来等你回答，而你在会话 A 或
-          // 别的 tab —— 屏幕上什么都没有，也没有通知，你会以为它一直在跑
-          // （用户实测到的"提问没显示、也没通知"就是这个死角）。
-          // 这里补上一条可点击的提示，把"别处有人在等你"说出来。
-          if (otherSessionQuestionCount(dsh) > 0)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-              decoration: BoxDecoration(
-                color: context.c.warningBadgeSurface,
-                border: Border(bottom: BorderSide(color: context.c.warning, width: 1)),
-              ),
-              child: Row(
-                children: [
-                  Icon(Icons.help_outline_rounded, size: 16, color: context.c.warning),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      '其他会话有 ${otherSessionQuestionCount(dsh)} 个提问在等你回答',
-                      style: TextStyle(color: context.c.warning, fontSize: 12.5, fontWeight: FontWeight.bold),
-                    ),
-                  ),
-                  TextButton.icon(
-                    style: TextButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                      backgroundColor: context.c.surface.withOpacity(0.8),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-                    ),
-                    onPressed: () => _jumpToQuestionSession(dsh),
-                    icon: Icon(Icons.arrow_forward_rounded, size: 14, color: context.c.warning),
-                    label: Text('去回答', style: TextStyle(color: context.c.warning, fontWeight: FontWeight.bold, fontSize: 12)),
-                  ),
-                ],
-              ),
-            ),
-
-          // Pending Tool Approvals Banner
-          if (dsh.pendingApprovals.isNotEmpty)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  colors: [context.c.warningBadgeSurface, context.c.warningBorder],
-                ),
-                border: Border(
-                  bottom: BorderSide(color: context.c.warning, width: 1.0),
-                ),
-              ),
-              child: Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(4),
-                    decoration: BoxDecoration(
-                      color: context.c.warning,
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(Icons.priority_high_rounded, color: Colors.white, size: 14),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          activeApprovals.isNotEmpty
-                              ? '当前会话有 ${activeApprovals.length} 个工具操作等待授权'
-                              : '其他会话有 ${dsh.pendingApprovals.length} 个工具操作等待授权',
-                          style: TextStyle(
-                            color: context.c.warning,
-                            fontSize: 12.5,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        if (activeApprovals.isNotEmpty)
-                          Text(
-                            '工具: ${activeApprovals.first.toolName}',
-                            style: TextStyle(color: context.c.warning, fontSize: 11),
-                          ),
-                      ],
-                    ),
-                  ),
-                  TextButton.icon(
-                    style: TextButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                      backgroundColor: context.c.surface.withOpacity(0.8),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-                    ),
-                    // 审批属于其他会话时，直接跳到那个会话去处理 —— 此前是
-                    // 跳去安全策略页，而安全页 v1.11.4 起只留摘要、其"去处理"
-                    // 又跳回当前会话，形成谁也到不了审批卡片的死循环。
-                    onPressed: activeApprovals.isNotEmpty
-                        ? _scrollToBottom
-                        : () => _jumpToApprovalSession(dsh),
-                    icon: Icon(
-                      activeApprovals.isNotEmpty ? Icons.arrow_downward_rounded : Icons.shield_rounded,
-                      size: 14,
-                      color: context.c.warning,
-                    ),
-                    label: Text(
-                      activeApprovals.isNotEmpty ? '滚动查看' : '前往审核',
-                      style: TextStyle(color: context.c.warning, fontWeight: FontWeight.bold, fontSize: 12),
-                    ),
-                  ),
-                ],
-              ),
-            ),
+          ChatTopBanners(
+            dsh: dsh,
+            activeApprovals: activeApprovals,
+            onScrollToBottom: _scroll.scrollToBottom,
+          ),
 
           // Chat Body with Floating Jump to Latest Button
           Expanded(
-            child: dsh.isLoadingHistory
-                ? const Center(child: CircularProgressIndicator())
-                : Stack(
-                    children: [
-                      if (dsh.messages.isEmpty && activeApprovals.isEmpty)
-                        Center(
-                          child: SingleChildScrollView(
-                            padding: const EdgeInsets.symmetric(horizontal: 24),
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Container(
-                                  width: 64,
-                                  height: 64,
-                                  decoration: BoxDecoration(
-                                    color: context.c.selectedSurface,
-                                    shape: BoxShape.circle,
-                                    border: Border.all(color: const Color(0xFFCCE4F7)),
-                                  ),
-                                  child: Icon(
-                                    Icons.auto_awesome,
-                                    color: context.c.accent,
-                                    size: 30,
-                                  ),
-                                ),
-                                const SizedBox(height: 16),
-                                Text(
-                                  '今天想探索什么？',
-                                  style: TextStyle(
-                                    color: context.c.textPrimary,
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.w600,
-                                    letterSpacing: 0.2,
-                                  ),
-                                ),
-                                const SizedBox(height: 6),
-                                Text(
-                                  '当前工作区: ${currentWs?.title ?? "默认工作区"}',
-                                  style: TextStyle(
-                                    color: context.c.textSecondary,
-                                    fontSize: 13,
-                                  ),
-                                ),
-                                const SizedBox(height: 24),
-                                Wrap(
-                                  spacing: 8,
-                                  runSpacing: 8,
-                                  alignment: WrapAlignment.center,
-                                  children: [
-                                    _buildSuggestionChip('🛠️ 分析项目代码', () {
-                                      _inputController.text = '分析当前项目代码结构并概述核心功能';
-                                    }),
-                                    _buildSuggestionChip('⚡ 检查潜在问题', () {
-                                      _inputController.text = '检查当前项目中的潜在 Bug 或异常';
-                                    }),
-                                    _buildSuggestionChip('💡 生成测试建议', () {
-                                      _inputController.text = '为当前模块编写单元测试用例建议';
-                                    }),
-                                  ],
-                                ),
-                              ],
-                            ),
-                          ),
-                        )
-                      else
-                        // [fix 2026-10-16] 用 Selector 把重建范围收到消息列表。
-                        //
-                        // 这里原来是内联的 ListView.builder，跟着整个
-                        // ChatView.build() 一起重建 —— 而 build() 顶上的
-                        // `Provider.of<DshService>(context)` 是 listen:true，
-                        // 每个流式增量都会通知一次。结果是 AppBar、横幅、
-                        // 输入框、搜索面板全都白重建一遍，只有这一块真的需要变。
-                        //
-                        // 订阅 `streamRevision` 而不是 `messages`：后者返回的是
-                        // 同一个 List 实例（`dsh.messages => _messages`），流式期间
-                        // 只原地改内容，Selector 的 `==` 比较永远判等 → 列表根本
-                        // 不会重建。streamRevision 每个 flush 边界都自增，是这里
-                        // 唯一可靠的"内容变了"信号。
-                        Selector<DshService, int>(
-                          selector: (BuildContext ctx, DshService d) => d.streamRevision,
-                          builder: (BuildContext ctx, _, __) {
-                            final messages = dsh.messages;
-                            final headerCount = _historyHeaderItemCount(dsh);
-                            return MessageListView(
-                              messages: messages,
-                              headerCount: headerCount,
-                              itemCount: messages.length + (showTurnOutput ? 1 : 0) + headerCount,
-                              controller: _scrollController,
-                              onScrollNotification: _onScrollNotification,
-                              // [feat 2026-10-17] 电脑端同款轮次刻度：右边缘一列短刻度，
-                              // 点某格直接跳到那一轮（十轮以上的会话靠滑是找不回来的）。
-                              overlay: _buildTurnRail(dsh),
-                              buildHeader: () => _buildHistoryHeader(dsh),
-                              buildItem: (ctx, msgIndex) {
-                                final m = messages[msgIndex];
-                                // 附 GlobalKey：会话内查找要靠 ensureVisible 精确滚到
-                                // 命中的那条消息。没有 key 只能按索引估算 offset，而
-                                // 消息高度是可变的，估算必然滚偏。
-                                final highlighted = _highlightedMessageIds.contains(m.id);
-                                Widget built = _buildMessageItem(m, dsh);
-                                // [fix 2026-10-16] 只给正在流式的那条加
-                                // RepaintBoundary。它是唯一逐 chunk 重绘的气泡，
-                                // 里面是 MarkdownBody 重新解析 + 链接化扫描；
-                                // 不给它单独一层，每帧的光栅化会连带波及列表里
-                                // 已经稳定的历史气泡。历史消息包了反而是浪费
-                                // （它们不重绘，多一层 saveLayer）。
-                                if (m.isStreaming) {
-                                  built = RepaintBoundary(child: built);
-                                }
-                                if (highlighted) {
-                                  // 高亮放在这里而不是 _buildMessageItem 内部：这样
-                                  // 记忆卡、工具卡等所有分支都被同一层覆盖，不必逐个
-                                  // 分支记得包一次（漏一个就是"某些消息不高亮"）。
-                                  built = DecoratedBox(
-                                    decoration: BoxDecoration(
-                                      color: context.c.warningBadgeSurface.withOpacity(0.5),
-                                      borderRadius: BorderRadius.circular(8),
-                                      border: Border.all(
-                                        color: context.c.warning,
-                                        width: 1.2,
-                                      ),
-                                    ),
-                                    child: built,
-                                  );
-                                }
-                                return KeyedSubtree(
-                                  key: _keyForMessage(m.id),
-                                  child: built,
-                                );
-                              },
-                              buildTrailer: () {
-                                // 审批卡片不再挂在消息流末尾（详见 _buildApprovalBlocks 的注释）。
-                                // 这里只剩消息和本轮产出卡。
+            child: ChatMessageStream(
+              dsh: dsh,
+              controller: _scrollController,
+              onScrollNotification: _scroll.onScrollNotification,
+              turnRail: _buildTurnRail(dsh),
+              showTurnOutput: showTurnOutput,
+              showEmptyState: dsh.messages.isEmpty && activeApprovals.isEmpty,
+              buildItem: (ctx, msgIndex) {
+                final m = dsh.messages[msgIndex];
+                // 附 GlobalKey：会话内查找要靠 ensureVisible 精确滚到
+                // 命中的那条消息。没有 key 只能按索引估算 offset，而
+                // 消息高度是可变的，估算必然滚偏。
+                final highlighted = _highlightedMessageIds.contains(m.id);
+                Widget built = _buildMessageItem(
+                  m,
+                  dsh,
+                  isTurnStart: _isTurnStartOf(dsh.messages, msgIndex),
+                );
+                // [fix 2026-10-16] 只给正在流式的那条加
+                // RepaintBoundary。它是唯一逐 chunk 重绘的气泡，
+                // 里面是 MarkdownBody 重新解析 + 链接化扫描；
+                // 不给它单独一层，每帧的光栅化会连带波及列表里
+                // 已经稳定的历史气泡。历史消息包了反而是浪费
+                // （它们不重绘，多一层 saveLayer）。
+                if (m.isStreaming) {
+                  built = RepaintBoundary(child: built);
+                }
+                if (highlighted) {
+                  // 高亮放在这里而不是 _buildMessageItem 内部：这样
+                  // 记忆卡、工具卡等所有分支都被同一层覆盖，不必逐个
+                  // 分支记得包一次（漏一个就是"某些消息不高亮"）。
+                  built = DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: context.c.warningBadgeSurface.withOpacity(0.5),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: context.c.warning,
+                        width: 1.2,
+                      ),
+                    ),
+                    child: built,
+                  );
+                }
+                return KeyedSubtree(
+                  key: _keyForMessage(m.id),
+                  child: built,
+                );
+              },
+              buildTrailer: () {
+                // 审批卡片不再挂在消息流末尾（详见 ChatBlockerDock 里 _buildApprovalBlocks 的注释）。
+                // 这里只剩消息和本轮产出卡。
 
-                                // 「本轮产出」卡片：事件进流那一半 —— 交付物出现在
-                                // 交付它的那一轮之后（见 build 里锚点的说明）。
-                                //
-                                // 主点击 = 就地预览，长按 = 下载 / 用其它应用打开 ——
-                                // 与信息面板逐字同一套手势。这两处曾经不一致：会话里
-                                // 点一下要下载 + 切应用，面板里点一下只是看一眼。
-                                return TurnOutputCard(
-                                  deliverables: dsh.deliverables,
-                                  busyPath: _deliverableBusy.value,
-                                  errorText: _deliverableError,
-                                  onOpen: (item) => _previewDeliverable(dsh, item),
-                                  onDownload: (item) => _openDeliverable(dsh, item),
-                                  onShowAll: () => _openSessionInfo(dsh, section: SessionInsightSection.deliverables),
-                                );
-                              },
-                            );
-                          },
-                        ),
-
-                      if (_showScrollToBottom)
-                        Positioned(
-                          right: 16,
-                          bottom: 12,
-                          child: Material(
-                            elevation: 2,
-                            color: context.c.accent,
-                            borderRadius: BorderRadius.circular(8),
-                            child: InkWell(
-                              borderRadius: BorderRadius.circular(8),
-                              onTap: _scrollToBottom,
-                              child: const Padding(
-                                padding: EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-                                child: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Icon(Icons.arrow_downward_rounded, size: 15, color: Colors.white),
-                                    SizedBox(width: 4),
-                                    Text(
-                                      '回到最新消息',
-                                      style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
+                // 「本轮产出」卡片：事件进流那一半 —— 交付物出现在
+                // 交付它的那一轮之后（见 build 里锚点的说明）。
+                //
+                // 主点击 = 就地预览，长按 = 下载 / 用其它应用打开 ——
+                // 与信息面板逐字同一套手势。这两处曾经不一致：会话里
+                // 点一下要下载 + 切应用，面板里点一下只是看一眼。
+                return TurnOutputCard(
+                  deliverables: dsh.deliverables,
+                  busyPath: _deliverableBusy.value,
+                  errorText: _deliverableError,
+                  onOpen: (item) => _previewDeliverable(dsh, item),
+                  // Phase 4.7：长按不再直接下载，而是弹**统一**的 action sheet
+                  // （打开预览 / 下载并打开 / 复制路径）。卡片上的说明文字仍写
+                  // "长按下载"—— 那句描述的是"长按能得到下载"，弹层里确实有它，
+                  // 而多出来的两个动作是白送的。
+                  onDownload: (item) => _showDeliverableActions(dsh, item),
+                  onShowAll: () => _openSessionInfo(dsh,
+                      section: SessionInsightSection.deliverables),
+                );
+              },
+              showScrollToBottom: _scroll.showScrollToBottom,
+              onScrollToBottom: _scroll.scrollToBottom,
+              workspaceName: currentWs?.title,
+              onInsertSuggestion: (text) => _inputController.text = text,
+            ),
           ),
 
           // 会话内查找面板（v1.4.2）。位置在交互块之上、输入框之下：查找是会话级
@@ -2582,7 +778,9 @@ class _ChatViewState extends State<ChatView> {
           if (_searchOpen)
             Builder(builder: (searchCtx) {
               final q = _searchQuery.trim();
-              final rawHits = q.isEmpty ? const <SearchHit>[] : MessageSearch.search(dsh.messages, _searchQuery);
+              final rawHits = q.isEmpty
+                  ? const <SearchHit>[]
+                  : MessageSearch.search(dsh.messages, _searchQuery);
               return MessageSearchPanel(
                 query: _searchQuery,
                 results: q.isEmpty ? const [] : MessageSearch.collapse(rawHits),
@@ -2600,211 +798,40 @@ class _ChatViewState extends State<ChatView> {
           // 点「允许一次」），而提问卡早就是固定区 + 限高 + 操作栏钉底。两个卡片
           // 必须一致，否则用户学到的心智模型取决于 Agent 最后说了多长。
           //
-          // 这一段整体有上限 + 可滚动：dock 是 body Column 里的非 flex 子项，
-          // 高度会跟卡片数量、附件数量、系统字号一起涨。一旦超过剩余高度，整个
-          // body Column 就 OVERFLOWING —— 系统字号 1.3x + 一张审批 + 一个提问 +
-          // 几张附件即可复现（实测 RenderFlex 报错）。
-          //
-          // 这里必须用**显式高度上限**而不是 Flexible：Column 里的 Flexible 会把
-          // 子项按剩余空间撑满，于是输入栏被推上去 182px（实测底边 398 而非
-          // 580）—— 那正是 v1.9.0 修过的"输入框下方一条空白"缺陷。
-          ConstrainedBox(
-            constraints: BoxConstraints(
-              maxHeight: MediaQuery.sizeOf(context).height * _dockMaxHeightFraction,
-            ),
-            child: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  ..._buildApprovalBlocks(activeApprovals, dsh),
+          // 限高 + 可滚动的理由见 `ChatBlockerDock` 的文档（显式高度上限，不用 Flexible）。
+          ChatBlockerDock(dsh: dsh, approvals: activeApprovals),
 
-                  // 提问卡片 / TODO 面板 / 图片附件（patch 0003）。
-                  //
-                  // 顺序是有意的：提问在最上面，因为它阻塞着 agent 的下一步 —— 用户
-                  // 必须先看到并回答它，TODO 和图片都是背景信息。附件紧贴输入框，
-                  // 因为它是"这轮对话里出现的图"，不是一条独立消息。
-                  ..._buildInteractiveBlocks(dsh),
-                ],
-              ),
-            ),
-          ),
-
-          // 上一轮失败说明（回合级）。放在输入框正上方：它解释的是"为什么刚才
-          // 那一轮断了"，紧挨着用户接下来要输入的地方，且不遮挡历史消息。
-          if (dsh.lastTurnFailure != null) _buildTurnFailureBanner(dsh),
+          if (dsh.lastTurnFailure != null) ChatTurnFailureBanner(dsh: dsh),
 
           // Modern Clean Input Bar
-          _buildInputBar(dsh),
-        ],
-      ),
-    );
-  }
-
-  /// 跳到"正在等你授权"的那个会话。
-  ///
-  /// 与提问的 _jumpToQuestionSession 对称：审批同样是"agent 停下来等你"，
-  /// 卡片渲染在**它所属会话**的对话流末尾。之前 banner 把用户送进安全策略页
-  /// 的死循环（安全页只剩摘要、"去处理"又跳回当前会话），这里补上真正的出口。
-  Future<void> _jumpToApprovalSession(DshService dsh) async {
-    final cur = dsh.currentSession;
-    final target = dsh.pendingApprovals.firstWhere(
-      (a) => cur == null || !cur.matchesSessionId(a.sessionId),
-      orElse: () => dsh.pendingApprovals.first,
-    );
-    HapticFeedback.selectionClick();
-    await dsh.openSessionById(target.sessionId);
-  }
-
-  /// 不属于当前会话的待答提问数量。
-  int otherSessionQuestionCount(DshService dsh) {
-    final cur = dsh.currentSession;
-    if (cur == null) return dsh.pendingQuestions.length;
-    return dsh.pendingQuestions.where((q) => !cur.matchesSessionId(q.sessionId)).length;
-  }
-
-  /// 跳到"正在等你回答"的那个会话。
-  Future<void> _jumpToQuestionSession(DshService dsh) async {
-    final cur = dsh.currentSession;
-    final target = dsh.pendingQuestions.firstWhere(
-      (q) => cur == null || !cur.matchesSessionId(q.sessionId),
-      orElse: () => dsh.pendingQuestions.first,
-    );
-    HapticFeedback.selectionClick();
-    await dsh.openSessionById(target.sessionId);
-  }
-
-  /// 上一轮失败横幅：把"这轮为什么断了"直接说清楚，并给一键"重试"的入口。
-  Widget _buildTurnFailureBanner(DshService dsh) {
-    final info = dsh.lastTurnFailure!;
-    final label = switch (info.kind) {
-      'error' => '本轮执行出错',
-      'interrupted' => '本轮被中断',
-      'blocked' => '本轮被阻止',
-      _ => '本轮未正常结束',
-    };
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.fromLTRB(12, 0, 12, 6),
-      padding: const EdgeInsets.fromLTRB(12, 10, 6, 10),
-      decoration: BoxDecoration(
-        color: context.c.dangerSurface,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: context.c.danger.withOpacity(0.35)),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(Icons.error_outline_rounded, size: 18, color: context.c.danger),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  label,
-                  style: TextStyle(color: context.c.danger, fontSize: 12.5, fontWeight: FontWeight.bold),
-                ),
-                if (info.text.isNotEmpty) ...[
-                  const SizedBox(height: 2),
-                  SelectableText(
-                    info.text,
-                    style: TextStyle(color: context.c.textSecondary, fontSize: 12, height: 1.35),
-                  ),
-                ],
-              ],
-            ),
-          ),
-          IconButton(
-            icon: Icon(Icons.close_rounded, size: 16, color: context.c.textTertiary),
-            tooltip: '知道了',
-            visualDensity: VisualDensity.compact,
-            onPressed: dsh.dismissTurnFailure,
+          ChatComposer(
+            dsh: dsh,
+            inputController: _inputController,
+            inputFocusNode: _inputFocusNode,
+            pendingAttachments: _pendingAttachments,
+            notice: _notice,
+            queueExpanded: _queueExpanded,
+            onToast: _toast,
+            onSend: () => _sendMessage(dsh),
+            onRemoveAttachment: (attachment) =>
+                setState(() => _pendingAttachments.remove(attachment)),
+            onPickAttach: () => _showAttachSheet(dsh),
+            onPickCommand: () => _showCommandSheet(dsh),
+            onPickModel: () => showChatModelSwitchSheet(context, dsh),
+            onToggleQueueExpanded: () =>
+                setState(() => _queueExpanded = !_queueExpanded),
+            onEditQueueRow: (row) => _editQueueRow(dsh, row),
+            onRemoveQueueRow: (row) => _removeQueueRow(dsh, row),
+            onSteerQueueRow: (row) => _steerQueueRow(dsh, row),
+            onNoticeAction: (notice) => _onNoticeAction(dsh, notice),
+            // 状态胶囊行（v1.27）里「待审批 / 待提问」那一枚的右侧按钮。
+            // 审批/提问的 dock 就在输入框正上方（`ChatBlockerDock`），所以
+            // "去处理"= 滚到底：长回答会把 dock 顶出视野，这一步就是把它露出来。
+            onRevealBlocked: () => _scroll.scrollToBottom(),
           ),
         ],
       ),
     );
-  }
-
-  /// 待授权的工具操作。与 [QuestionCard] 同属「阻塞型」交互，因此同样挂在输入框
-  /// 上方的固定 dock，并同样自己限高、把操作按钮钉在底部。
-  ///
-  /// 一次只展示一张：两个审批同时可点的话，用户很容易批错那一个 —— 而错批的
-  /// 代价是让 agent 执行了一条没打算执行的命令。剩下的折叠成计数行，让用户知道
-  /// 还有几张、可以逐张过。
-  List<Widget> _buildApprovalBlocks(List<ApprovalRequest> approvals, DshService dsh) {
-    if (approvals.isEmpty) return const [];
-    final blocks = <Widget>[];
-    final first = approvals.first;
-    blocks.add(
-      ConstrainedBox(
-        constraints: const BoxConstraints(maxHeight: 300),
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.only(bottom: 8),
-          child: ApprovalCard(
-            request: first,
-            onRespond: (r, outcome, [reason]) => dsh.respondApproval(r, outcome, reason: reason),
-          ),
-        ),
-      ),
-    );
-    if (approvals.length > 1) {
-      blocks.add(
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
-          child: Text(
-            '还有 ${approvals.length - 1} 个操作等待授权，处理完上面这个后依次显示',
-            style: TextStyle(fontSize: 11, color: context.c.textTertiary),
-          ),
-        ),
-      );
-    }
-    return blocks;
-  }
-
-  /// 提问 / TODO / 附件三块。抽出来是因为它们共享「只属于当前会话」这条约束，
-  /// 放在一起比散在 build 里更容易看出这个约束。
-  List<Widget> _buildInteractiveBlocks(DshService dsh) {
-    final blocks = <Widget>[];
-    final questions = dsh.currentSessionQuestions;
-
-    for (final q in questions) {
-      blocks.add(
-        QuestionCard(
-          key: ValueKey(q.eventId),
-          pending: q,
-          // 只有真的连着网关才允许提交：离线时 send 会静默失败，用户会对着一个
-          // 按不动的按钮以为是自己没点到。
-          canAnswer: dsh.isConnected,
-          onSubmit: (selections, customs) => dsh.answerQuestion(
-            q,
-            selections: selections,
-            customs: customs,
-          ),
-          onDismiss: () => dsh.dismissQuestion(q),
-        ),
-      );
-    }
-
-    final qErr = dsh.lastQuestionError;
-    if (qErr != null && questions.isNotEmpty) {
-      blocks.add(QuestionErrorBanner(message: qErr));
-    }
-
-    final todos = dsh.currentTodos;
-    if (todos.isNotEmpty) {
-      blocks.add(TodoPanel(todos: todos));
-    }
-
-    for (final att in dsh.currentAttachments) {
-      blocks.add(
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          child: AttachmentImageTile(ref: att, endpoint: dsh.attachmentUrl(att)),
-        ),
-      );
-    }
-
-    return blocks;
   }
 
   /// 消息里的附件：图片走缩略图，文件走一行文件条。
@@ -2816,7 +843,8 @@ class _ChatViewState extends State<ChatView> {
   /// * [ChatMessage.attachments] —— 服务端签发的附件（历史与实时帧都带）；
   /// * [ChatMessage.localImagePreviews] —— 本机刚发出去那张图的字节（只有乐观消息有），
   ///   让图片在轮询回包之前就已经在屏幕上。
-  Widget _buildMessageAttachments(ChatMessage msg, DshService dsh, bool isUser) {
+  Widget _buildMessageAttachments(
+      ChatMessage msg, DshService dsh, bool isUser) {
     if (!msg.hasAttachments) return const SizedBox.shrink();
 
     final blocks = <Widget>[
@@ -2832,8 +860,9 @@ class _ChatViewState extends State<ChatView> {
                 fit: BoxFit.contain,
                 // 与 AttachmentImageTile 同一个理由：按显示尺寸解码，别把整张原图
                 // 解进内存（一张 12MP 照片几十 MB，滚几条消息就能把 App 顶 OOM）。
-                cacheWidth:
-                    (220 * MediaQuery.devicePixelRatioOf(context)).round().clamp(1, 4096),
+                cacheWidth: (220 * MediaQuery.devicePixelRatioOf(context))
+                    .round()
+                    .clamp(1, 4096),
                 errorBuilder: (_, __, ___) => Container(
                   width: 180,
                   height: 90,
@@ -2855,19 +884,26 @@ class _ChatViewState extends State<ChatView> {
       for (final ref in msg.attachments)
         Padding(
           padding: const EdgeInsets.only(bottom: 6),
-          child: ref.isImage
-              ? AttachmentImageTile(
-                  ref: ref,
-                  // 字节留在宿主机：必须带 Authorization 头去取（见 AttachmentImageTile）。
-                  endpoint: dsh.attachmentUrl(ref),
-                  maxWidth: 220,
-                )
-              : _attachmentFileRow(ref),
+          // Phase 4.7：附件长按 → **同一个** action sheet（动作集按上下文裁剪，
+          // 见 `_showAttachmentActions`）。包在这里而不是改 `attachment_tile.dart`：
+          // 那个组件是纯展示的，长按属于"这条消息的交互"，归会话页。
+          child: GestureDetector(
+            onLongPress: () => _showAttachmentActions(dsh, ref),
+            child: ref.isImage
+                ? AttachmentImageTile(
+                    ref: ref,
+                    // 字节留在宿主机：必须带 Authorization 头去取（见 AttachmentImageTile）。
+                    endpoint: dsh.attachmentUrl(ref),
+                    maxWidth: 220,
+                  )
+                : _attachmentFileRow(ref),
+          ),
         ),
     ];
 
     return Column(
-      crossAxisAlignment: isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+      crossAxisAlignment:
+          isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
       children: blocks,
     );
   }
@@ -2878,7 +914,9 @@ class _ChatViewState extends State<ChatView> {
   /// （`deliverable_preview_sheet` 里有完整实现）。这里先把"这条消息带了什么文件"
   /// 如实显示出来，而不是给一个点了报错的按钮。
   Widget _attachmentFileRow(AttachmentRef ref) {
-    final kb = ref.byteSize == null ? null : '${(ref.byteSize! / 1024).toStringAsFixed(0)} KB';
+    final kb = ref.byteSize == null
+        ? null
+        : '${(ref.byteSize! / 1024).toStringAsFixed(0)} KB';
     final meta = [ref.mimeType, if (kb != null) kb].join(' · ');
 
     return Container(
@@ -2892,7 +930,8 @@ class _ChatViewState extends State<ChatView> {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.attach_file_rounded, size: 15, color: context.c.textSecondary),
+          Icon(Icons.attach_file_rounded,
+              size: 15, color: context.c.textSecondary),
           const SizedBox(width: 6),
           Flexible(
             child: Column(
@@ -2913,7 +952,8 @@ class _ChatViewState extends State<ChatView> {
                   meta,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                  style:
+                      TextStyle(fontSize: 10.5, color: context.c.textTertiary),
                 ),
               ],
             ),
@@ -2923,73 +963,19 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
-  Widget _buildSuggestionChip(String text, VoidCallback onTap) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(16),
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-        decoration: BoxDecoration(
-          color: context.c.surface,
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: context.c.border),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.02),
-              blurRadius: 4,
-              offset: const Offset(0, 1),
-            ),
-          ],
-        ),
-        child: Text(
-          text,
-          style: TextStyle(color: context.c.textPrimary, fontSize: 12.5, fontWeight: FontWeight.w500),
-        ),
-      ),
-    );
-  }
-
-  // ---- 会话历史无限上翻（v1.15）[feat 2026-10-12] ----
-
-  /// 上翻头部占几个槽位：还有更多历史、正在加载、或已到开头时占 1，
-  /// （历史本来就一条不剩的短会话不占，避免空会话顶部挂一条"已到开头"）。
-  int _historyHeaderItemCount(DshService dsh) {
-    if (dsh.messages.isEmpty) return 0;
-    if (dsh.isLoadingOlder || dsh.hasMoreHistory || dsh.historyExhausted) return 1;
-    return 0;
-  }
-
-  /// 顶部状态：加载中转圈 / 已到会话开头。
-  Widget _buildHistoryHeader(DshService dsh) {
-    if (dsh.isLoadingOlder) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 14),
-        child: Center(
-          child: SizedBox(
-            width: 20,
-            height: 20,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
-        ),
-      );
-    }
-    if (dsh.historyExhausted) {
-      return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 10),
-        child: Center(
-          child: Text('已到会话开头', style: TextStyle(color: context.c.textTertiary, fontSize: 12)),
-        ),
-      );
-    }
-    // 还有更多但未触发（等滑到顶部）：占位保持高度稳定，避免触发瞬间列表跳动。
-    return const SizedBox(height: 1);
-  }
-
   /// 渲染一条消息气泡。
   ///
   /// [dsh] 是必需的：正文里的产物引用要链接化（靠会话的交付物清单做白名单），
   /// 而点开那些链接又要回到同一个 `DshService` 去取内容。
-  Widget _buildMessageItem(ChatMessage msg, DshService dsh) {
+  ///
+  /// [isTurnStart] 表示这条消息是一轮的开头（见 `_isTurnStartOf`）：用户消息恒为
+  /// true，assistant 消息只在前面不是 assistant 时成立。它决定两件事 ——
+  /// `AI · HH:mm` 标签行是否渲染，以及这条消息上方是轮间 16dp 还是轮内 4dp。
+  Widget _buildMessageItem(
+    ChatMessage msg,
+    DshService dsh, {
+    bool isTurnStart = false,
+  }) {
     // 0. [feat 2026-10-17] 引擎注入的通知（role 是 user，但没人打过这些字）。
     //
     // 必须是**第一条**分支：它的 role 就是 'user'，一旦落到下面的用户气泡分支就会
@@ -3062,7 +1048,8 @@ class _ChatViewState extends State<ChatView> {
       embeddedContext = msg.content.substring(earliestMarkerIndex).trim();
     }
 
-    if (displayContent.isEmpty && (embeddedContext != null && embeddedContext.isNotEmpty)) {
+    if (displayContent.isEmpty &&
+        (embeddedContext != null && embeddedContext.isNotEmpty)) {
       return Padding(
         padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
         child: MemoryCard(content: embeddedContext),
@@ -3070,508 +1057,725 @@ class _ChatViewState extends State<ChatView> {
     }
 
     final isUser = msg.role == 'user';
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisAlignment: isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
-        children: [
-          if (!isUser) ...[
-            Container(
-              width: 30,
-              height: 30,
-              decoration: BoxDecoration(
-                color: context.c.selectedSurface,
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: const Color(0xFFCCE4F7)),
-              ),
-              child: Icon(Icons.auto_awesome, color: context.c.accent, size: 16),
-            ),
-            const SizedBox(width: 8),
-          ],
-          Flexible(
-            child: Column(
-              crossAxisAlignment: isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-              children: [
-                // Thinking Fold Card
-                if ((msg.thinking != null && msg.thinking!.isNotEmpty) || (msg.isStreaming && msg.content.isEmpty))
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 6),
-                    child: ThinkingCard(
-                      content: msg.thinking ?? '',
-                      isThinking: msg.isStreaming,
-                    ),
-                  ),
+    final topGap = isTurnStart ? AppSpace.xl : AppSpace.s;
 
-                // Tool Executions
-                for (final tool in msg.tools)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 6),
-                    child: ToolCallCard(tool: tool),
-                  ),
-
-                // [fix 2026-10-17] 消息里的附件（图片缩略图 / 文件条）。
-                //
-                // 以前消息流里**完全不渲染附件**：附件只出现在输入框上方那条"本轮
-                // 附件"里，而手机自己发出去的图片连那条都没有（网关的历史转换把
-                // 非 text part 整段丢了），用户看到的就是"我发的图被吞了"。
-                _buildMessageAttachments(msg, dsh, isUser),
-
-                // Content Bubble
-                if (displayContent.isNotEmpty)
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
-                    decoration: BoxDecoration(
-                      color: isUser ? context.c.accent : context.c.surface,
-                      borderRadius: isUser
-                          ? const BorderRadius.only(
-                              topLeft: Radius.circular(10),
-                              bottomLeft: Radius.circular(10),
-                              bottomRight: Radius.circular(10),
-                              topRight: Radius.circular(3),
-                            )
-                          : const BorderRadius.only(
-                              topRight: Radius.circular(10),
-                              bottomLeft: Radius.circular(10),
-                              bottomRight: Radius.circular(10),
-                              topLeft: Radius.circular(3),
+    // ---- 用户消息：消息流里唯一保留实心气泡的角色 ----
+    if (isUser) {
+      // 长按触发器的取舍见 `_buildMessageItem` 上方「Phase 4.7」那段总说明：
+      // 正文里的长按仍然是系统选词（SelectableText 在命中区内先赢手势竞技场），
+      // 这条 onLongPress 只在按住气泡内边距 / 附件行 / 时间戳行时触发。
+      final userMarkdownStyle = _userMarkdownStyle;
+      return Padding(
+        padding: EdgeInsets.only(top: topGap, bottom: AppSpace.m),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            Flexible(
+              child: GestureDetector(
+                onLongPress: () => _showMessageActions(dsh, msg),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    _buildMessageAttachments(msg, dsh, true),
+                    if (displayContent.isNotEmpty)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: AppSpace.l,
+                          vertical: AppSpace.m,
+                        ),
+                        decoration: BoxDecoration(
+                          color: context.c.userBubble,
+                          // 圆角统一 12：以前右上角是 3 的小圆角当"气泡尾巴"。
+                          // 那套拟物语言与现在的扁平层级冲突，而且 3px 的小角在
+                          // 深色下看起来像缺了一块。
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: SafeMarkdown(
+                          data: linkifyDeliverableRefs(
+                              displayContent, dsh.deliverables),
+                          selectable: true,
+                          onTapLink: (text, href, title) =>
+                              _openMessageLink(dsh, href),
+                          fallbackTextStyle: TextStyle(
+                            fontSize: AppText.title,
+                            color: _onSolidBubble,
+                            height: 1.5,
+                          ),
+                          styleSheet: userMarkdownStyle,
+                          // 代码块右上角「全屏阅读」（Phase 5.1）。
+                          builders: _codeBlockBuilders(userMarkdownStyle.code),
+                        ),
+                      ),
+                    if (embeddedContext != null && embeddedContext.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: AppSpace.s),
+                        child: MemoryCard(content: embeddedContext),
+                      ),
+                    Padding(
+                      padding: const EdgeInsets.only(top: AppSpace.xs),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            _formatTime(msg.timestamp),
+                            style: TextStyle(
+                              color: context.c.textTertiary,
+                              fontSize: AppText.caption,
                             ),
-                      border: Border.all(
-                        color: isUser
-                            ? context.c.accent
-                            : context.c.border,
-                        width: 1.0,
-                      ),
-                      // [fix 2026-10-16] 去掉了原来这里的 boxShadow
-                      // （Colors.black 2% + blurRadius 4）。在滚动列表里，
-                      // 每个带阴影的 item 每帧都要一次 saveLayer；而这个
-                      // 阴影黑到肉眼根本分辨不出来。气泡本来就有 1px border
-                      // 和不同的圆角，层次感不靠它。
-                    ),
-                    child: SafeMarkdown(
-                      // 正文里提到本会话声明过的产物时，把它变成可点链接（长按
-                      // 复制原文仍然可用）。只认清单白名单，所以正文里的示例路径、
-                      // 别人的目录都不会被误变成一个点开就报错的链接。
-                      data: linkifyDeliverableRefs(displayContent, dsh.deliverables),
-                      selectable: true,
-                      onTapLink: (text, href, title) => _openMessageLink(dsh, href),
-                      fallbackTextStyle: TextStyle(
-                        fontSize: 14,
-                        color: isUser ? Colors.white : context.c.textPrimary,
-                        height: 1.45,
-                      ),
-                      styleSheet: MarkdownStyleSheet(
-                        p: TextStyle(fontSize: 14, color: isUser ? Colors.white : context.c.textPrimary, height: 1.45),
-                        code: TextStyle(
-                          color: isUser ? Colors.white : const Color(0xFF0369A1),
-                          backgroundColor: isUser ? const Color(0x33FFFFFF) : context.c.background,
-                          fontFamily: 'monospace',
-                        ),
-                        codeblockDecoration: BoxDecoration(
-                          color: isUser ? const Color(0x1A000000) : context.c.background,
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(color: isUser ? const Color(0x33FFFFFF) : context.c.border),
-                        ),
+                          ),
+                          // 长按是**不可发现**的手势，所以每条消息都留一个显式的
+                          // 「⋯」入口（点一下就是同一个 sheet）。放在时间戳旁边
+                          // 而不是气泡角上：那里不会跟正文的任何字形抢位置。
+                          _messageMoreButton(
+                              msg.id, () => _showMessageActions(dsh, msg)),
+                        ],
                       ),
                     ),
-                  ),
-
-                // Embedded Context Card if present
-                if (embeddedContext != null && embeddedContext.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: MemoryCard(content: embeddedContext),
-                  ),
-
-                // Streaming Indicator
-                if (msg.isStreaming)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        SizedBox(
-                          width: 12,
-                          height: 12,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: context.c.accent),
-                        ),
-                        const SizedBox(width: 6),
-                        Text('AI 正在思考并执行操作...', style: TextStyle(color: context.c.textSecondary, fontSize: 11)),
-                      ],
-                    ),
-                  ),
-
-                // Timestamp — ChatMessage.timestamp is a non-nullable DateTime
-                // (the constructor defaults it to DateTime.now()), so the old
-                // `if (msg.timestamp != null)` guard was always true and the
-                // timestamp always rendered. Behaviour is unchanged.
-                Padding(
-                  padding: const EdgeInsets.only(top: 4),
-                  child: Text(
-                    _formatTime(msg.timestamp),
-                    style: TextStyle(color: context.c.textTertiary, fontSize: 10),
-                  ),
+                  ],
                 ),
-              ],
+              ),
             ),
-          ),
-          if (isUser) ...[
-            const SizedBox(width: 8),
+            const SizedBox(width: AppSpace.m),
+            // 用户头像保留：右对齐气泡需要一个人格锚点。引擎注入的通知走
+            // HarnessNoticeCard，不会到这里（见本方法第 0 条分支）。
             Container(
               width: 30,
               height: 30,
               decoration: BoxDecoration(
-                color: context.c.accent,
+                color: context.c.userBubble,
                 borderRadius: BorderRadius.circular(6),
               ),
-              child: const Icon(Icons.person_rounded, color: Colors.white, size: 17),
+              child: Icon(
+                Icons.person_rounded,
+                color: _onSolidBubble,
+                size: 17,
+              ),
             ),
           ],
-        ],
-      ),
-    );
-  }
+        ),
+      );
+    }
 
-  /// 麦克风按钮：点一下开始识别，再点一下停止。
-  ///
-  /// 三处刻意的行为：
-  /// * **识别中按钮变色**，用户能一眼看出还在听 —— 语音最反直觉的问题就是
-  ///   「不知道它有没有在听」，不给出视觉反馈会让人反复点。
-  /// * **识别结果替换整个输入框**而不是追加。流式识别的中间结果是累积的，
-  ///   追加会得到「你好你好你好世界世界」这种叠字。
-  /// * **永远可点**，且在不可用时说明具体原因（见下）。
-  ///
-  /// ## 这里修的是一个真实缺陷
-  ///
-  /// 上一版在「未探测完成」时返回空白 SizedBox、在「不可用」时返回**不带 onTap
-  /// 的图标**。后果是：按钮要么看不见，要么看着是个按钮、点下去毫无反应，
-  /// 而麦克风权限弹窗也永远不会出现 —— 用户描述的就是「有按钮但没法点击，
-  /// 也没弹出什么权限设置」。
-  ///
-  /// 根因是把「申请权限」和「探测能力」合并成了一次性的初始化，且失败后永久
-  /// 记为不可用。现在无论什么状态都保持可点：点下去会重新探测并触发权限申请；
-  /// 确实不行时用 SnackBar 说清是哪种原因，给出可执行的下一步。
-  /// 待发附件条。每个附件显示名字与体积，可单项删除。
-  Widget _buildPendingAttachments() {
+    // ---- AI 消息：裸排版（Phase 2.1）----
+    //
+    // 改动前：surface 底 + 1px border + radius 10/3 的气泡，外加每条消息前面一个
+    // 30×30 的 auto_awesome 头像方块。一条 AI 回复只要被拆成 5 条流式消息，屏幕上
+    // 就是 5 个一样的头像 + 5 个一样的卡片边框 —— 视觉噪音几乎全部来自这些"每条
+    // 消息都重复一次"的装饰，而不是内容本身。
+    //
+    // 现在：**没有容器底色、没有描边、没有头像**。唯一的身份标识是左侧 2px 的
+    // accent 竖线（35% 不透明），且竖线纵向覆盖这条消息的全部内容（思考 / 工具 /
+    // 正文）—— 连续几条 assistant 消息因此会拼成一段连续的引文，那才是"一轮回答"
+    // 的形状。身份信息补偿到轮首那一行 caption：「AI · HH:mm」。
+    final assistantMarkdownStyle = _assistantMarkdownStyle;
     return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
+      padding: EdgeInsets.only(
+        top: topGap,
+        bottom: isTurnStart ? AppSpace.m : AppSpace.s,
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          for (final a in _pendingAttachments)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 4),
-              child: Row(
+          if (isTurnStart)
+            // 轮首那行 caption 也接长按：它属于"气泡外框"，是最容易被按住的一块
+            // 非正文区域（正文里的长按留给系统选词）。
+            GestureDetector(
+              onLongPress: () => _showMessageActions(dsh, msg),
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: AppSpace.s),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'AI · ${_formatTime(msg.timestamp)}',
+                      style: TextStyle(
+                        fontSize: AppText.caption,
+                        color: context.c.textTertiary,
+                        height: 1.2,
+                      ),
+                    ),
+                    // 显式的「⋯」入口只挂在**轮首**那一条上：流式回复被拆成十几条
+                    // assistant 消息，每条挂一个就等于在屏幕上撒十几个省略号。轮首
+                    // 那一条足够发现这套交互，其余的靠长按外框（同 `_showMessageActions`）。
+                    _messageMoreButton(
+                        msg.id, () => _showMessageActions(dsh, msg)),
+                  ],
+                ),
+              ),
+            ),
+          // Phase 4.7：长按外框（左侧竖线区 / 边缘内边距 / 工具卡）弹统一 sheet；
+          // 正文里的长按仍是系统选词。理由见 `_showMessageActions` 上方的总说明。
+          GestureDetector(
+            onLongPress: () => _showMessageActions(dsh, msg),
+            child: Container(
+              decoration: BoxDecoration(
+                // aiBubble 在两种主题下都是透明 —— 显式写出来是为了让"AI 气泡
+                // 无底色"成为一段可读的声明，而不是靠省略参数来表达。
+                color: context.c.aiBubble,
+                border: Border(
+                  left: BorderSide(
+                    color: context.c.accent.withOpacity(0.35),
+                    width: 2,
+                  ),
+                ),
+              ),
+              padding: const EdgeInsets.only(left: 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Icon(
-                    a is PendingImage ? Icons.image_outlined : Icons.insert_drive_file_outlined,
-                    size: 15,
-                    color: a is PendingImage ? context.c.accent : context.c.purple,
-                  ),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      a.name,
-                      style: TextStyle(fontSize: 12, color: context.c.textPrimary),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                  // 思考过程：引用块，无底色（见 thinking_card.dart）。
+                  if ((msg.thinking != null && msg.thinking!.isNotEmpty) ||
+                      (msg.isStreaming && msg.content.isEmpty))
+                    ThinkingCard(
+                      content: msg.thinking ?? '',
+                      isThinking: msg.isStreaming,
                     ),
-                  ),
-                  const SizedBox(width: 6),
-                  Text(
-                    a.sizeLabel,
-                    style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
-                  ),
-                  const SizedBox(width: 2),
-                  InkWell(
-                    onTap: () => setState(() => _pendingAttachments.remove(a)),
-                    borderRadius: BorderRadius.circular(11),
-                    child: Padding(
-                      padding: const EdgeInsets.all(3),
-                      child: Icon(Icons.close_rounded, size: 15, color: context.c.textTertiary),
+
+                  // 工具调用：同一消息内 ≥3 个聚合成一行（阈值在
+                  // AggregatedToolCalls 里），<3 个逐条渲染。
+                  if (msg.tools.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: AppSpace.s),
+                      child: AggregatedToolCalls(tools: msg.tools),
                     ),
-                  ),
+
+                  _buildMessageAttachments(msg, dsh, false),
+
+                  if (displayContent.isNotEmpty)
+                    SafeMarkdown(
+                      // 正文里提到本会话声明过的产物时，把它变成可点链接（长按
+                      // 复制原文仍然可用）。只认清单白名单，所以正文里的示例路径、
+                      // 别人的目录都不会被误变成一个点开就报错的链接。
+                      data: linkifyDeliverableRefs(
+                          displayContent, dsh.deliverables),
+                      selectable: true,
+                      onTapLink: (text, href, title) =>
+                          _openMessageLink(dsh, href),
+                      fallbackTextStyle: TextStyle(
+                        fontSize: AppText.title,
+                        color: context.c.textPrimary,
+                        height: 1.5,
+                      ),
+                      styleSheet: assistantMarkdownStyle,
+                      // 代码块右上角「全屏阅读」（Phase 5.1）。
+                      builders: _codeBlockBuilders(assistantMarkdownStyle.code),
+                    ),
+
+                  if (embeddedContext != null && embeddedContext.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: AppSpace.s),
+                      child: MemoryCard(content: embeddedContext),
+                    ),
+
+                  if (msg.isStreaming)
+                    Padding(
+                      padding: const EdgeInsets.only(top: AppSpace.s),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          SizedBox(
+                            width: 12,
+                            height: 12,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: context.c.accent,
+                            ),
+                          ),
+                          const SizedBox(width: AppSpace.s),
+                          Text(
+                            'AI 正在思考并执行操作...',
+                            style: TextStyle(
+                              color: context.c.textSecondary,
+                              fontSize: AppText.caption,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                  // 时间戳只出现在轮首那行「AI · HH:mm」里。
+                  // 流式回复会被拆成十几条 assistant 消息，逐条带一个时间戳等于在
+                  // 同一段回复里显示十几个相隔几秒的时刻 —— 信息量为零的噪音。
                 ],
               ),
             ),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildMicButton(DshService dsh) {
-    final listening = _voiceListening;
-    // 只有"已探测且确定不可用"才显示划掉的麦克风。未探测完成时显示正常图标 ——
-    // 用空白会让功能看起来不存在。
-    final unavailable = _voiceSupported == false;
+  /// 这条消息是不是「一轮」的开头。
+  ///
+  /// 用户消息永远开启新一轮；assistant 消息只有前面不是 assistant 时才算轮首
+  /// （它的时间戳和身份标签就渲染在那里）。用它同时决定两件事：AI 标签行 +
+  /// 轮内 4dp / 轮间 16dp 的垂直节奏。
+  bool _isTurnStartOf(List<ChatMessage> messages, int index) {
+    if (index < 0 || index >= messages.length) return false;
+    final msg = messages[index];
+    if (msg.role == 'user') return true;
+    if (msg.role != 'assistant') return false;
+    if (index == 0) return true;
+    return messages[index - 1].role != 'assistant';
+  }
 
-    return Tooltip(
-      message: unavailable ? '语音输入不可用（长按查看诊断）' : '语音输入（长按查看诊断）',
-      child: InkWell(
-        onTap: () => listening ? _stopVoice(dsh) : _startVoice(dsh),
-        // 长按出诊断报告。
-        //
-        // 存在的理由：语音失败有四五种彼此无关的原因（没有识别引擎、权限被拒且
-        // 系统不再弹窗、插件卡在权限回调上、缺中文语言包、上次会话没释放），而
-        // 它们在用户眼里**都只是"点了没反应"**。让 App 把自己每一步的实测结果
-        // 直接说出来，比一轮轮猜快得多。
-        onLongPress: _showVoiceDiagnose,
-        borderRadius: BorderRadius.circular(20),
-        // 44x44：Material 推荐的最小可触达尺寸。36px 在手机上确实偏小，
-        // 语音又是个高频入口（用户报"按钮有点小"）。
-        child: SizedBox(
-          width: 44,
-          height: 44,
-          child: listening
-              ? Padding(
-                  padding: const EdgeInsets.all(10),
-                  child: CircularProgressIndicator(strokeWidth: 2.2, color: context.c.danger),
-                )
-              : Center(
-                  child: Icon(
-                    unavailable ? Icons.mic_off_rounded : Icons.mic_rounded,
-                    size: 24,
-                    color: listening
-                        ? context.c.danger
-                        : (unavailable ? context.c.textTertiary : context.c.textSecondary),
-                  ),
-                ),
+  /// 实心（品牌色）底上的前景色。
+  ///
+  /// 不用 `Colors.white`：深色主题的品牌色是提亮过的 #6E8BFF，白字压在它上面
+  /// 只有约 3:1（低于正文 AA 4.5:1）。`surface` 在浅色下是纯白、深色下是近黑的
+  /// #161B22 —— 同一个 token 在两种主题下都恰好是 accent 的正确前景色。
+  Color get _onSolidBubble => context.c.surface;
+
+  /// 用户气泡内的 Markdown 样式。
+  ///
+  /// 正文 14 → 13.5（`AppText.title`）、行高 1.45 → 1.5。缩一点字号是为了让
+  /// 13.5/1.5 的正文在两套主题下都能撑住对比度：气泡底色本身已经是品牌色，
+  /// 字号再大就变成"色块里塞满字"。
+  MarkdownStyleSheet get _userMarkdownStyle {
+    final fg = _onSolidBubble;
+    return MarkdownStyleSheet(
+      p: TextStyle(fontSize: AppText.title, color: fg, height: 1.5),
+      code: TextStyle(
+        color: fg,
+        backgroundColor: fg.withOpacity(0.2),
+        fontFamily: 'monospace',
+        fontSize: AppText.subhead,
+      ),
+      codeblockDecoration: BoxDecoration(
+        color: fg.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: fg.withOpacity(0.2)),
+      ),
+    );
+  }
+
+  /// AI 正文的 Markdown 样式。
+  ///
+  /// 两处关键替换：行内代码的前景色从硬编码的 `0xFF0369A1`（一个只适合浅色底的
+  /// 深青蓝）换成 `accent`，底色从 `background` 换成独立的 `codeBackground`
+  /// —— 代码块现在和页面底同色，只有一层极淡的描边把它和正文分开。
+  MarkdownStyleSheet get _assistantMarkdownStyle {
+    return MarkdownStyleSheet(
+      p: TextStyle(
+        fontSize: AppText.title,
+        color: context.c.textPrimary,
+        height: 1.5,
+      ),
+      code: TextStyle(
+        color: context.c.accent,
+        backgroundColor: context.c.codeBackground,
+        fontFamily: 'monospace',
+        fontSize: AppText.subhead,
+      ),
+      codeblockDecoration: BoxDecoration(
+        color: context.c.codeBackground,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: context.c.border),
+      ),
+    );
+  }
+
+  /// 弹层入口都搬进了 `chat_sheets.dart`；这里是薄转调，保留原调用形态。
+  Future<void> _showAttachSheet(DshService dsh) => showChatAttachSheet(
+        context,
+        dsh,
+        toast: _toast,
+        onAttach: ({required bool asFile}) => _attach(dsh, asFile: asFile),
+      );
+
+  Future<void> _showCommandSheet(DshService dsh) => showChatCommandSheet(
+        context,
+        dsh,
+        inputController: _inputController,
+        focusNode: _inputFocusNode,
+        toast: _toast,
+      );
+
+  // [feat 2026-10-17] 这里原有四个一行转发壳：`_showSessionPermissionSheet` /
+  // `_showModelSwitchSheet` / `_showDeleteCurrentSessionDialog` /
+  // `_showWorkspaceSwitchSheet`。它们存在的唯一理由是「顶栏 8 项菜单」需要一个
+  // `VoidCallback`；菜单收敛进会话信息面板之后，那四项改由 `chat_sheets.dart`
+  // 在面板内部直接调用同名函数（那里本来就有 `DshService`），转发壳失去调用方，
+  // 于是删掉 —— 留着就是四段永远不会执行的代码。
+
+  Future<void> _openTrajectory(DshService dsh) => showChatTrajectorySheet(
+        context,
+        dsh,
+        onJumpToMessage: (id, index, total) =>
+            _highlightAndScrollToMessage(id, index: index, total: total),
+      );
+
+  // ======================================================================
+  // Phase 4.7：统一的长按 action sheet
+  // ======================================================================
+  //
+  // ## 选了哪个方案：C（正文内长按 = 选词；长按非文本区 = sheet）+ 显式「⋯」
+  //
+  // 规格给的三个方案里：
+  //
+  // * **A（长按 = sheet，选词改双击/手柄）不可行**。`SafeMarkdown(selectable:true)`
+  //   在 flutter_markdown 0.7.7 里渲染成**每段一个 `SelectableText`**（见包内
+  //   `builder.dart` 的 `_buildRichText`），不是整块 `SelectionArea`：
+  //   `SelectableText` 的长按 = "选中一个词 + 弹系统工具条"，是 `EditableText`
+  //   内部行为，没有任何公开开关能把长按让出去而只留手柄。想做到 A 只能自己
+  //   造一套选择实现 —— 那是把系统的复制/全选/分享工具条整条换掉。
+  // * **B（长按彻底不作 sheet）太保守**：任务要的是"长按统一 action sheet"，
+  //   B 只剩一个按钮可点，长按这条动线就没了。
+  // * **C 是事实上的边界**：`SelectableText` 的 `LongPressGestureRecognizer`
+  //   在命中区内比外层 `GestureDetector` **更深、先加入手势竞技场**，长按识别器
+  //   同时到点时先 resolve accepted——所以正文上方按住 = 选词（系统行为原样），
+  //   而按住气泡内边距 / 左侧竖线 / 附件行 / 时间戳行 = 我们这条 `onLongPress`。
+  //   这正是 C 描述的切法，而且**不需要给 SafeMarkdown 关 selectable**。
+  //
+  // 这条边界不是靠读源码断言就算数的，测试里钉了两端
+  // （`test/widgets/message_action_sheet_test.dart`）：
+  //   * `长按正文不会弹 sheet`（正文长按必须留给系统选词）；
+  //   * `长按气泡外框 / 点「⋯」会弹 sheet`。
+  //
+  // ## 为什么还要一个「⋯」按钮
+  //
+  // 长按完全不可发现（turn_output_card 里那句"长按下载"的提示就是为了这一点）。
+  // 加一个 15dp、textTertiary 的省略号，成本是一行像素，换来的是"这套交互能被
+  // 看见"。它和长按走**同一个** `_showMessageActions`，不存在第二条通路。
+
+  /// 消息的「⋯」入口（点一下 = 同一个 action sheet）。
+  Widget _messageMoreButton(String messageId, VoidCallback onTap) {
+    return InkResponse(
+      key: ValueKey('message-more-$messageId'),
+      onTap: onTap,
+      radius: 16,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(
+            horizontal: AppSpace.s, vertical: AppSpace.xs),
+        child: Icon(
+          Icons.more_horiz_rounded,
+          size: 15,
+          color: context.c.textTertiary,
         ),
       ),
     );
   }
 
-  /// 长按麦克风：弹出语音状态诊断。
+  /// 代码块渲染钩子（Phase 5.1）：只替换 `pre`，其余元素走默认渲染。
   ///
-  /// 用途见调用点注释 —— 把"点了没反应"拆成可判读的几条实测结果，用户截屏即可
-  /// 定位。文案刻意不用"错误"开头：多数情况不是缺陷，而是设备确实缺识别引擎。
-  Future<void> _showVoiceDiagnose() async {
-    if (!mounted) return;
-    showDialog<void>(
-      context: context,
-      barrierDismissible: true,
-      builder: (ctx) => AlertDialog(
-        title: const Text('语音输入诊断'),
-        content: _VoiceDiagnoseBody(),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('关闭'),
+  /// 传的是**同一份** `MarkdownStyleSheet.code`：代码块在消息里和全屏页上因此是
+  /// 同一套等宽/字号，不存在"点开之后字变了"。
+  Map<String, MarkdownElementBuilder> _codeBlockBuilders(TextStyle? codeStyle) {
+    return {
+      'pre': CodeBlockOpenBuilder(
+        codeStyle: codeStyle ??
+            TextStyle(
+              fontSize: AppText.subhead,
+              fontFamily: 'monospace',
+              color: context.c.textPrimary,
+            ),
+        padding: const EdgeInsets.all(AppSpace.l),
+      ),
+    };
+  }
+
+  /// 弹消息的统一 action sheet，动作按上下文裁剪：
+  ///
+  /// | 动作 | 出现条件 |
+  /// |---|---|
+  /// | 复制原文 | 有正文 |
+  /// | 引用 | 有正文 |
+  /// | 重新发送 | 有正文**且**是自己发的 |
+  /// | 查看本轮轨迹 | AI 消息（轨迹是**会话级**的，所以不看是否有正文） |
+  Future<void> _showMessageActions(DshService dsh, ChatMessage msg) async {
+    final text = msg.content.trim();
+    final actions = <MessageActionSpec>[
+      if (text.isNotEmpty) ...const [
+        MessageActionSpec(
+          id: 'copy',
+          label: '复制原文',
+          icon: Icons.copy_rounded,
+        ),
+        MessageActionSpec(
+          id: 'quote',
+          label: '引用',
+          icon: Icons.format_quote_rounded,
+          hint: '以 > 缩进放进输入框',
+        ),
+      ],
+      if (msg.isUser && text.isNotEmpty)
+        const MessageActionSpec(
+          id: 'resend',
+          label: '重新发送',
+          icon: Icons.refresh_rounded,
+          hint: '输入框里有草稿时不会覆盖它',
+        ),
+      if (msg.isAssistant)
+        const MessageActionSpec(
+          id: 'trajectory',
+          label: '查看本轮轨迹',
+          icon: Icons.timeline_rounded,
+        ),
+    ];
+    if (actions.isEmpty) return; // 纯附件/空消息：没有可做的，别弹空壳
+
+    final picked = await showMessageActionSheet(
+      context,
+      title: msg.isUser ? '我的消息' : 'AI 消息',
+      subtitle: messageActionSnippet(text),
+      actions: actions,
+    );
+    if (picked == null || !mounted) return;
+
+    switch (picked) {
+      case 'copy':
+        await Clipboard.setData(ClipboardData(text: text));
+        if (!mounted) return;
+        _toast('已复制原文');
+      case 'quote':
+        _quoteMessage(dsh, text);
+      case 'resend':
+        _resendMessage(dsh, msg);
+      case 'trajectory':
+        await _openTrajectory(dsh);
+    }
+  }
+
+  /// 「引用」：把正文以 `> 内容` 的形式塞进输入框，光标停在引用块之后。
+  ///
+  /// 三个细节都是刻意的：
+  /// * **逐行加 `>`**：一段多行引用如果只给第一行加，后面几行在 Markdown 里就
+  ///   掉出了引用块，重发出去的内容与原意不符；
+  /// * **插在光标处**（有选区则替换选区）而不是覆盖整个输入框 —— 用户可能正在
+  ///   写回复，引用是"补一句"而不是"重来"；
+  /// * **同步草稿**：输入框内容会随会话切换被换掉，不同步就等于切一次会话丢一次。
+  void _quoteMessage(DshService dsh, String content) {
+    final text = content.trim();
+    if (text.isEmpty) return;
+
+    final quoted = text
+        .split('\n')
+        .map((line) => line.trim().isEmpty ? '>' : '> $line')
+        .join('\n');
+    final insert = '$quoted\n\n';
+
+    final value = _inputController.value;
+    final selection = value.selection;
+    final start = selection.isValid ? selection.start : value.text.length;
+    final end = selection.isValid ? selection.end : value.text.length;
+    final next = value.text.replaceRange(start, end, insert);
+
+    _inputController.value = TextEditingValue(
+      text: next,
+      selection: TextSelection.collapsed(offset: start + insert.length),
+    );
+    dsh.updateDraft(next);
+    _inputFocusNode.requestFocus();
+    _toast('已引用到输入框');
+  }
+
+  /// 「重新发送」：原样再发一次这条消息。
+  ///
+  /// **不**静默覆盖输入框里未发出的草稿。原因：重发是用户自己发起的破坏性动作，
+  /// 而草稿是他刚写完还没交出去的字 —— 悄悄丢掉后者比"这次重发没成功"糟得多。
+  /// 所以有草稿时把焦点交回输入框并说明，让他先决定草稿怎么办。
+  void _resendMessage(DshService dsh, ChatMessage msg) {
+    final text = msg.content.trim();
+    if (text.isEmpty) return;
+    if (_inputController.text.trim().isNotEmpty) {
+      _inputFocusNode.requestFocus();
+      _toast('输入框里还有没发出去的内容，先清空再重发');
+      return;
+    }
+    _inputController.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+    _sendMessage(dsh);
+  }
+
+  /// 附件长按：同一个 sheet，附件专属动作。
+  ///
+  /// 附件没有"路径"可复制（字节留在宿主机，网关只给 id + 元数据），所以动作集是
+  /// 打开图片（仅图片）/ 复制文件名 / 复制附件 ID —— 最后一个是排障时唯一稳定的
+  /// 句柄（`sha256:…` 就是网关侧的 key）。
+  Future<void> _showAttachmentActions(DshService dsh, AttachmentRef ref) async {
+    final name = (ref.filename != null && ref.filename!.trim().isNotEmpty)
+        ? ref.filename!.trim()
+        : ref.id;
+    final meta = [
+      ref.mimeType,
+      if (ref.byteSize != null)
+        '${(ref.byteSize! / 1024).toStringAsFixed(0)} KB',
+    ].join(' · ');
+
+    final picked = await showMessageActionSheet(
+      context,
+      title: name,
+      subtitle: meta,
+      actions: [
+        if (ref.isImage)
+          const MessageActionSpec(
+            id: 'open-image',
+            label: '打开图片',
+            icon: Icons.open_in_full_rounded,
+            hint: '全屏查看，可双指缩放',
           ),
-        ],
+        const MessageActionSpec(
+          id: 'copy-filename',
+          label: '复制文件名',
+          icon: Icons.copy_rounded,
+        ),
+        const MessageActionSpec(
+          id: 'copy-attachment-id',
+          label: '复制附件 ID',
+          icon: Icons.fingerprint_rounded,
+          hint: '排障时用它定位这个附件',
+        ),
+      ],
+    );
+    if (picked == null || !mounted) return;
+
+    switch (picked) {
+      case 'open-image':
+        await _showAttachmentImage(dsh, ref);
+      case 'copy-filename':
+        await Clipboard.setData(ClipboardData(text: name));
+        if (!mounted) return;
+        _toast('已复制文件名');
+      case 'copy-attachment-id':
+        await Clipboard.setData(ClipboardData(text: ref.id));
+        if (!mounted) return;
+        _toast('已复制附件 ID');
+    }
+  }
+
+  /// 全屏看一张消息里的图片。
+  ///
+  /// 复用 `dsh.attachmentUrl(ref)`（同一份 Authorization 头）：裸 `Image.network`
+  /// 会 401，而图片字节留在宿主机、必须带 token 去取。
+  Future<void> _showAttachmentImage(DshService dsh, AttachmentRef ref) async {
+    final endpoint = dsh.attachmentUrl(ref);
+    if (endpoint == null) {
+      _toast('未连接网关，取不到这张图');
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (dialogCtx) => Dialog(
+        key: const ValueKey('attachment-image-viewer'),
+        insetPadding: const EdgeInsets.all(AppSpace.l),
+        backgroundColor: dialogCtx.c.background,
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: InteractiveViewer(
+                maxScale: 4,
+                child: Image.network(
+                  endpoint.url,
+                  headers: endpoint.headers,
+                  fit: BoxFit.contain,
+                  // 缩略图已经解码过一次；这里不能再用 cacheWidth —— 全屏看的就是
+                  // 细节，按显示尺寸降采样等于"点开之后更糊"。
+                  errorBuilder: (_, __, ___) => Center(
+                    child: Text(
+                      '图片加载失败',
+                      style: TextStyle(
+                        fontSize: AppText.body,
+                        color: dialogCtx.c.danger,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              top: AppSpace.xs,
+              right: AppSpace.xs,
+              child: IconButton(
+                key: const ValueKey('attachment-image-close'),
+                icon:
+                    Icon(Icons.close_rounded, color: dialogCtx.c.textSecondary),
+                onPressed: () => Navigator.pop(dialogCtx),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  Future<void> _startVoice(DshService dsh) async {    final ok = await VoiceInputService.instance.start(
-      // 中间结果是累积的，必须整段替换。
-      onPartial: (text, _) => _applyVoiceText(text, dsh),
-      onFinal: (text) => _applyVoiceText(text, dsh),
-      // [fix 2026-10-12] 引擎自动结束（时长上限/静音）：立刻灭掉聆听态，
-      // 以前按钮会一直亮着"聆听中"但引擎早已停了，说的内容也不会再进来。
-      onAutoStopped: mounted
-          ? (_) {
-              if (mounted) setState(() => _voiceListening = false);
-            }
-          : null,
-      onError: (msg) {
-        _toast(msg);
-        if (mounted) setState(() => _voiceListening = false);
-      },
+  /// 产出卡长按：同一个 sheet，交付物专属动作（打开 / 下载 / 复制路径）。
+  ///
+  /// 与信息面板、正文产物链接**共用同一批实现**（`_previewDeliverable` /
+  /// `_openDeliverable`）：三个入口一套行为，不存在"同一个文件在三处不一样"。
+  Future<void> _showDeliverableActions(
+      DshService dsh, DeliverableItem item) async {
+    final picked = await showMessageActionSheet(
+      context,
+      title: item.fileName,
+      subtitle: item.description.isNotEmpty ? item.description : item.path,
+      actions: const [
+        MessageActionSpec(
+          id: 'open',
+          label: '打开预览',
+          icon: Icons.visibility_rounded,
+          hint: '只读，不落文件',
+        ),
+        MessageActionSpec(
+          id: 'download',
+          label: '下载并打开',
+          icon: Icons.download_rounded,
+          hint: '落一份到手机上，交给系统应用',
+        ),
+        MessageActionSpec(
+          id: 'copy-path',
+          label: '复制路径',
+          icon: Icons.content_copy_rounded,
+          hint: '绝对路径，可直接粘到聊天里',
+        ),
+      ],
     );
-    if (mounted) {
-      setState(() {
-        _voiceListening = ok;
-        // 成功说明设备可用（可能用户刚在系统设置里开了麦克风权限），把状态纠正
-        // 回来，否则图标会一直停在"划掉的麦克风"上，看起来仍然不可用。
-        if (ok) _voiceSupported = true;
-      });
-    }
-  }
+    if (picked == null || !mounted) return;
 
-  Future<void> _stopVoice(DshService dsh) async {
-    await VoiceInputService.instance.stop();
-    if (mounted) setState(() => _voiceListening = false);
-  }
-
-  void _applyVoiceText(String text, DshService dsh) {
-    if (text.trim().isEmpty) return;
-    _inputController.text = text;
-    _inputController.selection = TextSelection.collapsed(offset: text.length);
-    // 语音内容同样要进草稿，否则进程被杀后说的这段话会丢。
-    dsh.updateDraft(text);
-  }
-
-  // ---------------------------------------------------------- 长按说话 --
-  //
-  // 长按生效的**唯一**条件：输入框为空（见下方 builder 里的 holdEnabled）。
-  // 一旦有文字，长按必须还给系统原本的"选中/粘贴"——抢走它会让编辑长文本
-  // 变得很难用。已有文字时想继续用语音，右边的麦克风按钮（点按）仍然在。
-
-  Future<void> _beginHoldTalk(DshService dsh) async {
-    if (_holdPhase != _HoldTalkPhase.idle) return;
-    HapticFeedback.mediumImpact();
-    setState(() {
-      _holdPhase = _HoldTalkPhase.recording;
-      _holdText = '';
-      _holdStartedAt = DateTime.now();
-    });
-    // 录音时长显示：1 秒一跳就够了，别用逐帧动画去拖主线程。
-    _holdTick?.cancel();
-    _holdTick = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted && _holdPhase == _HoldTalkPhase.recording) setState(() {});
-    });
-    // 兜底看门狗：语音服务挂死时 _endHoldTalk（依赖松手）可能永远不来，
-    // 也可能来了但 stop() 挂在平台回调上。30s 后强制收尾，把输入框还回去。
-    _holdWatchdog?.cancel();
-    _holdWatchdog = Timer(const Duration(seconds: 30), () {
-      if (!mounted || _holdPhase != _HoldTalkPhase.recording) return;
-      _cancelHoldTalk();
-      if (mounted) _toast('录音异常结束，已恢复输入框');
-    });
-
-    final ok = await VoiceInputService.instance.start(
-      // [fix 2026-10-12] 引擎自动结束（时长上限/静音超时/内部断句）：长按模式
-      // 下立刻进入确认态，用已有的 partial 文本收尾。以前这条路径没有任何
-      // 通知 —— 引擎停了 UI 还在"聆听"，用户松手时收到"没有听清"，说过的话
-      // 全部丢失。这正是"说一大段 → 未识别到"的根源。
-      onAutoStopped: mounted
-          ? (reason) => _finishHoldTalk(dsh, autoStopped: reason)
-          : null,
-      onPartial: (text, _) {
+    switch (picked) {
+      case 'open':
+        await _previewDeliverable(dsh, item);
+      case 'download':
+        await _openDeliverable(dsh, item);
+      case 'copy-path':
+        await Clipboard.setData(ClipboardData(text: item.path));
         if (!mounted) return;
-        setState(() {
-          _holdText = text;
-          _holdAwaitingFinal = false;
-        });
-      },
-      onFinal: (text) {
-        if (!mounted) return;
-        setState(() {
-          _holdText = text;
-          // 松手后才到的 final：把它补进输入框（前提是用户没改过内容）。
-          if (_holdAwaitingFinal && _inputController.text == _holdText) {
-            _inputController.text = text;
-          }
-          _holdAwaitingFinal = false;
-        });
-      },
-      onError: (msg) {
-        if (!mounted) return;
-        _holdTick?.cancel();
-        setState(() {
-          _holdPhase = _HoldTalkPhase.idle;
-          _holdText = '';
-        });
-        _toast(msg);
-      },
-    );
-    if (!mounted) return;
-    if (!ok) {
-      // 启动失败的原因已由 onError 说明；这里只负责收状态。
-      _holdTick?.cancel();
-      setState(() => _holdPhase = _HoldTalkPhase.idle);
-      return;
+        _toast('已复制路径');
     }
-    setState(() => _voiceSupported = true);
   }
 
-  /// 松手：停止识别，转录本进输入框，进入"重录 / 发送"确认态。
-  Future<void> _endHoldTalk(DshService dsh) async {
-    if (_holdPhase != _HoldTalkPhase.recording) return;
-    _holdTick?.cancel();
-    _holdAwaitingFinal = true;
-    // [fix 2026-10-11] The watchdog must outlive stop(): if stop() hangs on a
-    // platform callback (the exact bug c810842 fixed), cancelling it here
-    // leaves _holdPhase stuck at recording with nothing to fire — gestures are
-    // swallowed and the composer becomes untappable again. Timeout-stop first,
-    // and only then release the watchdog.
-    try {
-      await VoiceInputService.instance.stop().timeout(const Duration(seconds: 5));
-    } catch (_) {
-      // stop() failed or timed out — force-cancel recognition and fall through
-      // so the UI never stays stuck in the recording phase.
-      VoiceInputService.instance.cancel();
-    }
-    _holdWatchdog?.cancel();
-    if (!mounted) return;
-    await _finishHoldTalk(dsh);
-  }
-
-  /// [fix 2026-10-12] 录音收尾的统一出口：把已识别文本送进"重录/发送"确认态。
+  /// 滚动状态机检到"会话换了"时，属于 State 的那部分重置。
   ///
-  /// 两条路径共用：用户松手（_endHoldTalk）与引擎自动结束（onAutoStopped，
-  /// 时长上限/静音超时）。autoStopped 非空时 toast 说明原因 —— 用户需要知道
-  /// "引擎替我停了"，而不是对着还亮着的聆听界面发呆。
-  ///
-  /// 关键语义：**只要有 partial 文本就进确认态，不再报"没有听清"**。引擎被
-  /// 掐断时已识别的部分比一句"重来"有价值得多；真正一个字都没有才回 idle。
-  ///
-  /// ⚠️ 这里刻意**不做任何 sleep/延迟等待**：迟到的 final 由既有的
-  /// `_holdAwaitingFinal` 机制补写进输入框（onFinal 分支），不需要在这里等它。
-  /// 之前试过"空文本先等 300ms 再放弃"，但在 widget 测试的 fake clock 里
-  /// pumpAndSettle 推不动无 frame 调度的 timer，启动失败用例会卡在录音态。
-  Future<void> _finishHoldTalk(DshService dsh, {String? autoStopped}) async {
-    if (_holdPhase != _HoldTalkPhase.recording) return;
-    _holdTick?.cancel();
-    _holdWatchdog?.cancel();
-
-    final text = _holdText.trim();
-    if (text.isEmpty) {
-      // 一个字都没有：直接回 idle。松手后若引擎的 final 迟到，onFinal 分支
-      // 会因为 _holdAwaitingFinal 仍为 true 而把它补进输入框 —— 文本不丢。
-      setState(() {
-        _holdPhase = _HoldTalkPhase.idle;
-        _holdText = '';
-      });
-      _toast(autoStopped != null
-          ? '引擎提前结束且没有识别到内容（$autoStopped），请再长按说一次'
-          : '没有听清，再长按说一次');
-      return;
+  /// 顺序与原来 build() 里的那段逐行一致：先清界面态，再换草稿。
+  void _onScrollSessionSwitched(DshService dsh, String? previousSessionId) {
+    // 会话级的界面状态跟着切：队列展开态、产出卡片锚点、失败提示。
+    _queueExpanded = false;
+    _outputCardAnchorIndex = -1;
+    _lastSeenDeliverableEvents = dsh.deliverableEventCount;
+    _deliverableBusy.value = null;
+    _deliverableError = null;
+    // 切会话时换草稿（v1.4.2）。
+    //
+    // ⚠️ 两个坑，改动前都真实存在（v1.14 修）：
+    //
+    // 1) **不能**在这里调 `dsh.updateDraft(...)`。它的键是"当前会话"，而此刻
+    //    `_currentSession` 已经是**新**会话了 —— 等于把旧会话的正文写进新会话的
+    //    草稿槽。后果是：切回旧会话时输入框被它自己的旧草稿（往往是空的）覆盖，
+    //    用户刚打的字凭空消失；而那半句话则悄悄出现在新会话的输入框里。
+    //    所以这里按**上一个会话的 id** 显式写回它自己的槽位。
+    // 2) **首次进入不能写**。上一个会话 id 为 null 时（首个会话），输入框必然
+    //    是空的，写进去等于把这个会话已存的草稿用空串清掉（`DraftStore.write`
+    //    收到空串就是删除）。
+    if (previousSessionId != null &&
+        previousSessionId != dsh.currentSession?.sessionId) {
+      dsh.drafts.write(previousSessionId, _inputController.text);
     }
-
-    setState(() {
-      _holdPhase = _HoldTalkPhase.confirm;
-      _inputController.text = text;
-      _inputController.selection = TextSelection.collapsed(offset: text.length);
-    });
-    dsh.updateDraft(text);
-    if (autoStopped != null && mounted) {
-      _toast('引擎到达时长上限自动停止，已识别的内容已保留，可继续编辑或直接发送');
-    }
-  }
-
-  /// 手势被系统打断（来电、手势冲突等）：直接放弃这次录音。
-  void _cancelHoldTalk() {
-    if (_holdPhase != _HoldTalkPhase.recording) return;
-    _holdTick?.cancel();
-    _holdWatchdog?.cancel();
-    _holdAwaitingFinal = false;
-    VoiceInputService.instance.cancel();
-    if (!mounted) return;
-    setState(() {
-      _holdPhase = _HoldTalkPhase.idle;
-      _holdText = '';
-    });
-  }
-
-  /// 「重录」：清掉这次结果，立刻重新开始说话（不用再长按一次）。
-  Future<void> _redoHoldTalk(DshService dsh) async {
-    _inputController.clear();
-    dsh.updateDraft('');
-    setState(() {
-      _holdPhase = _HoldTalkPhase.idle;
-      _holdText = '';
-    });
-    await _beginHoldTalk(dsh);
-  }
-
-  /// 「发送」：把识别到的文本按正常消息发出去。
-  Future<void> _sendHoldTalk(DshService dsh) async {
-    final text = _inputController.text;
-    setState(() => _holdPhase = _HoldTalkPhase.idle);
-    if (text.trim().isEmpty) return;
-    _sendMessage(dsh); // 返回 void，别 await
+    final restored = dsh.currentDraft;
+    _inputController.text = restored;
+    _inputController.selection =
+        TextSelection.collapsed(offset: restored.length);
   }
 
   void _toast(String msg) {
@@ -3622,165 +1826,27 @@ class _ChatViewState extends State<ChatView> {
     return dsh.jobs.where((j) => j.isLive).length;
   }
 
-  /// 上下文压力告警（**只在跨过阈值时**才占空间）。
+  /// 打开会话信息面板（弹层实现见 `chat_sheets.dart` 的 `showChatSessionInfoSheet`）。
   ///
-  /// 触发条件里带 `isLive`：投影缓存快照可能落后几个小时，拿它去催用户
-  /// "该新开会话了"是在用旧数据催一个不可逆的决定。
-  Widget _buildContextPressureRow(DshService dsh) {
-    final stats = dsh.sessionStats;
-    final fraction = stats?.contextFraction;
-    if (stats == null || !stats.isLive || fraction == null) return const SizedBox.shrink();
-    if (fraction < SessionStatusStrip.pressureCriticalThreshold) return const SizedBox.shrink();
-
-    final pct = (fraction * 100).round();
-    return Container(
-      key: const ValueKey('context-pressure-row'),
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.fromLTRB(8, 4, 4, 4),
-      decoration: BoxDecoration(
-        color: context.c.dangerSurface,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: context.c.dangerBorder),
-      ),
-      child: Row(
-        children: [
-          Icon(Icons.warning_amber_rounded, size: 15, color: context.c.danger),
-          const SizedBox(width: 6),
-          Expanded(
-            child: Text(
-              '上下文已用 $pct%，继续下去可能被截断',
-              style: TextStyle(fontSize: 11.5, color: context.c.danger),
-            ),
-          ),
-          TextButton(
-            onPressed: () => dsh.createNewSession(),
-            style: TextButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              minimumSize: Size.zero,
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-            child: Text('新开会话', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: context.c.danger)),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// 打开会话信息面板：状态条的任意一段、卡片的"查看全部"、以及输入框上方的
-  /// 上下文告警都走这里。
-  ///
-  /// 打开时先发一次第三档加载（`jobs` + `schedules` —— 全链路最贵的两个请求，
-  /// 只在用户明确要看的时候拉）；面板自己也会在首帧后调一次 `onRefresh`，
-  /// 所以这里不重复发，只负责把"看过产出"这件事记下来。
-  /// 打开本会话的轨迹面板（v1.22）：轮 → 事件的时间线。
-  ///
-  /// 数据从 `dsh.messages` **当场重建**，并且让弹层在自己的路由里订阅一次
-  /// DshService —— 正在跑的那一轮会随流式事件推进。这和 `_openSessionInfo`
-  /// 是同一条理由：会话域的数据随时在变，冻住打开那一刻的快照只会让人以为卡死了。
-  ///
-  /// token 传的是 `lastTurnTokens`：引擎只上报**本轮**的增量，历史轮没有数据源，
-  /// 面板对拿不到的那些轮显示 `—`（见 `models/trajectory.dart` 的诚实规则 2）。
-  Future<void> _openTrajectory(DshService dsh) async {
-    // 先取 NavigatorState：下面闭包里 `context` 是弹层自己的，弹层关掉之后它就失效了。
-    final navigator = Navigator.of(context);
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => Consumer<DshService>(
-        builder: (_, d, __) {
-          final messages = d.messages;
-          return TrajectorySheet(
-            trajectory: Trajectory.build(
-              messages,
-              liveTurnTokens: d.lastTurnTokens,
-              running: d.isSending || d.isSessionRunning,
-            ),
-            onJumpToMessage: (id) {
-              // 关掉面板再滚：轨迹与消息流是同一屏的两个视图，留在面板上看不到
-              // 滚动效果，用户会以为"点了没反应"。
-              navigator.pop();
-              final index = messages.indexWhere((m) => m.id == id);
-              _highlightAndScrollToMessage(
-                id,
-                index: index >= 0 ? index : null,
-                total: messages.length,
-              );
-            },
-          );
-        },
-      ),
-    );
-  }
-
-  Future<void> _openSessionInfo(DshService dsh, {SessionInsightSection section = SessionInsightSection.usage}) async {
+  /// 这里只负责把「看过产出」记下来 —— 其余（第三档懒加载、面板订阅）都在弹层里。
+  Future<void> _openSessionInfo(
+    DshService dsh, {
+    SessionInsightSection section = SessionInsightSection.usage,
+  }) {
     _deliverablesAck[_ackKey(dsh)] = dsh.deliverableCount ?? 0;
     if (mounted) setState(() {});
-
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: context.c.surface,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
-      // 面板里的数据是**会话域**的，随时可能被事件刷新（例如作业列表刚拉回来），
-      // 所以让它在自己的路由里订阅一次 DshService —— 否则弹层会冻结在打开那一刻
-      // 的快照上，懒加载的结果永远看不见。
-      builder: (_) => Consumer<DshService>(
-        builder: (_, d, __) => ValueListenableBuilder<String?>(
-          valueListenable: _deliverableBusy,
-          builder: (_, busyPath, __) => SessionInfoSheet(
-            stats: d.sessionStats,
-            turnBurnTokens: d.lastTurnTokens,
-            deliverables: d.deliverables,
-            changes: d.workspaceChanges,
-            changesAvailable: d.workspaceChangesAvailable,
-            changesReason: d.workspaceChangesReason,
-            // [feat 2026-10-13] 变更清单的来源与"为什么 git 答不出来"。
-            // 工作区不是仓库时（多项目工作区的常见形态），面板必须说清原因并给出
-            // 相邻仓库，而不是留一片空白。
-            changesSource: d.workspaceChangesSource,
-            changesNote: d.workspaceChangesNote,
-            repoCandidates: d.workspaceRepos,
-            jobs: d.jobs,
-            jobsUnavailable: d.jobsDegraded.isNotEmpty,
-            schedules: d.schedules,
-            busyDeliverablePath: busyPath,
-            initialSection: section,
-            onOpenDeliverable: (item) => _openDeliverable(d, item),
-            // [feat 2026-10-13] 主点击改为文本预览（下载退到长按），回调为 null 时
-            // 面板自动退回旧行为，所以这里不做能力探测。
-            onPreviewDeliverable: (item) => d.fetchDeliverableText(item.path),
-            onLoadDiff: d.fetchDiff,
-            onKillJob: (job) => d.stopJob(job.id),
-            // [feat 2026-10-13] 后台任务输出查看器（引擎 `job/follow` 的可续读环）。
-            // 传回调即开启入口；null 时面板整块隐藏。
-            onLoadJobOutput: (job, from) => d.fetchJobOutput(job.id, from: from),
-            onDeleteSchedule: (s) => d.deleteSchedule(s.id),
-            onRefresh: d.fetchSessionExtras,
-            // [feat 2026-10-12] 子代理 / goal 控制 / 一键诊断。子代理列表属于
-            // 第三档懒加载（面板 onRefresh 一起拉）；拉不到（null）整块隐藏。
-            subagents: d.subagents,
-            subagentsUnavailable: d.subagentsUnavailable,
-            onInterruptSubagent: (sub) async {
-              final ok = await d.interruptSubagent(sub.id);
-              if (ok) await d.fetchSubagents();
-              return ok;
-            },
-            // [feat 2026-10-16] 智能体团队（Lead + 队友 + 共享任务板）。与子代理
-            // 同属面板懒加载，同一批拉取。
-            team: d.team,
-            teamUnavailable: d.teamUnavailable,
-            onControlGoal: (action, goal) => d.controlGoal(
-                  action,
-                  goalId: goal.goalId ?? '',
-                  revision: goal.revision ?? 0,
-                ),
-            onRunDiagnostics: () => d.runDiagnostics(),
-            diagnostics: d.diagnostics,
-            diagnosticsBusy: d.diagnosticsBusy,
-          ),
-        ),
-      ),
+    return showChatSessionInfoSheet(
+      context,
+      section: section,
+      deliverableBusy: _deliverableBusy,
+      openDeliverable: (d, item) => _openDeliverable(d, item),
+      // 归属工作区名：面板的「切换工作区」行要显示"当前在哪"。
+      // 用 `workspaceOfCurrentSession` 而不是 `currentWorkspace` —— 从通知/深链接
+      // 直接按 id 打开的会话可能不属于任何已加载工作区，那时显示相邻工作区的名字
+      // 就是一个错误的事实（与顶栏第二行同一口径）。
+      workspaceLabel: dsh.workspaceOfCurrentSession?.title,
+      // 轨迹面板必须由这里传入：它的"跳到消息"要用本页的滚动与高亮能力。
+      onOpenTrajectory: () => _openTrajectory(dsh),
     );
   }
 
@@ -3857,432 +1923,42 @@ class _ChatViewState extends State<ChatView> {
     });
   }
 
-  Widget _buildInputBar(DshService dsh) {
-    return Container(
-      // 测试用来量输入栏的实际位置：键盘弹出后它的底边必须紧贴键盘顶边，
-      // 中间不允许出现空白（这正是用户报的那个问题）。
-      key: const ValueKey('chat-input-bar'),
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
-      decoration: BoxDecoration(
-        color: context.c.surface,
-        border: Border(top: BorderSide(color: context.c.border)),
-      ),
-      child: SafeArea(
-        child: Container(
-          decoration: BoxDecoration(
-            color: context.c.surfaceMuted,
-            borderRadius: BorderRadius.circular(18),
-            border: Border.all(color: context.c.border),
-          ),
-          padding: const EdgeInsets.fromLTRB(10, 8, 8, 6),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // 上下文告警（v1.14）：**只在跨过阈值时**出现。
-              //
-              // 输入框上方是"我要行动"的位置，而"上下文快满了"正是一个必须当场
-              // 做的决策（继续会被截断 / 该新开会话）。平时一行都不占 —— 常驻在
-              // 这里的信息会被键盘弹起时的压缩挤掉，也会挤掉真正要打字的空间。
-              _buildContextPressureRow(dsh),
-              // 运行中说明（v1.14）：把"你发的消息会排队"讲在**打字之前**。
-              // 放在提示条/队列面板之上 —— 它描述的是"这个输入框现在是什么含义"。
-              _buildRunningHint(dsh),
-              // 上一条排队消息的回执（可撤回）。放在队列面板之上：它讲的是
-              // "刚刚那一下发生了什么"，而队列讲的是"现在攒了些什么"。
-              _buildNotice(dsh),
-              // 排队消息（v1.13）：agent 正在跑时你发出去的话先在这里等。
-              // 放在输入卡片**内部**最上方：它是"这条队列属于这个输入框"，
-              // 而不是另一块独立面板。
-              _buildQueueDock(dsh),
-              // 待发附件也放进卡片内 —— 它与"这条消息要发什么"是同一件事，
-              // 摆在卡片外会显得是两个不相干的东西。
-              if (_pendingAttachments.isNotEmpty) _buildPendingAttachments(),
-              // 提示词模板（v1.11.0）：点一下把模板文字接进输入框。
-              // 没有模板时不占任何空间。
-              if (dsh.snippets.isNotEmpty) _buildSnippetChips(dsh),
-
-              // 录音态的"正在聆听"面板由手势层内部渲染（见下方注释 2）——
-              // 这里**不能**把整块换成别的 widget，否则承载长按识别器的那一层
-              // 会被销毁、松手事件永远不来。
-              //
-              // ⚠️ 两个坑，都踩过，别退回去：
-              //
-              // 1) 为什么是"盖一层"而不是给 TextField 套 GestureDetector：
-                //    EditableText **内部**也有一个长按识别器（选词 + 弹工具条），
-                //    在手势竞技场里它比外层先注册、会赢 —— 实测长按有时能录音、
-                //    有时毫无反应，关掉 enableInteractiveSelection 也压不住。
-                //    盖一层不透明的层，指针根本到不了下面的 EditableText。
-                //
-                // 2) 为什么录音态**不换掉这一层**、只换它的内容：
-                //    长按开始后如果把承载识别器的 widget 从树上摘掉，识别器会被
-                //    一起销毁 —— `onLongPressEnd` 永远不会触发，于是松手之后
-                //    一直卡在"正在聆听"（这条在真机上同样会发生）。
-                //    所以这一层在整个手势期间必须保持存活；三个回调也**始终非空**
-                //    （在回调内部判状态），中途把回调置 null 同样会销毁识别器。
-                //
-                // 为什么不妨碍打字：系统文字输入走 EditableText 的 text input
-                // connection，不经过命中测试；而且一旦有内容这一层立刻消失，
-                // 光标/选择/长按选词全部恢复原样。
-                //
-                // 用 ValueListenableBuilder 只重建这一小块：可见性依赖输入内容，
-                // 用 setState 会每敲一个字重建整个 ChatView（含消息列表）。
-                ValueListenableBuilder<TextEditingValue>(
-                  valueListenable: _inputController,
-                  builder: (context, value, _) {
-                    final empty = value.text.isEmpty;
-                    final recording = _holdPhase == _HoldTalkPhase.recording;
-                    // 空框时覆盖，直到松手进入确认态（那时要让用户能改字/点按钮）。
-                    final showGestureLayer = (empty || recording) &&
-                        _holdPhase != _HoldTalkPhase.confirm;
-                    // 录音面板比输入框高（麦克风圆点 + 两行文字）。Stack 的高度由
-                    // 第一个孩子决定，所以录音时要显式给足空间，否则面板会被压在
-                    // 输入框那一行的高度里、报 RenderFlex overflow。
-                    // SizedBox 始终存在（只在高度上变），保证树的形状稳定 ——
-                    // 形状一变就可能重建承载长按识别器的元素，松手就收不到了。
-                    return SizedBox(
-                      height: recording ? 54 : null,
-                      child: Stack(
-                        children: [
-                          TextField(
-                            key: const ValueKey('chat-input-field'),
-                            controller: _inputController,
-                            focusNode: _inputFocusNode,
-                            style: TextStyle(color: context.c.textPrimary, fontSize: 14.5),
-                            maxLines: 5,
-                            minLines: 1,
-                            decoration: const InputDecoration(
-                              // 空框的提示由手势层负责（它才是那段交互的说明），
-                              // 这里留空，避免两层文案叠在一起。
-                              hintText: '',
-                              border: InputBorder.none,
-                              isDense: true,
-                              contentPadding: EdgeInsets.fromLTRB(6, 4, 6, 8),
-                            ),
-                            onChanged: (v) => dsh.updateDraft(v),
-                            onSubmitted: (_) => _sendMessage(dsh),
-                          ),
-                          if (showGestureLayer)
-                            Positioned.fill(
-                              child: GestureDetector(
-                                key: const ValueKey('chat-hold-layer'),
-                                behavior: HitTestBehavior.opaque,
-                                // 录音中不接受点按。**注意不要让这个回调变 null**：
-                                // 中途改动 GestureDetector 的识别器集合会牵动识别器
-                                // 生命周期，这里一律保持非空、在内部判状态。
-                                onTap: () {
-                                  if (_holdPhase == _HoldTalkPhase.recording) {
-                                    // 录音态下点按 = 自救出口。语音服务偶发挂死
-                                    //（listen 超时/平台不回调）时 _holdPhase 会被
-                                    // 卡在 recording，手势层吞掉一切点击且不再放行
-                                    // —— 用户表现为"输入框点不动、键盘弹不出来"。
-                                    // 点按直接放弃这次录音，把输入框还回去。
-                                    _cancelHoldTalk();
-                                    _toast('已取消录音');
-                                    return;
-                                  }
-                                  // requestFocus 只拿焦点，不保证唤起输入法：
-                                  // 指针被这层 opaque 手势层吃掉时，EditableText
-                                  // 自己的 tap→IME 请求不会发生。显式补一次
-                                  // requestImeFocus，让键盘一定弹出来。
-                                  _inputFocusNode.requestFocus();
-                                  FocusScope.of(context).requestFocus(_inputFocusNode);
-                                },
-                                onLongPressStart: (_) => _beginHoldTalk(dsh),
-                                onLongPressEnd: (_) => _endHoldTalk(dsh),
-                                onLongPressCancel: () => _cancelHoldTalk(),
-                                child: recording
-                                    ? _buildHoldRecordingPanel()
-                                    // 指令只在还没聚焦时显示：已经点了、键盘都弹出来了，
-                                    // 再挂着"点按打字"是多余的噪音。用 ListenableBuilder
-                                    // 只听焦点，避免为这点变化重建整个页面。
-                                    : ListenableBuilder(
-                                        listenable: _inputFocusNode,
-                                        builder: (context, _) {
-                                          if (_inputFocusNode.hasFocus) {
-                                            return const SizedBox.shrink();
-                                          }
-                                          return Align(
-                                            alignment: Alignment.centerLeft,
-                                            child: Padding(
-                                              padding: const EdgeInsets.fromLTRB(6, 4, 6, 8),
-                                              child: Text(
-                                                '点按打字，长按说话',
-                                                style: TextStyle(color: context.c.textTertiary, fontSize: 13.5),
-                                              ),
-                                            ),
-                                          );
-                                        },
-                                      ),
-                              ),
-                            ),
-                        ],
-                      ),
-                    );
-                  },
-                ),
-
-              if (_holdPhase == _HoldTalkPhase.confirm)
-                // 确认态：识别结果已经在输入框里（可直接改字），这里给两个动作。
-                _buildHoldConfirmRow(dsh)
-              else if (_holdPhase == _HoldTalkPhase.idle)
-                LayoutBuilder(
-                  builder: (context, box) {
-                    // 这一行的横向空间永远是紧的：在 360dp 宽的手机上，固定宽度
-                    // 的模型胶囊会把整行顶出去（实测 317 > 316，溢出 1px）。
-                    // 所以胶囊的可读宽度按**剩余空间**算，而不是钉死一个常量。
-                    //
-                    // 预留：停止键 36（不显示时 0）+ 斜杠命令键 36 + 附件键 36 +
-                    // 麦克风 44 + 发送键 44 + 三处间隔 6 + 胶囊自身装饰（内边距/
-                    // 图标/箭头）47 + 4 的安全余量。
-                    final stopWidth = (dsh.isSending || dsh.isCanceling) ? 36.0 : 0.0;
-                    // [feat 2026-10-12] 新增的 "/" 命令键也占 36，必须计入预留，
-                    // 否则 360dp 屏上胶囊把整行顶溢出 1px（queue_steer_impl_test 锁的就是这条）。
-                    const reserved = 36.0 + 36.0 + 44.0 + 44.0 + 6.0 + 47.0 + 4.0;
-                    final textCap = (box.maxWidth - stopWidth - reserved).clamp(40.0, 104.0);
-                    return Row(
-                      children: [
-                        // 停止键固定在**最左**（v1.14）：它曾经和发送键抢同一个位置，
-                        // 于是"输入框被清空"（切会话、重录、草稿恢复）会在用户毫无输入
-                        // 动作的情况下把发送键变成停止键 —— 手一抖就取消掉自己正在跑的
-                        // 回合。位置分开之后，任何状态变化都不会改变任何按钮的含义。
-                        _buildStopButton(dsh),
-                        // [feat 2026-10-12] "/" 命令菜单入口。输入框已有 / 开头
-                        // 草稿时高亮，两个入口共用同一个 sheet。
-                        _buildComposerIcon(
-                          key: const ValueKey('composer-slash-button'),
-                          icon: Icons.bolt_rounded,
-                          tooltip: '斜杠命令',
-                          highlighted: _inputController.text.startsWith('/'),
-                          onTap: () => _showCommandSheet(dsh),
-                        ),
-                        _buildComposerIcon(
-                          icon: Icons.add_rounded,
-                          tooltip: '添加图片或文件',
-                          highlighted: _pendingAttachments.isNotEmpty,
-                          onTap: () => _showAttachSheet(dsh),
-                        ),
-                        const Spacer(),
-                        _buildModelPill(dsh, maxTextWidth: textCap),
-                        const SizedBox(width: 2),
-                        _buildMicButton(dsh),
-                        const SizedBox(width: 4),
-                        _buildSendButton(dsh),
-                      ],
-                    );
-                  },
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// 录音中的面板：麦克风 + 已说的内容 + 时长，并明确写"松开结束"。
-  ///
-  /// 交互提示必须写出来：长按说话是"看不见的手势"，没有文案用户不会知道
-  /// 什么时候可以松手、松手会发生什么。
-  Widget _buildHoldRecordingPanel() {
-    final elapsed = _holdStartedAt == null
-        ? 0
-        : DateTime.now().difference(_holdStartedAt!).inSeconds;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(6, 6, 6, 8),
-      child: Row(
-        children: [
-          Container(
-            width: 30,
-            height: 30,
-            decoration: BoxDecoration(
-              color: context.c.dangerSurface,
-              shape: BoxShape.circle,
-              border: Border.all(color: context.c.danger.withOpacity(0.5)),
-            ),
-            child: Icon(Icons.mic_rounded, size: 17, color: context.c.danger),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  _holdText.isEmpty ? '正在聆听…' : _holdText,
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: _holdText.isEmpty ? context.c.textSecondary : context.c.textPrimary,
-                    fontSize: 14,
-                    height: 1.3,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  '松开结束 · ${elapsed}s',
-                  style: TextStyle(color: context.c.textTertiary, fontSize: 11),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// 松手后的确认行：重录 / 发送。
-  Widget _buildHoldConfirmRow(DshService dsh) {
-    return Padding(
-      padding: const EdgeInsets.only(top: 2),
-      child: Row(
-        children: [
-          Expanded(
-            child: OutlinedButton.icon(
-              style: OutlinedButton.styleFrom(
-                foregroundColor: context.c.textSecondary,
-                side: BorderSide(color: context.c.border),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
-                padding: const EdgeInsets.symmetric(vertical: 10),
-              ),
-              onPressed: () => _redoHoldTalk(dsh),
-              icon: const Icon(Icons.refresh_rounded, size: 17),
-              label: const Text('重录', style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600)),
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: context.c.accent,
-                foregroundColor: Colors.white,
-                elevation: 0,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
-                padding: const EdgeInsets.symmetric(vertical: 10),
-              ),
-              onPressed: () => _sendHoldTalk(dsh),
-              icon: const Icon(Icons.arrow_upward_rounded, size: 17),
-              label: const Text('发送', style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.bold)),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// 提示词模板 chips：横向滚动，点按把模板文字**追加**到输入框（不覆盖
-  /// 已有内容 —— 用户可能已经打了半句）。
-  Widget _buildSnippetChips(DshService dsh) {
-    return SizedBox(
-      height: 30,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        itemCount: dsh.snippets.length,
-        separatorBuilder: (_, __) => const SizedBox(width: 6),
-        itemBuilder: (ctx, i) {
-          final snip = dsh.snippets[i];
-          return ActionChip(
-            label: Text(snip.label, style: TextStyle(fontSize: 11.5, color: context.c.textSecondary)),
-            backgroundColor: context.c.surface,
-            side: BorderSide(color: context.c.border),
-            visualDensity: VisualDensity.compact,
-            onPressed: () {
-              final cur = _inputController.text;
-              _inputController.text = cur.isEmpty
-                  ? snip.text
-                  : '$cur\n${snip.text}';
-              _inputController.selection = TextSelection.fromPosition(
-                TextPosition(offset: _inputController.text.length),
-              );
-              dsh.updateDraft(_inputController.text);
-            },
-          );
-        },
-      ),
-    );
-  }
-
-  /// 运行中说明（v1.14）：把"这条消息的含义变了"讲在用户打字**之前**。
-  ///
-  /// 为什么必须有：上一版靠一枚"排队/插话"开关表达这件事，而开关只在回合跑起来
-  /// 之后才出现 —— 用户打字时看不到它，按发送时也未必看它，于是"这一条到底会排队
-  /// 还是插话"完全靠记忆。这里改成一句常驻说明：含义是不变的（永远排队），
-  /// 所以可以一直讲同一句话。
-  Widget _buildRunningHint(DshService dsh) {
-    if (!dsh.isSessionRunning) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6, left: 2, right: 2),
-      child: Row(
-        children: [
-          Icon(Icons.info_outline_rounded, size: 12, color: context.c.textTertiary),
-          const SizedBox(width: 5),
-          Expanded(
-            child: Text(
-              '本轮执行中 · 你发的消息会在本轮结束后自动发送',
-              style: TextStyle(fontSize: 11, color: context.c.textTertiary),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// 输入卡片上方的原地提示条（v1.14）：排队回执 / 插话结果 / 失败回滚说明。
-  ///
-  /// 与 `_toast` 的分工：`_toast` 用 SnackBar，适合"知道了"这类说完就算的消息；
-  /// 这条提示承载的是"你刚写的东西去哪了"，必须留在原地、可撤回、可重试。
-  Widget _buildNotice(DshService dsh) {
-    return ValueListenableBuilder<_ComposerNotice?>(
-      valueListenable: _notice,
-      builder: (context, notice, _) {
-        if (notice == null) return const SizedBox.shrink();
-        final tone = notice.ok ? context.c.textSecondary : context.c.danger;
-        return Container(
-          key: const ValueKey('chat-notice'),
-          margin: const EdgeInsets.only(bottom: 6),
-          padding: const EdgeInsets.fromLTRB(8, 4, 4, 4),
-          decoration: BoxDecoration(
-            color: notice.ok ? context.c.surface : context.c.dangerSurface,
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: notice.ok ? context.c.border : context.c.danger),
-          ),
-          child: Row(
-            children: [
-              Icon(
-                notice.ok ? Icons.check_circle_outline_rounded : Icons.error_outline_rounded,
-                size: 14,
-                color: tone,
-              ),
-              const SizedBox(width: 5),
-              Expanded(
-                child: Text(
-                  notice.text,
-                  style: TextStyle(fontSize: 11.5, color: notice.ok ? context.c.textSecondary : context.c.danger),
-                ),
-              ),
-              if (notice.action != _NoticeAction.none)
-                _queueTextButton(
-                  key: const ValueKey('chat-notice-action'),
-                  label: notice.action == _NoticeAction.undoQueue ? '撤回' : '重试',
-                  onTap: () => _onNoticeAction(dsh, notice),
-                ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  void _onNoticeAction(DshService dsh, _ComposerNotice notice) {
+  void _onNoticeAction(DshService dsh, ComposerNotice notice) {
     switch (notice.action) {
-      case _NoticeAction.undoQueue:
+      case NoticeAction.undoQueue:
         final id = notice.undoItemId;
+        final steered = _lastSteered;
         _clearNotice();
-        if (id != null) unawaited(_removeQueued(dsh, id, appliedText: '已撤回'));
+        if (id == null) break;
+        if (steered != null && steered.id == id) {
+          // ---- 「撤回插队」的降级实现（v1.27）----
+          //
+          // 网关**没有** unsteer：`queueAction` 只是把 `action.kind` 透传给网关，
+          // 已知可用的 kind 只有 edit / remove / steer（全仓 grep
+          // "unsteer|requeue" = 0）。而且被 steer 的条目已被引擎当场领走，
+          // 队列里再没有它 —— remove / edit 都无从下手。
+          //
+          // 所以唯一的诚实做法是：**把这句话原样放回输入框**，让用户自己决定
+          // 要不要再发一次。三处与"真撤销"的不等价，别对外说成"已撤销":
+          //   1) 引擎可能**已经执行过**那条 steer（它插进的是"最近的步骤"），
+          //      放回输入框不代表那条指令没有生效；
+          //   2) 不重新投递、也不进队列 —— 用户必须自己再点发送；
+          //   3) 回执 3 秒后消失，`_lastSteered` 并不清空（清空没意义），
+          //      所以别把它当"还能撤销"的依据。
+          _inputController.text = steered.text;
+          _inputController.selection =
+              TextSelection.collapsed(offset: _inputController.text.length);
+          dsh.updateDraft(_inputController.text);
+          _toast('网关不支持撤销插队，已把这句话放回输入框（不会自动重发）');
+          break;
+        }
+        unawaited(_removeQueued(dsh, id, appliedText: '已撤回'));
         break;
-      case _NoticeAction.retrySend:
+      case NoticeAction.retrySend:
         _clearNotice();
         _sendMessage(dsh);
         break;
-      case _NoticeAction.none:
+      case NoticeAction.none:
         break;
     }
   }
@@ -4297,221 +1973,6 @@ class _ChatViewState extends State<ChatView> {
   /// 要提供插话就只能靠一枚提前预设的开关（因为按下之前没有别的办法表达"我要插话"），
   /// 而那正是"用户忘了开关停在哪"的根源。消息先排队、用户看见它排在队列里、
   /// 再决定要不要让它插进去 —— 这是唯一顺序。
-  Widget _buildQueueDock(DshService dsh) {
-    final rows = dsh.queueItems;
-    // 队列可见性三态：读不到（已知失败）也要渲染，否则"路由坏了"会被静默当成
-    // "没有排队消息"（生产上真的发生过：GET queue 被通配路由吞掉）。
-    final unknown = dsh.queueKnown == false;
-    if (rows.isEmpty && dsh.queueError.isEmpty && !unknown) return const SizedBox.shrink();
-
-    final header = rows.isEmpty
-        ? (unknown ? '队列状态未知' : '排队消息')
-        : '${rows.length} 条排队中 · 本轮结束后自动发送';
-
-    // 展开态的上限：输入卡片是这条 Column 里唯一 Expanded（消息列表）的兄弟，
-    // 且**自身高度无上限** —— 20 条排队 × 约 66px 会直接把输入卡片顶出屏幕
-    // （RenderFlex 溢出）。所以就地展开必须限高 + 内部自己滚。
-    const double collapsedMax = 3 * 66.0;
-    const double expandedMax = 220;
-
-    return Container(
-      key: const ValueKey('queue-dock'),
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.fromLTRB(8, 6, 6, 6),
-      decoration: BoxDecoration(
-        color: context.c.surfaceMuted,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: context.c.border),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(Icons.queue_rounded, size: 14, color: context.c.textSecondary),
-              const SizedBox(width: 5),
-              Expanded(
-                child: Text(
-                  header,
-                  style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: context.c.textSecondary),
-                ),
-              ),
-              if (dsh.queueLoading)
-                SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.6, color: context.c.textTertiary)),
-            ],
-          ),
-          if (dsh.queueError.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Text(dsh.queueError, style: TextStyle(fontSize: 11, color: context.c.danger)),
-            ),
-          // 折叠时最多列 3 条：队列可能有十几条，全画出来会把输入框挤出屏幕 ——
-          // 而输入框才是这一块的主角。
-          //
-          // 溢出不再跳转到别的页面（那个页面已经删除）：**点一下就地把这个面板
-          // 展开**，仍然限高（220）+ 内部滚动，所以既看得到全部，又不会把输入框
-          // 顶出屏幕。
-          ConstrainedBox(
-            constraints: BoxConstraints(maxHeight: _queueExpanded ? expandedMax : collapsedMax),
-            child: SingleChildScrollView(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  for (final row in (_queueExpanded ? rows : rows.take(3))) _buildQueueRow(dsh, row),
-                ],
-              ),
-            ),
-          ),
-          if (rows.length > 3)
-            Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton(
-                key: const ValueKey('queue-dock-toggle'),
-                onPressed: () => setState(() => _queueExpanded = !_queueExpanded),
-                style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                  minimumSize: Size.zero,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-                child: Text(
-                  _queueExpanded ? '收起' : '还有 ${rows.length - 3} 条 · 展开全部',
-                  style: TextStyle(fontSize: 11, color: context.c.accent),
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildQueueRow(DshService dsh, QueueItem row) {
-    final armed = _armedSteerItemId == row.id;
-    return Padding(
-      key: ValueKey('queue-row-${row.id}'),
-      padding: const EdgeInsets.only(top: 6),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: Text(
-                  row.label,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 12.5, color: context.c.textPrimary),
-                ),
-              ),
-              const SizedBox(width: 8),
-              // 触摸区 36×36（旧版是 16px 图标 + 4px padding = 24px，与紧邻的
-              // 「删除」中心距只有 28px，误触会直接改掉正在跑的任务上下文）。
-              _queueIconButton(Icons.edit_outlined, '编辑', () => _editQueueRow(dsh, row), key: ValueKey('queue-edit-${row.id}')),
-              const SizedBox(width: 4),
-              _queueIconButton(Icons.close_rounded, '删除', () => _removeQueueRow(dsh, row), key: ValueKey('queue-remove-${row.id}')),
-            ],
-          ),
-          const SizedBox(height: 2),
-          if (dsh.isSessionRunning)
-            Row(
-              children: [
-                _queueTextButton(
-                  key: ValueKey('queue-steer-${row.id}'),
-                  label: armed ? '确认插话？' : '立即插话',
-                  // 第一次点击只"武装"，第二次才真的插进正在跑的回合。这条路径
-                  // 会改变 agent 当前的执行上下文，一次误触的代价是一整轮跑偏。
-                  onTap: () => _steerQueueRow(dsh, row),
-                  tone: armed ? context.c.warning : context.c.accent,
-                  filled: armed,
-                ),
-                if (armed) ...[
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      // 引擎的 steer 是插进**最近的步骤**（agent.steer），不会取消
-                      // 这一轮 —— 文案必须与真实语义一致，否则用户会以为任务要重跑。
-                      '会插进当前步骤，本轮不会重来',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 10.5, color: context.c.warning),
-                    ),
-                  ),
-                ],
-              ],
-            )
-          else
-            // 不可用时**给原因**，而不是一个点了没反应的死按钮。
-            Text(
-              '仅本轮运行中可插话发送',
-              style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _queueIconButton(IconData icon, String tooltip, VoidCallback? onTap, {Key? key}) {
-    return Tooltip(
-      message: tooltip,
-      child: InkWell(
-        key: key,
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(6),
-        child: SizedBox(
-          width: 36,
-          height: 36,
-          child: Center(
-            child: Icon(
-              icon,
-              size: 17,
-              color: onTap == null ? context.c.textTertiary : context.c.textSecondary,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// 队列条目上的文字按钮（v1.14）。
-  ///
-  /// 用文字而不是图标：⚡ 这种图标没有语义，而且同一个图标在发送键上已经被用过
-  /// 一次（两个含义）；文字按钮的触摸区天然达标，也不用靠 Tooltip 解释自己。
-  Widget _queueTextButton({
-    required String label,
-    required VoidCallback onTap,
-    Color? tone,
-    bool filled = false,
-    Key? key,
-  }) {
-    final color = tone ?? context.c.accent;
-    return InkWell(
-      key: key,
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(8),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
-        decoration: BoxDecoration(
-          color: filled ? color : Colors.transparent,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: color.withOpacity(filled ? 1.0 : 0.5)),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 11,
-            fontWeight: FontWeight.w600,
-            color: filled ? Colors.white : color,
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// 队列动作结束后的统一收敛。
-  ///
-  /// [QueueActionOutcome.alreadyGone] 必须**静默收敛**：那条消息已经被引擎领走，
-  /// 是正常时序（比如你点「立即插话」的同时这一轮刚好结束），报红错等于把本来
-  /// 就该发生的事说成故障。
   void _settleQueueAction(
     DshService dsh,
     QueueActionOutcome outcome, {
@@ -4526,7 +1987,8 @@ class _ChatViewState extends State<ChatView> {
         _showNotice('这条已经发出去了', duration: const Duration(seconds: 2));
         break;
       case QueueActionOutcome.failed:
-        _showNotice(dsh.queueError.isEmpty ? failedText : dsh.queueError, ok: false);
+        _showNotice(dsh.queueError.isEmpty ? failedText : dsh.queueError,
+            ok: false);
         break;
     }
   }
@@ -4537,34 +1999,50 @@ class _ChatViewState extends State<ChatView> {
   }
 
   /// 按 id 删除一条排队消息（删除按钮与回执条的「撤回」共用）。
-  Future<void> _removeQueued(DshService dsh, String itemId, {required String appliedText}) async {
+  Future<void> _removeQueued(DshService dsh, String itemId,
+      {required String appliedText}) async {
     final outcome = await dsh.queueAction(itemId, 'remove');
     if (!mounted) return;
-    _settleQueueAction(dsh, outcome, appliedText: appliedText, failedText: '删除失败');
+    _settleQueueAction(dsh, outcome,
+        appliedText: appliedText, failedText: '删除失败');
   }
 
-  /// 「立即插话」：第一次点击只进入待确认态，第二次才真的插话。
+  /// 「立即插话」（v1.27）：**点一下就插**，随后给 3 秒可撤回的回执。
+  ///
+  /// 为什么改掉"两次点击确认"：那个交互要用户先看一眼按钮文字变成「确认插话？」、
+  /// 再点第二次，而 2.5 秒的窗口一过又悄悄还原 —— 时间压力 + 状态不可见，实测
+  /// 只会让人反复试。现在把安全网换到**事后**：立即执行，回执条上直接给「撤回」。
+  ///
+  /// 撤回的语义见 `_onNoticeAction` 里那段注释 —— 网关没有 unsteer，所谓"撤回"
+  /// 是把正文放回输入框，不是把已经插进回合的指令拿回来。
   Future<void> _steerQueueRow(DshService dsh, QueueItem row) async {
-    if (_armedSteerItemId != row.id) {
-      HapticFeedback.selectionClick();
-      _steerArmTimer?.cancel();
-      setState(() => _armedSteerItemId = row.id);
-      _steerArmTimer = Timer(_steerConfirmWindow, () {
-        _steerArmTimer = null;
-        if (!mounted) return;
-        if (_armedSteerItemId == row.id) setState(() => _armedSteerItemId = null);
-      });
-      return;
-    }
-    _disarmSteer();
     HapticFeedback.mediumImpact();
     final outcome = await dsh.queueAction(row.id, 'steer');
     if (!mounted) return;
-    _settleQueueAction(dsh, outcome, appliedText: '已插话发送', failedText: '插话失败');
+    switch (outcome) {
+      case QueueActionOutcome.applied:
+        // 记下这一条：插队成功后它已被引擎领走，队列里再没有它，回执上的
+        // itemId 本身还原不出正文。
+        _lastSteered = row;
+        _showNotice(
+          '已插队到当前步骤',
+          action: NoticeAction.undoQueue,
+          undoItemId: row.id,
+          duration: const Duration(seconds: 3),
+        );
+        break;
+      case QueueActionOutcome.alreadyGone:
+        // 正常时序（点的同时这一轮刚好把它领走），不报红错。
+        _showNotice('这条已经发出去了', duration: const Duration(seconds: 2));
+        break;
+      case QueueActionOutcome.failed:
+        _showNotice(dsh.queueError.isEmpty ? '插话失败' : dsh.queueError,
+            ok: false);
+        break;
+    }
   }
 
   Future<void> _editQueueRow(DshService dsh, QueueItem row) async {
-    _disarmSteer();
     final controller = TextEditingController(text: row.text);
     final next = await showDialog<String>(
       context: context,
@@ -4578,7 +2056,8 @@ class _ChatViewState extends State<ChatView> {
           decoration: const InputDecoration(hintText: '只能编辑文字内容'),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           FilledButton(
             onPressed: () => Navigator.pop(ctx, controller.text),
             child: const Text('保存'),
@@ -4595,248 +2074,5 @@ class _ChatViewState extends State<ChatView> {
     final outcome = await dsh.queueAction(row.id, 'edit', text: next);
     if (!mounted) return;
     _settleQueueAction(dsh, outcome, appliedText: '已保存', failedText: '保存失败');
-  }
-
-  /// 操作行里的图标按钮。
-  ///
-  /// 刻意**不画圆圈边框**：这一行里已经有一个模型胶囊和一个实心发送键，再套三个
-  /// 圆圈就又回到"一堆控件并列"的碎感。图标本身足够表达功能，触摸区仍给足 36px。
-  Widget _buildComposerIcon({
-    Key? key,
-    required IconData icon,
-    required String tooltip,
-    required VoidCallback onTap,
-    bool highlighted = false,
-  }) {
-    return Tooltip(
-      key: key,
-      message: tooltip,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(18),
-        child: SizedBox(
-          width: 36,
-          height: 36,
-          child: Center(
-            child: Icon(
-              icon,
-              size: 22,
-              color: highlighted ? context.c.accent : context.c.textSecondary,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// 输入卡片里的模型选择。
-  ///
-  /// 从顶栏移到这里：它是"这条消息要发给谁"的设定，和输入内容属于同一个决策
-  /// 单元，放在手边更顺手，也省掉顶栏一整行。顶栏那个胶囊随之去掉 —— 同一件事
-  /// 不该在两处各显示一份。
-  ///
-  /// [maxTextWidth] 由操作行按剩余空间算出来（见 `_buildInputBar`）：手机上横向
-  /// 空间不足时先压缩模型名，而不是把整行顶出屏幕。
-  Widget _buildModelPill(DshService dsh, {double maxTextWidth = 104}) {
-    final name = dsh.currentModel.replaceFirst('cn:', '');
-    return InkWell(
-      onTap: () => _showModelSwitchSheet(context, dsh),
-      borderRadius: BorderRadius.circular(9),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.smart_toy_outlined, size: 14, color: context.c.textSecondary),
-            const SizedBox(width: 5),
-            ConstrainedBox(
-              constraints: BoxConstraints(maxWidth: maxTextWidth),
-              child: Text(
-                name,
-                style: TextStyle(fontSize: 12, color: context.c.textSecondary),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-            Icon(Icons.keyboard_arrow_down_rounded, size: 16, color: context.c.textTertiary),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// 停止键（v1.14 起与发送键**彻底分家**）。
-  ///
-  /// 只在本机**正在跑**这一轮时出现，并且固定在操作行最左端 —— 它曾经和发送键
-  /// 抢同一个位置（空输入框 = 停止、有内容 = 发送），后果是：任何"输入框被清空"
-  /// 的路径（切会话恢复草稿、重录、恢复草稿）都会在用户毫无输入动作的情况下
-  /// 把发送键变成停止键，手一抖就取消掉自己正在跑的回合，还丢掉一整轮进度。
-  /// 位置分开之后，任何状态变化都不会改变任何按钮的含义。
-  ///
-  /// 判据必须是 `isSending`（本机发起），**不是** `isSessionRunning`：会话可能是
-  /// 电脑端发起、手机只是旁观，那时给一个停止键等于让手机去停别人的活。
-  Widget _buildStopButton(DshService dsh) {
-    if (dsh.isCanceling) {
-      return const SizedBox(
-        width: 36,
-        height: 36,
-        child: Center(
-          child: SizedBox(
-            width: 16,
-            height: 16,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
-        ),
-      );
-    }
-    if (!dsh.isSending) return const SizedBox.shrink();
-    return Tooltip(
-      message: '停止本轮',
-      child: InkWell(
-        key: const ValueKey('chat-stop-button'),
-        onTap: () {
-          HapticFeedback.mediumImpact();
-          dsh.cancelActiveTurn();
-        },
-        borderRadius: BorderRadius.circular(18),
-        child: Container(
-          width: 36,
-          height: 36,
-          decoration: BoxDecoration(
-            color: context.c.dangerSurface,
-            shape: BoxShape.circle,
-            border: Border.all(color: context.c.danger),
-          ),
-          child: Icon(Icons.stop_rounded, color: context.c.danger, size: 18),
-        ),
-      ),
-    );
-  }
-
-  /// 发送键。
-  ///
-  /// * 没有可发的内容时**置灰且不可点** —— 上一版无论有没有文字都是亮着的，
-  ///   点下去没反应，用户会以为卡住了。
-  /// * 运行中它**还是发送键**（含义变成"排队"），不再变成停止键；角标上的数字
-  ///   是"已经排了几条"。含义的改变由输入框上方的常驻说明讲清楚，不靠按钮变脸。
-  ///
-  /// ⚠️ 整个判断必须包在 ValueListenableBuilder 里。最初把 `hasDraft` 写在
-  /// 函数开头，而调用它的输入栏只在 DshService 通知时才重建 —— 用户敲字只
-  /// 触发 ValueListenableBuilder 这一小块重建，于是"敲了字按钮还是置灰"。
-  Widget _buildSendButton(DshService dsh) {
-    return ValueListenableBuilder<TextEditingValue>(
-      valueListenable: _inputController,
-      builder: (context, value, _) {
-        final canSend = value.text.trim().isNotEmpty || _pendingAttachments.isNotEmpty;
-        final queued = dsh.isSessionRunning ? dsh.queueItems.length : 0;
-        return SizedBox(
-          width: 44,
-          height: 44,
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              Positioned.fill(
-                child: InkWell(
-                  key: const ValueKey('chat-send-button'),
-                  onTap: canSend ? () => _sendMessage(dsh) : null,
-                  borderRadius: BorderRadius.circular(22),
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: canSend ? context.c.accent : context.c.border,
-                      shape: BoxShape.circle,
-                    ),
-                    child: Icon(
-                      Icons.arrow_upward_rounded,
-                      size: 22,
-                      color: canSend ? Colors.white : context.c.textTertiary,
-                    ),
-                  ),
-                ),
-              ),
-              // 队列数角标：运行中按发送 = 排队，用户需要知道已经攒了几条。
-              // 刻意不用 ⚡ 之类的另一套图标 —— 同一个位置换图标会让人以为
-              // "发送键变成了别的东西"，而这正是上一版的问题。
-              if (queued > 0)
-                Positioned(
-                  right: 0,
-                  top: 0,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                    constraints: const BoxConstraints(minWidth: 15),
-                    decoration: BoxDecoration(
-                      color: context.c.warning,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: context.c.surface, width: 1.5),
-                    ),
-                    child: Text(
-                      '$queued',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(fontSize: 9.5, fontWeight: FontWeight.bold, color: Colors.white),
-                    ),
-                  ),
-                ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-/// 「语音输入诊断」对话框的内容体。
-///
-/// 独立成一个 StatefulWidget 而不是在调用处内联：诊断要 await 四五次平台查询，
-/// 需要一个自己的加载态；塞进 ChatView 的 dialog builder 里会让那边没法 setState。
-class _VoiceDiagnoseBody extends StatefulWidget {
-  @override
-  State<_VoiceDiagnoseBody> createState() => _VoiceDiagnoseBodyState();
-}
-
-class _VoiceDiagnoseBodyState extends State<_VoiceDiagnoseBody> {
-  String? _report;
-
-  @override
-  void initState() {
-    super.initState();
-    // 超时兜底：诊断本身也不能变成"打不开"。
-    VoiceInputService.instance
-        .diagnose()
-        .timeout(const Duration(seconds: 20), onTimeout: () => '诊断超时：平台没有响应')
-        .then((r) {
-      if (mounted) setState(() => _report = r);
-    }).catchError((Object e) {
-      if (mounted) setState(() => _report = '诊断失败: $e');
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final c = context.c;
-    return SizedBox(
-      width: 320,
-      child: _report == null
-          ? const Padding(
-              padding: EdgeInsets.symmetric(vertical: 24),
-              child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
-            )
-          : SingleChildScrollView(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  SelectableText(
-                    _report!,
-                    style: TextStyle(fontSize: 12.5, height: 1.7, color: c.textPrimary),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    '若「服务可用」为否且「中文语言包」为空，说明这台设备没有语音识别'
-                    '服务，App 侧无法解决。',
-                    style: TextStyle(fontSize: 11.5, height: 1.6, color: c.textTertiary),
-                  ),
-                ],
-              ),
-            ),
-    );
   }
 }

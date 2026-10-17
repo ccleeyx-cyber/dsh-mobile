@@ -3,7 +3,10 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 
 import 'package:dsh_mobile/main.dart';
+import 'package:dsh_mobile/models/approval_request.dart';
 import 'package:dsh_mobile/models/pending_attachment.dart';
+import 'package:dsh_mobile/models/task_center.dart';
+import 'package:dsh_mobile/models/workspace.dart';
 import 'package:dsh_mobile/services/dsh_service.dart';
 import 'package:dsh_mobile/services/voice_input_service.dart';
 import 'package:dsh_mobile/theme/app_colors.dart';
@@ -20,7 +23,8 @@ void main() {
   ///
   /// 返回 service 实例，因为有些路径只在"已连接"时才可达（附件入口就是），
   /// 调用方需要自己设定连接状态。
-  Future<DshService> pumpChat(WidgetTester tester, {Size size = const Size(400, 900)}) async {
+  Future<DshService> pumpChat(WidgetTester tester,
+      {Size size = const Size(400, 900)}) async {
     tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -29,7 +33,8 @@ void main() {
       ChangeNotifierProvider<DshService>.value(
         value: dsh,
         child: MaterialApp(
-          builder: (ctx, child) => ThemeScope(isDark: false, child: child ?? const SizedBox()),
+          builder: (ctx, child) =>
+              ThemeScope(isDark: false, child: child ?? const SizedBox()),
           home: const ChatView(),
         ),
       ),
@@ -213,10 +218,12 @@ void main() {
         MultiProvider(
           providers: [
             ChangeNotifierProvider<DshService>.value(value: DshService()),
-            ChangeNotifierProvider<ThemeController>.value(value: ThemeController()),
+            ChangeNotifierProvider<ThemeController>.value(
+                value: ThemeController()),
           ],
           child: MaterialApp(
-            builder: (ctx, child) => ThemeScope(isDark: false, child: child ?? const SizedBox()),
+            builder: (ctx, child) =>
+                ThemeScope(isDark: false, child: child ?? const SizedBox()),
             home: const MainShell(),
           ),
         ),
@@ -238,7 +245,8 @@ void main() {
       //
       // 去掉导航栏后内层底边等于屏幕底边，抬高量恰好等于键盘高度。
       await pumpShell(tester);
-      expect(find.byType(NavigationBar), findsOneWidget, reason: '前置条件：收起时有导航栏');
+      expect(find.byType(NavigationBar), findsOneWidget,
+          reason: '前置条件：收起时有导航栏');
 
       tester.view.viewInsets = const FakeViewPadding(bottom: 320);
       await tester.pump();
@@ -311,7 +319,9 @@ void main() {
           find.byWidgetPredicate(
             (w) =>
                 w is Icon &&
-                (w.icon == Icons.mic_rounded || w.icon == Icons.mic_none_rounded || w.icon == Icons.mic_off_rounded),
+                (w.icon == Icons.mic_rounded ||
+                    w.icon == Icons.mic_none_rounded ||
+                    w.icon == Icons.mic_off_rounded),
           )
         ),
         ('发送', find.byIcon(Icons.arrow_upward_rounded)),
@@ -323,7 +333,8 @@ void main() {
         final cardRect = tester.getRect(card.last);
         final ctlRect = tester.getRect(finder);
         expect(
-          ctlRect.left >= cardRect.left - 1 && ctlRect.right <= cardRect.right + 1,
+          ctlRect.left >= cardRect.left - 1 &&
+              ctlRect.right <= cardRect.right + 1,
           isTrue,
           reason: '$label 应位于输入卡片内部：控件 $ctlRect vs 卡片 $cardRect',
         );
@@ -353,10 +364,12 @@ void main() {
       await pumpChat(tester);
 
       InkWell sendInk() => tester.widget<InkWell>(
-            find.ancestor(
-              of: find.byIcon(Icons.arrow_upward_rounded),
-              matching: find.byType(InkWell),
-            ).first,
+            find
+                .ancestor(
+                  of: find.byIcon(Icons.arrow_upward_rounded),
+                  matching: find.byType(InkWell),
+                )
+                .first,
           );
 
       // 空输入框：发送键必须是禁用的 —— 上一版无论有没有文字都是亮着的，
@@ -376,15 +389,18 @@ void main() {
       final state = tester.state(find.byType(ChatView));
 
       (state as dynamic).debugAddPendingAttachment(
-        const PendingFile(localId: 'f1', name: 'a.txt', byteLength: 8, receiptId: 'r'),
+        const PendingFile(
+            localId: 'f1', name: 'a.txt', byteLength: 8, receiptId: 'r'),
       );
       await tester.pump();
 
       final ink = tester.widget<InkWell>(
-        find.ancestor(
-          of: find.byIcon(Icons.arrow_upward_rounded),
-          matching: find.byType(InkWell),
-        ).first,
+        find
+            .ancestor(
+              of: find.byIcon(Icons.arrow_upward_rounded),
+              matching: find.byType(InkWell),
+            )
+            .first,
       );
       // 引擎的准入规则是"文字或附件"，所以只有附件也必须能发。
       expect(ink.onTap, isNotNull, reason: '只挂附件也应当能发送');
@@ -398,7 +414,9 @@ void main() {
       final mic = find.byWidgetPredicate(
         (w) =>
             w is Icon &&
-            (w.icon == Icons.mic_rounded || w.icon == Icons.mic_none_rounded || w.icon == Icons.mic_off_rounded),
+            (w.icon == Icons.mic_rounded ||
+                w.icon == Icons.mic_none_rounded ||
+                w.icon == Icons.mic_off_rounded),
       );
       expect(mic, findsOneWidget);
 
@@ -426,11 +444,80 @@ void main() {
       expect(find.byIcon(Icons.folder_rounded), findsNothing,
           reason: '工作区胶囊已从顶栏移除');
       expect(
-        find.descendant(of: find.byType(AppBar), matching: find.byIcon(Icons.arrow_drop_down)),
+        find.descendant(
+            of: find.byType(AppBar),
+            matching: find.byIcon(Icons.arrow_drop_down)),
         findsNothing,
         reason: '顶栏不应再有胶囊式下拉',
       );
 
+      await teardown(tester);
+    });
+  });
+
+  // ============================ 状态胶囊行（v1.27） ============================
+  //
+  // 输入区原来自上而下叠了六层常驻内容（上下文告警 / 运行提示 / 回执 / 队列 dock /
+  // 附件 / 模板 chips）。手机上键盘一弹，真正留给"我要打的那句话"的高度不足一行。
+  // 现在常驻最多两行：状态胶囊行 + 文本框，其余按优先级轮换、轮换掉的进「⋯」。
+  group('状态胶囊行：同一时刻只显示一条待办', () {
+    testWidgets('只有一条待办时：只显示那一枚胶囊，没有「⋯」', (tester) async {
+      final dsh = await pumpChat(tester);
+      dsh.debugSetRunning(true);
+      await tester.pump();
+
+      expect(find.textContaining('本轮执行中'), findsOneWidget);
+      // 一条待办没有"其余"可言，多画一个 ⋯ 只会让人以为里面还有东西。
+      expect(find.byKey(const ValueKey('composer-status-more')), findsNothing);
+      await teardown(tester);
+    });
+
+    testWidgets('多条待办时只显示优先级最高的那条，「⋯」里能看到全部', (tester) async {
+      final dsh = await pumpChat(tester);
+      dsh.debugSetRunning(true);
+      dsh.debugSetQueue(
+          [const QueueItem(id: 'm1', text: '排队的一条', attachments: 0)]);
+      await tester.pump();
+
+      // 队列(accent) 比"本轮执行中"(textSecondary) 优先，所以胶囊显示队列。
+      expect(find.textContaining('1 条排队中'), findsOneWidget);
+      expect(find.textContaining('本轮执行中'), findsNothing, reason: '同一时刻只显示一条');
+      final more = find.byKey(const ValueKey('composer-status-more'));
+      expect(more, findsOneWidget);
+
+      await tester.tap(more);
+      await tester.pumpAndSettle();
+      // 弹层里两件事都在 —— 这是"被轮换掉的那些去哪了"的答案。
+      // （'1 条排队中' 会出现两次：胶囊本体一次、弹层里一行。'本轮执行中' 只在
+      //  弹层里，正好用来证明"被轮换掉的那条确实在弹层中"。）
+      expect(find.text('1 条排队中'), findsWidgets);
+      expect(find.text('本轮执行中 · 你发的消息会在本轮结束后自动发送'), findsOneWidget);
+      await teardown(tester);
+    });
+
+    testWidgets('待审批压过队列与运行提示（它是唯一卡住 agent 的事）', (tester) async {
+      final dsh = await pumpChat(tester);
+      dsh.debugSetCurrentSession(
+          SessionMeta(sessionId: 'session-a', title: 'A'));
+      dsh.debugSetRunning(true);
+      dsh.debugSetQueue(
+          [const QueueItem(id: 'm1', text: '排队的一条', attachments: 0)]);
+      dsh.debugSetPendingApprovals([
+        ApprovalRequest(
+          id: 'ap1',
+          eventId: 'e1',
+          sessionId: 'session-a',
+          toolName: 'bash',
+          reason: '要执行命令',
+          createdAt: 0,
+        ),
+      ]);
+      await tester.pump();
+
+      expect(find.textContaining('在等你批准'), findsOneWidget);
+      expect(find.textContaining('条排队中'), findsNothing, reason: '队列让位给审批');
+      expect(
+          find.byKey(const ValueKey('composer-status-more')), findsOneWidget);
       await teardown(tester);
     });
   });

@@ -56,6 +56,15 @@ class SafeMarkdown extends StatelessWidget {
   /// 所以宿主只需要维护一条打开链接的路径。
   final MarkdownTapLinkCallback? onTapLink;
 
+  /// 元素级自定义渲染钩子（原样透传给 `MarkdownBody.builders`）。
+  ///
+  /// 目前唯一的用户是**代码块**：`pre` 需要被替换成带「全屏阅读」按钮的版本
+  /// （见 `views/code_viewer_page.dart` 的 `CodeBlockOpenBuilder`）。做成可选参数
+  /// 而不是写死在这层，是因为 `widgets/` 不该反过来认识 `views/` 的页面，而且
+  /// 其它调用方（交付物预览、运维面板、记忆卡）不需要这个钩子 —— 默认 null
+  /// 时行为与改动前**逐字一致**。
+  final Map<String, MarkdownElementBuilder> builders;
+
   const SafeMarkdown({
     super.key,
     required this.data,
@@ -63,6 +72,7 @@ class SafeMarkdown extends StatelessWidget {
     this.selectable = true,
     this.fallbackTextStyle,
     this.onTapLink,
+    this.builders = const <String, MarkdownElementBuilder>{},
   });
 
   @override
@@ -115,9 +125,11 @@ class SafeMarkdown extends StatelessWidget {
         selectable: selectable,
         styleSheet: styleSheet,
         onTapLink: onTapLink,
+        builders: builders,
       );
     } catch (e, stack) {
-      debugPrint('[SafeMarkdown] Fallback to raw text due to parsing error: $e\n$stack');
+      debugPrint(
+          '[SafeMarkdown] Fallback to raw text due to parsing error: $e\n$stack');
       return SelectableText(
         text,
         style: fallbackTextStyle ??

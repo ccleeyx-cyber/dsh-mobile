@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../models/bridge_extras.dart';
 import '../services/dsh_service.dart';
 import '../theme/app_colors.dart';
+import '../widgets/inline_error_bar.dart';
 import '../widgets/safe_markdown.dart';
 
 /// 运维面板（bridge v1.16）：把"手机上能对主机做的事"收进一屏四个页签。
@@ -905,6 +906,12 @@ class _GoalsTabState extends State<_GoalsTab> {
   /// 这些写都是 CAS 的，两个并发操作里必有一个拿着旧 revision，注定失败。
   String? _busyAction;
 
+  /// 目标控制/编辑失败的常驻错误（Phase 4.5）。
+  ///
+  /// 这两类失败都是"看起来什么都没发生"：按了暂停、目标还在跑；改了目标、
+  /// 文本没变。SnackBar 飘走之后用户没有任何线索说明为什么。
+  String? _actionError;
+
   @override
   void initState() {
     super.initState();
@@ -983,12 +990,11 @@ class _GoalsTabState extends State<_GoalsTab> {
     setState(() => _busyAction = null);
 
     if (!ok) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('引擎拒绝了「$label」—— 目标可能已被模型侧改动，revision 已过期，刷新后重试。'),
-        behavior: SnackBarBehavior.floating,
-      ));
+      setState(() => _actionError =
+          '引擎拒绝了「$label」—— 目标可能已被模型侧改动，revision 已过期，点「重试」会先刷新再让你继续。');
       return;
     }
+    setState(() => _actionError = null);
     await _fetch();
   }
 
@@ -1014,12 +1020,11 @@ class _GoalsTabState extends State<_GoalsTab> {
     setState(() => _busyAction = null);
 
     if (error != null) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('编辑失败：$error'),
-        behavior: SnackBarBehavior.floating,
-      ));
+      // 编辑失败时目标文本会**保持原样**，看起来就像没点到编辑 —— 所以留在页面上。
+      setState(() => _actionError = '编辑失败：$error');
       return;
     }
+    setState(() => _actionError = null);
     // 编辑成功会让 revision +1，页面上的 ref 已经过期 —— 必须重取，否则下一次
     // 暂停/继续会拿着旧 revision 打回去。
     await _fetch();
@@ -1065,6 +1070,16 @@ class _GoalsTabState extends State<_GoalsTab> {
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.fromLTRB(14, 14, 14, 24),
       children: <Widget>[
+        if (_actionError != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: InlineErrorBar(
+              key: const ValueKey('goal-action-error'),
+              message: _actionError!,
+              onRetry: _retry,
+              onDismiss: () => setState(() => _actionError = null),
+            ),
+          ),
         // 缓存快照必须自己先说清楚，且要说在数字**前面**：用户先读到的是这一段。
         if (board.isSnapshot) ...<Widget>[
           _noticeBox(
@@ -1410,6 +1425,10 @@ class _ForksTabState extends State<_ForksTab> {
   int? _busySeq;
   bool _busyWhole = false;
 
+  /// 分支失败的常驻错误（Phase 4.5）：失败后列表没有任何变化，SnackBar 一走
+  /// 用户就只剩"我点了分支，但好像什么都没发生"。
+  String? _actionError;
+
   @override
   void initState() {
     super.initState();
@@ -1489,12 +1508,10 @@ class _ForksTabState extends State<_ForksTab> {
       final message = outcome.unavailable
           ? '该轮还没有结束，引擎拒绝从这里分支（fork-unavailable）。等这一轮跑完再选它。'
           : (outcome.error.isEmpty ? '分支失败，引擎没有给出原因。' : '分支失败：${outcome.error}');
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(message),
-        behavior: SnackBarBehavior.floating,
-      ));
+      setState(() => _actionError = message);
       return;
     }
+    setState(() => _actionError = null);
 
     final sessionId = outcome.sessionId;
     await showDialog<void>(
@@ -1566,6 +1583,16 @@ class _ForksTabState extends State<_ForksTab> {
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
       children: <Widget>[
+        if (_actionError != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: InlineErrorBar(
+              key: const ValueKey('fork-action-error'),
+              message: _actionError!,
+              onRetry: _retry,
+              onDismiss: () => setState(() => _actionError = null),
+            ),
+          ),
         Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[

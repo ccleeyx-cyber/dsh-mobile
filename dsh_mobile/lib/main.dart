@@ -255,6 +255,11 @@ ThemeData buildLightTheme() => ThemeData(
       useMaterial3: true,
       brightness: Brightness.light,
       scaffoldBackgroundColor: AppColors.background,
+      // seedColor 直接读 token 层，而不是在这里抄一遍品牌色 —— 品牌色调整时
+      // 只需要改 theme/app_colors.dart 一处，Material 派生的整条调色板（primary /
+      // secondary / container 系列）会跟着重算。这里显式传 surface/primary 是
+      // 因为 fromSeed 的派生值不会等于我们定的中性面，覆盖掉才能让 Card /
+      // FilledButton 与手写的 widget 用同一块底色。
       colorScheme: ColorScheme.fromSeed(
         seedColor: AppColors.accent,
         brightness: Brightness.light,
@@ -290,6 +295,9 @@ ThemeData buildDarkTheme() => ThemeData(
       useMaterial3: true,
       brightness: Brightness.dark,
       scaffoldBackgroundColor: AppColors.backgroundDark,
+      // 与浅色逐项对称：同一个 seed 语义（品牌色）+ 同一组覆盖字段，只换成
+      // *Dark 取值。两个工厂的结构必须完全一致，测试会逐项比对
+      // （test/theme/dark_mode_test.dart「两个主题结构对称」）。
       colorScheme: ColorScheme.fromSeed(
         seedColor: AppColors.accentDark,
         brightness: Brightness.dark,

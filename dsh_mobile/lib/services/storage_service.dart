@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../models/local_snippet.dart';
 import '../models/server_config.dart';
 import 'secure_store.dart';
 
@@ -85,6 +86,77 @@ class StorageService {
   }
 
   static final Random _rng = Random.secure();
+
+  // ------------------------------------------------- 本地快捷指令（v1.27）--
+
+  /// 本地快捷指令的持久化键（Phase 5.4）。
+  ///
+  /// **存储键**：`dsh_local_snippets`，值是一个 JSON 数组，每个元素形如
+  /// `{"id":"local_...","label":"翻译","text":"把下面这段翻成{lang}：","tag":"翻译"}`。
+  ///
+  /// 为什么是独立的一个键、而不是塞进 `dsh_server_config`：
+  ///
+  ///   * 快捷指令是**本机**的东西，删掉/换掉当前网关不该把它带走。挂在网关下面
+  ///     等于让它随配置一起被覆盖；
+  ///   * 网关下发的 `dsh.snippets` 只有内存副本（服务端 `~/.dsh/mobile-access/
+  ///     snippets.json` 才是真源），两者刻意不同步 —— 本地这份永远不写回服务端。
+  ///
+  /// **迁移策略**（比"新版本读旧数据"更宽一点，覆盖三种真实会遇到的形状）：
+  ///
+  ///   1. 键不存在（升级前的安装、或用户从没建过）→ 空列表。**不写回**，所以
+  ///      下次还能区分"没有"与"空"；
+  ///   2. 某个元素缺 `id`/`label`/`tag` → 该字段按空串处理，`id` 就地按**位置**
+  ///      补一个（`local-<i>`），这一轮里编辑/删除/排序立刻可用；下次保存时才落盘；
+  ///   3. JSON 坏掉 / 不是数组 / 元素不是对象 → 能救的照救，救不了的就跳过；
+  ///      整体解析失败返回空列表并**保留盘上的原文不删** —— 读失败不等于没有数据，
+  ///      真把用户的东西清掉才是。正文为空串的条目跳过（它插不进输入框，留着只
+  ///      会在列表里多一行点不出内容的行）。
+  ///
+  /// 取值上限 [maxLocalSnippets] 条，超出时**保留前 N 条**（与界面上的顺序一致，
+  /// 用户在底部看不到的条目先被截掉），并在界面上如实提示。
+  static const String _keyLocalSnippets = 'dsh_local_snippets';
+
+  /// 本地条目上限。网关侧是 50 条，本地放宽一档且不联网，纯粹是防止某个 bug
+  /// 把 SharedPreferences 写成几 MB。
+  static const int maxLocalSnippets = 200;
+
+  static Future<List<LocalSnippet>> loadLocalSnippets() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_keyLocalSnippets);
+    if (raw == null || raw.trim().isEmpty) return const [];
+
+    dynamic decoded;
+    try {
+      decoded = jsonDecode(raw);
+    } catch (_) {
+      // 坏 JSON：返回空列表，但**不回写**。下次用户保存时会用一份干净的数据覆盖，
+      // 在此之前盘上的原文原封不动（万一只是本次解码路径出了问题）。
+      return const [];
+    }
+    if (decoded is! List) return const [];
+
+    final out = <LocalSnippet>[];
+    for (var i = 0; i < decoded.length; i++) {
+      final e = decoded[i];
+      if (e is! Map) continue;
+      final s = LocalSnippet.fromJson(Map<String, dynamic>.from(e));
+      if (s.text.trim().isEmpty) continue;
+      out.add(s.id.isEmpty ? s.copyWith(id: 'local-$i') : s);
+      if (out.length >= maxLocalSnippets) break;
+    }
+    return out;
+  }
+
+  static Future<void> saveLocalSnippets(List<LocalSnippet> snippets) async {
+    final prefs = await SharedPreferences.getInstance();
+    final capped = snippets.length > maxLocalSnippets
+        ? snippets.sublist(0, maxLocalSnippets)
+        : snippets;
+    await prefs.setString(
+      _keyLocalSnippets,
+      jsonEncode(capped.map((s) => s.toJson()).toList()),
+    );
+  }
 
   // v1.14 删除了「运行中投递方式」的持久化（原 `dsh_delivery_mode` 键）。
   //

@@ -5,15 +5,19 @@ import '../models/dsh_settings.dart';
 import '../models/app_version.dart';
 import '../models/client_update.dart';
 import '../models/gateway_features.dart';
+import '../models/local_snippet.dart';
 import '../services/dsh_service.dart';
 import '../services/platform_services.dart';
+import '../services/storage_service.dart';
 import '../services/update_service.dart';
 import 'config_page.dart';
 import 'gateway_health_view.dart';
 import 'push_setup_view.dart';
 import 'security_permissions_view.dart';
 import '../theme/app_colors.dart';
+import '../theme/app_spacing.dart';
 import '../main.dart';
+import 'widgets/snippet_param_dialog.dart';
 
 class CustomSettingsView extends StatefulWidget {
   /// [feat 2026-10-17] 安全策略页是**推入**的（不再是底部导航的一级 tab），
@@ -21,7 +25,16 @@ class CustomSettingsView extends StatefulWidget {
   /// 为 null 时"去处理"退化成只关掉本页（不给一个点了没反应的按钮）。
   final VoidCallback? onOpenChat;
 
-  const CustomSettingsView({super.key, this.onOpenChat});
+  /// 测试注入口：用内存里的「网关下发条目」替代 `dsh.snippets`。
+  ///
+  /// 为什么需要：合并列表那条规则（本地在前、网关只读）只有在两边的条目同时存在
+  /// 时才看得见，而 `DshService.snippets` 只能由一次真实 HTTP 抓取填充 —— widget
+  /// 测试不该为了一行顺序去打真网关（历史上打真网关的测试往用户会话里塞过垃圾）。
+  /// 生产路径永远不传它。
+  @visibleForTesting
+  final List<Snippet>? debugRemoteSnippets;
+
+  const CustomSettingsView({super.key, this.onOpenChat, this.debugRemoteSnippets});
 
   /// Stable handles for the ntfy block, so the interface tests can assert on it
   /// without depending on copy that is expected to keep changing.
@@ -54,6 +67,58 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
   bool _ntfyEnabled = false;
   bool _ntfyDirty = false;
   bool _pushBusy = false;
+
+  // ---- 本地快捷指令（v1.27，Phase 5.4）----
+  //
+  // 只读一份内存副本：本地条目是"少数几条、一次性改完"的东西，不值得为它引状态
+  // 管理。真源在 StorageService 的 `dsh_local_snippets`，任何一次改动都**先写盘
+  // 再更新内存**（写失败会留在屏幕上并如实提示，见 _persistLocalSnippets）。
+  List<LocalSnippet> _localSnippets = const [];
+  bool _snippetsLoading = true;
+  String? _localSnippetsError;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadLocalSnippets();
+  }
+
+  Future<void> _loadLocalSnippets() async {
+    var list = const <LocalSnippet>[];
+    String? error;
+    try {
+      list = await StorageService.loadLocalSnippets();
+    } on MissingPluginException {
+      // 没有本地存储后端（widget 测试、或极早期启动还没挂上插件）：当成"还没有
+      // 本地指令"。这不是数据丢失，写的时候会照实报错。
+      error = null;
+    } catch (e) {
+      // 读失败也不清数据、不崩页：界面降级成只读那一档。
+      error = '$e';
+    }
+    if (!mounted) return;
+    setState(() {
+      _localSnippets = list;
+      _snippetsLoading = false;
+      _localSnippetsError = error;
+    });
+  }
+
+  /// 写盘并同步内存。失败时保留屏幕上的改动但明说"没能存住" —— 静默把它改回去，
+  /// 用户会以为点保存没反应。
+  Future<void> _persistLocalSnippets(List<LocalSnippet> next) async {
+    setState(() => _localSnippets = next);
+    try {
+      await StorageService.saveLocalSnippets(next);
+      if (_localSnippetsError != null && mounted) {
+        setState(() => _localSnippetsError = null);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _localSnippetsError = '$e');
+      _settingsToast('没能写入本地存储，这条改动重启后会丢');
+    }
+  }
 
   @override
   void dispose() {
@@ -593,9 +658,9 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
             children: [
               Icon(Icons.palette_outlined, size: 16, color: context.c.purple),
               const SizedBox(width: 7),
-              const Text(
+              Text(
                 '主题模式',
-                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFF374151)),
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: context.c.textPrimary),
               ),
             ],
           ),
@@ -848,59 +913,10 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
 
           const SizedBox(height: 16),
 
-          // 2.5 Prompt Snippets（提示词模板）
-          _buildSectionHeader('提示词模板 (Quick Snippets)', Icons.bolt_rounded, context.c.warning),
+          // 2.5 快捷指令（本地 + 网关下发合并展示，Phase 5.4）
+          _buildSectionHeader('快捷指令 (Quick Snippets)', Icons.bolt_rounded, context.c.warning),
           const SizedBox(height: 8),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: _cardDecoration(),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '在聊天输入框上方显示的快捷模板条。点击模板即把内容追加到输入框。',
-                  style: TextStyle(color: context.c.textSecondary, fontSize: 12),
-                ),
-                const SizedBox(height: 10),
-                if (dsh.snippets.isEmpty)
-                  Text('还没有模板，点下面按钮添加。', style: TextStyle(color: context.c.textTertiary, fontSize: 12))
-                else
-                  ...dsh.snippets.map(
-                    (s) => Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              '${s.label} — ${s.text.length > 40 ? '${s.text.substring(0, 40)}…' : s.text}',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(color: context.c.textPrimary, fontSize: 12.5),
-                            ),
-                          ),
-                          IconButton(
-                            icon: Icon(Icons.delete_outline_rounded, size: 16, color: context.c.danger),
-                            tooltip: '删除该模板',
-                            onPressed: () async {
-                              final next = [...dsh.snippets]..removeWhere((x) => x.id == s.id);
-                              await dsh.saveSnippets(next);
-                            },
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: TextButton.icon(
-                    icon: Icon(Icons.add_rounded, size: 16, color: context.c.accent),
-                    label: Text('添加模板', style: TextStyle(color: context.c.accent, fontSize: 12, fontWeight: FontWeight.w600)),
-                    onPressed: () => _showAddSnippetDialog(context, dsh),
-                  ),
-                ),
-              ],
-            ),
-          ),
+          _buildSnippetsSection(context, widget.debugRemoteSnippets ?? dsh.snippets),
 
           const SizedBox(height: 16),
 
@@ -1133,42 +1149,425 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     );
   }
 
-  /// 添加一条提示词模板：标签 + 内容，保存到网关。
-  Future<void> _showAddSnippetDialog(BuildContext context, DshService dsh) async {
-    final labelController = TextEditingController();
-    final textController = TextEditingController();
+  /// 「快捷指令」分区（v1.27，Phase 5.4）。
+  ///
+  /// 列表 = **本地条目**（可改可删可排序，排前面，带「本地」徽标）+ **网关下发
+  /// 条目**（只读，带「网关」徽标 + 锁）。
+  ///
+  /// 为什么合并成一个列表而不是两个分区：对用户来说"我有哪些快捷指令"只有一个
+  /// 答案。分成两块，他就得猜哪一份是真正会出现在输入框里的，而两份的名字还可能
+  /// 撞车。顺序（本地优先）与可编辑性（网关只读）都在这一层表达，模型层不掺和。
+  Widget _buildSnippetsSection(BuildContext context, List<Snippet> remote) {
+    final local = _localSnippets;
+
+    return Container(
+      key: const ValueKey('settings-snippets-section'),
+      padding: const EdgeInsets.all(16),
+      decoration: _cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '聊天输入框「命令与模板」里列出的快捷模板。本地条目排在最前面、可改可删可排序，'
+            '只存在这台手机上；网关下发的条目在这里只读（真源在服务端）。'
+            '正文里的 {参数} 会在插入前让你一屏填完。',
+            style: TextStyle(
+              color: context.c.textSecondary,
+              fontSize: AppText.body,
+              height: 1.35,
+            ),
+          ),
+          const SizedBox(height: AppSpace.l),
+          if (_snippetsLoading)
+            Row(
+              key: const ValueKey('settings-snippets-loading'),
+              children: [
+                const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+                const SizedBox(width: AppSpace.m),
+                Text(
+                  '正在读取本地快捷指令…',
+                  style: TextStyle(fontSize: AppText.caption, color: context.c.textSecondary),
+                ),
+              ],
+            )
+          else ...[
+            if (_localSnippetsError != null) ...[
+              _buildSnippetsStorageWarning(context),
+              const SizedBox(height: AppSpace.l),
+            ],
+            if (local.isEmpty && remote.isEmpty)
+              Text(
+                '还没有快捷指令。点下面「新增本地指令」建一条 —— 它只存在这台手机上，删网关也不会丢。',
+                style: TextStyle(fontSize: AppText.body, color: context.c.textTertiary, height: 1.35),
+              ),
+            for (var i = 0; i < local.length; i++) _buildLocalSnippetRow(context, i),
+            for (final s in remote) _buildRemoteSnippetRow(context, s),
+            if (local.isNotEmpty && remote.isEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: AppSpace.s),
+                child: Text(
+                  '网关还没有下发过模板；这一屏的本地条目不会上传到网关。',
+                  style: TextStyle(fontSize: AppText.caption, color: context.c.textTertiary),
+                ),
+              ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                key: const ValueKey('snippet-add-local'),
+                icon: Icon(Icons.add_rounded, size: 16, color: context.c.accent),
+                label: Text(
+                  '新增本地指令',
+                  style: TextStyle(
+                    color: context.c.accent,
+                    fontSize: AppText.body,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                onPressed: () => _showLocalSnippetEditor(context),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 读/写本地存储失败时的诚实提示。
+  ///
+  /// 它不写"出错了"了事，而是说明**已保存的内容没有被动过** —— 用户最怕的是
+  /// "我的东西是不是被删了"，而这一屏确实没删。
+  Widget _buildSnippetsStorageWarning(BuildContext context) {
+    return Container(
+      key: const ValueKey('settings-snippets-storage-warning'),
+      padding: const EdgeInsets.all(AppSpace.l),
+      decoration: BoxDecoration(
+        color: context.c.warningSurface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: context.c.warningBorder),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.warning_amber_rounded, size: 15, color: context.c.warning),
+          const SizedBox(width: AppSpace.m),
+          Expanded(
+            child: Text(
+              '本地存储不可用：这一屏现在读不到/存不住本地指令，'
+              '但已经存下的内容没有被删除，其余设置也不受影响。',
+              style: TextStyle(fontSize: AppText.caption, height: 1.35, color: context.c.textSecondary),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSnippetBadge(BuildContext context, String text, Color color, Key key) {
+    return Container(
+      key: key,
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(5),
+      ),
+      child: Text(
+        text,
+        style: TextStyle(fontSize: AppText.caption, fontWeight: FontWeight.w600, color: color),
+      ),
+    );
+  }
+
+  /// 本地条目：整行可编辑 + 上移/下移（不做拖拽 —— 手机上一屏能放几条，拖拽的
+  /// 命中成本比点两下箭头高得多）。
+  Widget _buildLocalSnippetRow(BuildContext context, int index) {
+    final s = _localSnippets[index];
+    final placeholders = s.placeholders;
+    final label = s.label.trim().isEmpty ? LocalSnippet.autoLabel(s.text) : s.label.trim();
+
+    return Container(
+      key: ValueKey('snippet-row-${s.id}'),
+      margin: const EdgeInsets.only(bottom: AppSpace.m),
+      padding: const EdgeInsets.fromLTRB(AppSpace.l, AppSpace.m, AppSpace.s, AppSpace.s),
+      decoration: BoxDecoration(
+        color: context.c.surfaceMuted,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: context.c.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: AppText.body,
+                    fontWeight: FontWeight.w600,
+                    color: context.c.textPrimary,
+                  ),
+                ),
+              ),
+              const SizedBox(width: AppSpace.m),
+              _buildSnippetBadge(context, '本地', context.c.accent, ValueKey('snippet-local-badge-${s.id}')),
+              if (s.tag.trim().isNotEmpty) ...[
+                const SizedBox(width: AppSpace.s),
+                _buildSnippetBadge(
+                  context,
+                  '#${s.tag.trim()}',
+                  context.c.purple,
+                  ValueKey('snippet-tag-${s.id}'),
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: AppSpace.xs),
+          Text(
+            s.text,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: AppText.subhead, height: 1.35, color: context.c.textSecondary),
+          ),
+          if (placeholders.isNotEmpty) ...[
+            const SizedBox(height: AppSpace.xs),
+            Text(
+              '参数：${placeholders.map((p) => '{$p}').join(' ')}',
+              key: ValueKey('snippet-params-${s.id}'),
+              style: TextStyle(fontSize: AppText.caption, color: context.c.textTertiary),
+            ),
+          ],
+          const SizedBox(height: AppSpace.xs),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  placeholders.isEmpty ? '' : '插入前会弹一屏填参数',
+                  style: TextStyle(fontSize: AppText.caption, color: context.c.textTertiary),
+                ),
+              ),
+              _snippetIconButton(
+                context,
+                key: ValueKey('snippet-fill-${s.id}'),
+                icon: Icons.playlist_add_check_rounded,
+                tooltip: '试填并复制',
+                onPressed: () => _previewLocalSnippet(context, s),
+              ),
+              _snippetIconButton(
+                context,
+                key: ValueKey('snippet-up-${s.id}'),
+                icon: Icons.arrow_upward_rounded,
+                tooltip: '上移',
+                onPressed: index == 0 ? null : () => _moveLocalSnippet(index, -1),
+              ),
+              _snippetIconButton(
+                context,
+                key: ValueKey('snippet-down-${s.id}'),
+                icon: Icons.arrow_downward_rounded,
+                tooltip: '下移',
+                onPressed: index == _localSnippets.length - 1 ? null : () => _moveLocalSnippet(index, 1),
+              ),
+              _snippetIconButton(
+                context,
+                key: ValueKey('snippet-edit-${s.id}'),
+                icon: Icons.edit_outlined,
+                tooltip: '编辑',
+                onPressed: () => _showLocalSnippetEditor(context, existing: s),
+              ),
+              _snippetIconButton(
+                context,
+                key: ValueKey('snippet-delete-${s.id}'),
+                icon: Icons.delete_outline_rounded,
+                tooltip: '删除',
+                color: context.c.danger,
+                onPressed: () => _deleteLocalSnippet(context, s),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 网关下发的条目：**只读**。没有编辑/删除按钮，而不是给一个点了没反应的图标。
+  Widget _buildRemoteSnippetRow(BuildContext context, Snippet s) {
+    final placeholders = LocalSnippet.placeholderNames(s.text);
+    final label = s.label.trim().isEmpty ? LocalSnippet.autoLabel(s.text) : s.label.trim();
+
+    return Container(
+      key: ValueKey('snippet-row-gateway-${s.id}'),
+      margin: const EdgeInsets.only(bottom: AppSpace.m),
+      padding: const EdgeInsets.all(AppSpace.l),
+      decoration: BoxDecoration(
+        color: context.c.surface,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: context.c.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: AppText.body,
+                    fontWeight: FontWeight.w600,
+                    color: context.c.textPrimary,
+                  ),
+                ),
+              ),
+              const SizedBox(width: AppSpace.m),
+              _buildSnippetBadge(context, '网关', context.c.textTertiary, ValueKey('snippet-gateway-badge-${s.id}')),
+              const SizedBox(width: AppSpace.s),
+              Icon(Icons.lock_outline_rounded, size: 13, color: context.c.textTertiary),
+            ],
+          ),
+          const SizedBox(height: AppSpace.xs),
+          Text(
+            s.text,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: AppText.subhead, height: 1.35, color: context.c.textSecondary),
+          ),
+          if (placeholders.isNotEmpty) ...[
+            const SizedBox(height: AppSpace.xs),
+            Text(
+              '参数：${placeholders.map((p) => '{$p}').join(' ')}',
+              style: TextStyle(fontSize: AppText.caption, color: context.c.textTertiary),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _snippetIconButton(
+    BuildContext context, {
+    required Key key,
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback? onPressed,
+    Color? color,
+  }) {
+    return IconButton(
+      key: key,
+      tooltip: tooltip,
+      icon: Icon(
+        icon,
+        size: 16,
+        color: onPressed == null ? context.c.textTertiary : (color ?? context.c.textSecondary),
+      ),
+      visualDensity: VisualDensity.compact,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+      onPressed: onPressed,
+    );
+  }
+
+  /// 新增/编辑本地指令。空名称回落为正文首行，空正文拒绝。
+  Future<void> _showLocalSnippetEditor(BuildContext context, {LocalSnippet? existing}) async {
+    final labelController = TextEditingController(text: existing?.label ?? '');
+    final textController = TextEditingController(text: existing?.text ?? '');
+    final tagController = TextEditingController(text: existing?.tag ?? '');
+
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: context.c.surface,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: BorderSide(color: context.c.border)),
-        title: Text('添加模板', style: TextStyle(color: context.c.textPrimary, fontSize: 16, fontWeight: FontWeight.bold)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: labelController,
-              autofocus: true,
-              maxLength: 20,
-              decoration: InputDecoration(hintText: '显示名称（如：继续）', counterText: '', border: OutlineInputBorder(borderRadius: BorderRadius.circular(8))),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: context.c.border),
+        ),
+        title: Text(
+          existing == null ? '新增本地指令' : '编辑本地指令',
+          style: TextStyle(
+            fontSize: AppText.title,
+            fontWeight: FontWeight.bold,
+            color: context.c.textPrimary,
+          ),
+        ),
+        content: SizedBox(
+          width: 420,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '只保存在这台手机上，不上传网关。正文里的 {参数} 会在插入前让你一屏填完。',
+                  style: TextStyle(fontSize: AppText.caption, height: 1.35, color: context.c.textSecondary),
+                ),
+                const SizedBox(height: AppSpace.l),
+                TextField(
+                  key: const ValueKey('snippet-editor-label'),
+                  controller: labelController,
+                  autofocus: true,
+                  maxLength: 24,
+                  style: TextStyle(fontSize: AppText.body, color: context.c.textPrimary),
+                  decoration: InputDecoration(
+                    labelText: '名称',
+                    hintText: '如：翻译成英文',
+                    counterText: '',
+                    isDense: true,
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                ),
+                const SizedBox(height: AppSpace.l),
+                TextField(
+                  key: const ValueKey('snippet-editor-text'),
+                  controller: textController,
+                  minLines: 3,
+                  maxLines: 6,
+                  maxLength: 2000,
+                  keyboardType: TextInputType.multiline,
+                  style: TextStyle(fontSize: AppText.body, color: context.c.textPrimary, height: 1.35),
+                  decoration: InputDecoration(
+                    labelText: '正文',
+                    hintText: '如：把下面这段翻成{lang}：',
+                    counterText: '',
+                    isDense: true,
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                ),
+                const SizedBox(height: AppSpace.l),
+                TextField(
+                  key: const ValueKey('snippet-editor-tag'),
+                  controller: tagController,
+                  maxLength: 12,
+                  style: TextStyle(fontSize: AppText.body, color: context.c.textPrimary),
+                  decoration: InputDecoration(
+                    labelText: '分类标签（可选）',
+                    hintText: '如：翻译',
+                    counterText: '',
+                    isDense: true,
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: textController,
-              maxLines: 4,
-              maxLength: 400,
-              decoration: InputDecoration(hintText: '模板内容（将追加到输入框）', counterText: '', border: OutlineInputBorder(borderRadius: BorderRadius.circular(8))),
-            ),
-          ],
+          ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text('取消', style: TextStyle(color: context.c.textSecondary))),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('取消', style: TextStyle(color: context.c.textSecondary)),
+          ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
               backgroundColor: context.c.accent,
               foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
               elevation: 0,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
             ),
             onPressed: () => Navigator.pop(ctx, true),
             child: const Text('保存', style: TextStyle(fontWeight: FontWeight.bold)),
@@ -1176,16 +1575,103 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
         ],
       ),
     );
+
     final label = labelController.text.trim();
-    final text = textController.text.trim();
+    final body = textController.text.trim();
+    final tag = tagController.text.trim();
     labelController.dispose();
     textController.dispose();
-    if (ok != true || text.isEmpty) return;
-    final next = [
-      ...dsh.snippets,
-      Snippet(id: 'snip_${DateTime.now().millisecondsSinceEpoch}', label: label.isEmpty ? text.substring(0, text.length.clamp(0, 20)) : label, text: text),
-    ];
-    await dsh.saveSnippets(next);
+    tagController.dispose();
+    if (ok != true) return;
+    if (body.isEmpty) {
+      _settingsToast('正文为空，没有保存');
+      return;
+    }
+
+    final resolvedLabel = label.isEmpty ? LocalSnippet.autoLabel(body) : label;
+    final next = [..._localSnippets];
+    if (existing == null) {
+      if (next.length >= StorageService.maxLocalSnippets) {
+        _settingsToast('本地指令最多 ${StorageService.maxLocalSnippets} 条');
+        return;
+      }
+      next.add(LocalSnippet(
+        id: 'local_${DateTime.now().microsecondsSinceEpoch}',
+        label: resolvedLabel,
+        text: body,
+        tag: tag,
+      ));
+    } else {
+      final i = next.indexWhere((x) => x.id == existing.id);
+      if (i < 0) return;
+      next[i] = next[i].copyWith(label: resolvedLabel, text: body, tag: tag);
+    }
+    await _persistLocalSnippets(next);
+    _settingsToast(existing == null ? '已新增本地指令' : '已保存');
+  }
+
+  Future<void> _moveLocalSnippet(int index, int delta) async {
+    final j = index + delta;
+    if (j < 0 || j >= _localSnippets.length) return;
+    final next = [..._localSnippets];
+    final moved = next.removeAt(index);
+    next.insert(j, moved);
+    await _persistLocalSnippets(next);
+  }
+
+  Future<void> _deleteLocalSnippet(BuildContext context, LocalSnippet snippet) async {
+    final label = snippet.label.trim().isEmpty ? LocalSnippet.autoLabel(snippet.text) : snippet.label.trim();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: context.c.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: context.c.border),
+        ),
+        title: Text(
+          '删除本地指令',
+          style: TextStyle(fontSize: AppText.title, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+        ),
+        content: Text(
+          '「$label」会从这台手机上删掉；网关下发的同名条目（如果有）不受影响。',
+          style: TextStyle(fontSize: AppText.body, height: 1.4, color: context.c.textSecondary),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('取消', style: TextStyle(color: context.c.textSecondary)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: context.c.danger,
+              foregroundColor: Colors.white,
+              elevation: 0,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final next = [..._localSnippets]..removeWhere((x) => x.id == snippet.id);
+    await _persistLocalSnippets(next);
+    _settingsToast('已删除');
+  }
+
+  /// 设置页里的「试填」：走和输入框**同一条**参数对话框（`showSnippetParamDialog`），
+  /// 填完把结果复制走。
+  ///
+  /// 为什么要在这里也能试填：用户在设置页写 `{参数}` 时，唯一能验证"这条指令填出来
+  /// 是什么样"的机会就在这一屏。
+  Future<void> _previewLocalSnippet(BuildContext context, LocalSnippet snippet) async {
+    final label = snippet.label.trim().isEmpty ? LocalSnippet.autoLabel(snippet.text) : snippet.label.trim();
+    final rendered = await showSnippetParamDialog(context, title: label, template: snippet.text);
+    if (rendered == null) return;
+    await Clipboard.setData(ClipboardData(text: rendered));
+    _settingsToast(snippet.placeholders.isEmpty ? '已复制指令正文' : '已复制填好参数的正文');
   }
 
   /// 用户主动点「检查更新」才会走到这里（启动时不查，保持静默）。

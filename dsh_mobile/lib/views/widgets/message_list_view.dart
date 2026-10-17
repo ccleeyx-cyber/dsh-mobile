@@ -87,10 +87,15 @@ class MessageListView extends StatelessWidget {
 
     // 刻度整层 IgnorePointer 之外的部分可点：只让刻度自己吃点击，别挡住气泡上的
     // 长按/链接。Stack 里 overlay 是独立命中的，所以不需要额外包 IgnorePointer。
+    //
+    // [feat 2026-10-17] 刻度从**右边缘**移到**左边缘**。右边缘原本有三个抢同一块
+    // 热区的东西：轮次刻度、"回到最新消息"浮钮（右下）、以及 Android 从右边缘发起
+    // 的返回手势。三者叠在一起的结果是"点刻度偶尔返回上一页"。左侧没有返回手势
+    // 的竞争，且单手持机时左边缘本来就在拇指/食指的顺手位。
     return Stack(
       children: [
         Positioned.fill(child: list),
-        Positioned(right: 4, top: 0, bottom: 0, child: overlay!),
+        Positioned(left: 2, top: 0, bottom: 0, child: overlay!),
       ],
     );
   }

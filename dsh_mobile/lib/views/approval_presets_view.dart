@@ -28,6 +28,7 @@ import '../models/approval_preset.dart';
 import '../models/bridge_extras.dart';
 import '../services/dsh_service.dart';
 import '../theme/app_colors.dart';
+import '../widgets/inline_error_bar.dart';
 
 /// picker 的可选值。**文案不在这里写死** —— 走
 /// [PermissionConfigSnapshot.policyLabel]，与内置预设、安全策略页用的是同一份
@@ -51,6 +52,9 @@ class _ApprovalPresetsViewState extends State<ApprovalPresetsView> {
 
   /// 删除进行中：禁掉所有删除按钮，避免连点发出两个删除请求。
   bool _busy = false;
+
+  /// 预设删除/保存失败的常驻错误（Phase 4.5）。
+  String? _actionError;
 
   @override
   void initState() {
@@ -146,9 +150,12 @@ class _ApprovalPresetsViewState extends State<ApprovalPresetsView> {
     if (err != null) {
       // 网关原文（例如「「strict」是内置预设，不能被覆盖」）直接贴出来，
       // 换成"删除失败"等于把唯一能解释原因的信息丢掉。
-      _toast(err, tone: context.c.danger);
+      // [feat 2026-10-17] Phase 4.5：这条不能是 toast —— 删除失败时列表**完全
+      // 没变**，提示飘走之后用户只会再点一次删除。
+      setState(() => _actionError = err);
       return;
     }
+    setState(() => _actionError = null);
     await _load();
     if (!mounted) return;
     _toast('已删除「${info.label}」');
@@ -183,6 +190,15 @@ class _ApprovalPresetsViewState extends State<ApprovalPresetsView> {
       body: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         children: [
+          if (_actionError != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: InlineErrorBar(
+                key: const ValueKey('preset-action-error'),
+                message: _actionError!,
+                onDismiss: () => setState(() => _actionError = null),
+              ),
+            ),
           _buildIntroCard(context),
           const SizedBox(height: 16),
           _sectionHeader(context, '内置预设（只读）', Icons.verified_user_outlined, context.c.accent),

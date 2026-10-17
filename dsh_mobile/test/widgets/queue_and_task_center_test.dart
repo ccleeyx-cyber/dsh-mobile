@@ -25,7 +25,8 @@ import 'package:dsh_mobile/views/chat_view.dart';
 /// `queue_steer_impl_test.dart` —— 那些用例需要 `debugSetDeliverResult` 之类的
 /// 注入口，与本文件的"纯渲染"断言是两类事情。
 void main() {
-  Future<DshService> pump(WidgetTester tester, Widget child, {Size size = const Size(420, 900)}) async {
+  Future<DshService> pump(WidgetTester tester, Widget child,
+      {Size size = const Size(420, 900)}) async {
     tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -34,7 +35,8 @@ void main() {
       ChangeNotifierProvider<DshService>.value(
         value: dsh,
         child: MaterialApp(
-          builder: (ctx, c) => ThemeScope(isDark: false, child: c ?? const SizedBox()),
+          builder: (ctx, c) =>
+              ThemeScope(isDark: false, child: c ?? const SizedBox()),
           home: child,
         ),
       ),
@@ -77,6 +79,14 @@ void main() {
       ]);
       await tester.pump();
 
+      // v1.27：折叠态只是状态胶囊行里的**一行**（「2 条排队中 · 展开」）。
+      // 改造前这里是常驻的队列面板，叠在输入框上方第六层。
+      expect(find.textContaining('2 条排队中'), findsOneWidget);
+      expect(find.text('先跑单元测试'), findsNothing, reason: '折叠态不该把队列摊开占行');
+
+      await tester.tap(find.byKey(const ValueKey('queue-dock-toggle')));
+      await tester.pump();
+
       expect(find.text('2 条排队中 · 本轮结束后自动发送'), findsOneWidget);
       expect(find.text('先跑单元测试'), findsOneWidget);
       expect(find.text('（2 个附件）'), findsOneWidget);
@@ -91,25 +101,26 @@ void main() {
       await teardown(tester);
     });
 
-    testWidgets('队列很长时输入栏里只列 3 条，其余可**就地展开**（不再跳任务页）', (tester) async {
+    testWidgets('队列很长时默认只占一行胶囊，点开后**就地展开**全部（不再跳任务页）', (tester) async {
       final dsh = await pump(tester, const ChatView());
       dsh.debugSetQueue([
-        for (var i = 1; i <= 5; i++) QueueItem(id: 'm$i', text: '排队第 $i 条', attachments: 0),
+        for (var i = 1; i <= 5; i++)
+          QueueItem(id: 'm$i', text: '排队第 $i 条', attachments: 0),
       ]);
       await tester.pump();
 
-      expect(find.text('5 条排队中 · 本轮结束后自动发送'), findsOneWidget);
-      expect(find.text('排队第 1 条'), findsOneWidget);
-      expect(find.text('排队第 3 条'), findsOneWidget);
-      expect(find.text('排队第 4 条'), findsNothing, reason: '第 4 条起不该出现在折叠态里');
+      // 折叠态 = 一行胶囊：条数 + 展开动作。条目一条都不占常驻行 —— 输入区上方
+      // 的空间要留给"我要打的那句话"。
+      expect(find.textContaining('5 条排队中'), findsOneWidget);
+      expect(find.byKey(const ValueKey('queue-dock')), findsNothing);
+      expect(find.text('排队第 1 条'), findsNothing, reason: '折叠态不摊开条目');
 
       // 溢出提示必须是一个**动作**，而且不再指向任何二级页面。
-      expect(find.textContaining('还有 2 条'), findsOneWidget);
       expect(find.textContaining('任务'), findsNothing, reason: '任务页已删除，不许留死链');
 
       await tester.tap(find.byKey(const ValueKey('queue-dock-toggle')));
       await tester.pump();
-      expect(find.text('排队第 4 条'), findsOneWidget, reason: '就地展开后应能看到全部');
+      expect(find.text('排队第 1 条'), findsOneWidget, reason: '就地展开后应能看到全部');
       expect(find.text('排队第 5 条'), findsOneWidget);
       expect(find.text('收起'), findsOneWidget);
       await teardown(tester);
@@ -122,7 +133,8 @@ void main() {
       // 直接顶出可视区。
       final dsh = await pump(tester, const ChatView());
       dsh.debugSetQueue([
-        for (var i = 1; i <= 20; i++) QueueItem(id: 'm$i', text: '排队第 $i 条', attachments: 0),
+        for (var i = 1; i <= 20; i++)
+          QueueItem(id: 'm$i', text: '排队第 $i 条', attachments: 0),
       ]);
       await tester.pump();
 
@@ -130,11 +142,13 @@ void main() {
       await tester.pump();
 
       expect(tester.takeException(), isNull, reason: '展开不得触发布局溢出');
-      final dockHeight = tester.getSize(find.byKey(const ValueKey('queue-dock'))).height;
+      final dockHeight =
+          tester.getSize(find.byKey(const ValueKey('queue-dock'))).height;
       expect(dockHeight, lessThan(400), reason: '展开态必须限高（实测约 286px），不能随条数线性增长');
 
       // 输入卡片仍在屏幕内（没有被顶出去）。
-      final inputBar = tester.getRect(find.byKey(const ValueKey('chat-input-bar')));
+      final inputBar =
+          tester.getRect(find.byKey(const ValueKey('chat-input-bar')));
       expect(inputBar.bottom, lessThanOrEqualTo(900.0));
       expect(inputBar.top, greaterThan(0.0));
       await teardown(tester);
@@ -142,8 +156,12 @@ void main() {
 
     testWidgets('会话没在跑时给出"为什么不能插话"，而不是一个死按钮', (tester) async {
       final dsh = await pump(tester, const ChatView());
-      dsh.debugSetQueue([const QueueItem(id: 'm1', text: '待发送', attachments: 0)]);
+      dsh.debugSetQueue(
+          [const QueueItem(id: 'm1', text: '待发送', attachments: 0)]);
       dsh.debugSetRunning(false);
+      await tester.pump();
+      // 条目要展开才看得到（v1.27：队列默认折叠成一行胶囊）。
+      await tester.tap(find.byKey(const ValueKey('queue-dock-toggle')));
       await tester.pump();
 
       // 旧版是一个 onTap:null 的灰色 ⚡ —— 点了没反应，用户只能猜为什么。
@@ -155,9 +173,11 @@ void main() {
 
     testWidgets('切换会话时回到折叠态（展开态是会话级界面状态）', (tester) async {
       final dsh = await pump(tester, const ChatView());
-      dsh.debugSetCurrentSession(SessionMeta(sessionId: 'session-a', title: 'A'));
+      dsh.debugSetCurrentSession(
+          SessionMeta(sessionId: 'session-a', title: 'A'));
       dsh.debugSetQueue([
-        for (var i = 1; i <= 5; i++) QueueItem(id: 'm$i', text: '排队第 $i 条', attachments: 0),
+        for (var i = 1; i <= 5; i++)
+          QueueItem(id: 'm$i', text: '排队第 $i 条', attachments: 0),
       ]);
       await tester.pump();
 
@@ -165,7 +185,8 @@ void main() {
       await tester.pump();
       expect(find.text('排队第 5 条'), findsOneWidget);
 
-      dsh.debugSetCurrentSession(SessionMeta(sessionId: 'session-b', title: 'B'));
+      dsh.debugSetCurrentSession(
+          SessionMeta(sessionId: 'session-b', title: 'B'));
       await tester.pump();
       expect(find.text('排队第 5 条'), findsNothing, reason: '换会话后不该继承上一个会话的展开态');
       await teardown(tester);

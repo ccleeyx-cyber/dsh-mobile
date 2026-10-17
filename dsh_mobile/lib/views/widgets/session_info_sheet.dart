@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import '../../models/bridge_extras.dart';
 import '../../models/task_center.dart';
 import '../../theme/app_colors.dart';
+import '../../theme/app_spacing.dart';
 import 'deliverable_preview_sheet.dart';
 import 'session_status_strip.dart';
 import 'turn_output_card.dart';
@@ -58,6 +59,16 @@ class SessionInfoSheet extends StatefulWidget {
     this.onRunDiagnostics,
     this.diagnostics,
     this.diagnosticsBusy = false,
+    this.modelLabel,
+    this.permissionLabel,
+    this.workspaceLabel,
+    this.onNewSession,
+    this.onSwitchModel,
+    this.onEditPermission,
+    this.onSwitchWorkspace,
+    this.onDeleteSession,
+    this.onOpenTrajectory,
+    this.onOpenHostOps,
   });
 
   /// 用量 / 上下文 / goal。`null` 表示还没取到。
@@ -108,7 +119,8 @@ class SessionInfoSheet extends StatefulWidget {
   /// 为什么需要它：引擎的 job 输出是一个**可按偏移续读的环**，手机看日志的唯一
   /// 正确姿势就是拿着上一次的 `next` 继续读。为 null 时整块日志入口隐藏（老网关
   /// 没有这个路由），而不是给一个点了报错的按钮。
-  final Future<JobOutputChunk> Function(JobItem job, int? from)? onLoadJobOutput;
+  final Future<JobOutputChunk> Function(JobItem job, int? from)?
+      onLoadJobOutput;
 
   final List<ScheduleItem> schedules;
 
@@ -125,7 +137,8 @@ class SessionInfoSheet extends StatefulWidget {
   /// 为 null 时**一点旧行为都不改**：点一行还是走"下载 + 拉起系统应用"那条链路。
   /// 非 null 时主点击改成预览，下载退到**长按**（见 [_buildDeliverableGroup] 的
   /// 注释说明为什么选长按而不是再加一个下载图标）。
-  final Future<TextFileContent> Function(DeliverableItem item)? onPreviewDeliverable;
+  final Future<TextFileContent> Function(DeliverableItem item)?
+      onPreviewDeliverable;
 
   /// 取单个文件的 diff。
   final Future<List<DiffHunk>> Function(String path)? onLoadDiff;
@@ -180,6 +193,45 @@ class SessionInfoSheet extends StatefulWidget {
   final DiagnosticsReport? diagnostics;
 
   final bool diagnosticsBusy;
+
+  // ---- [feat 2026-10-17 / Phase 3] 会话操作分区 ----
+  //
+  // AppBar 的溢出菜单原来有 8 项，手机上要"点开菜单→扫一遍→找一项"。全部收敛到
+  // 这里之后，AppBar 只剩搜索 + 信息两个常驻 icon，而"会话级操作"回到了它本该
+  // 在的地方 —— 会话信息面板本来就是会话的总入口。
+  //
+  // 这个组件**依然是自包含的**：下面这些只有"显示什么"和"点了做什么"，
+  // 它自己不读 DshService、不构造任何弹层（弹层由宿主回调自己弹）。
+
+  /// 当前模型名（已去掉 `cn:` 前缀）。`null` = 不知道 → 整行不渲染。
+  final String? modelLabel;
+
+  /// 当前对话权限策略的可读名。`null` = 不知道 → 整行不渲染。
+  final String? permissionLabel;
+
+  /// 当前工作区标题。`null` = 不知道 → 整行不渲染。
+  final String? workspaceLabel;
+
+  /// 切换模型 / 编辑权限 / 切换工作区 / 删除会话。
+  ///
+  /// 任何一个为 null 时，对应的那一行**不渲染** —— 给一条点了没反应的"切换模型"
+  /// 比不给更糟（用户会以为它在工作，然后发现模型没变）。
+  final Future<void> Function()? onSwitchModel;
+
+  /// 新开一个会话。
+  ///
+  /// AppBar 上的「新建对话」按钮收敛到面板里来了（顶栏只留搜索 + 信息两个常驻
+  /// icon）。`null` 时这一行不渲染。
+  final Future<void> Function()? onNewSession;
+  final Future<void> Function()? onEditPermission;
+  final Future<void> Function()? onSwitchWorkspace;
+  final Future<void> Function()? onDeleteSession;
+
+  /// 「运行轨迹」「运维面板」两个入口（推入 `TrajectorySheet` / `HostOpsView`）。
+  ///
+  /// 它们是**页面级**的目的地，不是这里能内联渲染的数据，所以只给出口。
+  final Future<void> Function()? onOpenTrajectory;
+  final Future<void> Function()? onOpenHostOps;
 
   @override
   State<SessionInfoSheet> createState() => _SessionInfoSheetState();
@@ -281,7 +333,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
     // 而不是抛异常或滚到一个不存在的锚点。
     final ctx = _keyFor(section)?.currentContext;
     if (ctx == null) return;
-    Scrollable.ensureVisible(ctx, duration: const Duration(milliseconds: 240), alignment: 0.02);
+    Scrollable.ensureVisible(ctx,
+        duration: const Duration(milliseconds: 240), alignment: 0.02);
   }
 
   Future<void> _refresh() async {
@@ -302,8 +355,10 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       context: context,
       isScrollControlled: true,
       backgroundColor: context.c.surface,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
-      builder: (_) => _DiffSheet(change: change, loader: () => loader(change.path)),
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (_) =>
+          _DiffSheet(change: change, loader: () => loader(change.path)),
     );
   }
 
@@ -343,8 +398,12 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         content: Text('引擎没有直接的停止接口，将请求 Agent 终止「$name」——'
             '这会占用一轮对话，作业不会立刻结束。已经产生的结果不会回滚。'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('终止')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('终止')),
         ],
       ),
     );
@@ -382,7 +441,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         _jobStopNotice = '该后台任务已不在本会话的可停止列表中。';
       } else {
         _jobStopNoticeError = true;
-        _jobStopNotice = result.error.isNotEmpty ? result.error : '停止请求被拒绝或未送达。';
+        _jobStopNotice =
+            result.error.isNotEmpty ? result.error : '停止请求被拒绝或未送达。';
       }
     });
   }
@@ -394,10 +454,15 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('删除定时任务？'),
-        content: Text('将删除「${schedule.title.isEmpty ? schedule.id : schedule.title}」。之后不会再触发提醒。'),
+        content: Text(
+            '将删除「${schedule.title.isEmpty ? schedule.id : schedule.title}」。之后不会再触发提醒。'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('删除')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('删除')),
         ],
       ),
     );
@@ -430,7 +495,10 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                   Expanded(
                     child: Text(
                       '会话信息',
-                      style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+                      style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                          color: context.c.textPrimary),
                     ),
                   ),
                   if (_refreshing)
@@ -443,12 +511,14 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                     IconButton(
                       key: const ValueKey('session-info-refresh'),
                       tooltip: '刷新作业与定时',
-                      icon: Icon(Icons.refresh_rounded, size: 20, color: context.c.textSecondary),
+                      icon: Icon(Icons.refresh_rounded,
+                          size: 20, color: context.c.textSecondary),
                       onPressed: _refresh,
                     ),
                   IconButton(
                     tooltip: '关闭',
-                    icon: Icon(Icons.close_rounded, size: 20, color: context.c.textSecondary),
+                    icon: Icon(Icons.close_rounded,
+                        size: 20, color: context.c.textSecondary),
                     onPressed: () => Navigator.of(context).maybePop(),
                   ),
                 ],
@@ -461,8 +531,16 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    // 会话操作（v1.27）：原来 AppBar 溢出菜单里的四项。
+                    // 放在**最上面** —— 它是这个面板唯一"会改变什么"的部分，
+                    // 其余区块都是只读的现状描述。
+                    if (_hasSessionActions) _buildSessionActions(),
+                    if (widget.onOpenTrajectory != null ||
+                        widget.onOpenHostOps != null)
+                      _buildShortcuts(),
                     KeyedSubtree(key: _usageKey, child: _buildUsage()),
-                    KeyedSubtree(key: _deliverablesKey, child: _buildDeliverables()),
+                    KeyedSubtree(
+                        key: _deliverablesKey, child: _buildDeliverables()),
                     KeyedSubtree(key: _changesKey, child: _buildChanges()),
                     KeyedSubtree(key: _jobsKey, child: _buildJobs()),
                     // [feat 2026-10-16] 智能体团队。放在子代理**之前**：团队是更高
@@ -472,14 +550,163 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                     // [feat 2026-10-12] 子代理区块。引擎没有列出能力/读取失败时
                     // 返回 null —— 整块隐藏，绝不显示一张假空表。
                     if (widget.subagents != null)
-                      KeyedSubtree(key: _subagentsKey, child: _buildSubagents()),
+                      KeyedSubtree(
+                          key: _subagentsKey, child: _buildSubagents()),
                     KeyedSubtree(key: _schedulesKey, child: _buildSchedules()),
                     // [feat 2026-10-12] 一键连接诊断。
-                    KeyedSubtree(key: _diagnosticsKey, child: _buildDiagnostics()),
+                    KeyedSubtree(
+                        key: _diagnosticsKey, child: _buildDiagnostics()),
                   ],
                 ),
               ),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // --------------------------------------------------- 会话操作 [v1.27] ----
+
+  bool get _hasSessionActions =>
+      widget.onSwitchModel != null ||
+      widget.onNewSession != null ||
+      widget.onEditPermission != null ||
+      widget.onSwitchWorkspace != null ||
+      widget.onDeleteSession != null;
+
+  /// 「会话操作」：原来 AppBar 溢出菜单里的四项（切换模型 / 对话权限 /
+  /// 切换工作区 / 删除会话）。
+  ///
+  /// 每一项都是"会改变什么"的动作，所以放在面板最上面；下面那些区块都是只读的
+  /// 现状描述。没有回调的项整行不渲染 —— 见字段注释里那条理由。
+  Widget _buildSessionActions() {
+    return _section(
+      title: '会话操作',
+      icon: Icons.tune_rounded,
+      children: [
+        if (widget.onNewSession != null)
+          _actionRow(
+            key: const ValueKey('session-action-new'),
+            icon: Icons.add_comment_outlined,
+            label: '新开会话',
+            value: '上下文快满时的出路',
+            onTap: widget.onNewSession!,
+          ),
+        if (widget.onSwitchModel != null)
+          _actionRow(
+            key: const ValueKey('session-action-model'),
+            icon: Icons.smart_toy_outlined,
+            label: '切换模型',
+            value: widget.modelLabel,
+            onTap: widget.onSwitchModel!,
+          ),
+        if (widget.onEditPermission != null)
+          _actionRow(
+            key: const ValueKey('session-action-permission'),
+            icon: Icons.shield_outlined,
+            label: '对话权限',
+            value: widget.permissionLabel,
+            onTap: widget.onEditPermission!,
+          ),
+        if (widget.onSwitchWorkspace != null)
+          _actionRow(
+            key: const ValueKey('session-action-workspace'),
+            icon: Icons.folder_outlined,
+            label: '切换工作区',
+            value: widget.workspaceLabel,
+            onTap: widget.onSwitchWorkspace!,
+          ),
+        if (widget.onDeleteSession != null)
+          _actionRow(
+            key: const ValueKey('session-action-delete'),
+            icon: Icons.delete_outline_rounded,
+            label: '删除会话',
+            // 不可撤销的动作用 danger 标出来，和其它三项在视觉上分开。
+            danger: true,
+            onTap: widget.onDeleteSession!,
+          ),
+      ],
+    );
+  }
+
+  /// 「运行轨迹」「运维面板」两个内嵌区块入口。
+  ///
+  /// 它们是页面级目的地（`TrajectorySheet` / `HostOpsView`），不是这里能内联
+  /// 渲染的数据，所以只给出口；两个回调都为 null 时整块不渲染。
+  Widget _buildShortcuts() {
+    return _section(
+      title: '入口',
+      icon: Icons.open_in_new_rounded,
+      children: [
+        if (widget.onOpenTrajectory != null)
+          _actionRow(
+            key: const ValueKey('session-entry-trajectory'),
+            icon: Icons.timeline_rounded,
+            label: '运行轨迹',
+            value: '本轮事件时间线',
+            onTap: widget.onOpenTrajectory!,
+          ),
+        if (widget.onOpenHostOps != null)
+          _actionRow(
+            key: const ValueKey('session-entry-hostops'),
+            icon: Icons.dns_outlined,
+            label: '运维面板',
+            value: '主机与引擎状态',
+            onTap: widget.onOpenHostOps!,
+          ),
+      ],
+    );
+  }
+
+  /// 一行带箭头（和可选当前值）的动作。
+  ///
+  /// 点下去**先收起本面板**再执行：这些动作自己会再弹一层（模型清单 / 权限策略 /
+  /// 工作区列表 / 删除确认），叠在信息面板上会让人搞不清"我刚点的是哪一层的按钮"，
+  /// 而且删完会话之后底下的信息面板已经过期了。
+  Widget _actionRow({
+    required Key key,
+    required IconData icon,
+    required String label,
+    required Future<void> Function() onTap,
+    String? value,
+    bool danger = false,
+  }) {
+    final tone = danger ? context.c.danger : context.c.textPrimary;
+    return InkWell(
+      key: key,
+      borderRadius: BorderRadius.circular(8),
+      onTap: () async {
+        final action = onTap;
+        Navigator.of(context).maybePop();
+        await action();
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 2),
+        child: Row(
+          children: [
+            Icon(icon,
+                size: 15,
+                color: danger ? context.c.danger : context.c.textSecondary),
+            const SizedBox(width: AppSpace.m),
+            Expanded(
+              child: Text(label,
+                  style: TextStyle(fontSize: AppText.body, color: tone)),
+            ),
+            if (value != null && value.isNotEmpty)
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 140),
+                child: Text(
+                  value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      fontSize: AppText.caption, color: context.c.textTertiary),
+                ),
+              ),
+            const SizedBox(width: AppSpace.s),
+            Icon(Icons.chevron_right_rounded,
+                size: 16, color: context.c.textTertiary),
           ],
         ),
       ),
@@ -506,7 +733,9 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
             valueColor: AlwaysStoppedAnimation(
               fraction >= SessionStatusStrip.pressureCriticalThreshold
                   ? context.c.danger
-                  : (fraction > SessionStatusStrip.pressureLineThreshold ? context.c.warning : context.c.success),
+                  : (fraction > SessionStatusStrip.pressureLineThreshold
+                      ? context.c.warning
+                      : context.c.success),
             ),
           ),
         ));
@@ -528,7 +757,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       // 而缓存读是同一段上下文被反复重读，会把数字吹大一个量级（用户实测
       // 11.08M 输入 + 0.34M 输出 + 193.46M 缓存读），显示成 205M 完全不是消耗。
       final consumed = stats.consumedTokens;
-      children.add(_metricRow('会话累计消耗', consumed == null ? '—' : _compact(consumed)));
+      children.add(
+          _metricRow('会话累计消耗', consumed == null ? '—' : _compact(consumed)));
       if (stats.hasCacheReuse) {
         children.add(Padding(
           padding: const EdgeInsets.only(top: 2),
@@ -555,12 +785,16 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         children.add(const SizedBox(height: 4));
         children.add(_metricRow(
           '会话统计',
-          tps == null ? counts : '$counts · ${SessionStatusStrip.formatTokensPerSecond(tps)} tok/s',
+          tps == null
+              ? counts
+              : '$counts · ${SessionStatusStrip.formatTokensPerSecond(tps)} tok/s',
         ));
 
         final durations = <String>[
-          if ((counters.llmMs ?? 0) > 0) '模型用时 ${_shortDuration(counters.llmMs!)}',
-          if ((counters.toolMs ?? 0) > 0) '工具调用 ${_shortDuration(counters.toolMs!)}',
+          if ((counters.llmMs ?? 0) > 0)
+            '模型用时 ${_shortDuration(counters.llmMs!)}',
+          if ((counters.toolMs ?? 0) > 0)
+            '工具调用 ${_shortDuration(counters.toolMs!)}',
           // 首 token 平均：引擎给的是总量 + 步数，电脑端也是这么除的。
           if ((counters.ttftMs ?? 0) > 0 && (counters.ttftSteps ?? 0) > 0)
             '首 token 平均 ${_shortDuration(counters.ttftMs! ~/ counters.ttftSteps!)}',
@@ -604,20 +838,29 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                 Icon(Icons.flag_rounded, size: 14, color: context.c.accent),
                 const SizedBox(width: 6),
                 Text('目标 · ${goal.phaseLabel}',
-                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: context.c.textPrimary)),
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: context.c.textPrimary)),
                 const Spacer(),
                 if (goal.roundsStarted != null)
                   Text(
                     '第 ${goal.roundsStarted}${goal.maxGoalRounds != null ? '/${goal.maxGoalRounds}' : ''} 轮',
-                    style: TextStyle(fontSize: 11, color: context.c.textTertiary),
+                    style:
+                        TextStyle(fontSize: 11, color: context.c.textTertiary),
                   ),
               ],
             ),
             const SizedBox(height: 4),
-            Text(goal.objective, style: TextStyle(fontSize: 12, color: context.c.textSecondary, height: 1.35)),
+            Text(goal.objective,
+                style: TextStyle(
+                    fontSize: 12,
+                    color: context.c.textSecondary,
+                    height: 1.35)),
             if (goal.blockedReason != null) ...[
               const SizedBox(height: 4),
-              Text('受阻：${goal.blockedReason}', style: TextStyle(fontSize: 11.5, color: context.c.danger)),
+              Text('受阻：${goal.blockedReason}',
+                  style: TextStyle(fontSize: 11.5, color: context.c.danger)),
             ],
             // [feat 2026-10-12] 暂停/继续/完成。只在拿得到引擎 CAS ref（id+revision）
             // 时出现：没有 ref 的按钮会带着猜测的目标发 RPC，宁可不显示。
@@ -626,12 +869,15 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
               Row(
                 children: [
                   if (goal.phase == 'active')
-                    _goalAction('暂停', 'pause', goal, key: const ValueKey('goal-pause'))
+                    _goalAction('暂停', 'pause', goal,
+                        key: const ValueKey('goal-pause'))
                   else if (goal.phase == 'paused' || goal.phase == 'blocked')
-                    _goalAction('继续', 'resume', goal, key: const ValueKey('goal-resume')),
+                    _goalAction('继续', 'resume', goal,
+                        key: const ValueKey('goal-resume')),
                   if (goal.phase != 'complete') ...[
                     const SizedBox(width: 8),
-                    _goalAction('完成', 'complete', goal, key: const ValueKey('goal-complete')),
+                    _goalAction('完成', 'complete', goal,
+                        key: const ValueKey('goal-complete')),
                   ],
                 ],
               ),
@@ -641,7 +887,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       ));
     }
 
-    return _section(title: '用量与上下文', icon: Icons.data_usage_rounded, children: children);
+    return _section(
+        title: '用量与上下文', icon: Icons.data_usage_rounded, children: children);
   }
 
   /// 一个 goal 操作按钮。执行中转圈；引擎拒绝给一条明确的失败说明。
@@ -660,8 +907,12 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         ),
       ),
       child: busy
-          ? const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2))
-          : Text(label, style: TextStyle(fontSize: 11.5, color: context.c.textPrimary)),
+          ? const SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(strokeWidth: 2))
+          : Text(label,
+              style: TextStyle(fontSize: 11.5, color: context.c.textPrimary)),
     );
   }
 
@@ -693,7 +944,9 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
     final total = ms < 0 ? 0 : ms;
     if (total < 60000) {
       final seconds = total / 1000;
-      return seconds >= 10 ? '${seconds.round()}s' : '${seconds.toStringAsFixed(1)}s';
+      return seconds >= 10
+          ? '${seconds.round()}s'
+          : '${seconds.toStringAsFixed(1)}s';
     }
     final minutes = total ~/ 60000;
     final seconds = (total % 60000) ~/ 1000;
@@ -746,7 +999,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
           if (needsHint) _hint('点文件名就地预览内容；长按仍走下载 / 用其它应用打开。'),
           // 按轮倒序分组，**默认只展开最新一轮**：长会话可能声明过几十个文件，
           // 而用户要的是"刚给我的那批"。其余轮次折起来但不隐藏。
-          for (var i = 0; i < groups.length; i++) _buildDeliverableGroup(groups[i], i == 0),
+          for (var i = 0; i < groups.length; i++)
+            _buildDeliverableGroup(groups[i], i == 0),
         ],
       ],
     );
@@ -764,11 +1018,13 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         // 其中只有一个能点 —— 那比手势难发现更糟。长按是这个行上唯一不与主
         // 点击冲突、也不新增视觉噪声的第二动作位。
         GestureDetector(
-          onLongPress: (preview != null && open != null) ? () => open(item) : null,
+          onLongPress:
+              (preview != null && open != null) ? () => open(item) : null,
           child: DeliverableRow(
             item: item,
             dense: true,
-            busy: widget.busyDeliverablePath != null && widget.busyDeliverablePath == item.path,
+            busy: widget.busyDeliverablePath != null &&
+                widget.busyDeliverablePath == item.path,
             onOpen: preview != null
                 ? () => _openDeliverablePreview(item)
                 : (open == null ? null : () => open(item)),
@@ -787,7 +1043,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
           key: ValueKey('deliverable-group-${group.turn}'),
           tilePadding: EdgeInsets.zero,
           childrenPadding: const EdgeInsets.only(bottom: 4),
-          title: Text(label, style: TextStyle(fontSize: 12, color: context.c.textSecondary)),
+          title: Text(label,
+              style: TextStyle(fontSize: 12, color: context.c.textSecondary)),
           children: rows,
         ),
       );
@@ -799,7 +1056,11 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       children: [
         Padding(
           padding: const EdgeInsets.only(top: 2, bottom: 2),
-          child: Text(label, style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: context.c.textPrimary)),
+          child: Text(label,
+              style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: context.c.textPrimary)),
         ),
         ...rows,
       ],
@@ -826,7 +1087,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       // 优先说网关给的 note：它才是那句真正解释"为什么 git 这里是空的"的话
       // （例："当前工作区不是 git 仓库，但相邻有 2 个仓库；下方文件列表来自本轮
       // Agent 的文件写入记录"）。本地拼的通用文案只是 note 缺席时的兜底。
-      children.add(_changesBanner(note.isNotEmpty ? note : _changesFallbackReason()));
+      children.add(
+          _changesBanner(note.isNotEmpty ? note : _changesFallbackReason()));
     } else if (note.isNotEmpty) {
       // 有内容也可能带说明：清单里混了"没有行数的 Agent 写入行"时，note 就是
       // 用来解释这个的，必须显示在列表**上方**而不是折叠起来。
@@ -845,11 +1107,14 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         if (children.isNotEmpty) children.add(const SizedBox(height: 8));
         final source = _changesSourceCaption();
         if (source != null) children.add(_hint(source));
-        for (final change in widget.changes) { children.add(_buildChangeRow(change)); }
+        for (final change in widget.changes) {
+          children.add(_buildChangeRow(change));
+        }
       }
     }
 
-    return _section(title: '本次变更', icon: Icons.difference_rounded, children: children);
+    return _section(
+        title: '本次变更', icon: Icons.difference_rounded, children: children);
   }
 
   /// note 缺席时用来解释"读不到"的兜底文案。**只有**在这里才退回通用说法 ——
@@ -858,7 +1123,9 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
     if (widget.changesReason == 'not-a-git-repository') {
       return '这个工作区不是 git 仓库，列不出改动（引擎侧的变更快照不通过 RPC 暴露）。';
     }
-    if (widget.changesReason.isNotEmpty) return '变更清单暂不可用：${widget.changesReason}';
+    if (widget.changesReason.isNotEmpty) {
+      return '变更清单暂不可用：${widget.changesReason}';
+    }
     return '变更清单暂不可用。';
   }
 
@@ -890,7 +1157,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       child: Text(
         text,
         key: const ValueKey('changes-note'),
-        style: TextStyle(fontSize: 11.5, color: context.c.warning, height: 1.35),
+        style:
+            TextStyle(fontSize: 11.5, color: context.c.warning, height: 1.35),
       ),
     );
   }
@@ -904,7 +1172,11 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('相邻仓库', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: context.c.textSecondary)),
+        Text('相邻仓库',
+            style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+                color: context.c.textSecondary)),
         const SizedBox(height: 4),
         Wrap(
           spacing: 6,
@@ -919,7 +1191,9 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                   borderRadius: BorderRadius.circular(6),
                   border: Border.all(color: context.c.border),
                 ),
-                child: Text(repo.name, style: TextStyle(fontSize: 11, color: context.c.textSecondary)),
+                child: Text(repo.name,
+                    style: TextStyle(
+                        fontSize: 11, color: context.c.textSecondary)),
               ),
           ],
         ),
@@ -960,7 +1234,10 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
             SizedBox(
               width: 34,
               child: Text(change.label,
-                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: context.c.warning)),
+                  style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold,
+                      color: context.c.warning)),
             ),
             const SizedBox(width: 6),
             Expanded(
@@ -969,22 +1246,35 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                 children: [
                   Text(
                     change.path,
-                    style: TextStyle(fontSize: 12, fontFamily: 'monospace', color: context.c.textPrimary),
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontFamily: 'monospace',
+                        color: context.c.textPrimary),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
                   // 为什么这一行没有行数：不说清，用户只能把它读成"没改"。
                   if (sourceHint != null)
-                    Text(sourceHint, style: TextStyle(fontSize: 10, color: context.c.textTertiary, height: 1.3)),
+                    Text(sourceHint,
+                        style: TextStyle(
+                            fontSize: 10,
+                            color: context.c.textTertiary,
+                            height: 1.3)),
                 ],
               ),
             ),
             const SizedBox(width: 6),
-            Text(delta, style: TextStyle(fontSize: 10.5, color: context.c.textTertiary)),
+            Text(delta,
+                style:
+                    TextStyle(fontSize: 10.5, color: context.c.textTertiary)),
             const SizedBox(width: 4),
             // 这类行没有可展开的 diff，所以不画"能点开"的 chevron —— 画了就骗人。
-            Icon(fromToolCall ? Icons.info_outline_rounded : Icons.chevron_right_rounded,
-                size: 16, color: context.c.textTertiary),
+            Icon(
+                fromToolCall
+                    ? Icons.info_outline_rounded
+                    : Icons.chevron_right_rounded,
+                size: 16,
+                color: context.c.textTertiary),
           ],
         ),
       ),
@@ -1012,7 +1302,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
           // "一个作业都没在跑"，然后关掉手机走人。
           Row(
             children: [
-              Icon(Icons.help_outline_rounded, size: 15, color: context.c.warning),
+              Icon(Icons.help_outline_rounded,
+                  size: 15, color: context.c.warning),
               const SizedBox(width: 6),
               Expanded(
                 child: Text(
@@ -1044,7 +1335,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       context: context,
       isScrollControlled: true,
       backgroundColor: context.c.surface,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
       builder: (_) => _JobLogSheet(job: job, load: load),
     );
   }
@@ -1072,7 +1364,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
             ),
             child: Text(
               job.statusLabel,
-              style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: color),
+              style: TextStyle(
+                  fontSize: 10, fontWeight: FontWeight.bold, color: color),
             ),
           ),
           Expanded(
@@ -1081,14 +1374,16 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
               children: [
                 Text(
                   job.label.isEmpty ? job.id : job.label,
-                  style: TextStyle(fontSize: 12.5, color: context.c.textPrimary),
+                  style:
+                      TextStyle(fontSize: 12.5, color: context.c.textPrimary),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
                 if (meta.isNotEmpty)
                   Text(
                     meta.join(' · '),
-                    style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                    style: TextStyle(
+                        fontSize: 10.5, color: context.c.textTertiary),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
@@ -1108,7 +1403,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
               borderRadius: BorderRadius.circular(4),
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                child: Icon(Icons.article_outlined, size: 15, color: context.c.accent),
+                child: Icon(Icons.article_outlined,
+                    size: 15, color: context.c.accent),
               ),
             ),
           const SizedBox(width: 4),
@@ -1117,7 +1413,9 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
           Text(
             _jobDurationLabel(job),
             key: ValueKey('job-duration-${job.id}'),
-            style: TextStyle(fontSize: 10.5, color: job.isLive ? context.c.success : context.c.textTertiary),
+            style: TextStyle(
+                fontSize: 10.5,
+                color: job.isLive ? context.c.success : context.c.textTertiary),
           ),
           if (job.isLive && widget.onKillJob != null)
             TextButton(
@@ -1126,7 +1424,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                 minimumSize: Size.zero,
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               ),
-              child: Text('终止', style: TextStyle(fontSize: 12, color: context.c.danger)),
+              child: Text('终止',
+                  style: TextStyle(fontSize: 12, color: context.c.danger)),
             ),
         ],
       ),
@@ -1166,7 +1465,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
     if (!job.isLive) return job.durationLabel ?? '—';
     final base = job.durationMs;
     if (base == null) return '计时中';
-    final elapsed = base + DateTime.now().difference(_jobsAnchor).inMilliseconds;
+    final elapsed =
+        base + DateTime.now().difference(_jobsAnchor).inMilliseconds;
     return _durationText(elapsed);
   }
 
@@ -1186,16 +1486,25 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
   }
 
   Widget _buildJobStopNotice() {
-    final color = _jobStopNoticeError ? context.c.danger : context.c.textSecondary;
+    final color =
+        _jobStopNoticeError ? context.c.danger : context.c.textSecondary;
     return Padding(
       key: const ValueKey('job-stop-notice'),
       padding: const EdgeInsets.only(top: 6),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(_jobStopNoticeError ? Icons.error_outline_rounded : Icons.info_outline_rounded, size: 14, color: color),
+          Icon(
+              _jobStopNoticeError
+                  ? Icons.error_outline_rounded
+                  : Icons.info_outline_rounded,
+              size: 14,
+              color: color),
           const SizedBox(width: 6),
-          Expanded(child: Text(_jobStopNotice!, style: TextStyle(fontSize: 11.5, color: color, height: 1.35))),
+          Expanded(
+              child: Text(_jobStopNotice!,
+                  style:
+                      TextStyle(fontSize: 11.5, color: color, height: 1.35))),
         ],
       ),
     );
@@ -1213,7 +1522,10 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         key: const ValueKey('schedules-section'),
         tilePadding: EdgeInsets.zero,
         title: Text('定时任务 ${widget.schedules.length}',
-            style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: context.c.textPrimary)),
+            style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+                color: context.c.textPrimary)),
         childrenPadding: const EdgeInsets.only(bottom: 6),
         children: [
           if (widget.schedules.isEmpty)
@@ -1229,10 +1541,15 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(s.title.isEmpty ? s.id : s.title,
-                              style: TextStyle(fontSize: 12.5, color: context.c.textPrimary)),
+                              style: TextStyle(
+                                  fontSize: 12.5,
+                                  color: context.c.textPrimary)),
                           Text(
-                            [s.schedule, if (s.kind.isNotEmpty) s.kind].where((e) => e.isNotEmpty).join(' · '),
-                            style: TextStyle(fontSize: 11, color: context.c.textTertiary),
+                            [s.schedule, if (s.kind.isNotEmpty) s.kind]
+                                .where((e) => e.isNotEmpty)
+                                .join(' · '),
+                            style: TextStyle(
+                                fontSize: 11, color: context.c.textTertiary),
                           ),
                         ],
                       ),
@@ -1242,9 +1559,12 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                         onPressed: () => _confirmDeleteSchedule(s),
                         style: TextButton.styleFrom(
                           minimumSize: Size.zero,
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 4),
                         ),
-                        child: Text('删除', style: TextStyle(fontSize: 12, color: context.c.danger)),
+                        child: Text('删除',
+                            style: TextStyle(
+                                fontSize: 12, color: context.c.danger)),
                       ),
                   ],
                 ),
@@ -1265,7 +1585,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         if (widget.subagentsUnavailable)
           Row(
             children: [
-              Icon(Icons.help_outline_rounded, size: 15, color: context.c.warning),
+              Icon(Icons.help_outline_rounded,
+                  size: 15, color: context.c.warning),
               const SizedBox(width: 6),
               const Expanded(
                 child: Text(
@@ -1286,9 +1607,15 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                 children: [
                   Container(
                     margin: const EdgeInsets.only(right: 8),
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                     decoration: BoxDecoration(
-                      color: (sub.isDiagnostic ? context.c.textTertiary : sub.isRunning ? context.c.accent : context.c.border).withOpacity(0.12),
+                      color: (sub.isDiagnostic
+                              ? context.c.textTertiary
+                              : sub.isRunning
+                                  ? context.c.accent
+                                  : context.c.border)
+                          .withOpacity(0.12),
                       borderRadius: BorderRadius.circular(5),
                     ),
                     child: Text(
@@ -1296,14 +1623,21 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                       style: TextStyle(
                         fontSize: 10,
                         fontWeight: FontWeight.bold,
-                        color: sub.isDiagnostic ? context.c.textSecondary : sub.isRunning ? context.c.accent : context.c.textSecondary,
+                        color: sub.isDiagnostic
+                            ? context.c.textSecondary
+                            : sub.isRunning
+                                ? context.c.accent
+                                : context.c.textSecondary,
                       ),
                     ),
                   ),
                   Expanded(
                     child: Text(
-                      sub.isDiagnostic ? '${sub.displayLabel}（${sub.reason}）' : sub.displayLabel,
-                      style: TextStyle(fontSize: 12.5, color: context.c.textPrimary),
+                      sub.isDiagnostic
+                          ? '${sub.displayLabel}（${sub.reason}）'
+                          : sub.displayLabel,
+                      style: TextStyle(
+                          fontSize: 12.5, color: context.c.textPrimary),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -1312,14 +1646,22 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                   // 发了必拒 —— 按钮从一开始就不出现。
                   if (sub.interruptible && widget.onInterruptSubagent != null)
                     TextButton(
-                      onPressed: _interruptingId == null ? () => _confirmInterruptSubagent(sub) : null,
+                      onPressed: _interruptingId == null
+                          ? () => _confirmInterruptSubagent(sub)
+                          : null,
                       style: TextButton.styleFrom(
                         minimumSize: Size.zero,
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 4),
                       ),
                       child: _interruptingId == sub.id
-                          ? const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2))
-                          : Text('中断', style: TextStyle(fontSize: 12, color: context.c.danger)),
+                          ? const SizedBox(
+                              width: 12,
+                              height: 12,
+                              child: CircularProgressIndicator(strokeWidth: 2))
+                          : Text('中断',
+                              style: TextStyle(
+                                  fontSize: 12, color: context.c.danger)),
                     ),
                 ],
               ),
@@ -1368,7 +1710,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
 
     if (!team.supported) {
       children.add(_hint('当前引擎未启用智能体团队能力。'));
-      return _section(title: '智能体团队', icon: Icons.groups_rounded, children: children);
+      return _section(
+          title: '智能体团队', icon: Icons.groups_rounded, children: children);
     }
 
     if (team.failure.isNotEmpty) {
@@ -1390,7 +1733,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
 
     if (team.isEmpty) {
       children.add(_hint('这个会话没有智能体团队。'));
-      return _section(title: '智能体团队', icon: Icons.groups_rounded, children: children);
+      return _section(
+          title: '智能体团队', icon: Icons.groups_rounded, children: children);
     }
 
     final mates = team.teammates;
@@ -1400,7 +1744,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       child: Row(
         children: [
           _chip('${team.members.length} 名成员',
-              color: team.isWorking ? context.c.accent : context.c.textSecondary),
+              color:
+                  team.isWorking ? context.c.accent : context.c.textSecondary),
           const SizedBox(width: 6),
           if (team.tasks.isNotEmpty)
             _chip('${team.tasks.length} 个任务', color: context.c.textSecondary),
@@ -1408,7 +1753,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
           // source 徽标说明这份快照是引擎实时投影还是磁盘检查点 —— 两者可能
           // 有分钟级时差，用户问"怎么进度不一样"时这是第一个要看的东西。
           if (team.source == 'cache')
-            Text('离线快照', style: TextStyle(fontSize: 10, color: context.c.textTertiary)),
+            Text('离线快照',
+                style: TextStyle(fontSize: 10, color: context.c.textTertiary)),
         ],
       ),
     ));
@@ -1421,14 +1767,18 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       children.add(Padding(
         padding: const EdgeInsets.only(top: 10, bottom: 4),
         child: Text('共享任务板',
-            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: context.c.textSecondary)),
+            style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: context.c.textSecondary)),
       ));
       for (final t in team.tasks) {
         children.add(_buildTeamTaskRow(t));
       }
     }
 
-    return _section(title: '智能体团队', icon: Icons.groups_rounded, children: children);
+    return _section(
+        title: '智能体团队', icon: Icons.groups_rounded, children: children);
   }
 
   Widget _chip(String label, {required Color color}) {
@@ -1440,7 +1790,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       ),
       child: Text(
         label,
-        style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: color),
+        style:
+            TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: color),
       ),
     );
   }
@@ -1473,11 +1824,14 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
               if (m.error.isNotEmpty || (!m.isLead && m.isFailed))
                 IconButton(
                   visualDensity: VisualDensity.compact,
-                  constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                  constraints:
+                      const BoxConstraints(minWidth: 28, minHeight: 28),
                   padding: EdgeInsets.zero,
                   tooltip: expanded ? '收起' : '展开',
                   icon: Icon(
-                    expanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
+                    expanded
+                        ? Icons.expand_less_rounded
+                        : Icons.expand_more_rounded,
                     size: 18,
                     color: context.c.textSecondary,
                   ),
@@ -1523,7 +1877,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                 Text(
                   t.subject.isEmpty ? t.description : t.subject,
                   key: ValueKey('team-task-${t.id}'),
-                  style: TextStyle(fontSize: 12.5, color: context.c.textPrimary),
+                  style:
+                      TextStyle(fontSize: 12.5, color: context.c.textPrimary),
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                 ),
@@ -1535,7 +1890,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                         if (t.ownerName.isNotEmpty) '负责：${t.ownerName}',
                         if (t.isBlocked) '被阻塞',
                       ].join(' · '),
-                      style: TextStyle(fontSize: 11, color: context.c.textTertiary),
+                      style: TextStyle(
+                          fontSize: 11, color: context.c.textTertiary),
                     ),
                   ),
               ],
@@ -1556,8 +1912,12 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         content: Text('将请求引擎停止「${sub.displayLabel}」当前的回合。它已排队但未发送的消息会保留，'
             '稍后仍可继续对话。'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('中断')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('中断')),
         ],
       ),
     );
@@ -1594,9 +1954,16 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
               key: const ValueKey('run-diagnostics'),
               onPressed: widget.diagnosticsBusy ? null : _runDiagnostics,
               icon: widget.diagnosticsBusy
-                  ? const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2))
-                  : Icon(Icons.play_arrow_rounded, size: 16, color: context.c.accent),
-              label: Text(widget.diagnosticsBusy ? '检测中…' : (report == null ? '运行诊断' : '重新诊断'),
+                  ? const SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : Icon(Icons.play_arrow_rounded,
+                      size: 16, color: context.c.accent),
+              label: Text(
+                  widget.diagnosticsBusy
+                      ? '检测中…'
+                      : (report == null ? '运行诊断' : '重新诊断'),
                   style: TextStyle(fontSize: 12, color: context.c.accent)),
             ),
           ],
@@ -1628,12 +1995,23 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                     child: Text.rich(
                       TextSpan(
                         text: c.label,
-                        style: TextStyle(fontSize: 12, color: context.c.textPrimary),
+                        style: TextStyle(
+                            fontSize: 12, color: context.c.textPrimary),
                         children: [
                           if (c.value != null && c.value!.isNotEmpty)
-                            TextSpan(text: '  ${c.value}', style: TextStyle(fontSize: 11, color: context.c.textTertiary)),
-                          if (c.detail != null && c.detail!.isNotEmpty && c.detail != 'ok')
-                            TextSpan(text: '  ${c.detail}', style: TextStyle(fontSize: 11, color: context.c.textTertiary)),
+                            TextSpan(
+                                text: '  ${c.value}',
+                                style: TextStyle(
+                                    fontSize: 11,
+                                    color: context.c.textTertiary)),
+                          if (c.detail != null &&
+                              c.detail!.isNotEmpty &&
+                              c.detail != 'ok')
+                            TextSpan(
+                                text: '  ${c.detail}',
+                                style: TextStyle(
+                                    fontSize: 11,
+                                    color: context.c.textTertiary)),
                         ],
                       ),
                     ),
@@ -1646,7 +2024,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
             child: TextButton.icon(
               key: const ValueKey('copy-diagnostics'),
               onPressed: () async {
-                await Clipboard.setData(ClipboardData(text: report.toPlainText()));
+                await Clipboard.setData(
+                    ClipboardData(text: report.toPlainText()));
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
                     content: Text('诊断报告已复制'),
@@ -1655,8 +2034,11 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                   ));
                 }
               },
-              icon: Icon(Icons.copy_rounded, size: 14, color: context.c.textSecondary),
-              label: Text('复制报告', style: TextStyle(fontSize: 11.5, color: context.c.textSecondary)),
+              icon: Icon(Icons.copy_rounded,
+                  size: 14, color: context.c.textSecondary),
+              label: Text('复制报告',
+                  style: TextStyle(
+                      fontSize: 11.5, color: context.c.textSecondary)),
             ),
           ),
         ],
@@ -1679,7 +2061,10 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
 
   // -------------------------------------------------------- 通用 ----
 
-  Widget _section({required String title, required IconData icon, required List<Widget> children}) {
+  Widget _section(
+      {required String title,
+      required IconData icon,
+      required List<Widget> children}) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 16),
       child: Container(
@@ -1698,7 +2083,10 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                 Icon(icon, size: 15, color: context.c.textSecondary),
                 const SizedBox(width: 6),
                 Text(title,
-                    style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700, color: context.c.textPrimary)),
+                    style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        color: context.c.textPrimary)),
               ],
             ),
             const SizedBox(height: 8),
@@ -1714,8 +2102,15 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       padding: const EdgeInsets.symmetric(vertical: 2),
       child: Row(
         children: [
-          Expanded(child: Text(label, style: TextStyle(fontSize: 12, color: context.c.textSecondary))),
-          Text(value, style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold, color: context.c.textPrimary)),
+          Expanded(
+              child: Text(label,
+                  style:
+                      TextStyle(fontSize: 12, color: context.c.textSecondary))),
+          Text(value,
+              style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.bold,
+                  color: context.c.textPrimary)),
         ],
       ),
     );
@@ -1723,7 +2118,8 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
 
   Widget _hint(String text) => Text(
         text,
-        style: TextStyle(fontSize: 11.5, color: context.c.textTertiary, height: 1.35),
+        style: TextStyle(
+            fontSize: 11.5, color: context.c.textTertiary, height: 1.35),
       );
 }
 
@@ -1776,20 +2172,31 @@ class _DiffSheetState extends State<_DiffSheet> {
                     child: Text(
                       widget.change.path,
                       style: TextStyle(
-                          fontSize: 13, fontWeight: FontWeight.bold, fontFamily: 'monospace', color: context.c.textPrimary),
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          fontFamily: 'monospace',
+                          color: context.c.textPrimary),
                       maxLines: 2,
                     ),
                   ),
-                  Text(widget.change.delta, style: TextStyle(fontSize: 11, color: context.c.textTertiary)),
+                  Text(widget.change.delta,
+                      style: TextStyle(
+                          fontSize: 11, color: context.c.textTertiary)),
                 ],
               ),
             ),
             Divider(height: 1, color: context.c.border),
             Flexible(
               child: _failed
-                  ? Padding(padding: const EdgeInsets.all(20), child: Text('diff 读取失败', style: TextStyle(color: context.c.danger)))
+                  ? Padding(
+                      padding: const EdgeInsets.all(20),
+                      child: Text('diff 读取失败',
+                          style: TextStyle(color: context.c.danger)))
                   : hunks == null
-                      ? const Padding(padding: EdgeInsets.all(28), child: Center(child: CircularProgressIndicator(strokeWidth: 2)))
+                      ? const Padding(
+                          padding: EdgeInsets.all(28),
+                          child: Center(
+                              child: CircularProgressIndicator(strokeWidth: 2)))
                       : hunks.isEmpty
                           ? Padding(
                               padding: const EdgeInsets.all(20),
@@ -1797,7 +2204,9 @@ class _DiffSheetState extends State<_DiffSheet> {
                                 widget.change.status == '??'
                                     ? '未跟踪的新文件，git 没有可比对的旧版本。'
                                     : '没有文本差异（可能是二进制或仅权限变更）。',
-                                style: TextStyle(fontSize: 12.5, color: context.c.textSecondary),
+                                style: TextStyle(
+                                    fontSize: 12.5,
+                                    color: context.c.textSecondary),
                               ),
                             )
                           : ListView(
@@ -1805,10 +2214,14 @@ class _DiffSheetState extends State<_DiffSheet> {
                               children: [
                                 for (final hunk in hunks) ...[
                                   Padding(
-                                    padding: const EdgeInsets.only(top: 6, bottom: 4),
+                                    padding: const EdgeInsets.only(
+                                        top: 6, bottom: 4),
                                     child: Text(
                                       hunk.header,
-                                      style: TextStyle(fontSize: 11, color: context.c.accent, fontFamily: 'monospace'),
+                                      style: TextStyle(
+                                          fontSize: 11,
+                                          color: context.c.accent,
+                                          fontFamily: 'monospace'),
                                     ),
                                   ),
                                   for (final line in hunk.lines)
@@ -1817,9 +2230,11 @@ class _DiffSheetState extends State<_DiffSheet> {
                                       color: line.kind == 'add'
                                           ? context.c.success.withOpacity(0.10)
                                           : line.kind == 'del'
-                                              ? context.c.danger.withOpacity(0.10)
+                                              ? context.c.danger
+                                                  .withOpacity(0.10)
                                               : null,
-                                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 4, vertical: 1),
                                       child: Text(
                                         '${line.kind == 'add' ? '+' : line.kind == 'del' ? '-' : ' '}${line.text}',
                                         style: TextStyle(
@@ -1879,7 +2294,8 @@ class _JobLogSheetState extends State<_JobLogSheet> {
   String _error = '';
   JobItem _job;
 
-  _JobLogSheetState() : _job = const JobItem(id: '', kind: '', label: '', status: 'running');
+  _JobLogSheetState()
+      : _job = const JobItem(id: '', kind: '', label: '', status: 'running');
 
   @override
   void initState() {
@@ -1952,7 +2368,8 @@ class _JobLogSheetState extends State<_JobLogSheet> {
   Widget build(BuildContext context) {
     final title = _job.label.isEmpty ? _job.id : _job.label;
     return Padding(
-      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      padding:
+          EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
       child: SizedBox(
         height: MediaQuery.of(context).size.height * 0.72,
         child: Column(
@@ -1968,7 +2385,10 @@ class _JobLogSheetState extends State<_JobLogSheet> {
                       children: [
                         Text(
                           title,
-                          style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: context.c.textPrimary),
+                          style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.bold,
+                              color: context.c.textPrimary),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
@@ -1980,7 +2400,8 @@ class _JobLogSheetState extends State<_JobLogSheet> {
                             // 未结束就明说"跟随中"，避免用户以为日志到此为止。
                             if (!_settled) '跟随中（每 2 秒追加）',
                           ].join(' · '),
-                          style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                          style: TextStyle(
+                              fontSize: 10.5, color: context.c.textTertiary),
                         ),
                       ],
                     ),
@@ -1988,12 +2409,14 @@ class _JobLogSheetState extends State<_JobLogSheet> {
                   IconButton(
                     tooltip: '立即刷新',
                     onPressed: _busy ? null : () => _refresh(),
-                    icon: Icon(Icons.refresh_rounded, size: 20, color: context.c.accent),
+                    icon: Icon(Icons.refresh_rounded,
+                        size: 20, color: context.c.accent),
                   ),
                   IconButton(
                     tooltip: '关闭',
                     onPressed: () => Navigator.of(context).pop(),
-                    icon: Icon(Icons.close_rounded, size: 20, color: context.c.textSecondary),
+                    icon: Icon(Icons.close_rounded,
+                        size: 20, color: context.c.textSecondary),
                   ),
                 ],
               ),
@@ -2003,7 +2426,8 @@ class _JobLogSheetState extends State<_JobLogSheet> {
               Container(
                 width: double.infinity,
                 margin: const EdgeInsets.symmetric(horizontal: 16),
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
                 decoration: BoxDecoration(
                   color: context.c.warningSurface,
                   borderRadius: BorderRadius.circular(8),
@@ -2011,7 +2435,8 @@ class _JobLogSheetState extends State<_JobLogSheet> {
                 ),
                 child: Text(
                   '日志开头部分已被丢弃（超出保留窗口），下面是仍保留的片段 —— 这不是完整日志。',
-                  style: TextStyle(fontSize: 11, color: context.c.warning, height: 1.35),
+                  style: TextStyle(
+                      fontSize: 11, color: context.c.warning, height: 1.35),
                 ),
               ),
             if (_job.outputHeadLost && !_lossy)
@@ -2019,7 +2444,8 @@ class _JobLogSheetState extends State<_JobLogSheet> {
                 padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
                 child: Text(
                   '引擎报告最早可读偏移为 ${_job.outputEarliest}，之前的内容已不在环内。',
-                  style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                  style:
+                      TextStyle(fontSize: 10.5, color: context.c.textTertiary),
                 ),
               ),
             const SizedBox(height: 6),
@@ -2039,9 +2465,11 @@ class _JobLogSheetState extends State<_JobLogSheet> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(_error, style: TextStyle(fontSize: 12.5, color: context.c.danger)),
+            Text(_error,
+                style: TextStyle(fontSize: 12.5, color: context.c.danger)),
             const SizedBox(height: 10),
-            OutlinedButton(onPressed: () => _refresh(), child: const Text('重试')),
+            OutlinedButton(
+                onPressed: () => _refresh(), child: const Text('重试')),
           ],
         ),
       );
@@ -2064,7 +2492,8 @@ class _JobLogSheetState extends State<_JobLogSheet> {
         if (i == _lines.length) {
           return Padding(
             padding: const EdgeInsets.only(top: 8),
-            child: Text('追加失败：$_error', style: TextStyle(fontSize: 11, color: context.c.danger)),
+            child: Text('追加失败：$_error',
+                style: TextStyle(fontSize: 11, color: context.c.danger)),
           );
         }
         final line = _lines[i];
@@ -2078,7 +2507,10 @@ class _JobLogSheetState extends State<_JobLogSheet> {
                 padding: const EdgeInsets.symmetric(vertical: 4),
                 child: Text(
                   '—— 此处有丢失的字节 ——',
-                  style: TextStyle(fontSize: 10, color: context.c.warning, fontStyle: FontStyle.italic),
+                  style: TextStyle(
+                      fontSize: 10,
+                      color: context.c.warning,
+                      fontStyle: FontStyle.italic),
                 ),
               ),
             SelectableText(

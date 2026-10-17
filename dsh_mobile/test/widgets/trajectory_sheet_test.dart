@@ -271,19 +271,29 @@ void main() {
       await tester.pump(const Duration(seconds: 21));
     }
 
-    testWidgets('顶栏菜单里能打开轨迹面板', (tester) async {
+    testWidgets('顶栏的信息面板里能打开轨迹面板', (tester) async {
       VoiceInputService.instance.debugSetAvailable(false);
       await pumpChat(tester);
 
-      await tester.tap(find.byIcon(Icons.more_vert_rounded));
-      // 两次 pump：菜单是带入场动画的路由，动画没跑完时菜单项虽然已经挂进树，
-      // 但命中测试还拿不到它（tap 会警告 "would not hit test" 然后什么都不发生）。
+      // [feat 2026-10-17] 顶栏那个 8 项「更多」菜单已被收敛掉：轨迹、运维、权限、
+      // 模型切换全部搬进会话信息面板（会话域操作的唯一入口）。所以入口从
+      // "点 more_vert 再点菜单项"变成"点信息面板 icon 再点入口行"。
+      await tester.tap(find.byKey(const ValueKey('chat-open-session-info')));
+      // 两次 pump：bottom sheet 是带入场动画的路由，动画没跑完时入口行虽然已经
+      // 挂进树，但命中测试还拿不到它（tap 会警告 "would not hit test"）。
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
 
-      expect(find.text('运行轨迹'), findsOneWidget);
+      final trajectoryEntry = find.byKey(const ValueKey('session-entry-trajectory'));
+      expect(trajectoryEntry, findsOneWidget);
+      // 面板本身是一整块可滚动的长内容，"入口"分区在下方 —— 先把它滚进视野。
+      // 用 ensureVisible 而不是 scrollUntilVisible：弹层里不止一个 Scrollable，
+      // scrollUntilVisible 需要一个**唯一**的 Scrollable，会直接抛
+      // "Bad state: Too many elements"。ensureVisible 走的是祖先链，不会歧义。
+      await tester.ensureVisible(trajectoryEntry);
+      await tester.pump();
 
-      await tester.tap(find.text('运行轨迹'));
+      await tester.tap(trajectoryEntry);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
 

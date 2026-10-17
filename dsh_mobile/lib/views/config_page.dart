@@ -8,6 +8,7 @@ import '../services/dsh_service.dart';
 import '../services/storage_service.dart';
 import 'main_shell.dart';
 import '../theme/app_colors.dart';
+import '../widgets/inline_error_bar.dart';
 
 class ConfigPage extends StatefulWidget {
   const ConfigPage({super.key});
@@ -26,6 +27,9 @@ class _ConfigPageState extends State<ConfigPage> {
   final _npsController = TextEditingController(text: ''); // 兼容旧数据保留，UI 已移除
   bool _useHttps = false;
   bool _isTesting = false;
+
+  /// 「测试连通性」失败的原因（Phase 4.5）。null = 没有待展示的失败。
+  String? _testError;
 
   /// 配对成功后网关分配的本机设备 id（dev_xxxxxxxx），保存进配置。
   /// [feat 2026-10-12] 电脑端撤销广播按它命中本机。
@@ -458,16 +462,20 @@ class _ConfigPageState extends State<ConfigPage> {
     setState(() => _isTesting = false);
     if (ok) {
       dshService.clearAuthError();
+      setState(() => _testError = null);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('连接成功，鉴权验证通过'),
+          duration: Duration(milliseconds: 1400),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
     }
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(ok
-            ? '✅ 连接成功！鉴权验证通过'
-            : '❌ 连接失败: ${dshService.lastError.isEmpty ? "Token 错误或网关未响应" : dshService.lastError}'),
-        backgroundColor: ok ? Colors.green : Colors.red,
-      ),
-    );
+    // 失败：常驻错误条 + 原因。原来这里是 `Colors.green/Colors.red` 硬编码 +
+    // ✅❌ emoji —— 深色模式下那块纯绿/纯红与整套 token 完全不是一个体系。
+    setState(() => _testError =
+        '连接失败：${dshService.lastError.isEmpty ? 'Token 错误或网关未响应' : dshService.lastError}');
   }
 
   /// 一键切换并连接选中的网关。
@@ -660,6 +668,24 @@ class _ConfigPageState extends State<ConfigPage> {
                   padding: const EdgeInsets.symmetric(vertical: 14),
                 ),
               ),
+              // [feat 2026-10-17] 连接失败留在页面上（Phase 4.5）。
+              //
+              // 这一页是"第一次配对"的唯一入口，失败提示尤其不能飘走：用户此刻
+              // 手上没有别的信息源，提示一消失，他就只能靠反复点、或者去翻日志。
+              // 成功仍然用短提示（成功不需要留住）。
+              if (_testError != null)
+                InlineErrorBar(
+                  key: const ValueKey('config-test-error'),
+                  message: _testError!,
+                  onDismiss: () => setState(() => _testError = null),
+                  retryLabel: '重试',
+                  onRetry: _isTesting
+                      ? null
+                      : () {
+                          setState(() => _testError = null);
+                          _testConnection();
+                        },
+                ),
               const SizedBox(height: 12),
               OutlinedButton.icon(
                 onPressed: _scanAndConnect,

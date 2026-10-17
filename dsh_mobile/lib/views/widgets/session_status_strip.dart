@@ -8,6 +8,16 @@ import '../../theme/app_colors.dart';
 /// 所以"有哪些小节"这件事的归属方是状态条（生产者），面板只是消费者。
 enum SessionInsightSection { usage, deliverables, changes, jobs, schedules }
 
+/// 与网关的长连接状态（v1.27 新增的最左一段）。
+///
+/// 三态各自对应一个**完全不同的用户处境**，所以不能合并成一个布尔：
+/// * [connected]：正常，**整段隐藏** —— 它占着最显眼的左端却零信息量。
+/// * [reconnecting]：正在自动重连（指数退避），用户此刻发什么都可能失败，
+///   需要知道"不是我操作错了，是还在连"，所以给一个会呼吸的点。
+/// * [disconnected]：已经放弃自动重试（或首次连接就失败），必须给一个**可点**
+///   的出口 —— 只报"已断开"而不给重连入口，等于把人关在门外。
+enum SessionConnectionState { connected, reconnecting, disconnected }
+
 /// 会话状态条：AppBar 下方一条常驻单行信息。
 ///
 /// 它回答的是"这个会话**现在**是什么样"——所以它只放**状态**，不放事件；
@@ -25,7 +35,8 @@ enum SessionInsightSection { usage, deliverables, changes, jobs, schedules }
 ///    是最紧的，只留给"我要发的话"和阈值触发的告警。
 /// 3. **只放三个数字级别的信息。** 这里放不下的（用量明细、文件清单、作业列表）
 ///    一律进底部信息面板，本组件只负责"有没有、有几个、要不要点进去"。
-class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget {
+class SessionStatusStrip extends StatelessWidget
+    implements PreferredSizeWidget {
   const SessionStatusStrip({
     super.key,
     this.isRunning = false,
@@ -42,6 +53,10 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
     this.totalTokens,
     this.cacheHitPercent,
     this.onTapSection,
+    this.connection,
+    this.onReconnect,
+    this.runningElsewhereCount,
+    this.onTapRunningElsewhere,
   });
 
   /// 当前会话是否正在跑一个回合。
@@ -95,6 +110,31 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
   /// 点了某一段。`null` 时整条不可点。
   final ValueChanged<SessionInsightSection>? onTapSection;
 
+  /// 长连接状态。`null` = **还不知道**（沿用本文件的"未知即隐藏"规则）；
+  /// [SessionConnectionState.connected] 同样隐藏 —— 一切正常时不占位置。
+  ///
+  /// 与 `isRunning` 分开：那个说的是"这一轮在跑"，这个说的是"我还能不能把话
+  /// 发出去"。两者同时为真很常见（回合在跑，同时连接在抖）。
+  final SessionConnectionState? connection;
+
+  /// 断开状态下点这一段时调用的重连动作。为 null 时这一段不可点 ——
+  /// 但文案仍然是"已断开"，不会退化成一句不可点的死标签却不说明原因。
+  final VoidCallback? onReconnect;
+
+  /// 当前会话**之外**还有几个会话在跑（Phase 5.2）。
+  ///
+  /// 为什么这个数字放在状态条而不是 AppBar 再加一行：状态条是"这个 App 现在
+  /// 什么样"的唯一常驻读数位，而"还有别的会话在跑"正是同一类事实；更重要的是
+  /// 它挂在 `AppBar.bottom`，键盘弹起时不参与压缩 —— 加一行标题会挤掉会话名。
+  ///
+  /// `null` = 未知（工作区列表还没拉到）→ 整段隐藏。绝不显示 `0`：`0` 在用户
+  /// 眼里是"没有别的会话在跑"，而真相可能是"我根本没拉过工作区列表"。
+  final int? runningElsewhereCount;
+
+  /// 点"另外 N 个会话执行中"时打开会话选择。为 null 时该段不可点（但仍显示，
+  /// 因为"还有别的东西在跑"这个事实本身有价值）。
+  final VoidCallback? onTapRunningElsewhere;
+
   /// 低于这个比例不画进度线——常态下这一条要尽量安静。
   static const double pressureLineThreshold = 0.70;
 
@@ -106,6 +146,8 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
   /// 有没有任何东西可显示。没有就只留 1px 分隔线，**不留一条空白带**。
   bool get hasContent =>
       isRunning ||
+      _showConnection ||
+      (runningElsewhereCount ?? 0) > 0 ||
       deliverableCount != null ||
       (changeCount != null && !changesUnavailable) ||
       contextFraction != null ||
@@ -113,6 +155,10 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
       steps != null ||
       totalTokens != null ||
       (liveJobCount != null && liveJobCount! > 0);
+
+  /// 连接状态段只在"非正常"时出现：连上 = 隐藏，未知 = 隐藏。
+  bool get _showConnection =>
+      connection != null && connection != SessionConnectionState.connected;
 
   /// 紧凑数字：与电脑端一致（`113M tok` / `12.4k`）。
   ///
@@ -134,7 +180,9 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
   /// 10 以上取整，10 以下保留一位（`210` / `9.8`）。
   static String formatTokensPerSecond(double tps) {
     final clamped = tps < 0 ? 0.0 : tps;
-    return clamped >= 10 ? clamped.round().toString() : clamped.toStringAsFixed(1);
+    return clamped >= 10
+        ? clamped.round().toString()
+        : clamped.toStringAsFixed(1);
   }
 
   bool get _showPressureLine =>
@@ -148,6 +196,51 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
     if (f >= pressureCriticalThreshold) return context.c.danger;
     if (f > SessionStatusStrip.pressureLineThreshold) return context.c.warning;
     return context.c.textSecondary;
+  }
+
+  /// 连接状态段：重连中 = warning + 呼吸点；断开 = danger + 可点重连。
+  Widget _buildConnectionSegment(BuildContext context) {
+    final reconnecting = connection == SessionConnectionState.reconnecting;
+    final color = reconnecting ? context.c.warning : context.c.danger;
+    final label = reconnecting ? '连接中…' : '已断开 · 点击重连';
+    return Padding(
+      padding: const EdgeInsets.only(right: 8),
+      child: InkWell(
+        key: const ValueKey('strip-connection'),
+        borderRadius: BorderRadius.circular(6),
+        // 重连中是引擎自己在退避重试，再点一次只会多打一个请求 —— 按钮保持
+        // 不可点，但文案说清"正在连"，用户不会以为它卡死了。
+        onTap: reconnecting ? null : onReconnect,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (reconnecting)
+                _ConnectingDot(color: color)
+              else
+                Container(
+                  width: 6,
+                  height: 6,
+                  decoration:
+                      BoxDecoration(color: color, shape: BoxShape.circle),
+                ),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                maxLines: 1,
+                softWrap: false,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                  color: color,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -165,11 +258,50 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
 
     final segments = <Widget>[];
 
-    void addSegment({required Key key, required Widget child, required SessionInsightSection section}) {
+    // [feat 2026-10-17] Phase 5.2：当前会话之外还有会话在跑。
+    //
+    // 放在**最左**：它是"这台手机之外还有人/还有活在跑"的警示，比用量明细更该
+    // 先被看到。用 accent 而不是 danger —— 别处有活在跑不是错误，只是用户可能
+    // 想切过去看一眼（尤其是等结果的时候）。
+    //
+    // 数字来源是工作区列表里的 isRunning 聚合（见 `chat_dock.dart`）。那是个
+    // 可能过期的快照，所以这里只做"有/没有 + 几个"的粗粒度提示，不做精确进度。
+    final others = runningElsewhereCount;
+    if (others != null && others > 0) {
+      segments.add(InkWell(
+        key: const ValueKey('strip-other-running'),
+        borderRadius: BorderRadius.circular(6),
+        onTap: onTapRunningElsewhere,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.bolt_rounded, size: 12, color: context.c.accent),
+              const SizedBox(width: 2),
+              Text(
+                '另外 $others 个会话执行中',
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                  color: context.c.accent,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ));
+    }
+
+    void addSegment(
+        {required Key key,
+        required Widget child,
+        required SessionInsightSection section}) {
       if (segments.isNotEmpty) {
         segments.add(Padding(
           padding: const EdgeInsets.symmetric(horizontal: 6),
-          child: Text('·', style: TextStyle(fontSize: 11, color: context.c.textTertiary)),
+          child: Text('·',
+              style: TextStyle(fontSize: 11, color: context.c.textTertiary)),
         ));
       }
       segments.add(InkWell(
@@ -197,7 +329,9 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
         key: const ValueKey('strip-segment-counts'),
         section: SessionInsightSection.usage,
         child: Text(
-          tps == null ? counts : '$counts · ${formatTokensPerSecond(tps)} tok/s',
+          tps == null
+              ? counts
+              : '$counts · ${formatTokensPerSecond(tps)} tok/s',
           style: TextStyle(fontSize: 11.5, color: context.c.textSecondary),
         ),
       );
@@ -235,7 +369,9 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
             fontWeight: highlight ? FontWeight.w700 : FontWeight.w500,
             color: highlight
                 ? context.c.accent
-                : (count > 0 ? context.c.textSecondary : context.c.textTertiary),
+                : (count > 0
+                    ? context.c.textSecondary
+                    : context.c.textTertiary),
           ),
         ),
       );
@@ -260,7 +396,9 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text('上下文 $pct%', style: TextStyle(fontSize: 11.5, color: _contextColor(context))),
+            Text('上下文 $pct%',
+                style:
+                    TextStyle(fontSize: 11.5, color: _contextColor(context))),
             if (contextIsSnapshot) ...[
               const SizedBox(width: 3),
               // 快照必须看得出来：把几小时前的读数当实时值，用户会据此做出
@@ -302,14 +440,19 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
             child: Row(
               children: [
                 const SizedBox(width: 12),
+                // 最左端：连接状态（v1.27）。连上/未知时**整段不渲染**，所以正常
+                // 使用下这一行的左端和以前一模一样。
+                if (_showConnection) _buildConnectionSegment(context),
                 if (isRunning)
                   Container(
                     key: const ValueKey('strip-running'),
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 6, vertical: 1.5),
                     decoration: BoxDecoration(
                       color: context.c.accent.withOpacity(0.12),
                       borderRadius: BorderRadius.circular(4),
-                      border: Border.all(color: context.c.accent.withOpacity(0.3)),
+                      border:
+                          Border.all(color: context.c.accent.withOpacity(0.3)),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -317,12 +460,16 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
                         SizedBox(
                           width: 7,
                           height: 7,
-                          child: CircularProgressIndicator(strokeWidth: 1.4, color: context.c.accent),
+                          child: CircularProgressIndicator(
+                              strokeWidth: 1.4, color: context.c.accent),
                         ),
                         const SizedBox(width: 4),
                         Text(
                           '执行中',
-                          style: TextStyle(color: context.c.accent, fontSize: 9.5, fontWeight: FontWeight.bold),
+                          style: TextStyle(
+                              color: context.c.accent,
+                              fontSize: 9.5,
+                              fontWeight: FontWeight.bold),
                         ),
                       ],
                     ),
@@ -330,7 +477,9 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
                 // 空白区域也可点：用户想看的细节就在面板里，不必非得点中某个数字。
                 Expanded(
                   child: InkWell(
-                    onTap: onTapSection == null ? null : () => onTapSection!(SessionInsightSection.usage),
+                    onTap: onTapSection == null
+                        ? null
+                        : () => onTapSection!(SessionInsightSection.usage),
                     child: Padding(
                       padding: const EdgeInsets.only(left: 8, right: 10),
                       child: SingleChildScrollView(
@@ -358,6 +507,55 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
           border,
         ],
       ),
+    );
+  }
+}
+
+/// 「连接中…」前面那个会呼吸的小圆点。
+///
+/// 单独一个 StatefulWidget 而不是在 [SessionStatusStrip] 里开控制器：状态条是
+/// `PreferredSizeWidget`、每次 build 都会被重建，把动画控制器挂在它上面会让
+/// 圆点每帧重新开始呼吸。这里自己持有并**在 dispose 里释放** —— 一个没人看的
+/// 无限动画在状态条被移除后继续跑，既是电也是"明明断开了还在跳"的假象。
+class _ConnectingDot extends StatefulWidget {
+  const _ConnectingDot({required this.color});
+
+  final Color color;
+
+  @override
+  State<_ConnectingDot> createState() => _ConnectingDotState();
+}
+
+class _ConnectingDotState extends State<_ConnectingDot>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1100),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (_, __) {
+        // 三角波（0→1→0）：没有 TweenSequence 那么花，但"在动"这件事一眼就够。
+        final wave = 1 - (2 * _controller.value - 1).abs();
+        return Container(
+          key: const ValueKey('strip-connection-dot'),
+          width: 6,
+          height: 6,
+          decoration: BoxDecoration(
+            color: widget.color.withOpacity(0.35 + 0.65 * wave),
+            shape: BoxShape.circle,
+          ),
+        );
+      },
     );
   }
 }

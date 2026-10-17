@@ -19,7 +19,8 @@ import 'package:dsh_mobile/views/chat_view.dart';
 /// **一次网络都不打**：否则这些用例会往用户的真实会话里塞消息（历史教训）。
 /// 注入为 null 时程序走真实 HTTP 路径，那两个口子只影响测试。
 void main() {
-  Future<DshService> pump(WidgetTester tester, {Size size = const Size(420, 900)}) async {
+  Future<DshService> pump(WidgetTester tester,
+      {Size size = const Size(420, 900)}) async {
     tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -28,7 +29,8 @@ void main() {
       ChangeNotifierProvider<DshService>.value(
         value: dsh,
         child: MaterialApp(
-          builder: (ctx, c) => ThemeScope(isDark: false, child: c ?? const SizedBox()),
+          builder: (ctx, c) =>
+              ThemeScope(isDark: false, child: c ?? const SizedBox()),
           home: const ChatView(),
         ),
       ),
@@ -46,11 +48,24 @@ void main() {
     await tester.pump(const Duration(seconds: 21));
   }
 
-  dynamic stateOf(WidgetTester tester) => tester.state(find.byType(ChatView)) as dynamic;
+  dynamic stateOf(WidgetTester tester) =>
+      tester.state(find.byType(ChatView)) as dynamic;
 
   Finder sendKey() => find.byKey(const ValueKey('chat-send-button'));
   Finder stopKey() => find.byKey(const ValueKey('chat-stop-button'));
   Finder field() => find.byKey(const ValueKey('chat-input-field'));
+
+  /// 展开队列（v1.27）。
+  ///
+  /// 队列默认**折叠成状态胶囊行里的一行**（「N 条排队中 · 展开」），条目要展开
+  /// 才看得见。这不是为了省一层 UI：改造前输入区上方常驻六层，手机上键盘一弹
+  /// 真正留给打字的高度不足一行。展开动作在胶囊的 `queue-dock-toggle` 上。
+  Future<void> expandQueue(WidgetTester tester) async {
+    final toggle = find.byKey(const ValueKey('queue-dock-toggle'));
+    expect(toggle, findsOneWidget, reason: '队列非空时胶囊行必须给出展开入口');
+    await tester.tap(toggle);
+    await tester.pump();
+  }
 
   /// 打字 → 点发送 → 让注入后立即完成的异步投递落地。
   Future<void> sendText(WidgetTester tester, String text) async {
@@ -65,7 +80,9 @@ void main() {
     testWidgets('运行中发送恒为排队，且界面上不存在"排队/插话"开关', (tester) async {
       final dsh = await pump(tester);
       dsh.debugSetRunning(true);
-      dsh.debugSetDeliverResult(true, appendsRow: const QueueItem(id: 'q-new', text: '这条排上了', attachments: 0));
+      dsh.debugSetDeliverResult(true,
+          appendsRow:
+              const QueueItem(id: 'q-new', text: '这条排上了', attachments: 0));
       await tester.pump();
 
       await sendText(tester, '这条排上了');
@@ -83,8 +100,11 @@ void main() {
     testWidgets('回执条上的「撤回」把刚排进去的那一条从队列删掉', (tester) async {
       final dsh = await pump(tester);
       dsh.debugSetRunning(true);
-      dsh.debugSetQueue([const QueueItem(id: 'm1', text: '先来的', attachments: 0)]);
-      dsh.debugSetDeliverResult(true, appendsRow: const QueueItem(id: 'q-new', text: '我这条', attachments: 0));
+      dsh.debugSetQueue(
+          [const QueueItem(id: 'm1', text: '先来的', attachments: 0)]);
+      dsh.debugSetDeliverResult(true,
+          appendsRow:
+              const QueueItem(id: 'q-new', text: '我这条', attachments: 0));
       dsh.debugSetQueueActionResult(QueueActionOutcome.applied);
       await tester.pump();
 
@@ -125,7 +145,8 @@ void main() {
       expect(sendKey(), findsOneWidget);
       expect(stopKey(), findsOneWidget);
       // 停止在最左、发送在最右：位置不同 → "清空输入框"不会再改变任何按钮的含义。
-      expect(tester.getCenter(stopKey()).dx, lessThan(tester.getCenter(sendKey()).dx));
+      expect(tester.getCenter(stopKey()).dx,
+          lessThan(tester.getCenter(sendKey()).dx));
       await teardown(tester);
     });
 
@@ -160,7 +181,8 @@ void main() {
     testWidgets('旁观别人发起的回合时不给停止键（否则手机会停掉电脑端的活）', (tester) async {
       final dsh = await pump(tester);
       dsh.debugSetRunning(false); // 本机没在发
-      dsh.debugSetCurrentSession(SessionMeta(sessionId: 's-remote', title: '电脑端在跑', isRunning: true));
+      dsh.debugSetCurrentSession(
+          SessionMeta(sessionId: 's-remote', title: '电脑端在跑', isRunning: true));
       await tester.pump();
 
       expect(find.textContaining('本轮执行中'), findsOneWidget, reason: '会话确实在跑');
@@ -217,7 +239,12 @@ void main() {
     });
   });
 
-  group('立即插话：只有在队列条目上，且必须再点一次', () {
+  // v1.27：**点一下就插队**，安全网换成事后的「3 秒可撤回」。
+  //
+  // 旧交互是"第一次点击只武装、2.5 秒内第二次点击才真插"，超时静默还原 ——
+  // 状态不可见 + 有时间压力，实测只会让人反复试。断言从"武装态文案"改成
+  // "一次点击就发请求、回执带撤回、撤回把正文放回输入框且不重发"。
+  group('立即插话：点一下即插队，3 秒内可撤回', () {
     testWidgets('运行中说明行只在会话跑着时出现', (tester) async {
       final dsh = await pump(tester);
       dsh.debugSetRunning(false);
@@ -230,71 +257,67 @@ void main() {
       await teardown(tester);
     });
 
-    testWidgets('第一次点击只进入待确认态：文案变化、且一次网关都没打', (tester) async {
+    testWidgets('一次点击立即插队：打一次 steer，回执带「撤回」，没有二次确认态', (tester) async {
       final dsh = await pump(tester);
       dsh.debugSetRunning(true);
-      dsh.debugSetQueue([const QueueItem(id: 'm1', text: '这条想插队', attachments: 0)]);
-      await tester.pump();
-
-      await tester.tap(find.byKey(const ValueKey('queue-steer-m1')));
-      await tester.pump();
-
-      expect(stateOf(tester).debugArmedSteerItemId, 'm1');
-      expect(find.text('确认插话？'), findsOneWidget);
-      expect(find.text('立即插话'), findsNothing);
-      // 文案不许写"打断本轮"：引擎是 agent.steer()，插进最近的步骤、不取消本轮。
-      expect(find.text('会插进当前步骤，本轮不会重来'), findsOneWidget);
-      expect(dsh.debugLastQueueAction, isEmpty, reason: '第一次点击不该调用任何动作');
-      expect(dsh.queueItems.length, 1, reason: '条目仍在队列里');
-      await teardown(tester);
-    });
-
-    testWidgets('第二次点击才真正插话', (tester) async {
-      final dsh = await pump(tester);
-      dsh.debugSetRunning(true);
-      dsh.debugSetQueue([const QueueItem(id: 'm1', text: '这条想插队', attachments: 0)]);
+      dsh.debugSetQueue(
+          [const QueueItem(id: 'm1', text: '这条想插队', attachments: 0)]);
       dsh.debugSetQueueActionResult(QueueActionOutcome.applied);
       await tester.pump();
+      await expandQueue(tester);
+
+      // 文案不许写"打断本轮"：引擎是 agent.steer()，插进最近的步骤、不取消本轮。
+      expect(find.text('会插进当前步骤，本轮不会重来'), findsOneWidget);
 
       await tester.tap(find.byKey(const ValueKey('queue-steer-m1')));
       await tester.pump();
-      await tester.tap(find.byKey(const ValueKey('queue-steer-m1')));
-      await tester.pump();
       await tester.pump();
 
-      expect(dsh.debugLastQueueAction, 'steer:m1');
-      expect(stateOf(tester).debugArmedSteerItemId, isNull);
-      expect(stateOf(tester).debugNoticeText, '已插话发送');
+      expect(dsh.debugLastQueueAction, 'steer:m1', reason: '点一次就该打一次 steer');
+      expect(stateOf(tester).debugNoticeText, '已插队到当前步骤');
+      expect(find.text('撤回'), findsOneWidget, reason: '回执上必须给出撤回出口');
+      expect(find.text('确认插话？'), findsNothing, reason: '不再有二次确认态');
       await teardown(tester);
     });
 
-    testWidgets('待确认态 2.5 秒后自动还原（不产生任何副作用）', (tester) async {
+    testWidgets('撤回把正文放回输入框，且不会自动重发（网关没有 unsteer）', (tester) async {
       final dsh = await pump(tester);
       dsh.debugSetRunning(true);
-      dsh.debugSetQueue([const QueueItem(id: 'm1', text: '这条想插队', attachments: 0)]);
+      dsh.debugSetQueue(
+          [const QueueItem(id: 'm1', text: '这条想插队', attachments: 0)]);
+      dsh.debugSetQueueActionResult(QueueActionOutcome.applied);
       await tester.pump();
+      await expandQueue(tester);
 
       await tester.tap(find.byKey(const ValueKey('queue-steer-m1')));
       await tester.pump();
-      expect(find.text('确认插话？'), findsOneWidget);
+      await tester.pump();
 
-      await tester.pump(const Duration(seconds: 3));
+      await tester.tap(find.byKey(const ValueKey('chat-notice-action')));
+      await tester.pump();
+      await tester.pump();
 
-      expect(find.text('立即插话'), findsOneWidget);
-      expect(stateOf(tester).debugArmedSteerItemId, isNull);
-      expect(dsh.debugLastQueueAction, isEmpty, reason: '超时还原不该执行插话');
+      // 关键契约：撤销**不**再打一次 remove（条目早被引擎领走），而是把话还回去。
+      expect(dsh.debugLastQueueAction, 'steer:m1',
+          reason: '撤销不该再发队列动作 —— 那条已经不在队列里了');
+      final field = tester.widget<TextField>(
+        find.byKey(const ValueKey('chat-input-field')),
+      );
+      expect(field.controller!.text, '这条想插队',
+          reason: '正文必须回到输入框（队列行里那份是测试注入的残留，不算）');
+      expect(dsh.messages, isEmpty, reason: '不许自动重发');
       await teardown(tester);
     });
 
     testWidgets('条目已被引擎领走：静默收敛，不报红错', (tester) async {
       final dsh = await pump(tester);
       dsh.debugSetRunning(true);
-      dsh.debugSetQueue([const QueueItem(id: 'm1', text: '这条想插队', attachments: 0)]);
+      dsh.debugSetQueue(
+          [const QueueItem(id: 'm1', text: '这条想插队', attachments: 0)]);
       dsh.debugSetQueueActionResult(QueueActionOutcome.alreadyGone);
       await tester.pump();
+      await expandQueue(tester);
 
-      await tester.tap(find.byKey(const ValueKey('queue-steer-m1')));
-      await tester.pump();
       await tester.tap(find.byKey(const ValueKey('queue-steer-m1')));
       await tester.pump();
       await tester.pump();
@@ -313,9 +336,8 @@ void main() {
       );
       dsh.debugSetQueueActionResult(QueueActionOutcome.failed);
       await tester.pump();
+      await expandQueue(tester);
 
-      await tester.tap(find.byKey(const ValueKey('queue-steer-m1')));
-      await tester.pump();
       await tester.tap(find.byKey(const ValueKey('queue-steer-m1')));
       await tester.pump();
       await tester.pump();
@@ -328,8 +350,10 @@ void main() {
     testWidgets('队列条目上的「编辑 / 删除」触摸区不小于 36dp（旧版只有 24dp，紧贴插话）', (tester) async {
       final dsh = await pump(tester);
       dsh.debugSetRunning(true);
-      dsh.debugSetQueue([const QueueItem(id: 'm1', text: '这条', attachments: 0)]);
+      dsh.debugSetQueue(
+          [const QueueItem(id: 'm1', text: '这条', attachments: 0)]);
       await tester.pump();
+      await expandQueue(tester);
 
       for (final id in ['queue-edit-m1', 'queue-remove-m1']) {
         final size = tester.getSize(find.byKey(ValueKey(id)));
@@ -337,8 +361,10 @@ void main() {
         expect(size.height, greaterThanOrEqualTo(36.0), reason: '$id 的触摸区太小');
       }
       // 删除与插话之间必须留出间距：旧版两键中心距 28px，误触会插队。
-      final remove = tester.getCenter(find.byKey(const ValueKey('queue-remove-m1')));
-      final steer = tester.getCenter(find.byKey(const ValueKey('queue-steer-m1')));
+      final remove =
+          tester.getCenter(find.byKey(const ValueKey('queue-remove-m1')));
+      final steer =
+          tester.getCenter(find.byKey(const ValueKey('queue-steer-m1')));
       expect((remove - steer).distance, greaterThan(28.0));
       await teardown(tester);
     });
@@ -349,14 +375,18 @@ void main() {
       final dsh = await pump(tester, size: const Size(360, 640));
       dsh.debugSetRunning(true);
       dsh.debugSetQueue([
-        for (var i = 1; i <= 3; i++) QueueItem(id: 'm$i', text: '排队第 $i 条，稍微长一点的正文内容', attachments: 0),
+        for (var i = 1; i <= 3; i++)
+          QueueItem(id: 'm$i', text: '排队第 $i 条，稍微长一点的正文内容', attachments: 0),
       ]);
       await tester.pump();
+      await expandQueue(tester);
       stateOf(tester).debugAddPendingAttachment(
-        const PendingFile(localId: 'f1', name: 'a.txt', byteLength: 8, receiptId: 'r1'),
+        const PendingFile(
+            localId: 'f1', name: 'a.txt', byteLength: 8, receiptId: 'r1'),
       );
       stateOf(tester).debugAddPendingAttachment(
-        const PendingFile(localId: 'f2', name: 'b.txt', byteLength: 8, receiptId: 'r2'),
+        const PendingFile(
+            localId: 'f2', name: 'b.txt', byteLength: 8, receiptId: 'r2'),
       );
       await tester.pump();
 

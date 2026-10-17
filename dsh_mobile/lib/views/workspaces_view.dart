@@ -7,6 +7,8 @@ import '../models/workspace.dart';
 import '../models/gateway_features.dart';
 import '../services/dsh_service.dart';
 import '../theme/app_colors.dart';
+import '../theme/app_spacing.dart';
+import '../widgets/inline_error_bar.dart';
 
 class WorkspacesView extends StatefulWidget {
   final VoidCallback? onSwitchToChat;
@@ -27,6 +29,12 @@ class WorkspacesView extends StatefulWidget {
 class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObserver {
   final TextEditingController _searchController = TextEditingController();
   String _searchFilter = '';
+
+  /// 动作失败（重命名/删除/归档）的常驻错误文案（Phase 4.5）。
+  ///
+  /// 这三类失败以前都走 SnackBar：飘 2 秒就没了。而它们恰好都是"界面看起来
+  /// 没变化"的操作 —— 失败后列表还是原样，用户分不清"没成功"和"没点到"。
+  String? _actionError;
   Timer? _refreshTimer;
   bool _appResumed = true;
 
@@ -202,11 +210,16 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     if (ok != true || newText.isEmpty || newText == s.title) return;
     final success = await dsh.renameSession(s.sessionId, newText);
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(success ? '已重命名为「$newText」' : '重命名失败: ${dsh.lastError}'),
-      backgroundColor: success ? context.c.success : context.c.danger,
-      behavior: SnackBarBehavior.floating,
-    ));
+    if (success) {
+      setState(() => _actionError = null);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('已重命名为「$newText」'),
+        duration: const Duration(milliseconds: 1200),
+        behavior: SnackBarBehavior.floating,
+      ));
+      return;
+    }
+    setState(() => _actionError = '重命名失败：${dsh.lastError}');
   }
 
   // Delete Session Confirmation Dialog
@@ -243,17 +256,24 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
               elevation: 0,
             ),
             onPressed: () async {
+              // 先取 Messenger：对话框 pop 之后它自己的 context 已经失效。
+              final messenger = ScaffoldMessenger.of(context);
               Navigator.pop(ctx);
               final ok = await dsh.deleteSession(s.sessionId, ws.workspaceId);
-              if (context.mounted) {
-                ScaffoldMessenger.of(context).clearSnackBars();
-                ScaffoldMessenger.of(context).showSnackBar(
+              if (!mounted) return;
+              if (ok == true) {
+                setState(() => _actionError = null);
+                messenger.showSnackBar(
                   SnackBar(
-                    content: Text(ok ? '会话「${s.title}」已删除' : '删除失败: ${dsh.lastError}'),
-                    duration: const Duration(seconds: 2),
+                    content: Text('会话「${s.title}」已删除'),
+                    duration: const Duration(milliseconds: 1200),
                     behavior: SnackBarBehavior.floating,
                   ),
                 );
+              } else {
+                // 删除失败留在页面上：这条会话还在列表里，用户需要知道"为什么点了
+                // 确认它却没消失"。
+                setState(() => _actionError = '删除会话失败：${dsh.lastError}');
               }
             },
             child: const Text('确认删除', style: TextStyle(fontWeight: FontWeight.bold)),
@@ -268,6 +288,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     final messenger = ScaffoldMessenger.of(context);
     final content = await dsh.fetchWorkspaceMemory(ws.path);
     final textController = TextEditingController(text: content);
+    final sheetError = ValueNotifier<String?>(null);
 
     if (!context.mounted) {
       textController.dispose();
@@ -347,7 +368,15 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                     ),
                   ),
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: AppSpace.l),
+                // [feat 2026-10-17] 保存失败留在弹层里 —— 不要把用户写了一半的
+                // MEMORY.md 连同错误一起关掉。以前失败也是 SnackBar + pop：
+                // 内容没了、提示 2 秒后也没了，用户只能重新打开重新写。
+                ValueListenableBuilder<String?>(
+                  valueListenable: sheetError,
+                  builder: (ctx2, err, __) =>
+                      err == null ? const SizedBox.shrink() : InlineErrorBar(message: err, dense: true),
+                ),
                 SizedBox(
                   width: double.infinity,
                   height: 46,
@@ -360,12 +389,19 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                     ),
                     onPressed: () async {
                       final ok = await dsh.saveWorkspaceMemory(ws.path, textController.text);
-                      if (context.mounted) {
-                        Navigator.pop(ctx);
-                        messenger.showSnackBar(
-                          SnackBar(content: Text(ok ? '项目记忆已保存' : '保存失败，请检查网络')),
-                        );
+                      if (!context.mounted) return;
+                      if (!ok) {
+                        sheetError.value = '保存失败：${dsh.lastError.isEmpty ? '请检查网络连接' : dsh.lastError}';
+                        return;
                       }
+                      Navigator.pop(ctx);
+                      messenger.showSnackBar(
+                        const SnackBar(
+                          content: Text('项目记忆已保存'),
+                          duration: Duration(milliseconds: 1200),
+                          behavior: SnackBarBehavior.floating,
+                        ),
+                      );
                     },
                     child: const Text('保存项目记忆', style: TextStyle(fontWeight: FontWeight.bold)),
                   ),
@@ -375,7 +411,10 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           ),
         );
       },
-    ).whenComplete(() => textController.dispose());
+    ).whenComplete(() {
+      textController.dispose();
+      sheetError.dispose();
+    });
   }
 
   /// 归档筛选分段控件（未归档 / 已归档 / 全部）。
@@ -514,6 +553,22 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
       ),
       body: Column(
         children: [
+          // [feat 2026-10-17] Phase 4.5：动作失败改成**常驻**错误条。
+          //
+          // 以前这里三处（重命名/删除/归档）都是 `SnackBar`：飘 2 秒就走。用户
+          // 正在看列表、或者刚好低头 —— 抬头时提示已经消失，屏幕上只剩一个和
+          // 操作前一样的列表，于是他只能靠"再点一次"来判断到底成没成。
+          // 失败是**待办**不是通知，所以它必须留在这里直到被处理或重试成功。
+          if (_actionError != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+              child: InlineErrorBar(
+                key: const ValueKey('workspaces-action-error'),
+                message: _actionError!,
+                onDismiss: () => setState(() => _actionError = null),
+              ),
+            ),
+
           // 顶部只留"需要行动"的信号。
           //
           // 原先这里无条件挂着两枚计数 pill（`N 个挂载项目` / `N 个历史会话`），
@@ -1100,18 +1155,21 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 HapticFeedback.selectionClick();
                 // 主题色/ScaffoldMessenger 都来自 Element，必须在 await 之前取，
                 // 不能跨异步间隔再读 context。
-                final successColor = context.c.success;
-                final dangerColor = context.c.danger;
                 final messenger = ScaffoldMessenger.of(context);
                 final ok = await dsh.setSessionArchived(s.sessionId, !s.archived);
                 if (!mounted) return;
-                messenger.showSnackBar(SnackBar(
-                  content: Text(ok
-                      ? (s.archived ? '已取消归档' : '已归档「${s.title}」')
-                      : '${s.archived ? '取消归档' : '归档'}失败: ${dsh.lastError}'),
-                  backgroundColor: ok ? successColor : dangerColor,
-                  behavior: SnackBarBehavior.floating,
-                ));
+                if (ok) {
+                  setState(() => _actionError = null);
+                  messenger.showSnackBar(SnackBar(
+                    content: Text(s.archived ? '已取消归档' : '已归档「${s.title}」'),
+                    duration: const Duration(milliseconds: 1200),
+                    behavior: SnackBarBehavior.floating,
+                  ));
+                } else {
+                  // 归档失败时列表行**看起来没变**，用户会以为自己点空了 ——
+                  // 所以错误必须留在页面上，而不是飘 2 秒。
+                  setState(() => _actionError = '${s.archived ? '取消归档' : '归档'}失败：${dsh.lastError}');
+                }
               },
             ),
             IconButton(

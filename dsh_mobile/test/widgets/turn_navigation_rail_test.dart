@@ -21,7 +21,8 @@ void main() {
     addTearDown(tester.view.reset);
     await tester.pumpWidget(
       MaterialApp(
-        builder: (ctx, c) => ThemeScope(isDark: false, child: c ?? const SizedBox()),
+        builder: (ctx, c) =>
+            ThemeScope(isDark: false, child: c ?? const SizedBox()),
         home: Scaffold(body: Center(child: child)),
       ),
     );
@@ -39,7 +40,8 @@ void main() {
 
     expect(find.byKey(const ValueKey('turn-nav-rail')), findsOneWidget);
     for (var i = 1; i <= 10; i++) {
-      expect(find.byKey(ValueKey('turn-nav-$i')), findsOneWidget, reason: '第 $i 轮必须有刻度');
+      expect(find.byKey(ValueKey('turn-nav-$i')), findsOneWidget,
+          reason: '第 $i 轮必须有刻度');
     }
     expect(find.byKey(const ValueKey('turn-nav-11')), findsNothing);
     expect(find.byTooltip('跳到第 3 轮'), findsOneWidget);
@@ -75,13 +77,18 @@ void main() {
       return '${(box.constraints?.maxWidth ?? -1)}|${deco.color}';
     }
 
-    // 当前轮 17dp、其余 10dp：宽度差就是"我在哪一轮"的一眼可读化。
+    // 当前轮 17dp 细条、其余 6dp 圆点（v1.27：其余刻度从 10dp 收到 6dp 圆点，
+    // 解决"14 轮以后间距压到 2dp、点不中"那件事）。宽度差仍然是"我在哪一轮"
+    // 的一眼可读化。
     expect(description(2).split('|').first, '17.0');
-    expect(description(1).split('|').first, '10.0');
+    expect(description(1).split('|').first, '6.0');
   });
 
   testWidgets('没有轮次时整条不渲染（不留空白浮层）', (tester) async {
-    await pump(tester, TurnNavigationRail(marks: const [], currentTurn: null, onSelect: (_) {}));
+    await pump(
+        tester,
+        TurnNavigationRail(
+            marks: const [], currentTurn: null, onSelect: (_) {}));
     expect(find.byKey(const ValueKey('turn-nav-rail')), findsNothing);
   });
 
@@ -89,12 +96,50 @@ void main() {
     final tapped = <int>[];
     await pump(
       tester,
-      TurnNavigationRail(marks: marks(3), currentTurn: null, onSelect: tapped.add),
+      TurnNavigationRail(
+          marks: marks(3), currentTurn: null, onSelect: tapped.add),
     );
     expect(find.byKey(const ValueKey('turn-nav-rail')), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('turn-nav-1')));
     await tester.pump();
     expect(tapped, [1]);
+  });
+
+  testWidgets('间距固定 5，且超过 10 轮时不压紧而是放进占屏高 40% 的内部滚动列', (tester) async {
+    // 60 轮：如果还按"14 轮以后压到 2dp"的老逻辑，这里会挤成一条糊。
+    await pump(
+      tester,
+      TurnNavigationRail(marks: marks(60), currentTurn: 5, onSelect: (_) {}),
+    );
+
+    // 相邻两格的垂直中心距 = 3(刻度高) + 5(间距)。第一格仍然在屏上，可以直接量。
+    final a = tester.getCenter(find.byKey(const ValueKey('turn-nav-1')));
+    final b = tester.getCenter(find.byKey(const ValueKey('turn-nav-2')));
+    expect(b.dy - a.dy, closeTo(8.0, 0.01), reason: '间距必须恒为 5，不随轮数压紧');
+
+    // 视口高 900 → 滚动区上限 360，加上容器自身 padding 8×2 与 1px 边框 ×2。
+    final rail = tester.getSize(find.byKey(const ValueKey('turn-nav-rail')));
+    expect(rail.height, lessThanOrEqualTo(360.0 + 16.0 + 2.0),
+        reason: '超过 10 轮要交给内部滚动，而不是拉成一条顶出屏幕的长条');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('长按 rail 弹出轮次选择弹层，点一格直接跳那一轮', (tester) async {
+    final tapped = <int>[];
+    await pump(
+      tester,
+      TurnNavigationRail(
+          marks: marks(12), currentTurn: 3, onSelect: tapped.add),
+    );
+
+    await tester.longPress(find.byKey(const ValueKey('turn-nav-rail')));
+    await tester.pumpAndSettle();
+    expect(find.text('跳到某一轮'), findsOneWidget, reason: '长按必须能唤出轮次选择');
+    expect(find.byKey(const ValueKey('turn-picker-7')), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('turn-picker-7')));
+    await tester.pumpAndSettle();
+    expect(tapped, [7], reason: '选中哪一轮就回传哪一轮');
   });
 
   // ---- 挂进 ChatView：刻度只数真人回合 ----
@@ -108,19 +153,22 @@ void main() {
     addTearDown(tester.view.reset);
 
     final dsh = DshService();
-    dsh.debugSetCurrentSession(SessionMeta(sessionId: 'session-abc', title: 't'));
+    dsh.debugSetCurrentSession(
+        SessionMeta(sessionId: 'session-abc', title: 't'));
     await tester.pumpWidget(
       ChangeNotifierProvider<DshService>.value(
         value: dsh,
         child: MaterialApp(
-          builder: (ctx, c) => ThemeScope(isDark: false, child: c ?? const SizedBox()),
+          builder: (ctx, c) =>
+              ThemeScope(isDark: false, child: c ?? const SizedBox()),
           home: const ChatView(),
         ),
       ),
     );
     await tester.pump();
 
-    ChatMessage msg(String id, String role, String content, int seq) => ChatMessage(
+    ChatMessage msg(String id, String role, String content, int seq) =>
+        ChatMessage(
           id: id,
           role: role,
           content: content,
@@ -135,7 +183,11 @@ void main() {
       msg('u1', 'user', '第一轮提问', 2),
       msg('a1', 'assistant', '第一轮回复', 3),
       // 注入通知：不算一轮
-      msg('n1', 'user', 'Background subagent 6f29a191 finished and will do no further work unless you send it more.', 4),
+      msg(
+          'n1',
+          'user',
+          'Background subagent 6f29a191 finished and will do no further work unless you send it more.',
+          4),
       // 真人第二轮
       msg('u2', 'user', '第二轮提问', 5),
       msg('a2', 'assistant', '第二轮回复', 6),
@@ -147,9 +199,11 @@ void main() {
 
     expect(find.byKey(const ValueKey('turn-nav-rail')), findsOneWidget);
     for (var i = 1; i <= 3; i++) {
-      expect(find.byKey(ValueKey('turn-nav-$i')), findsOneWidget, reason: '第 $i 轮是真人的');
+      expect(find.byKey(ValueKey('turn-nav-$i')), findsOneWidget,
+          reason: '第 $i 轮是真人的');
     }
-    expect(find.byKey(const ValueKey('turn-nav-4')), findsNothing, reason: '注入通知不能占一格');
+    expect(find.byKey(const ValueKey('turn-nav-4')), findsNothing,
+        reason: '注入通知不能占一格');
 
     // 收尾：拆树 + 推掉 VoiceInputService 的计时器（否则报 "Timer is still pending"）。
     await tester.pumpWidget(const SizedBox.shrink());

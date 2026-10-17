@@ -20,8 +20,10 @@ import 'package:flutter/material.dart';
 /// 按**角色**取值，不按数字大小猜：
 ///
 /// - `AppText.caption` —— 时间戳、角标计数、辅助说明（可被系统放大）
+/// - `AppText.subhead` —— 等宽代码/终端输出的正文（工具调用输入输出、代码块）
 /// - `AppText.body`    —— 正文、选项、次要文案
 /// - `AppText.title`   —— 卡片标题、分区标题
+/// - `AppText.heading` —— 设置页分区头、sheet 标题行
 /// - `AppText.display` —— 空态大标题（罕见）
 ///
 /// 间距同理：`AppSpace.xs`（2）/ `s`（4）/ `m`（8）/ `l`（12）/ `xl`（16）。
@@ -34,11 +36,24 @@ class AppText {
   /// 10.5 —— 角标计数、时间戳前缀。最小的可读正文下限。
   static const double caption = 10.5;
 
+  /// 11.5 —— 等宽正文（工具调用的输入/输出、代码块、终端回显）。
+  ///
+  /// 它不能直接复用 [body]：等宽字每个字符都占满字宽，同样 12.5 号的代码行比
+  /// 比例字宽出约 8%，360dp 宽屏上会提前折行、把缩进结构打散。11.5 是"等宽下
+  /// 与 12.5 正文视觉重量相当"的那一档。
+  static const double subhead = 11.5;
+
   /// 12.5 —— 辅助说明、状态条、选项副文案。
   static const double body = 12.5;
 
   /// 13.5 —— 正文、卡片标题。
   static const double title = 13.5;
+
+  /// 15 —— 分区标题（设置页分组头、sheet 标题行、列表组标题）。
+  ///
+  /// 比 [title] 高一档，但刻意不到 16：16 以上在 5 寸屏的密集列表里会把内容挤掉
+  /// 一屏，而分区标题并不比正文更重要。
+  static const double heading = 15;
 
   /// 18 —— 空态大标题。刻意保留在 16/18 两档：超过 18pt 在 5 寸屏上会挤掉内容。
   static const double display = 18;

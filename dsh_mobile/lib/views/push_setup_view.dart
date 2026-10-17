@@ -155,10 +155,13 @@ class _PushSetupViewState extends State<PushSetupView> {
         _enabled = r.enabled;
       }
     });
-    _toast(
-      r == null ? '生成失败，请改用手动配置' : '已生成随机 topic 并开启推送',
-      tone: r == null ? context.c.danger : null,
-    );
+    if (r == null) {
+      // 生成失败 → 页面内常驻错误（不弹 toast）：用户下一步就是"改用手动配置"，
+      // 这句话必须一直可读，而不是 4 秒后消失。
+      setState(() => _formError = '生成失败：网关没有返回 topic / 订阅链接，请改用手动配置。');
+      return;
+    }
+    _toast('已生成随机 topic 并开启推送');
   }
 
   Future<void> _saveManual() async {
@@ -202,11 +205,20 @@ class _PushSetupViewState extends State<PushSetupView> {
     });
     final ok = await dsh.testPush();
     if (!mounted) return;
-    setState(() => _testBusy = false);
-    _toast(
-      ok ? '测试推送已发出，检查手机上的 ntfy 客户端' : '推送发送失败：检查地址、topic，以及是否已开启',
-      tone: ok ? null : context.c.danger,
-    );
+    setState(() {
+      _testBusy = false;
+      // [feat 2026-10-17] Phase 4.5：推送测试失败改为**页面内常驻**错误。
+      //
+      // 测试推送是这一页唯一能证明"配好了"的动作，失败提示飘 4 秒就走的话，
+      // 用户多半正在低头看手机通知栏 —— 等他抬头，屏幕上什么都没变，
+      // 于是他以为"可能成功了吧"。失败必须留在他看得见的地方。
+      if (!ok) {
+        _formError = dsh.lastError.isEmpty
+            ? '推送发送失败：检查地址、topic，以及是否已开启'
+            : dsh.lastError;
+      }
+    });
+    if (ok) _toast('测试推送已发出，检查手机上的 ntfy 客户端');
   }
 
   /// 订阅链接的两种形态：`ntfy://host/topic`（深链，直接开 App）与
