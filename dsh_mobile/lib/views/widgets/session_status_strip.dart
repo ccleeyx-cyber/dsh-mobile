@@ -36,6 +36,11 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
     this.contextFraction,
     this.contextIsSnapshot = false,
     this.liveJobCount,
+    this.turns,
+    this.steps,
+    this.tokensPerSecond,
+    this.totalTokens,
+    this.cacheHitPercent,
     this.onTapSection,
   });
 
@@ -68,6 +73,25 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
   /// 仍在跑的后台作业数；`null` = 未知（隐藏），`0` 同样隐藏（无需占位）。
   final int? liveJobCount;
 
+  /// 整会话的轮数 / 步数（引擎 `sessionStats` 投影）。`null` = 读不到 → 整段隐藏。
+  ///
+  /// [feat 2026-10-17] 电脑端状态条第一组就是 `6 轮 351 步 · 210 tok/s`。手机端
+  /// 以前没有这几个数字，只有"产出/改动/上下文"。
+  ///
+  /// **为什么不能自己数**：手机只加载了窗口内的消息（一页≈一两轮），数出来会是一个
+  /// 严重偏小的值（"6 轮"被算成"1 轮"）。轮/步必须来自引擎的全日志投影。
+  final int? turns;
+  final int? steps;
+
+  /// 解码速度 tok/s；`null` = 没测到（显示时整段省略，**不写 `0 tok/s`**）。
+  final double? tokensPerSecond;
+
+  /// 会话累计 token（含缓存读取，与电脑端 `113M tok` 同一口径）；`null` = 未知。
+  final int? totalTokens;
+
+  /// 缓存命中率（%）；`null` = 未知 → 省略。
+  final int? cacheHitPercent;
+
   /// 点了某一段。`null` 时整条不可点。
   final ValueChanged<SessionInsightSection>? onTapSection;
 
@@ -85,7 +109,33 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
       deliverableCount != null ||
       (changeCount != null && !changesUnavailable) ||
       contextFraction != null ||
+      turns != null ||
+      steps != null ||
+      totalTokens != null ||
       (liveJobCount != null && liveJobCount! > 0);
+
+  /// 紧凑数字：与电脑端一致（`113M tok` / `12.4k`）。
+  ///
+  /// 六位数以上**截断**而不是四舍五入：电脑端把 113,704,827 显示成 `113M`，四舍五入
+  /// 会得到 `114M` —— 同一个数字在两块屏幕上不一样，用户会以为是两个会话。
+  static String compactTokens(int value) {
+    if (value >= 1000000) {
+      final millions = value / 1000000;
+      return '${millions >= 10 ? millions.floor() : millions.toStringAsFixed(1)}M';
+    }
+    if (value >= 1000) {
+      final thousands = value / 1000;
+      return '${thousands >= 10 ? thousands.floor() : thousands.toStringAsFixed(1)}k';
+    }
+    return '$value';
+  }
+
+  /// 解码速度的显示口径与电脑端 `formatTokensPerSecond` 一致：
+  /// 10 以上取整，10 以下保留一位（`210` / `9.8`）。
+  static String formatTokensPerSecond(double tps) {
+    final clamped = tps < 0 ? 0.0 : tps;
+    return clamped >= 10 ? clamped.round().toString() : clamped.toStringAsFixed(1);
+  }
 
   bool get _showPressureLine =>
       contextFraction != null && contextFraction! > pressureLineThreshold;
@@ -131,6 +181,45 @@ class SessionStatusStrip extends StatelessWidget implements PreferredSizeWidget 
           child: child,
         ),
       ));
+    }
+
+    // 电脑端状态条第一组：`6 轮 351 步 · 210 tok/s`。
+    //
+    // 只在 steps > 0 时显示：全新会话显示 `0 轮 0 步` 没有任何信息量（电脑端也是
+    // 同一个门槛）。但 `0` 本身是**已知真值**，所以门槛是"有没有跑过"，不是"读没读到"。
+    if ((steps ?? 0) > 0) {
+      final counts = [
+        if (turns != null) '$turns 轮',
+        if (steps != null) '$steps 步',
+      ].join(' ');
+      final tps = tokensPerSecond;
+      addSegment(
+        key: const ValueKey('strip-segment-counts'),
+        section: SessionInsightSection.usage,
+        child: Text(
+          tps == null ? counts : '$counts · ${formatTokensPerSecond(tps)} tok/s',
+          style: TextStyle(fontSize: 11.5, color: context.c.textSecondary),
+        ),
+      );
+    }
+
+    // 第二组：`113M tok · 缓存命中 99%`。
+    //
+    // 口径与电脑端一致：这里的"累计"**含缓存读取**，因为电脑端那个 pill 就是
+    // `未缓存输入 + 缓存读取 + 输出` = 网关的 `totalTokens`。而"消耗"是另一个口径
+    // （未缓存输入 + 输出），那个在信息面板里，两者不能混。
+    if ((totalTokens ?? 0) > 0) {
+      final hit = cacheHitPercent;
+      addSegment(
+        key: const ValueKey('strip-segment-tokens'),
+        section: SessionInsightSection.usage,
+        child: Text(
+          hit == null
+              ? '${compactTokens(totalTokens!)} tok'
+              : '${compactTokens(totalTokens!)} tok · 缓存命中 $hit%',
+          style: TextStyle(fontSize: 11.5, color: context.c.textSecondary),
+        ),
+      );
     }
 
     if (deliverableCount != null) {

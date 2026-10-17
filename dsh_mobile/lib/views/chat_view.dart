@@ -1871,6 +1871,14 @@ class _ChatViewState extends State<ChatView> {
         // 压到最紧，而这里不参与压缩，打字时"执行中 / 产出 / 上下文"依然可读。
         bottom: SessionStatusStrip(
           isRunning: isSessionRunning,
+          // [feat 2026-10-17] 电脑端风格的那两组数字：`N 轮 M 步 · X tok/s`、
+          // `113M tok · 缓存命中 99%`。轮/步必须来自引擎的 sessionStats 投影 ——
+          // 手机只加载了窗口内的消息，自己数会把 6 轮算成 1 轮。
+          turns: dsh.sessionStats?.turns,
+          steps: dsh.sessionStats?.steps,
+          tokensPerSecond: dsh.sessionStats?.tokensPerSecond,
+          totalTokens: dsh.sessionStats?.totalTokens,
+          cacheHitPercent: dsh.sessionStats?.cacheHitPercent,
           deliverableCount: dsh.deliverableCount,
           deliverablesUnread: _deliverablesUnread(dsh),
           changeCount: dsh.changeCount,

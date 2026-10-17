@@ -220,6 +220,60 @@ void main() {
       expect(find.text('运行中 2'), findsOneWidget);
     });
 
+    // ---- 电脑端风格的两组用量数字（2026-10-17）----
+    //
+    // 用户的原话："用量信息我想和电脑端的这样显示"，截图里是
+    // `6 轮 351 步 · 210 tok/s  |  113M tok · 缓存命中 99%  |  21%`。
+    // 三组分别对应：sessionStats 投影、tokenUsage 投影、上下文压力。
+    testWidgets('轮/步 + tok/s：与电脑端同一条文案', (tester) async {
+      await pump(tester, const SessionStatusStrip(turns: 6, steps: 351, tokensPerSecond: 210.4));
+      expect(find.text('6 轮 351 步 · 210 tok/s'), findsOneWidget);
+    });
+
+    testWidgets('速度取不到时只省略这一段，不写 0 tok/s（那读起来像卡住了）', (tester) async {
+      await pump(tester, const SessionStatusStrip(turns: 6, steps: 351));
+      expect(find.text('6 轮 351 步'), findsOneWidget);
+      expect(find.textContaining('tok/s'), findsNothing);
+    });
+
+    testWidgets('没跑过（steps == 0）不显示"0 轮 0 步"', (tester) async {
+      await pump(tester, const SessionStatusStrip(turns: 0, steps: 0));
+      expect(find.textContaining('步'), findsNothing);
+    });
+
+    testWidgets('累计 tok + 缓存命中：截断口径与电脑端一致（113M 不是 114M）', (tester) async {
+      await pump(tester, const SessionStatusStrip(totalTokens: 113704827, cacheHitPercent: 99));
+      expect(find.text('113M tok · 缓存命中 99%'), findsOneWidget);
+    });
+
+    testWidgets('缓存命中率未知时只显示累计，不编一个 0%', (tester) async {
+      await pump(tester, const SessionStatusStrip(totalTokens: 12345));
+      // 与 M 同一套截断规则：满 10 个单位就取整（12.345k → 12k），否则保留一位。
+      expect(find.text('12k tok'), findsOneWidget);
+      expect(find.textContaining('缓存命中'), findsNothing);
+    });
+
+    testWidgets('两组用量都能点开用量小节', (tester) async {
+      SessionInsightSection? tapped;
+      await pump(
+        tester,
+        SessionStatusStrip(
+          turns: 6,
+          steps: 351,
+          totalTokens: 1000,
+          onTapSection: (s) => tapped = s,
+        ),
+      );
+      await tester.tap(find.byKey(const ValueKey('strip-segment-counts')));
+      await tester.pump();
+      expect(tapped, SessionInsightSection.usage);
+
+      tapped = null;
+      await tester.tap(find.byKey(const ValueKey('strip-segment-tokens')));
+      await tester.pump();
+      expect(tapped, SessionInsightSection.usage);
+    });
+
     testWidgets('执行中徽标 + 点某一段回调对应小节', (tester) async {
       SessionInsightSection? tapped;
       await pump(
@@ -501,6 +555,53 @@ void main() {
       );
       expect(find.text('会话累计消耗'), findsOneWidget);
       expect(find.text('128,000'), findsNothing, reason: '只有 totalTokens 时无法得知真实消耗');
+    });
+
+    testWidgets('引擎给得出会话统计时：轮/步 + 速度 + 用时都显示（电脑端那套）', (tester) async {
+      await pumpSheet(
+        tester,
+        const SessionInfoSheet(
+          stats: SessionStats(
+            source: 'live',
+            totalTokens: 113704827,
+            uncachedInputTokens: 1063674,
+            cacheReadTokens: 112301824,
+            counters: SessionCounters(
+              turns: 6,
+              steps: 351,
+              llmMs: 120000,
+              toolMs: 45000,
+              ttftMs: 351000,
+              ttftSteps: 351,
+              decodeMs: 300000,
+              decodeTokens: 63000,
+            ),
+          ),
+        ),
+      );
+
+      expect(find.text('会话统计'), findsOneWidget);
+      expect(find.text('6 轮 351 步 · 210 tok/s'), findsOneWidget);
+      expect(find.textContaining('模型用时 2m00s'), findsOneWidget);
+      expect(find.textContaining('工具调用 45s'), findsOneWidget);
+      expect(find.textContaining('首 token 平均 1.0s'), findsOneWidget);
+      expect(find.textContaining('命中 99%'), findsOneWidget, reason: '缓存复用那行要带上命中率');
+    });
+
+    testWidgets('没有会话统计投影（老网关）时整段不出现，也不编 0 轮 0 步', (tester) async {
+      await pumpSheet(tester, const SessionInfoSheet(stats: SessionStats(source: 'live', totalTokens: 1000)));
+      expect(find.text('会话统计'), findsNothing);
+      expect(find.textContaining('0 轮'), findsNothing);
+    });
+
+    testWidgets('steps == 0（空会话）不显示统计行', (tester) async {
+      await pumpSheet(
+        tester,
+        const SessionInfoSheet(
+          stats: SessionStats(source: 'live', totalTokens: 0, counters: SessionCounters(turns: 0, steps: 0)),
+        ),
+      );
+      expect(find.text('会话统计'), findsNothing);
     });
 
     testWidgets('缓存快照与实时值给的是两种说明', (tester) async {

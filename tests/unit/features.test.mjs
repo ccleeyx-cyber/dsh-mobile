@@ -24,6 +24,8 @@ import {
   combineChanges,
   parseUnifiedDiff,
   summarizeUsage,
+  summarizeSessionStats,
+  SESSION_STATS_FIELDS,
   describeSchedule,
   normalizeSchedule,
   buildNtfyRequest,
@@ -233,6 +235,118 @@ test('summarizeUsage: falls back to the projection cache and never fakes numbers
   assert.equal(empty.source, 'none');
   assert.equal(empty.totalTokens, null, 'unknown must be null, never 0');
   assert.equal(empty.contextWindow, null);
+});
+
+/* ------------------------------------------------------------------ *
+ * sessionStats 投影 —— 电脑端状态条那行「6 轮 351 步 · 210 tok/s」  [feat 2026-10-17]
+ *
+ * 手机端状态行要轮/步/速度，而这三样只有引擎的 `sessionStats` 投影有（电脑端
+ * dsh-client-ui-chat 的 StatsPills 读 useProjection('sessionStats')，它的兜底
+ * deriveStats 的字段名是"deliberately mirror the projection's field names"）。
+ * 网关以前没转发，手机端于是永远显示 —。
+ *
+ * 两级读法照抄 agentteam.mjs：① session/projections RPC（live 会话的权威值）；
+ * ② 冷会话回落投影缓存 `rows.<投影>.val`。只白名单 8 个数字字段。
+ * ------------------------------------------------------------------ */
+
+const FULL_SESSION_STATS = {
+  turns: 6,
+  steps: 351,
+  llmMs: 128400,
+  toolMs: 40200,
+  ttftMs: 5200,
+  ttftSteps: 340,
+  decodeMs: 61200,
+  decodeTokens: 12852
+};
+
+test('summarizeUsage: live 有 sessionStats 时带回 8 个白名单字段，既有字段一个不少', () => {
+  const stats = summarizeUsage({ sessionStats: FULL_SESSION_STATS }, null);
+  assert.deepEqual(stats.sessionStats, FULL_SESSION_STATS);
+  assert.deepEqual(Object.keys(stats.sessionStats).sort(), [...SESSION_STATS_FIELDS].sort(), '正好这 8 个键，不多不少');
+  // 状态条那行：6 轮 351 步 · 210 tok/s = decodeTokens / (decodeMs / 1000)
+  assert.equal(stats.sessionStats.turns, 6);
+  assert.equal(stats.sessionStats.steps, 351);
+  assert.equal(Math.round(stats.sessionStats.decodeTokens / (stats.sessionStats.decodeMs / 1000)), 210);
+  // 既有字段不能少、不能改名（App 已在用）
+  for (const key of [
+    'source', 'uncachedInputTokens', 'outputTokens', 'cacheReadTokens',
+    'cacheWriteTokens', 'totalTokens', 'pressureTokens', 'projectedTokens', 'contextWindow', 'goal'
+  ]) {
+    assert.ok(key in stats, `既有字段 ${key} 不能丢`);
+  }
+});
+
+test('summarizeUsage: 投影缺失时 sessionStats 是 null（不编 0），非法值也不混进来', () => {
+  const none = summarizeUsage(null, null);
+  assert.equal(none.sessionStats, null, '读不到就是 null，手机端据此显示 —');
+  assert.equal('sessionStats' in none, true, '键要在（值为 null），App 才能区分"未知"与"老网关没有这个字段"');
+
+  // 单个字段非法：字符串 / NaN / Infinity / 负数 → 那个字段 null；合法字段照传。
+  const garbage = summarizeUsage({
+    sessionStats: {
+      turns: '6',
+      steps: Number.NaN,
+      llmMs: -1,
+      toolMs: Number.POSITIVE_INFINITY,
+      ttftMs: 5200,
+      ttftSteps: null,
+      decodeMs: 0,
+      decodeTokens: 12852,
+      // 投影里还有这些"状态字段"，一个都不许白名单外泄
+      lastTurn: 6,
+      openStep: { turn: 6, step: 3 }
+    }
+  }, null);
+  assert.equal(garbage.sessionStats.turns, null, '字符串不是数字');
+  assert.equal(garbage.sessionStats.steps, null, 'NaN 不是数字');
+  assert.equal(garbage.sessionStats.llmMs, null, '时长不可能为负，负数按"没有"处理');
+  assert.equal(garbage.sessionStats.toolMs, null, 'Infinity 不是有限数字');
+  assert.equal(garbage.sessionStats.ttftMs, 5200, '合法值照传');
+  assert.equal(garbage.sessionStats.ttftSteps, null);
+  assert.equal(garbage.sessionStats.decodeMs, 0, 'decodeMs: 0 是合法事实（没有成功的解码步），照实传 0');
+  assert.deepEqual(Object.keys(garbage.sessionStats).sort(), [...SESSION_STATS_FIELDS].sort(), '白名单以外一个键都不带');
+  assert.equal(garbage.sessionStats.lastTurn, undefined, 'openStep/lastTurn 这种状态字段不外泄');
+
+  // 有对象但一个数都读不出来 = 读不到。
+  assert.equal(summarizeUsage({ sessionStats: { turns: 'x' } }, null).sessionStats, null);
+  assert.equal(summarizeSessionStats('nope'), null);
+});
+
+test('summarizeUsage: 冷会话从投影缓存行 rows.sessionStats.val 读，steps: 0 照实传 0', () => {
+  const rows = {
+    sessionStats: { ver: 1, seq: 42, val: { ...FULL_SESSION_STATS, turns: 0, steps: 0 } }
+  };
+  const stats = summarizeUsage(null, rows);
+  assert.equal(stats.sessionStats.turns, 0, '空会话的 0 是合法事实，不是"读不到"');
+  assert.equal(stats.sessionStats.steps, 0, '只有字段缺失/非数字才是 null，绝不把 0 当缺失');
+  assert.equal(stats.sessionStats.decodeTokens, 12852);
+});
+
+test('route: GET session/stats 把 sessionStats 挂在 stats 子对象上，既有字段不变', async () => {
+  const { deps, calls } = makeHarness({
+    projections: {
+      tokenUsage: { uncachedInputTokens: 100, outputTokens: 40, cacheReadTokens: 10, cacheWriteTokens: 5 },
+      contextPressure: { pressureTokens: 155, projectedTokens: 200, contextWindow: 128000 },
+      sessionStats: FULL_SESSION_STATS
+    }
+  });
+  deps.pathname = '/api/mobile/session/stats';
+  deps.parsedUrl = { query: { sessionId: 'session-1' } };
+  assert.equal(await handleFeatureRoute(deps), true);
+  const body = calls.sent[0].body;
+  assert.equal(body.ok, true);
+  assert.equal(body.stats.totalTokens, 155);
+  assert.equal(body.stats.goal, null);
+  assert.deepEqual(body.stats.sessionStats, FULL_SESSION_STATS);
+
+  // 会话不在内存里（RPC 失败 → readProjections 给 null）、缓存也没有这一行 → null。
+  const { deps: deps2, calls: calls2 } = makeHarness({ projections: null, rows: { tokenUsage: { ver: 1, seq: 9, val: { uncachedInputTokens: 7 } } } });
+  deps2.pathname = '/api/mobile/session/stats';
+  deps2.parsedUrl = { query: { sessionId: 'session-1' } };
+  assert.equal(await handleFeatureRoute(deps2), true);
+  assert.equal(calls2.sent[0].body.stats.sessionStats, null);
+  assert.equal(calls2.sent[0].body.stats.totalTokens, 7);
 });
 
 /* ------------------------------------------------------------------ *
@@ -1158,20 +1272,54 @@ test('convertSessionRecordsToMessages: 真的什么都没有仍然是原来的 d
 /* ------------------------------------------------------------------ *
  * convertSessionRecordsToMessages: 逐轮用量（缺陷 B）  [feat 2026-10-17]
  *
- * 事故现象："本轮用量"经常显示 —：引擎每个 step 的 assistant/message 都带 usage，
+ * 事故现象 1："本轮用量"经常显示 —：引擎每个 step 的 assistant/message 都带 usage，
  * 而网关把这份数据扔了，App 只能靠两次 stats 读数相减，基线没记到就永远 —。
  * 注意 `inputTokens` 是"未缓存输入"、`totalTokens` 是**累计**值，所以逐 step 只能加
  * inputTokens + outputTokens。
+ *
+ * 事故现象 2（[fix 2026-10-17] 第二版）：第一版把**每一条 user/message** 当成"新一轮开始"，
+ * 引擎插在回合中间的注入消息于是把这一轮的 usage 抢走，**真人那条永远是 null**。活数据：
+ *   turn/start 1899 → user 1902(source.kind=user) → user 1903(time-context)
+ *   → user 1904(dsh-mnemon) → assistant 1906..2059(每条带 usage, turn=6)
+ *   → user 1954(又一个真人追问) → …
+ * 后果：1902/1954/2949 这些真人消息 tokens 全 null，而 1843(time-context) 拿到 10008。
+ *
+ * 现在的规则（下面每个用例对应一条）：
+ *   a. turn/start 是**权威**回合边界（不再用 user/message 开轮）；
+ *   b. 载体只能是真人消息（readUserMessageSource(ev).human === true）；
+ *   c. 一轮多条真人消息 → 按分段给值（这条消息 → 下一次你说话之间的量）；
+ *   d. 必须 turn/end + 见过 usage + turn/start 在本段记录里(openedInWindow) 三者齐全，
+ *      否则 null（**绝不写 0**）；
+ *   e. 没有真人载体的轮（纯 schedule 唤醒）→ 用量丢弃，不挪给别人。
  * ------------------------------------------------------------------ */
 
 const usageOf = (inputTokens, outputTokens, totalTokens) => ({ inputTokens, outputTokens, totalTokens, cacheReadTokens: 35584 });
 
+/** 真人 user/message（source.kind='user' → human，是载体）。 */
+const humanMsg = (seq, text) => ({
+  event: { type: 'user/message', seq, time: 1000 + seq, data: { source: { kind: 'user' }, content: [{ type: 'text', text }] } }
+});
+/** 引擎注入的 user/message（不是人类 → 不承载、不结算）。 */
+const injectedMsg = (seq, text, kind) => ({
+  event: { type: 'user/message', seq, time: 1000 + seq, data: { source: { kind }, content: [{ type: 'text', text }] } }
+});
+const turnStart = (seq, turn) => ({ event: { type: 'turn/start', seq, data: { turn } } });
+const turnEnd = (seq, turn) => ({ event: { type: 'turn/end', seq, data: { turn, reason: { kind: 'completed' } } } });
+const assistantMsg = (seq, text, inputTokens, outputTokens, turn = 1) => ({
+  event: {
+    type: 'assistant/message',
+    seq,
+    data: { turn, step: 1, message: { content: [{ type: 'text', text }] }, usage: usageOf(inputTokens, outputTokens, 0) }
+  }
+});
+
 test('convertSessionRecordsToMessages: 一轮两个 assistant 的 usage 相加（input+output）', () => {
   const records = [
-    { event: { type: 'user/message', seq: 10, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '跑一下' }] } } },
-    { event: { type: 'assistant/message', seq: 11, data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'A' }] }, usage: usageOf(282, 312, 36178) } } },
-    { event: { type: 'assistant/message', seq: 12, data: { turn: 1, step: 2, message: { content: [{ type: 'text', text: 'B' }] }, usage: usageOf(1000, 500, 42000) } } },
-    { event: { type: 'turn/end', seq: 13, data: { turn: 1, reason: { kind: 'completed' } } } }
+    turnStart(9, 1),
+    humanMsg(10, '跑一下'),
+    assistantMsg(11, 'A', 282, 312),
+    assistantMsg(12, 'B', 1000, 500),
+    turnEnd(13, 1)
   ];
 
   const { messages } = convertSessionRecordsToMessages(records);
@@ -1183,10 +1331,11 @@ test('convertSessionRecordsToMessages: totalTokens 是累计值，绝不能被�
   // 实测样本：input 282 / output 312 / total 36178 / cacheRead 35584。
   // 若把 totalTokens 加进去，这一轮会从 594 被吹成 36772（差一个量级）。
   const records = [
-    { event: { type: 'user/message', seq: 1, data: { content: 'x' } } },
+    turnStart(0, 1),
+    humanMsg(1, 'x'),
     { event: { type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'text', text: 'a' }] }, usage: usageOf(282, 312, 36178) } } },
     { event: { type: 'assistant/message', seq: 3, data: { message: { content: [{ type: 'text', text: 'b' }] }, usage: usageOf(400, 100, 999999) } } },
-    { event: { type: 'turn/end', seq: 4, data: { turn: 1, reason: { kind: 'completed' } } } }
+    turnEnd(4, 1)
   ];
 
   const { messages } = convertSessionRecordsToMessages(records);
@@ -1196,8 +1345,9 @@ test('convertSessionRecordsToMessages: totalTokens 是累计值，绝不能被�
 
 test('convertSessionRecordsToMessages: 未结束的轮 tokens 必须是 null（不是部分和、不是 0）', () => {
   const records = [
-    { event: { type: 'user/message', seq: 1, data: { content: '还在跑' } } },
-    { event: { type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'text', text: 'a' }] }, usage: usageOf(282, 312, 36178) } } }
+    turnStart(1, 1),            // 回合已经开始（openedInWindow 成立）
+    humanMsg(2, '还在跑'),
+    assistantMsg(3, 'a', 282, 312)
     // 没有 turn/end：回合还在跑
   ];
 
@@ -1208,20 +1358,22 @@ test('convertSessionRecordsToMessages: 未结束的轮 tokens 必须是 null（�
 
 test('convertSessionRecordsToMessages: 一条 usage 都没有的轮 → null，缺 usage 的工具步不影响整轮', () => {
   const noUsage = [
-    { event: { type: 'user/message', seq: 1, data: { content: '嗨' } } },
+    turnStart(0, 1),
+    humanMsg(1, '嗨'),
     { event: { type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'text', text: '在' }] } } } },
-    { event: { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'completed' } } } }
+    turnEnd(3, 1)
   ];
   assert.equal(convertSessionRecordsToMessages(noUsage).messages[0].tokens, null, '全员缺 usage → null，绝不写 0');
 
   // 工具步（无 usage）夹在两个有 usage 的 step 之间：0 贡献，但整轮仍然成立。
   const mixed = [
-    { event: { type: 'user/message', seq: 10, data: { content: '查一下' } } },
-    { event: { type: 'assistant/message', seq: 11, data: { message: { content: [{ type: 'text', text: 'A' }] }, usage: usageOf(100, 10, 5000) } } },
+    turnStart(9, 2),
+    humanMsg(10, '查一下'),
+    assistantMsg(11, 'A', 100, 10),
     { event: { type: 'tool/call', seq: 12, data: { name: 'gtw', arguments: {}, callId: 'c1' } } },
     { event: { type: 'assistant/message', seq: 13, data: { message: { content: [] } } } },   // 工具步：没有 usage
-    { event: { type: 'assistant/message', seq: 14, data: { message: { content: [{ type: 'text', text: 'B' }] }, usage: usageOf(200, 20, 8000) } } },
-    { event: { type: 'turn/end', seq: 15, data: { turn: 2, reason: { kind: 'completed' } } } }
+    assistantMsg(14, 'B', 200, 20),
+    turnEnd(15, 2)
   ];
   assert.equal(convertSessionRecordsToMessages(mixed).messages[0].tokens, 100 + 10 + 200 + 20);
 });
@@ -1229,12 +1381,14 @@ test('convertSessionRecordsToMessages: 一条 usage 都没有的轮 → null，�
 test('convertSessionRecordsToMessages: 多轮各自结算，跑到一半的那轮是 null', () => {
   const records = [
     // 第一轮：已结束
-    { event: { type: 'user/message', seq: 10, data: { content: '问题一' } } },
-    { event: { type: 'assistant/message', seq: 11, data: { message: { content: [{ type: 'text', text: '答一' }] }, usage: usageOf(100, 50, 3000) } } },
-    { event: { type: 'turn/end', seq: 12, data: { turn: 1, reason: { kind: 'completed' } } } },
+    turnStart(9, 1),
+    humanMsg(10, '问题一'),
+    assistantMsg(11, '答一', 100, 50),
+    turnEnd(12, 1),
     // 第二轮：还在跑（没有 turn/end）
-    { event: { type: 'user/message', seq: 20, data: { content: '问题二' } } },
-    { event: { type: 'assistant/message', seq: 21, data: { message: { content: [{ type: 'text', text: '答二' }] }, usage: usageOf(700, 70, 9000) } } }
+    turnStart(19, 2),
+    humanMsg(20, '问题二'),
+    assistantMsg(21, '答二', 700, 70)
   ];
 
   const { messages } = convertSessionRecordsToMessages(records);
@@ -1244,19 +1398,120 @@ test('convertSessionRecordsToMessages: 多轮各自结算，跑到一半的那�
   assert.equal(users[1].tokens, null, '第二轮没有 turn/end → null');
 });
 
-test('convertSessionRecordsToMessages: 分页从轮中间切进来时，前面无主的 usage 不计到别人头上', () => {
-  // 一页从轮中间开始：assistant 先到（它们的 user/message 在上一页），随后才是新的提问。
+/* ------------------------------------------------------------------ *
+ * [fix 2026-10-17] 用量归属的三个关键边界（第二版补的用例）
+ * ------------------------------------------------------------------ */
+
+test('convertSessionRecordsToMessages: 注入夹在真人与 assistant 之间时，用量落在真人那条上', () => {
+  // 活数据时序：turn/start 1899 → user 1902(真人) → user 1903(time-context)
+  // → assistant 带 usage → turn/end。第一版把 1902 的轮在 1903 处切掉，于是 1903 抢走了
+  // 本轮的 usage，而 1902 是 null —— 注入消息要么被网关丢弃、要么在 App 里渲染成通知卡，
+  // 用量就此凭空消失。
   const records = [
-    { event: { type: 'assistant/message', seq: 100, data: { message: { content: [{ type: 'text', text: '上半轮' }] }, usage: usageOf(9999, 9999, 99999) } } },
-    { event: { type: 'turn/end', seq: 101, data: { turn: 4, reason: { kind: 'completed' } } } },
-    { event: { type: 'user/message', seq: 110, data: { content: '新问题' } } },
-    { event: { type: 'assistant/message', seq: 111, data: { message: { content: [{ type: 'text', text: '答' }] }, usage: usageOf(100, 20, 4000) } } },
-    { event: { type: 'turn/end', seq: 112, data: { turn: 5, reason: { kind: 'completed' } } } }
+    turnStart(1899, 6),
+    humanMsg(1902, '看一下网关日志'),
+    injectedMsg(1903, 'Current time: 2026-10-17T09:24:13+08:00[Asia/Shanghai]', 'time-context'),
+    assistantMsg(1906, '好', 2000, 300, 6),
+    assistantMsg(1907, '继续', 1000, 96, 6),
+    turnEnd(2059, 6)
   ];
 
   const { messages } = convertSessionRecordsToMessages(records);
-  const user = messages.find((m) => m.role === 'user');
-  assert.equal(user.tokens, 120, '只算本页真正属于这一轮的 usage');
+  const humans = messages.filter((m) => m.role === 'user' && !m.noticeKind);
+  const injected = messages.filter((m) => m.noticeKind === 'time-context');
+  assert.equal(humans.length, 1, '只有一条真人消息');
+  assert.equal(injected.length, 1, '注入消息仍然产出（App 渲染成通知卡），只是不承载用量');
+  assert.equal(humans[0].tokens, 2000 + 300 + 1000 + 96, '本轮的用量必须落在真人那条上');
+  assert.equal(injected[0].tokens, null, '注入消息不是载体：不承载、不结算（绝不能是从真人那儿抢走的）');
+});
+
+test('convertSessionRecordsToMessages: 一轮两条真人消息（回合中追问）各自拿分段值，两段之和 = 该轮总和', () => {
+  // 活数据：1902 与 1954 同属 turn 6（1954 是用户在回合进行中的追问）。
+  // 分段语义："这条消息到下一次你说话之间烧掉的量"；把整轮的量全塞给第一条会谎报单条成本。
+  const records = [
+    turnStart(1899, 6),
+    humanMsg(1902, '看一下网关日志'),
+    assistantMsg(1906, 'A', 1000, 100, 6),
+    assistantMsg(1930, 'B', 500, 50, 6),
+    humanMsg(1954, '顺便把测试也跑了'),      // 同一轮的第二条真人消息
+    assistantMsg(1955, 'C', 400, 40, 6),
+    assistantMsg(2000, 'D', 600, 60, 6),
+    turnEnd(2059, 6)
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  const humans = messages.filter((m) => m.role === 'user');
+  assert.equal(humans.length, 2);
+  const total = 1000 + 100 + 500 + 50 + 400 + 40 + 600 + 60;
+  assert.equal(humans[0].tokens, 1000 + 100 + 500 + 50, '第一条：它之后到第二次说话之间烧掉的量');
+  assert.equal(humans[1].tokens, 400 + 40 + 600 + 60, '最后一条：吃到轮尾');
+  assert.equal(humans[0].tokens + humans[1].tokens, total, '两段之和必须等于该轮总和（不重不漏）');
+});
+
+test('convertSessionRecordsToMessages: 分页从轮中间切进来（有 turn/end 但窗口里没有 turn/start）→ null', () => {
+  // 窗口从轮中间开始：这条真人消息是本轮的载体，但开头那段 usage 在上一页，
+  // 累加和是残缺的 —— 宁可 null 也不错报（openedInWindow 不成立）。
+  const midTurn = [
+    humanMsg(1954, '顺便把测试也跑了'),
+    assistantMsg(1955, 'C', 400, 40, 6),
+    turnEnd(2059, 6)
+  ];
+  const cut = convertSessionRecordsToMessages(midTurn);
+  assert.equal(cut.messages.filter((m) => m.role === 'user')[0].tokens, null, '窗口里没有 turn/start → 数据不全 → null');
+
+  // 紧接着的下一个轮 turn/start 在窗口里 → 它自己是完整的，照常结算；
+  // 上面残缺那段既不会算进它，也不会被它吞掉。
+  const withNextTurn = [
+    humanMsg(1954, '顺便把测试也跑了'),
+    assistantMsg(1955, 'C', 400, 40, 6),
+    turnEnd(2059, 6),
+    turnStart(2100, 7),
+    humanMsg(2102, '新问题'),
+    assistantMsg(2103, '答', 100, 20, 7),
+    turnEnd(2104, 7)
+  ];
+  const users = convertSessionRecordsToMessages(withNextTurn).messages.filter((m) => m.role === 'user');
+  assert.equal(users[0].tokens, null, '残缺轮仍然是 null');
+  assert.equal(users[1].tokens, 120, '下一个轮自己有 turn/start + turn/end + usage → 只算它自己的 120');
+
+  // 同一个门也想挡住"真人消息排在它自己的 turn/start 之前"这种时序：那条消息没有
+  // 在窗口里的 turn/start 可依，宁可 null 也不猜它属于哪个轮（实测时序不是这样）。
+  const reversed = convertSessionRecordsToMessages([
+    humanMsg(2102, '新问题'),
+    turnStart(2103, 7),
+    assistantMsg(2104, '答', 100, 20, 7),
+    turnEnd(2105, 7)
+  ]);
+  assert.equal(reversed.messages.filter((m) => m.role === 'user')[0].tokens, null, '载体在自己的 turn/start 之前 → null，不猜');
+});
+
+test('convertSessionRecordsToMessages: 没有真人载体的轮（纯 schedule 唤醒）用量丢弃，前后都不沾', () => {
+  const records = [
+    // 第一轮：真人提问 → 正常结算
+    turnStart(99, 1),
+    humanMsg(100, '问题一'),
+    assistantMsg(101, '答一', 100, 20, 1),
+    turnEnd(102, 1),
+    // 第二轮：只有 schedule 注入唤醒，一条真人消息都没有
+    turnStart(199, 2),
+    injectedMsg(200, '[SCHEDULE REMINDER BATCH] 提醒：看一下部署', 'schedule'),
+    assistantMsg(201, '收到', 700, 70, 2),
+    turnEnd(202, 2),
+    // 第三轮：又是真人提问
+    turnStart(299, 3),
+    humanMsg(300, '问题三'),
+    assistantMsg(301, '答三', 5, 5, 3),
+    turnEnd(302, 3)
+  ];
+
+  const { messages } = convertSessionRecordsToMessages(records);
+  const humans = messages.filter((m) => m.role === 'user' && !m.noticeKind);
+  assert.equal(humans.length, 2);
+  assert.equal(humans[0].tokens, 120, '第一轮的量不能被 schedule 轮抢走');
+  assert.equal(humans[1].tokens, 10, '第三轮也不该把中间那轮的 770 吞进来');
+  const injected = messages.filter((m) => m.noticeKind);
+  assert.equal(injected.length, 1);
+  assert.equal(injected[0].tokens, null, '没有载体的轮：用量丢弃，不挪给上一条或下一条');
 });
 
 test('convertSessionRecordsToMessages: 注入通知仍然保持既有语义，并同样带上 tokens', () => {
@@ -1269,11 +1524,11 @@ test('convertSessionRecordsToMessages: 注入通知仍然保持既有语义，�
   assert.equal(messages.length, 2);
   assert.equal(messages[0].role, 'user');
   assert.equal(messages[0].noticeKind, undefined, '真人消息不该带任何通知字段');
-  assert.equal(messages[0].tokens, null);
+  assert.equal(messages[0].tokens, null, '窗口里没有 turn/start（更没有 turn/end）→ 不给值');
   assert.equal(messages[0].attachments, undefined);
   assert.equal(messages[1].role, 'user', 'role 保持 user：老 App 的渲染行为不能变');
   assert.equal(messages[1].noticeKind, 'subagent-settlement');
-  assert.equal(messages[1].tokens, null, '被过滤掉的轮没有产出，用量不挪给别人');
+  assert.equal(messages[1].tokens, null, '注入消息不是载体：不承载用量');
   assert.equal(messages[1].attachments, undefined);
 });
 

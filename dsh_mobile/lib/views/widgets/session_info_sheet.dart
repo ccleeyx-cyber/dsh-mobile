@@ -534,9 +534,45 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
           padding: const EdgeInsets.only(top: 2),
           child: _hint('另有缓存复用 ${_compact(stats.cacheReadTokens ?? 0)}'
               '${(stats.cacheWriteTokens ?? 0) > 0 ? ' + 写入 ${_compact(stats.cacheWriteTokens!)}' : ''}'
+              '${stats.cacheHitPercent != null ? '（命中 ${stats.cacheHitPercent}%）' : ''}'
               '（重复读取的上下文，不计入上面的消耗）。'),
         ));
       }
+      // [feat 2026-10-17] 电脑端「会话统计」那组数字：轮/步、输出速度、模型/工具用时。
+      //
+      // 用户点名要"用量信息跟电脑端一样显示"。这几条以前只在电脑端有 —— 手机上既没有
+      // 轮/步总量（只有窗口内那几轮，自己数会算成 1 轮），也没有速度与用时。
+      // 读不到就整段不出现（老网关没有这个投影），绝不补 `0 轮 0 步`。
+      final counters = stats.counters;
+      if (counters != null && (counters.steps ?? 0) > 0) {
+        // 与电脑端同一排版：`6 轮 351 步 · 210 tok/s` —— 轮与步之间是**空格**，
+        // 速度才是 ` · ` 分隔的第二组。别用同一个分隔符把三段平铺（那是另一种读法）。
+        final counts = <String>[
+          if (counters.turns != null) '${counters.turns} 轮',
+          if (counters.steps != null) '${counters.steps} 步',
+        ].join(' ');
+        final tps = stats.tokensPerSecond;
+        children.add(const SizedBox(height: 4));
+        children.add(_metricRow(
+          '会话统计',
+          tps == null ? counts : '$counts · ${SessionStatusStrip.formatTokensPerSecond(tps)} tok/s',
+        ));
+
+        final durations = <String>[
+          if ((counters.llmMs ?? 0) > 0) '模型用时 ${_shortDuration(counters.llmMs!)}',
+          if ((counters.toolMs ?? 0) > 0) '工具调用 ${_shortDuration(counters.toolMs!)}',
+          // 首 token 平均：引擎给的是总量 + 步数，电脑端也是这么除的。
+          if ((counters.ttftMs ?? 0) > 0 && (counters.ttftSteps ?? 0) > 0)
+            '首 token 平均 ${_shortDuration(counters.ttftMs! ~/ counters.ttftSteps!)}',
+        ];
+        if (durations.isNotEmpty) {
+          children.add(Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: _hint(durations.join(' · ')),
+          ));
+        }
+      }
+
       if (widget.turnBurnTokens == null) {
         children.add(Padding(
           padding: const EdgeInsets.only(top: 2),
@@ -648,6 +684,21 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
   }
 
   String _formatTurnBurn(int? burn) => burn == null ? '—' : _compact(burn);
+
+  /// 短时长：`0.9s` / `45s` / `2m05s`。
+  ///
+  /// 与电脑端 `formatDuration` 同一口径（10 秒以下保留一位小数，分钟按 `m分s秒`）。
+  /// 引擎给的是毫秒总量，所以先除法再格式化。
+  static String _shortDuration(int ms) {
+    final total = ms < 0 ? 0 : ms;
+    if (total < 60000) {
+      final seconds = total / 1000;
+      return seconds >= 10 ? '${seconds.round()}s' : '${seconds.toStringAsFixed(1)}s';
+    }
+    final minutes = total ~/ 60000;
+    final seconds = (total % 60000) ~/ 1000;
+    return '${minutes}m${seconds.toString().padLeft(2, '0')}s';
+  }
 
   /// 千分位。自己写四行而不是引 intl：这个包里没有这个依赖，也不值得为它加。
   static String _group(int value) {

@@ -111,6 +111,65 @@ void main() {
     });
   });
 
+  group('首屏自动回补（ensureHistoryTurns）', () {
+    test('"真人回合"只数真人：注入通知与上下文块都不算', () {
+      final dsh = newService();
+      dsh.debugSetMessages([
+        // 上下文块
+        ChatMessage(
+          id: 'ctx1',
+          role: 'user',
+          content: 'MNEMON RUNTIME MEMORY SNAPSHOT\nRevision: abc',
+          seq: 10,
+          timestamp: DateTime.now().subtract(const Duration(minutes: 30)),
+        ),
+        // 真人
+        ChatMessage(
+          id: 'u1',
+          role: 'user',
+          content: '第一轮',
+          seq: 11,
+          timestamp: DateTime.now().subtract(const Duration(minutes: 30)),
+        ),
+        // 引擎注入的通知（role 是 user，但没人打过这些字）
+        ChatMessage(
+          id: 'n1',
+          role: 'user',
+          content: 'Background subagent 6f29a191 finished and will do no further work unless you send it more.',
+          seq: 12,
+          timestamp: DateTime.now().subtract(const Duration(minutes: 29)),
+        ),
+        // 真人
+        ChatMessage(
+          id: 'u2',
+          role: 'user',
+          content: '第二轮',
+          seq: 13,
+          timestamp: DateTime.now().subtract(const Duration(minutes: 28)),
+        ),
+      ]);
+
+      expect(dsh.debugHumanTurnCount, 2, reason: '注入与上下文块都不能被当成用户回过话');
+    });
+
+    test('没有更多历史时一次都不请求（不打无意义的网络）', () async {
+      final dsh = newService();
+      dsh.debugSetMessages([
+        ChatMessage(
+          id: 'u1',
+          role: 'user',
+          content: '唯一一轮',
+          seq: 11,
+          timestamp: DateTime.now().subtract(const Duration(minutes: 30)),
+        ),
+      ]);
+      // 新服务没有网关配置、也没有更多页 → 必须立刻返回，不抛异常。
+      await dsh.ensureHistoryTurns();
+      expect(dsh.messages.length, 1);
+      expect(dsh.hasMoreHistory, isFalse);
+    });
+  });
+
   group('本轮用量（lastTurnTokens）', () {
     test('优先用引擎的权威读数：最近一次跑完的那一轮', () {
       final dsh = newService();

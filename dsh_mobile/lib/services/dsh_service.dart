@@ -616,6 +616,36 @@ class DshService extends ChangeNotifier {
     }
   }
 
+  /// 当前消息列表里的**真人**回合数（排除注入通知与上下文/记忆块）。
+  ///
+  /// 只用于"首屏够不够"的判断，不用于显示 —— 显示整会话轮数的是引擎的
+  /// `sessionStats` 投影（见 `SessionStats.turns`）。
+  int get _humanTurnCount => _messages
+      .where((m) => m.isUser && !m.isHarnessNotice && !m.isContextOrMemory)
+      .length;
+
+  /// 首屏轮数不够时，自动往回补几页（v1.24.1）。
+  ///
+  /// **为什么需要**：引擎那份历史窗口的预算是按**消息条数**给的，而一条回合里每个
+  /// step 都算一条消息 —— 步数多的会话（实测 351 步 / 6 轮）一页只覆盖一两轮，用户
+  /// 看到的就是"明明有五轮，只显示两三"轮"。上翻虽然能拿到更早的，但用户不知道要
+  /// 往上滑，也不会觉得"这功能坏了"该去滑。
+  ///
+  /// 上限是硬的：每页实测 200~300 KB，所以最多补 [maxPages] 页；补到 [minTurns] 个
+  /// 真人回话就停（再多用户也没在看）。任何一页没有新增消息就立刻停，避免死循环。
+  Future<void> ensureHistoryTurns({int minTurns = 5, int maxPages = 4}) async {
+    final seq = _sessionLoadSeq;
+    var pages = 0;
+    while (pages < maxPages && hasMoreHistory && _humanTurnCount < minTurns) {
+      final before = _messages.length;
+      await loadOlderHistory();
+      if (seq != _sessionLoadSeq) return; // 会话已切走：别再为旧会话拉
+      pages++;
+      if (_messages.length <= before) break; // 没有进展（例如网关返回空页）
+    }
+    if (pages > 0) notifyListeners();
+  }
+
   bool get isSending => _isSending;
   bool get isCanceling => _isCanceling;
 
@@ -1089,6 +1119,13 @@ class DshService extends ChangeNotifier {
     _reconcileSessionMessages(raw, isRunning, sid);
   }
 
+  /// 测试用：当前消息列表里算作"真人回合"的条数。
+  ///
+  /// [ensureHistoryTurns] 的补页门槛就用它 —— 而"哪些消息算真人回合"这条口径
+  /// （注入通知不算、上下文/记忆块不算）只有在这里能单独观察。
+  @visibleForTesting
+  int get debugHumanTurnCount => _humanTurnCount;
+
   /// 测试用：直接设定待授权列表，不联网。
   ///
   /// 审批只由 fetchApprovals() 和 WebSocket 帧写入，两者都要真网关。审批卡的
@@ -1433,6 +1470,10 @@ class DshService extends ChangeNotifier {
         // 第一档立刻发：`stats` + `queue` 都是本地投影读，决定状态条首帧有没有
         // 上下文压力和队列内容。
         unawaited(fetchSessionOverview());
+        // [feat 2026-10-17] 首屏那一页常常只覆盖一两轮（窗口的预算是按消息条数给的，
+        // 而每步都算一条消息）。这里在后台补到 5 个真人回话，用户打开就能看到最近
+        // 几轮，而不是"只有两三轮"。上限硬编码在 ensureHistoryTurns 里（最多 4 页）。
+        unawaited(ensureHistoryTurns());
         // 第二档紧接一次：交付物（一次 MUX RPC）→ 变更（一个 git 子进程）。
         // 两个都决定状态条上的数字，但比第一档贵，所以不参与首帧；里面每一环
         // 都带会话守卫，会话切走就停。

@@ -367,6 +367,9 @@ class SessionStats {
   final int? contextWindow;
   final GoalInfo? goal;
 
+  /// 引擎 `sessionStats` 投影（轮/步/耗时/解码速度）；见 [counters] 的说明。
+  final SessionCounters? counters;
+
   const SessionStats({
     required this.source,
     this.uncachedInputTokens,
@@ -378,10 +381,12 @@ class SessionStats {
     this.projectedTokens,
     this.contextWindow,
     this.goal,
+    this.counters,
   });
 
   factory SessionStats.fromJson(Map<String, dynamic> json) {
     final goal = json['goal'];
+    final counters = json['sessionStats'];
     return SessionStats(
       source: json['source']?.toString() ?? 'none',
       uncachedInputTokens: _int(json['uncachedInputTokens']),
@@ -393,7 +398,36 @@ class SessionStats {
       projectedTokens: _int(json['projectedTokens']),
       contextWindow: _int(json['contextWindow']),
       goal: goal is Map ? GoalInfo.fromJson(Map<String, dynamic>.from(goal)) : null,
+      // [feat 2026-10-17] 引擎 `sessionStats` 投影（轮/步/耗时/解码速度）。
+      // 老网关没有这个键 → 保持 null，界面按"读不到"隐藏，而不是显示 0 轮 0 步。
+      counters: counters is Map
+          ? SessionCounters.fromJson(Map<String, dynamic>.from(counters))
+          : null,
     );
+  }
+
+  /// 电脑端状态条第一组：`N 轮 M 步 · X tok/s`。
+  ///
+  /// 轮/步来自引擎的**全日志**投影，所以它是对的整会话总量 —— 手机端只加载了
+  /// 窗口内的消息，靠数消息自己算会算成"1 轮"。
+  int? get turns => counters?.turns;
+
+  int? get steps => counters?.steps;
+
+  /// 解码速度（输出 token / 解码耗时）。分母为 0 或缺失时 null → 界面显示 `—`，
+  /// 不显示 `0 tok/s`（那读起来像"卡住了"）。
+  double? get tokensPerSecond => counters?.tokensPerSecond;
+
+  /// 缓存命中率（%）：缓存读取 / (未缓存输入 + 缓存读取)。
+  ///
+  /// 与电脑端 `cacheHitPercent` 同一口径；分母未知/为 0 时返回 null。
+  int? get cacheHitPercent {
+    final cached = cacheReadTokens;
+    final uncached = uncachedInputTokens;
+    if (cached == null || uncached == null) return null;
+    final denom = cached + uncached;
+    if (denom <= 0) return null;
+    return (cached * 100 / denom).round();
   }
 
   bool get hasUsage => totalTokens != null;
@@ -448,6 +482,68 @@ class SessionStats {
     final total = now.totalTokens;
     if (total == null || total < baseline) return null;
     return total - baseline;
+  }
+}
+
+/// 会话统计：电脑端状态条第一组那几个数字（`6 轮 351 步 · 210 tok/s`）。
+///
+/// 数据源是引擎的 **`sessionStats` 投影**（全日志级，不是当前窗口）：手机端只加载了
+/// 窗口内的消息，自己数消息会把一个 6 轮的会话算成"1 轮"。所以这几个数字必须由网关
+/// 从投影里取来 —— 读不到时整组隐藏（`null`），不显示 `0 轮 0 步`。
+///
+/// 字段名与引擎投影一致（电脑端的 `deriveStats` 兜底函数就是照着投影字段名写的）。
+class SessionCounters {
+  final int? turns;
+  final int? steps;
+  final int? llmMs;
+  final int? toolMs;
+  final int? ttftMs;
+  final int? ttftSteps;
+  final int? decodeMs;
+  final int? decodeTokens;
+
+  const SessionCounters({
+    this.turns,
+    this.steps,
+    this.llmMs,
+    this.toolMs,
+    this.ttftMs,
+    this.ttftSteps,
+    this.decodeMs,
+    this.decodeTokens,
+  });
+
+  factory SessionCounters.fromJson(Map<String, dynamic> json) {
+    int? asInt(dynamic v) {
+      if (v is int) return v;
+      if (v is num) return v.toInt();
+      return int.tryParse('${v ?? ''}');
+    }
+
+    return SessionCounters(
+      turns: asInt(json['turns']),
+      steps: asInt(json['steps']),
+      llmMs: asInt(json['llmMs']),
+      toolMs: asInt(json['toolMs']),
+      ttftMs: asInt(json['ttftMs']),
+      ttftSteps: asInt(json['ttftSteps']),
+      decodeMs: asInt(json['decodeMs']),
+      decodeTokens: asInt(json['decodeTokens']),
+    );
+  }
+
+  /// 有没有任何可显示的计数（`steps == 0` 的合法空会话另算，见下）。
+  bool get hasCounts => turns != null || steps != null;
+
+  /// 解码速度（tok/s）：`decodeTokens / (decodeMs / 1000)`。
+  ///
+  /// 电脑端同一口径。分母 <= 0 或任一未知 → null（界面显示 `—`）。**不能**回落成 0：
+  /// `0 tok/s` 会被读成"卡住了"，而真相是"这次没测到解码耗时"。
+  double? get tokensPerSecond {
+    final ms = decodeMs;
+    final tokens = decodeTokens;
+    if (ms == null || tokens == null || ms <= 0) return null;
+    return tokens / (ms / 1000);
   }
 }
 

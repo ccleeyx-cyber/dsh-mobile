@@ -26,7 +26,8 @@ import {
   coerceToolInput,
   describeTurnEnd,
   isCarriedContext,
-  isFailedTurnEnd
+  isFailedTurnEnd,
+  readUserMessageSource
 } from './core.mjs';
 
 import {
@@ -440,24 +441,62 @@ function toAttachmentRef(part) {
  * 2) `tokens` —— 修"本轮用量经常显示 —"。引擎**每个 step 的 `assistant/message` 都带
  *    `usage`**（`inputTokens/outputTokens/totalTokens/cacheReadTokens`），而网关以前把这份
  *    数据整个扔掉，App 只能靠"两次 stats 读数相减"，基线没记到就永远是 —。
- *    这里从每条 user/message 起累加**属于这一轮**的 assistant usage，落在该条消息上。
+ *
+ *    ## [fix 2026-10-17] 第二版：用量挂错消息了
+ *
+ *    第一版把**每一条 `user/message`** 都当成"新一轮开始"，于是引擎插在回合中间的注入
+ *    消息把这一轮的用量抢走，**真人那条永远是 null**。活数据实证（2026-10-17）：
+ *
+ *      turn/end  1896 (turn5) → turn/start 1899 (turn6)       ← 权威回合边界
+ *      user/message 1902  source.kind='user'                  真人提问 ← 应由它承载
+ *      user/message 1903  source.kind='time-context'          注入
+ *      user/message 1904  source.kind='dsh-mnemon'            注入
+ *      assistant/message 1906..2059  data.turn=6，每条带 usage ← 本轮的用量在这里
+ *      user/message 1954  source.kind='user'                  同一轮里用户追问
+ *
+ *    实测后果：网关返回的历史里 1902 / 1954 / 2949 这些**真人**消息 tokens 全是 null，
+ *    而 1843(time-context) 拿到 10008、2932(tool-jobs) 拿到 1800 —— 注入要么被网关丢弃、
+ *    要么在 App 里渲染成通知卡，那些用量就此凭空消失。
+ *
+ *    ### 现在的规则，以及每条的为什么
+ *
+ *    a. **`turn/start` 是权威回合边界**：见到它就结算上一轮、开一个新轮。**不**再用
+ *       user/message 开轮（那正是挂错对象的根因）。依据：`turn/start` 的 `data.turn` 与
+ *       `assistant/message` 的 `data.turn` 一致（引擎侧
+ *       `dsh-agent-loop/lib/index.js:943 this.session.append("turn/start", { turn })`），
+ *       且真实时序里 turn/start 排在真人消息**之前**（见上面 1899 → 1902）。
+ *    b. **载体（carrier）只能是真人消息**：`readUserMessageSource(ev).human === true`。
+ *       注入消息（time-context / dsh-mnemon / skill-catalog / agent-message /
+ *       subagent-settled / compact-checkpoint / runtime-context / tool-jobs / schedule …）
+ *       **不承载、不结算**，只属于当前这一轮。
+ *    c. **一轮里可能有多条真人消息**（用户在回合进行中追问，如 1902 + 1954）→ 按**分段**
+ *       给值：`tokens` 的语义是"**这条消息到下一次你说话之间**烧掉的量"。实现记
+ *       `cuts = [{ msg, sumAtCut }]`，每条真人消息处记一次当时的累计和；轮结束时
+ *       第 i 条 = `cuts[i+1].sumAtCut - cuts[i].sumAtCut`，最后一条 = `totalSum - cuts[last].sumAtCut`。
+ *       （把整轮的量全塞给第一条会谎报单条成本；两条相邻真人消息之间没有任何 usage 时
+ *       分段值可以是 0 —— 那是算出来的事实，不是"未知写 0"。）
+ *    d. **只在轮完整且本轮 usage 完整时才给值**，否则 `tokens: null`（**绝不写 0**）：
+ *       - 必须见过 `turn/end`（回合还在跑 → 中途和会被读成"这轮就花了这么多"）；
+ *       - 必须见过至少一条带 usage 的 assistant（否则无从谈起）；
+ *       - **必须 `turn/start` 也在这段记录里**（`openedInWindow`）：分页从轮中间切进来时
+ *         累加和是残缺的 —— 比如 1902 在上一页、只有 1954 在这一页，前者的量根本算不进来，
+ *         那时宁可 null 也不错报。这一条**单独有测试**。
+ *         注意这条规则也意味着：万一某个引擎版本把真人消息排在它自己的 `turn/start`
+ *         **之前**（实测时序不是这样：1899 在 1902 之前），那条消息同样会保持 null ——
+ *         这是刻意的。宁可空着，也不"猜"它属于哪个轮（把上一条/下一条的量塞给它才是谎）。
+ *    e. 没有任何真人载体的轮（例如纯 `[SCHEDULE REMINDER BATCH]` 唤醒的轮）→ 用量丢弃，
+ *       不给值，也**不挪**给上一条或下一条。
  *
  *    为什么只加 `inputTokens + outputTokens`：`inputTokens` 是"未缓存输入"，
  *    `totalTokens` 是**跨 step 累计**值（实测一条 assistant 是 input 282 / output 312 /
  *    total 36178 / cacheRead 35584）——逐 step 累加 totalTokens 会把数字吹大一个量级，
  *    还会把前面 step 的量重复计很多遍。
  *
- *    为什么未结束的轮不给值：回合还在跑时写一个中途和，App 会把它读成"这轮就花了这么多"。
- *    所以规则是"窗口内出现过 turn/end（`data.reason.kind` 是权威的回合结束信号）**且**
- *    至少见过一条 usage"才写和，否则写 `null` —— **绝不写 0**（0 会被渲染成
- *    "真的花了 0 token"，那是另一种谎）。依据：index.js 的 follower 用 `turn/start` 置
- *    turnOpen、`turn/end` 清 turnOpen（单开单闭），extractCheckpoints 也是"一个 turn/end
- *    一个检查点"，所以窗口内出现 turn/end 就等于该轮闭合；万一真有重复，最后一个也必然
- *    落在同一窗口内，结论不变（这里只记布尔 `ended`，天然兼容两种）。
- *
  *    边界：窗口内缺 usage 的 assistant（工具步）只是 0 贡献，**不会**把整轮判成 null；
- *    反过来，一条 usage 都没有的轮（含被 carried-context 过滤掉、没有产出消息的轮）是
- *    null；分页把一轮切在两页上时也只是 null —— 宁可空着也不错填。
+ *    一条 usage 都没有的轮（含被 carried-context 过滤掉、没有产出消息的轮）是 null。
+ *    老日志里**没有 `source` 标记**的 user/message 不算真人（`readUserMessageSource` 的
+ *    human 是硬闸）→ 那一轮也不给值：宁可空着也不错填。被 carried-context 过滤掉的真人
+ *    消息不产生 cuts，它那一段的量落到上一条载体的分段里。
  *
  * @param records - `session/page` records (`{ event }` entries), ascending.
  * @returns `{ messages }` — ascending, same fields as getSessionHistory plus seq
@@ -468,14 +507,40 @@ export function convertSessionRecordsToMessages(records, opts = {}) {
   const auditDropped = typeof opts.auditDropped === 'function' ? opts.auditDropped : null;
   let currentAssistantMsg = null;
 
-  // 逐轮用量累加器（见上面第 2 条）。`msg` 指向这一轮 user/message 产出的消息对象，
-  // 该条被过滤掉时为 null（那一轮的用量就没有承载对象，直接丢弃而不是挪给别人）。
+  // 逐轮用量累加器（见上面第 2 条）。`cuts[i].msg` 是本轮第 i 条**真人**消息产出的消息对象；
+  // 一条真人消息都没有的轮 cuts 为空，这一轮的用量就地丢弃（不挪给别人）。
   let currentTurn = null;
+  /**
+   * 开一轮新的累加器。
+   * @param openedInWindow - 这一轮的 `turn/start` 是否落在本段记录里。分页切在轮中间时为 false，
+   *   此时累加和是残缺的，结算时会被挡掉（见规则 d）。
+   */
+  const openTurn = (openedInWindow) => {
+    currentTurn = { openedInWindow, cuts: [], sum: 0, sawUsage: false, ended: false };
+    return currentTurn;
+  };
   const settleTurn = () => {
-    if (currentTurn?.msg) {
-      currentTurn.msg.tokens = currentTurn.ended && currentTurn.sawUsage ? currentTurn.sum : null;
-    }
+    if (!currentTurn) return;
+    const turn = currentTurn;
     currentTurn = null;
+    // 规则 d：三个条件缺一不可，否则所有载体保持 `tokens: null`（**绝不写 0**，也不写中途和）。
+    if (!turn.ended || !turn.sawUsage || !turn.openedInWindow) return;
+    for (let i = 0; i < turn.cuts.length; i += 1) {
+      // 规则 c：这条消息 → 下一条真人消息之间烧掉的量；最后一条吃到轮尾。
+      const end = i + 1 < turn.cuts.length ? turn.cuts[i + 1].sumAtCut : turn.sum;
+      turn.cuts[i].msg.tokens = end - turn.cuts[i].sumAtCut;
+    }
+  };
+  /**
+   * 记一条真人载体（规则 b/c）。
+   *
+   * 没有开着的轮（分页切在轮中间，`turn/start` 在上一页）时也建一个 `openedInWindow: false`
+   * 的容器：这样"这条消息是载体、但本轮数据不全"有唯一表示，而不是靠"没有容器"隐式表达；
+   * 结算时被 openedInWindow 挡掉，值仍是 null（宁可 null 也不错报）。
+   */
+  const noteCarrier = (message) => {
+    const turn = currentTurn ?? openTurn(false);
+    turn.cuts.push({ msg: message, sumAtCut: turn.sum });
   };
 
   for (const record of Array.isArray(records) ? records : []) {
@@ -483,10 +548,11 @@ export function convertSessionRecordsToMessages(records, opts = {}) {
     if (!ev) continue;
 
     if (ev.type === 'user/message') {
-      // 上一条 user/message 起的轮到此为止：结算它，再开新轮。
-      settleTurn();
+      // [fix 2026-10-17] 这里**不再**开轮/结算。注入消息也是 user/message，它们以前会把
+      // 这一轮抢走、让真人那条拿到 null（见函数头部的活数据实证）。现在注入消息只是
+      // "属于当前这一轮"的普通事件：不承载、不结算。
       currentAssistantMsg = null;
-      currentTurn = { msg: null, sum: 0, sawUsage: false, ended: false };
+      const human = readUserMessageSource(ev).human;
       const attachments = [];
       let text = '';
       if (Array.isArray(ev.data?.content)) {
@@ -532,7 +598,8 @@ export function convertSessionRecordsToMessages(records, opts = {}) {
           content: text.trim(),
           time: ev.time || Date.now(),
           seq: typeof ev.seq === 'number' ? ev.seq : null,
-          // 逐轮用量先占位为 null，扫描到下一条 user/message 时由 settleTurn 结算。
+          // 逐轮用量先占位为 null：**只有真人消息**是载体，轮结束时由 settleTurn 按分段写值；
+          // 注入消息永远是 null（新 App 靠这个字段区分"未知"与"老网关没有这个字段"）。
           tokens: null,
           ...(attachments.length > 0 ? { attachments } : {}),
           ...(notice
@@ -545,7 +612,7 @@ export function convertSessionRecordsToMessages(records, opts = {}) {
             : {})
         };
         messages.push(message);
-        currentTurn.msg = message;
+        if (human) noteCarrier(message);
       } else if (auditDropped && typeof ev.seq === 'number') {
         // [fix 2026-10-14] 纯附件/空文本用户消息以前是静默消失；现在留痕
         //（是否生成占位消息由 App 端显示层决定，网关至少不能无声吞掉）。
@@ -553,14 +620,19 @@ export function convertSessionRecordsToMessages(records, opts = {}) {
         // 能落到这一支的是真的什么都没有（或只有没有 attachmentId 的老形状 part）。
         auditDropped({ seq: ev.seq, why: 'empty-user-text', length: 0 });
       }
+    } else if (ev.type === 'turn/start') {
+      // [fix 2026-10-17] 权威回合边界（规则 a）：先结算上一轮，再开新的一轮。
+      // 它本身不是聊天消息，不产出任何 message。（引擎侧形状 `{ turn }`。）
+      settleTurn();
+      openTurn(true);
     } else if (ev.type === 'assistant/message') {
       // [feat 2026-10-17] 引擎每个 step 的 assistant/message 都带 usage，而它以前被整个
       // 扔掉（手机只能靠"两次 stats 相减"，基线没记到就永远显示 —）。这里把**属于当前
       // 这一轮**的量累加进 currentTurn。只加 inputTokens + outputTokens：inputTokens 是
       // 未缓存输入，totalTokens 是跨 step 的累计值（实测每条 assistant 都重复带着前面的
       // 总量），加它会把整轮吹大一个量级。缺 usage / 字段不是数字 → 0 贡献，**不**把整轮
-      // 判成 null（工具步没有 usage 是常态）。currentTurn 为 null（分页从轮中间切进来）
-      // 时这轮没有承载消息，直接不计。
+      // 判成 null（工具步没有 usage 是常态）。currentTurn 为 null（窗口里还没有 turn/start，
+      // 分页切在轮中间）时这轮没有承载容器，直接不计。
       if (currentTurn) {
         const usage = ev.data?.usage;
         if (usage && typeof usage === 'object') {
@@ -629,16 +701,19 @@ export function convertSessionRecordsToMessages(records, opts = {}) {
         });
       }
     } else if (ev.type === 'turn/end') {
-      // [feat 2026-10-17] 回合结束的**权威**信号（`data.reason.kind`，见 index.js 的
-      // follower 用 turn/start 置 turnOpen、turn/end 清 turnOpen）。窗口内出现它就说明
-      // 这一轮已经跑完，可以结算 tokens；只记布尔而不记次数，重复的 turn/end 也落在同一
-      // 窗口内，结论一样（详见本函数头部的"为什么未结束的轮不给值"）。
-      // 它本身不是聊天消息，不产出任何 message。
-      if (currentTurn) currentTurn.ended = true;
+      // [fix 2026-10-17] 轮结束（`data.reason.kind` 是权威的结束信号）。三个条件里的
+      // "见过 turn/end" 就在这里成立；同时**在这里结算**而不是等下一轮的 turn/start：
+      // 轮闭合之后才到达的真人消息属于下一轮，如果还把它挂到一个已结束的轮上，只会算出一个
+      // 0（那是另一种谎）。它本身不是聊天消息，不产出任何 message。
+      if (currentTurn) {
+        currentTurn.ended = true;
+        settleTurn();
+      }
     }
     // Every other event type: not a chat message.
   }
-  // 最后一条 user/message 起的轮在这里结算（分页结束时它还没有下一条 user/message 可切）。
+  // 窗口在轮中间就结束了（有 turn/start 无 turn/end）：这里再结算一次 —— `ended` 不成立，
+  // settleTurn 会保持所有载体为 null。分页切在轮中间时同理（`openedInWindow` 不成立）。
   settleTurn();
   return { messages };
 }
@@ -847,6 +922,58 @@ export function parseUnifiedDiff(text) {
  * ------------------------------------------------------------------ */
 
 /**
+ * `sessionStats` 投影里放行的字段 —— **只**这 8 个数字，一个都不多。
+ *
+ * 名单是照着电脑端抄的：`dsh-client-ui-chat` 的状态条（`StatsPills`，见
+ * `lib/client.js:7135`）读 `useProjection('sessionStats')`，而它的兜底函数
+ * `deriveStats`（`lib/client.js:6923`）明确写着 "Its field names deliberately mirror
+ * the projection's so the two swap wholesale"，返回的正是这 8 个键。手机端状态行要显示的
+ * 「6 轮 351 步 · 210 tok/s」就是 `turns` / `steps` / `decodeTokens`÷(`decodeMs`/1000)。
+ *
+ * 为什么不整包转发：投影是 `.strict()` 的 8 字段对象（引擎
+ * `dsh-session-stats/lib/types/projection.js:27`），多带一个键只会让引擎将来加字段时
+ * 变成客户端的解析风险；手机端要的也只有一个状态行。
+ */
+export const SESSION_STATS_FIELDS = ['turns', 'steps', 'llmMs', 'toolMs', 'ttftMs', 'ttftSteps', 'decodeMs', 'decodeTokens'];
+
+/**
+ * 把 `sessionStats` 投影（或其缓存行）收敛成手机端状态行要的 8 个数字。
+ *
+ * 单位（照引擎定义）：`llmMs` / `toolMs` / `ttftMs` / `decodeMs` 都是**毫秒**墙钟时长，
+ * `decodeTokens` 是**解码出来的 completion token 数**（`outputTokens` 之和）。所以
+ * "tok/s" 的算法是 `decodeTokens / (decodeMs / 1000)` —— 电脑端状态条就是这么算的。
+ * `decodeMs` 为 0 时（会话没有成功的解码步）那个商是 Infinity/NaN：**这里不特殊处理**，
+ * 电脑端是 `stats.decodeMs > 0 ? … : null`（`lib/client.js:7139`），手机端照同样规则显示
+ * `—` 即可。网关的职责只是如实给出两个数字，不替客户端编一个"没有"。
+ *
+ * 边界（每条都有测试）：
+ *   - 投影整体缺失（老引擎 / 冷会话且缓存里没这一行）→ `null`（**不是**全 0 对象，
+ *     手机端据此显示 `—`）；
+ *   - 单个字段缺失 / 不是数字 / 是负的 → 该字段 `null`（时长与计数不可能为负，负数是垃圾）；
+ *   - **`steps: 0` / `turns: 0` 是合法事实**（空会话）→ 照实传 0，由 App 决定怎么显示；
+ *     只有"字段缺失或非数字"才算没有 —— 这里刻意不做 `> 0` 的过滤；
+ *   - 8 个字段一个都读不出来时整体给 `null`（有对象但没内容，和"读不到"是同一种事实）。
+ *
+ * @param value - `values.sessionStats`（live RPC）或 `rows.sessionStats.val`（缓存）。
+ * @returns 8 字段对象，或 null。
+ */
+export function summarizeSessionStats(value) {
+  if (!value || typeof value !== 'object') return null;
+  const out = {};
+  let usable = false;
+  for (const field of SESSION_STATS_FIELDS) {
+    const v = value[field];
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+      out[field] = v;
+      usable = true;
+    } else {
+      out[field] = null;
+    }
+  }
+  return usable ? out : null;
+}
+
+/**
  * Summarize token usage and context pressure for one session.
  *
  * Prefers the session projection (`tokenUsage` / `contextPressure`), which is
@@ -867,6 +994,24 @@ export function summarizeUsage(values, rows) {
   const pressure = pressureLive && typeof pressureLive === 'object'
     ? pressureLive
     : (pressureCached && typeof pressureCached === 'object' ? pressureCached : null);
+
+  // [feat 2026-10-17] 电脑端状态条那行「6 轮 351 步 · 210 tok/s」读的是引擎的 `sessionStats`
+  // 投影，网关以前没给，手机端于是拿不到轮/步/速度。两级读法照抄同目录 agentteam.mjs
+  // 已经验证过的那套（这也是 lib/index.js 的 readProjections 的行为）：
+  //   ① `session/projections` RPC —— live 会话的权威值。Web 端看到的形状是
+  //      `projectionsBySession[<sessionId>].values.<投影名>`；这个 RPC 只问一个会话，所以答案
+  //      是 `{ values: { sessionStats } }`，而 readProjections() 已经把 `values` 剥出来了
+  //      （lib/index.js:468-478 → `value?.values ?? null`），因此这里就是 `values.sessionStats`；
+  //   ② 会话不在内存里（冷会话，绝大多数情况）时回落读投影缓存文件里的
+  //      `record.rows.sessionStats.val`（rows 由 deps.readProjectionRows 给出）。
+  // 两边形状不同：RPC 是纯值，缓存行是 `@{ver, seq, val}` 标记 → 走 decodeCachedRow。
+  const statsLive = values?.sessionStats;
+  const statsCached = decodeCachedRow(rows?.sessionStats);
+  const sessionStats = summarizeSessionStats(
+    statsLive && typeof statsLive === 'object'
+      ? statsLive
+      : (statsCached && typeof statsCached === 'object' ? statsCached : null)
+  );
 
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
   // Cache buckets follow provider semantics: a usage record that omits them
@@ -906,7 +1051,10 @@ export function summarizeUsage(values, rows) {
         goalId: typeof g.id === 'string' ? g.id : null,
         revision: num(g.revision)
       };
-    })()
+    })(),
+    // [feat 2026-10-17] 新增子对象，不改上面任何一个既有字段（App 已在用）。
+    // 读不到就是 null（**不是**编 0），手机端据此显示 —。
+    sessionStats
   };
 }
 
