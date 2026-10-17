@@ -9,6 +9,7 @@ import '../services/dsh_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_spacing.dart';
 import '../widgets/inline_error_bar.dart';
+import '../widgets/top_toast.dart';
 
 class WorkspacesView extends StatefulWidget {
   final VoidCallback? onSwitchToChat;
@@ -166,6 +167,167 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
   ///
   /// 失败要如实说（改的是 projcache 标题行，网关读不到缓存文件时会失败），
   /// 不能像删除那样静默乐观。
+  /// 新建工作区（[feat 2026-10-17]）。
+  ///
+  /// 两个字段：**路径**（服务端绝对路径，不存在会被创建）和**名称**（默认取目录名）。
+  /// 路径是这个动作的核心，所以给它等宽字体 + 明确的示例；名称只是列表里显示什么。
+  ///
+  /// 失败留在弹窗里（不关窗、不用会消失的提示）：用户刚打完一长串路径，因为目录
+  /// 权限不足失败时，把输入框关掉等于让他重打一遍。
+  Future<void> _showCreateWorkspaceDialog(DshService dsh) async {
+    final pathController = TextEditingController();
+    final titleController = TextEditingController();
+    String? error;
+    bool submitting = false;
+
+    final created = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) {
+          Future<void> submit() async {
+            final path = pathController.text.trim();
+            if (path.isEmpty) {
+              setDialogState(() => error = '请填一个路径');
+              return;
+            }
+            // 只做最基本的形态检查：DSH 的路径是**服务端**的，手机本地无法
+            // 判断合法性，真正的校验只能交给网关。
+            final looksAbsolute = path.startsWith('/') ||
+                RegExp(r'^[A-Za-z]:[\\/]').hasMatch(path);
+            if (!looksAbsolute) {
+              setDialogState(() => error = '请填服务端的绝对路径（如 /home/me/proj 或 E:\\workspace\\proj）');
+              return;
+            }
+            setDialogState(() {
+              submitting = true;
+              error = null;
+            });
+            final failure = await dsh.createWorkspace(
+              path: path,
+              title: titleController.text,
+            );
+            if (!ctx.mounted) return;
+            if (failure == null) {
+              Navigator.pop(ctx, true);
+              return;
+            }
+            setDialogState(() {
+              submitting = false;
+              error = failure;
+            });
+          }
+
+          return AlertDialog(
+            backgroundColor: context.c.surface,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: context.c.border),
+            ),
+            title: Text('新建工作区',
+                style: TextStyle(
+                    color: context.c.textPrimary,
+                    fontSize: 17,
+                    fontWeight: FontWeight.bold)),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  key: const ValueKey('workspace-create-path'),
+                  controller: pathController,
+                  autofocus: true,
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                  decoration: InputDecoration(
+                    labelText: '目录路径（服务端）',
+                    hintText: r'E:\workspace\my-project',
+                    hintStyle: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 12.5,
+                        color: context.c.textTertiary),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  key: const ValueKey('workspace-create-title'),
+                  controller: titleController,
+                  maxLength: 40,
+                  decoration: InputDecoration(
+                    labelText: '显示名称（可留空）',
+                    hintText: '默认取目录名',
+                    counterText: '',
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '目录不存在时会自动创建；同一路径重复新建不会生成重复工作区。',
+                  style: TextStyle(fontSize: 11.5, color: context.c.textTertiary),
+                ),
+                if (error != null) ...[
+                  const SizedBox(height: 10),
+                  // 就地显示、不自动消失：这正是"失败必须留在屏幕上"的最小实现。
+                  Container(
+                    key: const ValueKey('workspace-create-error'),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: context.c.dangerSurface,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: context.c.dangerBorder),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(Icons.error_outline_rounded, size: 15, color: context.c.danger),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            error!,
+                            style: TextStyle(fontSize: 12, color: context.c.danger),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: submitting ? null : () => Navigator.pop(ctx, false),
+                child: Text('取消', style: TextStyle(color: context.c.textSecondary)),
+              ),
+              ElevatedButton(
+                key: const ValueKey('workspace-create-submit'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: context.c.accent,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  elevation: 0,
+                ),
+                onPressed: submitting ? null : submit,
+                child: submitting
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: Colors.white))
+                    : const Text('创建', style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    pathController.dispose();
+    titleController.dispose();
+    if (!mounted || created != true) return;
+    setState(() => _actionError = null);
+    // 成功走顶部浮层（列表页底部是列表本体，贴底提示会盖住刚建好的那一行）。
+    TopToast.show(context, '工作区已创建');
+  }
+
   Future<void> _showRenameDialog(DshService dsh, SessionMeta s) async {
     final controller = TextEditingController(text: s.title);
     final ok = await showDialog<bool>(
@@ -541,6 +703,17 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           ],
         ),
         actions: [
+          // [feat 2026-10-17] 新增工作区。
+          //
+          // 工作区在引擎里就是 workspace.json 里的一行（路径 + 名称 + 会话列表），
+          // 新建时服务端会顺手把目录建出来。放在这里而不是"设置"里：这是工作区
+          // 列表页自己的物件，用户想加一个工作区时，眼睛就在这一页。
+          IconButton(
+            key: const ValueKey('workspaces-create'),
+            icon: Icon(Icons.add_rounded, color: context.c.textPrimary, size: 22),
+            tooltip: '新建工作区',
+            onPressed: () => _showCreateWorkspaceDialog(dsh),
+          ),
           IconButton(
             icon: Icon(Icons.refresh_rounded, color: context.c.textPrimary, size: 20),
             tooltip: '刷新工作区',

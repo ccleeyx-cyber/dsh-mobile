@@ -1716,6 +1716,9 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
   Color _teamPhaseColor(TeamMember m) {
     if (m.isFailed) return context.c.danger;
     if (m.isActive) return context.c.accent;
+    // [fix 2026-10-17] 「已完成」用终端绿而不是弱化灰：灰和"创建中/未知"撞色，
+    // 而完成是个**好结果**，值得一个明确的正向色。
+    if (m.isDone) return context.c.terminalGreen;
     return context.c.textTertiary;
   }
 

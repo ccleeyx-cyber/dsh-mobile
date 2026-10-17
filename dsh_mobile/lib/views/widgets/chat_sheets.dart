@@ -13,7 +13,7 @@ import '../../models/dsh_settings.dart';
 import '../../models/trajectory.dart';
 import '../../services/dsh_service.dart';
 import '../../theme/app_colors.dart';
-import '../host_ops_view.dart';
+import '../../widgets/top_toast.dart';
 import 'session_info_sheet.dart';
 import 'session_status_strip.dart';
 import 'trajectory_sheet.dart';
@@ -143,6 +143,9 @@ Future<void> showChatCommandSheet(
 
 /// 会话权限与执行策略弹层。只负责本会话的执行策略 —— 那是唯一真的生效的旋钮。
 void showChatPermissionSheet(BuildContext context, DshService dsh) {
+  // 弹层可能在 await 之后已经被 pop 掉，届时它的 context 就取不到 overlay 了
+  // （见 TopToastHandle 的说明）。这里先抓住出口。
+  final toast = TopToastHandle.capture(context);
   final currentSession = dsh.currentSession;
   final sessionId = currentSession?.sessionId ?? 'default';
   final currentPolicy = dsh.getSessionPermission(sessionId);
@@ -303,15 +306,14 @@ void showChatPermissionSheet(BuildContext context, DshService dsh) {
                         );
                         if (context.mounted) {
                           Navigator.pop(context);
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text('已更新会话权限策略: ${_getPolicyLabel(selectedPolicy)}'),
-                              duration: const Duration(seconds: 2),
-                              behavior: SnackBarBehavior.floating,
-                            ),
-                          );
                         }
                         await dsh.updatePermissions(updatedPerms);
+                        // 提示放在**提交之后**：之前是先弹提示再发请求，失败了
+                        // 也会说"已更新"（乐观提示是会骗人的）。
+                        toast.show(
+                          '对话权限已更新为 ${_getPolicyLabel(selectedPolicy)}',
+                          icon: Icons.shield_outlined,
+                        );
                       },
                       child: const Text('保存权限策略', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
                     ),
@@ -397,6 +399,8 @@ String _getPolicyLabel(String policy) {
 
 /// 快速模型选择：只影响本会话，全局默认在设置页改。
 void showChatModelSwitchSheet(BuildContext context, DshService dsh) {
+  // 同权限弹层：先抓住 toast 出口，弹层 pop 之后仍能提示。
+  final toast = TopToastHandle.capture(context);
   if (dsh.settings == null || dsh.settings!.availableModels.isEmpty) {
     dsh.fetchSettings();
   }
@@ -551,14 +555,12 @@ void showChatModelSwitchSheet(BuildContext context, DshService dsh) {
                         // code and a failed switch showed no feedback at all.
                         if (!itemCtx.mounted) return;
                         if (ok) {
-                          ScaffoldMessenger.of(itemCtx).showSnackBar(
-                            SnackBar(
-                              content: Text('本会话模型已切换为: ${m.name}（立即生效）'),
-                              backgroundColor: itemCtx.c.success,
-                              behavior: SnackBarBehavior.floating,
-                            ),
-                          );
+                          // [feat 2026-10-17] 成功提示走**顶部**浮层，不用底部
+                          // SnackBar：底部是输入卡片/状态胶囊/审批 dock 的地盘，
+                          // 一条贴底的提示会盖住用户正在打的字（用户明确要求）。
+                          toast.show('本会话模型已切换为 ${m.name}（立即生效）');
                         } else {
+                          // 失败仍然留在原地可见：这里不自己消失。
                           ScaffoldMessenger.of(itemCtx).showSnackBar(
                             SnackBar(
                               content: Text('模型切换失败: ${dsh.lastError.isNotEmpty ? dsh.lastError : "请检查网络或授权码"}'),
@@ -958,11 +960,12 @@ Future<void> showChatSessionInfoSheet(
                       onJumpToMessage(id, index >= 0 ? index : null, d.messages.length);
                     },
             ),
-            // 运维面板是**推入页**不是弹层：它自己带 Scaffold + 4 个页签，
-            // 塞进 bottom sheet 会没有高度可用。用外层 canvas 的 navigator。
-            onOpenHostOps: () async => navigator.push(
-              MaterialPageRoute(builder: (_) => const HostOpsView()),
-            ),
+            // [fix 2026-10-17] 运维面板不再是会话信息面板的入口。
+            //
+            // 它是**主机/引擎级**的东西（白名单命令、文件浏览器、连接诊断、目标板），
+            // 与会话域无关；挂在会话面板里等于把"服务端运维"伪装成"这个会话的功能"。
+            // 已移到「设置 → 诊断与运维」，这里传 null = 该行不渲染。
+            onOpenHostOps: null,
           ),
         ),
       ),

@@ -12,6 +12,7 @@ import '../services/storage_service.dart';
 import '../services/update_service.dart';
 import 'config_page.dart';
 import 'gateway_health_view.dart';
+import 'host_ops_view.dart';
 import 'push_setup_view.dart';
 import 'security_permissions_view.dart';
 import '../theme/app_colors.dart';
@@ -1027,6 +1028,41 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                       ),
                     ),
                   ],
+                ),
+                const SizedBox(height: 12),
+                // [feat 2026-10-17] 「运维面板」入口从会话信息面板搬到这里。
+                //
+                // 它做的是**主机/引擎级**的活：跑白名单命令、浏览服务端文件、
+                // 看连接诊断、管目标板。挂在会话信息面板里等于把服务端运维伪装成
+                // "这个会话的功能"，而它真正被用到的时机恰恰是"连不上/引擎异常"——
+                // 也就是用户会来设置页排查的时候。
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('settings-open-host-ops'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: context.c.textPrimary,
+                      side: BorderSide(color: context.c.border),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                    ),
+                    icon: Icon(Icons.dns_outlined, size: 16, color: context.c.textSecondary),
+                    label: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text('运维面板',
+                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500)),
+                        Text('命令 / 文件 / 诊断',
+                            style: TextStyle(fontSize: 11, color: context.c.textTertiary)),
+                      ],
+                    ),
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(builder: (_) => const HostOpsView()),
+                      );
+                    },
+                  ),
                 ),
               ],
             ),

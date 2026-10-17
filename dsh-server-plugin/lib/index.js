@@ -3347,6 +3347,81 @@ export function apply(ctx, config = {}, internals = {}) {
       }
 
       // 4.1 工作区与会话
+      //
+      // [feat 2026-10-17] 新增工作区。
+      //
+      // 工作区在引擎里就是 `~/.dsh/storages/workspace.json` 的一张表：
+      //   tables.workspaces[wsId] = { path, title, sessionIds[], createdAt, updatedAt }
+      // 所以"新建"= 建目录（不存在时）+ 加一行。读改写而不是整体覆盖，避免把
+      // 引擎刚写进去的 sessionIds 冲掉；同一个路径重复创建视为幂等，返回已有条目
+      // —— 用户手滑点两次不该得到两个同名工作区。
+      if (pathname === '/api/mobile/workspaces/create' && req.method === 'POST') {
+        // `jsonBody` 是上面统一解析好的（畸形 JSON 在那里就已经被拒了）。
+        const body = jsonBody || {};
+        const rawPath = String(body.path || '').trim();
+        if (!rawPath) {
+          sendJson(400, { ok: false, error: 'path is required' });
+          return;
+        }
+        const resolvedPath = path.resolve(rawPath);
+        const title = String(body.title || '').trim() || path.basename(resolvedPath);
+
+        const workspaceJsonPath = path.join(dshHomeDir, 'storages', 'workspace.json');
+        let rawWs = { tables: { workspaces: {} }, global: {} };
+        if (fs.existsSync(workspaceJsonPath)) {
+          try {
+            rawWs = JSON.parse(fs.readFileSync(workspaceJsonPath, 'utf8'));
+          } catch (e) {
+            sendJson(500, { ok: false, error: `workspace.json 解析失败：${e.message}` });
+            return;
+          }
+        }
+        if (!rawWs.tables) rawWs.tables = {};
+        if (!rawWs.tables.workspaces) rawWs.tables.workspaces = {};
+        const table = rawWs.tables.workspaces;
+
+        // 幂等：同一路径已经登记过就直接返回它。
+        for (const [id, info] of Object.entries(table)) {
+          if (info && typeof info.path === 'string' &&
+              path.resolve(info.path).toLowerCase() === resolvedPath.toLowerCase()) {
+            sendJson(200, {
+              ok: true,
+              workspaceId: id,
+              path: info.path,
+              title: info.title || title,
+              existed: true,
+            });
+            return;
+          }
+        }
+
+        try {
+          fs.mkdirSync(resolvedPath, { recursive: true });
+        } catch (e) {
+          sendJson(400, { ok: false, error: `目录创建失败：${e.message}` });
+          return;
+        }
+
+        const now = new Date().toISOString();
+        const wsId = crypto.randomUUID();
+        table[wsId] = {
+          path: resolvedPath,
+          title,
+          sessionIds: [],
+          createdAt: now,
+          updatedAt: now,
+        };
+        try {
+          fs.writeFileSync(workspaceJsonPath, JSON.stringify(rawWs, null, 2), 'utf8');
+        } catch (e) {
+          sendJson(500, { ok: false, error: `workspace.json 写入失败：${e.message}` });
+          return;
+        }
+        audit('workspace/create', { workspaceId: wsId, path: resolvedPath });
+        sendJson(200, { ok: true, workspaceId: wsId, path: resolvedPath, title, existed: false });
+        return;
+      }
+
       if (pathname === '/api/mobile/workspaces' && req.method === 'GET') {
         // ?archived=exclude|only|include. Anything else — a missing value, a typo,
         // or a repeated param (which url.parse turns into an array) — normalises to
@@ -3405,11 +3480,34 @@ export function apply(ctx, config = {}, internals = {}) {
           error: '',
         }];
         for (const m of rawMembers) {
+          const memberId = String(m.id || m.sessionId || '');
+          // [fix 2026-10-17] 成员状态不能直接用 `m.phase`。
+          //
+          // 引擎的 `agentTeam.members[].phase` 是**出生状态**：队友 spawn 出来之后
+          // 一直是 'active'，跑完了也不改。于是手机端永远显示"进行中"，而 Web 端
+          // 显示"已完成" —— 两边看的是不同字段（用户实测反馈）。
+          //
+          // 真正的进度在**子会话自己的投影**里：
+          //   * `turnBoundary.openTurnStartSeq != null` → 有未闭合回合 = 还在跑
+          //   * `subagentTiming.lastTurnCompleted === true`  → 回合已收口 = 已完成
+          let phase = String(m.phase || 'active');
+          try {
+            const childRows = memberId ? readProjectionRows(memberId) : null;
+            if (childRows) {
+              const tb = childRows.turnBoundary && childRows.turnBoundary.val;
+              const timing = childRows.subagentTiming && childRows.subagentTiming.val;
+              if (tb && tb.openTurnStartSeq !== null && tb.openTurnStartSeq !== undefined) {
+                phase = 'active';
+              } else if (timing && timing.lastTurnCompleted === true) {
+                phase = 'done';
+              }
+            }
+          } catch (_) { /* 读不到就保留引擎给的 phase */ }
           members.push({
-            id: String(m.id || m.sessionId || ''),
+            id: memberId,
             name: String(m.name || ''),
             role: 'teammate',
-            phase: String(m.phase || 'active'),
+            phase,
             error: String(m.error || ''),
           });
         }

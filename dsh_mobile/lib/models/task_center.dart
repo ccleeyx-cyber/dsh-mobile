@@ -783,7 +783,7 @@ class TeamMember {
   final String id;
   final String name;
   final String role; // 'lead' | 'teammate'
-  final String phase; // 'provisioning' | 'active' | 'failed'
+  final String phase; // 'provisioning' | 'active' | 'done' | 'failed'
   final String error;
 
   const TeamMember({
@@ -807,9 +807,15 @@ class TeamMember {
   bool get isFailed => phase == 'failed';
   bool get isProvisioning => phase == 'provisioning';
 
+  /// 回合已跑完（这个队友手上没有未闭合的回合）。
+  ///
+  /// 与 `isActive` 互斥：网关只会给出其中一个。存在的理由见 `phaseLabel`。
+  bool get isDone => phase == 'done';
+
   String get phaseLabel {
     if (isLead) return '主导';
     if (isFailed) return '失败';
+    if (isDone) return '已完成';
     if (isActive) return '进行中';
     return '创建中';
   }

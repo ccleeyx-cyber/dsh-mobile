@@ -2474,6 +2474,49 @@ class DshService extends ChangeNotifier {
   // 说"已是最新"。改为直接指向 GitHub Releases（见 `AppVersion.releasesUrl`），
   // 「有没有新版」由发布页本身回答，没有可漂移的中间状态。
 
+  /// 新建工作区（[feat 2026-10-17]）。
+  ///
+  /// 返回 `null` 表示成功；否则是给用户看的失败说明（由调用方**内联**显示，
+  /// 不用会自己消失的提示 —— 建工作区失败是个待办，不是通知）。
+  ///
+  /// 网关侧在 `workspace.json` 里加一行（已存在同一路径时幂等返回），目录不存在
+  /// 会被一并创建。所以这个动作在服务端有副作用：调用前不需要再问一次
+  /// "确定吗"，但要保证 path 是用户真的想建的那个。
+  Future<String?> createWorkspace({required String path, String? title}) async {
+    if (_currentConfig == null) return '还没连上网关';
+    final trimmed = path.trim();
+    if (trimmed.isEmpty) return '路径不能为空';
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces/create');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'path': trimmed,
+              if (title != null && title.trim().isNotEmpty) 'title': title.trim(),
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return '登录状态已失效，请重新配对';
+      if (res.statusCode == 200) {
+        await fetchWorkspaces();
+        return null;
+      }
+      // 网关会带一句人话（目录创建失败 / workspace.json 写入失败 …），原样透出，
+      // 不要用"操作失败"把最有用的那句吃掉。
+      try {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final msg = data is Map ? (data['error'] ?? data['message']) : null;
+        if (msg is String && msg.trim().isNotEmpty) return msg.trim();
+      } catch (_) {/* 落到下面的兜底 */}
+      return '新建失败（HTTP ${res.statusCode}）';
+    } catch (e) {
+      debugPrint('[DshService] createWorkspace error: $e');
+      return '网络异常，没建成功：$e';
+    }
+  }
+
   /// 归档 / 取消归档一个会话。
   Future<bool> setSessionArchived(String sessionId, bool archived) async {
     if (_currentConfig == null) return false;

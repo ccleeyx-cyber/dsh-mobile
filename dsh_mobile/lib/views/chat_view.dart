@@ -15,6 +15,7 @@ import '../widgets/memory_card.dart';
 import '../widgets/inline_file_links.dart';
 import '../widgets/harness_notice_card.dart';
 import '../widgets/safe_markdown.dart';
+import '../widgets/top_toast.dart';
 import 'widgets/attachment_tile.dart';
 import 'widgets/turn_navigation_rail.dart';
 import 'widgets/message_search.dart';
@@ -1832,15 +1833,13 @@ class _ChatViewState extends State<ChatView> {
 
   void _toast(String msg) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).clearSnackBars();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        // 「去系统设置里开麦克风」这类指引必须能读完，2 秒不够；短提示保持轻快。
-        duration: Duration(seconds: msg.length > 24 ? 6 : 2),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
+    // [feat 2026-10-17] 瞬时提示统一走**顶部**浮层（见 TopToast 的说明）：
+    // 底部被输入卡片 / 状态胶囊 / 审批 dock 占满，贴底的 SnackBar 会盖住用户
+    // 正在打的字，而且紧挨输入框会被读成"输入框的一部分"。
+    //
+    // 注意分工：这里只放**不痛的消息**（1.8 秒自己走）。失败类提示一律走
+    // `ComposerNotice` / `InlineErrorBar` 那种留在原地的形态。
+    TopToast.show(context, msg);
   }
 
   /// 输入栏：**一个卡片装下全部**（文本区 + 操作行）。
