@@ -67,6 +67,14 @@ class ChatScrollController {
   int _lastStreamRevision = 0;
   int _lastStreamContentLength = 0;
 
+  /// [fix 2026-10-17 用户反馈] 打开会话期间**瞬时**贴底，不做滚动动画。
+  ///
+  /// 痛点：点开会话时消息是分批到达的（缓存回填 → 首屏 GET → 尾部增量），
+  /// 每一次增长都走一次 300ms 的 `scrollToBottom()` 动画 —— 用户看到的就是
+  /// 列表"从上往下一路滚到底"。打开会话不是"来了新消息"，不需要动画，
+  /// 直接定位即可；动画留给会话内真正新到的消息。
+  bool _pinningToBottom = false;
+
   /// 浮钮是否该出现（离底超过 160）。
   bool get showScrollToBottom => _showScrollToBottom;
 
@@ -107,6 +115,22 @@ class ChatScrollController {
     });
   }
 
+  /// 是否还在"打开会话的初始填充"阶段（缓存/首屏/尾部增量陆续到达）。
+  ///
+  /// 判据：仍在拉历史，或这一批消息是在会话打开后很短的一段时间内到达的。
+  /// 超过窗口就认为用户已经在看这个会话了 —— 之后的新消息恢复滚动动画。
+  bool _isInitialFill(DshService dsh) {
+    if (_pinStartedAt == null) return false;
+    return DateTime.now().difference(_pinStartedAt!).inMilliseconds < 1500;
+  }
+
+  DateTime? _pinStartedAt;
+
+  /// 用户主动滚动时取消贴底窗口：他已经接管了位置，不该再被"拉回底部"。
+  void _cancelPinning() {
+    _pinningToBottom = false;
+  }
+
   void onScroll() {
     if (!controller.hasClients) return;
     final maxScroll = controller.position.maxScrollExtent;
@@ -127,10 +151,13 @@ class ChatScrollController {
     if (notification is ScrollStartNotification) {
       if (notification.dragDetails != null) {
         _isUserInteracting = true;
+        // [fix 2026-10-17] 用户一上手就不再"贴底"：他已接管位置。
+        _cancelPinning();
       }
     } else if (notification is ScrollUpdateNotification) {
       if (notification.dragDetails != null) {
         _isUserInteracting = true;
+        _cancelPinning();
         final maxScroll = notification.metrics.maxScrollExtent;
         final currentOffset = notification.metrics.pixels;
         final distFromBottom = maxScroll - currentOffset;
@@ -256,22 +283,33 @@ class ChatScrollController {
       // 会话级的界面状态跟着切：队列展开态、产出卡片锚点、失败提示、草稿换槽。
       // 这一段属于 State，交回给调用方（顺序与原来一致：先清界面态，再换草稿）。
       onSessionSwitched(previousSessionId);
+      // [fix 2026-10-17] 打开会话进入"贴底窗口"：后续几批消息（缓存回填 →
+      // 首屏 GET → 尾部增量）一律 jumpTo 到底，不再逐批做 300ms 动画。
+      _pinningToBottom = true;
+      _pinStartedAt = DateTime.now();
       jumpToBottom();
     } else if (_wasLoadingHistory && !dsh.isLoadingHistory) {
       _lastStreamRevision = dsh.streamRevision;
       _userScrolledUp = false;
       jumpToBottom();
+      // 历史加载收尾：贴底窗口结束（之后新消息恢复动画）。
+      _pinningToBottom = false;
     } else if (dsh.messages.length != _lastMessageCount) {
       final wasNearBottom = !_userScrolledUp;
-      // [feat 2026-10-12] prepend（上翻）也使长度增长，但它不是"尾部新消息"，
-      // 不能点亮"回到最新消息"浮钮 —— _maybeLoadOlder 置一次抑制位。
       final fromPrepend = _suppressTailButtonOnce;
       _suppressTailButtonOnce = false;
       final appendedAtTail = dsh.messages.length > _lastMessageCount && !fromPrepend;
       _lastMessageCount = dsh.messages.length;
       _lastStreamRevision = dsh.streamRevision;
       if (wasNearBottom) {
-        scrollToBottom();
+        // [fix 2026-10-17] 贴底窗口内（刚打开会话）用瞬时定位，避免"一路滚下来"。
+        if (_pinningToBottom &&
+            (dsh.isLoadingHistory || _isInitialFill(dsh))) {
+          jumpToBottom();
+        } else {
+          _pinningToBottom = false;
+          scrollToBottom();
+        }
       } else if (appendedAtTail) {
         // [feat 2026-10-12] 用户在上方、尾部来了新消息：确保"回到最新消息"
         // 浮钮出现（_onScroll 只在滚动时刷新它，新消息到达不滚动的话浮钮
