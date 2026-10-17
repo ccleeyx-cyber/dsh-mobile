@@ -69,12 +69,12 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
 
   /// AppBar 的默认高度。工具栏高度由框架的 `kToolbarHeight` 决定，
   /// `SessionStatusStrip` 自己实现 `PreferredSizeWidget`，高度在 AppBar 内部消化。
-  /// 顶栏高度。取 60 而不是默认的 56：标题是**两行**（会话名 + 归属工作区），
-  /// 60 才让第二行完整落在工具栏里。
+  /// 顶栏高度。标题现在是**单行**（会话名 + 工作区后缀），所以回到标准 56。
   ///
-  /// [fix 2026-10-17] 之前用默认 56，真机截图里第二行（工作区名）被下方的状态条
-  /// 压掉下半截 —— 只剩几个字的上半部分悬在那里，看着像渲染坏了。
-  static const double _toolbarHeight = 60;
+  /// [fix 2026-10-17] 中间一度是 60（为了塞下"会话名/工作区"两行）—— 那 60dp
+  /// 加上下面 34dp 的状态条，顶部固定带就吃掉 94dp。单行化之后 56 足够，
+  /// 省下的高度全归消息流。
+  static const double _toolbarHeight = kToolbarHeight;
 
   @override
   Size get preferredSize => const Size.fromHeight(_toolbarHeight);
@@ -169,8 +169,10 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
                 margin: const EdgeInsets.only(right: 5),
                 decoration: BoxDecoration(color: _getPolicyColor(context, policy), shape: BoxShape.circle),
               ),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 160),
+              // 会话名吃掉剩余宽度（Flexible）：它比工作区名重要得多，被挤压时
+              // 该省略的是后者。原来的 ConstrainedBox(160) 是硬上限，遇到长名字
+              // 会和后面的徽章、工作区一起把这一行顶溢出。
+              Flexible(
                 child: Text(
                   currentSession?.title ?? '新会话',
                   style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: context.c.textPrimary),
@@ -201,27 +203,41 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
                   ),
                 ),
               ],
-            ],
-          ),
-          if (workspaceTitle != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 1.5),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.folder_outlined, size: 10.5, color: context.c.textTertiary),
-                  const SizedBox(width: 3),
-                  Flexible(
-                    child: Text(
-                      workspaceTitle,
-                      style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+              // [fix 2026-10-17] 工作区名从"第二行"改为**同一行的后缀**。
+              //
+              // 顶栏原本是两行（会话名 / 归属工作区），加上下面 34dp 的状态条，
+              // 顶部固定带一共 94dp。改成一行 + 一个 `/ 工作区` 的小后缀之后，
+              // 工具栏回到 56dp，省下的 38dp 全归消息流 —— 手机上这是能多读半条
+              // 回复的量。
+              //
+              // 放进 Tooltip：手机上工作区名常常比会话名还长，硬塞会把会话名挤成
+              // 省略号（那才是真正要一眼看到的东西）。
+              if (workspaceTitle != null) ...[
+                Padding(
+                  padding: const EdgeInsets.only(left: 6),
+                  child: Tooltip(
+                    message: '归属工作区：$workspaceTitle',
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.folder_outlined, size: 10, color: context.c.textTertiary),
+                        const SizedBox(width: 2),
+                        ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 72),
+                          child: Text(
+                            workspaceTitle,
+                            style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                ],
-              ),
-            ),
+                ),
+              ],
+            ],
+          ),
         ],
       ),
       // [feat 2026-10-17] 顶栏从「新建 / 查找 / 更多」收敛到「查找 / 信息面板」两个。
@@ -652,7 +668,13 @@ class ChatTopBanners extends StatelessWidget {
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      // [fix 2026-10-17] 从 `vertical: 8` + 双行文案收成单行 4dp。
+      //
+      // 这条横幅是**常驻**到重连成功为止的，而它上面还有顶栏(60)+状态条(34)、
+      // 下面还有审批 dock 和输入区 —— 真机上四条固定带叠起来能吃掉近一半屏幕，
+      // 消息区只剩一条缝。断线这件事一句话就能说完，不值得占 70dp。
+      // 错误详情（`lastError`）改为进 title，不再单独占一行。
+      padding: const EdgeInsets.fromLTRB(14, 4, 8, 4),
       decoration: BoxDecoration(
         color: bgColor,
         border: Border(
@@ -663,15 +685,15 @@ class ChatTopBanners extends StatelessWidget {
         children: [
           // Visual Status Indicator
           Container(
-            padding: const EdgeInsets.all(5),
+            padding: const EdgeInsets.all(4),
             decoration: BoxDecoration(
               color: accentColor.withOpacity(0.12),
               shape: BoxShape.circle,
             ),
             child: isConnecting
                 ? SizedBox(
-                    width: 14,
-                    height: 14,
+                    width: 12,
+                    height: 12,
                     child: CircularProgressIndicator(
                       strokeWidth: 2.0,
                       color: accentColor,
@@ -679,40 +701,30 @@ class ChatTopBanners extends StatelessWidget {
                   )
                 : Icon(
                     Icons.wifi_off_rounded,
-                    size: 15,
+                    size: 13,
                     color: accentColor,
                   ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 8),
 
-          // Status Information
+          // Status Information（单行：一句话 + 可选的错误摘要进 tooltip）
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  isConnecting ? '网络已断开，正在尝试重连...' : '网络连接已断开',
-                  style: TextStyle(
-                    color: textColor,
-                    fontSize: 12.5,
-                    fontWeight: FontWeight.w600,
-                  ),
+            child: Tooltip(
+              message: dsh.lastError.isEmpty ? '' : dsh.lastError,
+              child: Text(
+                isConnecting
+                    ? '网络已断开，正在重连…'
+                    : (dsh.lastError.isEmpty
+                        ? '网络连接已断开'
+                        : '网络连接已断开 · ${dsh.lastError}'),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: textColor,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
                 ),
-                if (!isConnecting && dsh.lastError.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 1),
-                    child: Text(
-                      dsh.lastError,
-                      style: TextStyle(
-                        color: textColor.withOpacity(0.85),
-                        fontSize: 11,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-              ],
+              ),
             ),
           ),
 

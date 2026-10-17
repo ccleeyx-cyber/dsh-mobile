@@ -506,28 +506,33 @@ class ChatMessageStream extends StatelessWidget {
             },
           ),
         if (showScrollToBottom)
+          // [fix 2026-10-17] 从"文字胶囊"改成 36dp 圆形按钮。
+          //
+          // 原来是一枚带「回到最新消息」文字的蓝底胶囊（约 130×30），浮在右下角：
+          // 真机上它直接压在最近一条气泡/工具卡上，把那一行的字盖掉 —— 一个
+          // "帮你回到最新"的按钮反而挡住了最新的内容。圆形小按钮只占 36dp，
+          // 文案移进 tooltip（长按可见），遮挡面积缩小到原来的 1/4。
           Positioned(
-            right: 16,
+            right: 12,
             bottom: 12,
-            child: Material(
-              elevation: 2,
-              color: context.c.accent,
-              borderRadius: BorderRadius.circular(8),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(8),
-                onTap: onScrollToBottom,
-                child: const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.arrow_downward_rounded, size: 15, color: Colors.white),
-                      SizedBox(width: 4),
-                      Text(
-                        '回到最新消息',
-                        style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
-                      ),
-                    ],
+            child: Tooltip(
+              message: '回到最新消息',
+              child: Material(
+                elevation: 3,
+                color: context.c.accent,
+                shape: const CircleBorder(),
+                child: InkWell(
+                  key: const ValueKey('chat-scroll-to-bottom'),
+                  customBorder: const CircleBorder(),
+                  onTap: onScrollToBottom,
+                  child: const SizedBox(
+                    width: 36,
+                    height: 36,
+                    child: Icon(
+                      Icons.arrow_downward_rounded,
+                      size: 19,
+                      color: Colors.white,
+                    ),
                   ),
                 ),
               ),

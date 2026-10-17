@@ -194,21 +194,21 @@ void main() {
           'user',
           'Background subagent 6f29a191 finished and will do no further work unless you send it more.',
           4),
-      // 真人第二轮
-      msg('u2', 'user', '第二轮提问', 5),
-      msg('a2', 'assistant', '第二轮回复', 6),
-      // 真人第三轮
-      msg('u3', 'user', '第三轮提问', 7),
-      msg('a3', 'assistant', '第三轮回复', 8),
+      // [v1.28] 门槛提到 8 轮之后（4 轮以内的会话里那列点只是左侧杂质，见
+      // chat_view._buildTurnRail 的注释），这条用例要摆够 9 轮真人才看得到刻度。
+      for (var i = 2; i <= 9; i++) ...[
+        msg('u$i', 'user', '第 $i 轮提问', 4 + i),
+        msg('a$i', 'assistant', '第 $i 轮回复', 5 + i),
+      ],
     ]);
     await tester.pump();
 
     expect(find.byKey(const ValueKey('turn-nav-rail')), findsOneWidget);
-    for (var i = 1; i <= 3; i++) {
+    for (var i = 1; i <= 9; i++) {
       expect(find.byKey(ValueKey('turn-nav-$i')), findsOneWidget,
           reason: '第 $i 轮是真人的');
     }
-    expect(find.byKey(const ValueKey('turn-nav-4')), findsNothing,
+    expect(find.byKey(const ValueKey('turn-nav-10')), findsNothing,
         reason: '注入通知不能占一格');
 
     // 收尾：拆树 + 推掉 VoiceInputService 的计时器（否则报 "Timer is still pending"）。

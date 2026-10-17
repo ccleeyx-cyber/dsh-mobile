@@ -422,10 +422,12 @@ class _ChatViewState extends State<ChatView> {
   /// 浮在消息流右边缘的刻度层。只有一轮时不显示 —— 一格刻度没有导航价值。
   Widget _buildTurnRail(DshService dsh) {
     final marks = _turnMarks(dsh);
-    // [fix 2026-10-17] 门槛从"<2"提到"<3"：两轮的会话里，这条 rail 只有两个
-    // 3dp 的点，正好和消息左侧那道 2px 竖线并排 —— 真机上看起来就是两个悬浮的
-    // 杂质，而它带来的导航价值是零（两轮一屏就看得完）。
-    if (marks.length < 3) return const SizedBox.shrink();
+    // [fix 2026-10-17] 门槛提到 8 轮。
+    //
+    // 真机上看：4 轮会话里这列刻度就是左侧一竖串小点，而每条 AI 消息左边本来
+    // 已经有一条 2px 竖线 —— 两列竖排元素叠在同一个边距上，视觉上就是"杂质"。
+    // 它的价值只在"十轮以上、靠滑找不回来"的场景，所以那之前不出现。
+    if (marks.length < 8) return const SizedBox.shrink();
     return TurnNavigationRail(
       marks: marks,
       currentTurn: _visibleTurn,
