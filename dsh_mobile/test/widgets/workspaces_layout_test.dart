@@ -100,12 +100,14 @@ void main() {
       expect(find.textContaining('项待审批'), findsNothing);
     });
 
-    testWidgets('有任务在跑时才出现那一条，且只报"需要行动"的信号', (tester) async {
+    testWidgets('有任务在跑时顶部也不渲染"执行中"条（用户已点名删除）', (tester) async {
       await pumpView(tester, [
         ws(sessions: [session('s1', '跑着的会话', isRunning: true)]),
       ]);
-      expect(find.text('1 个任务执行中'), findsOneWidget);
-      // 会话总数那枚不再回来 —— 它与每张卡片里的「共 N 个历史对话」重复。
+      // [fix 2026-10-17 用户反馈] 「N 个任务执行中」pill 已删除：哪个会话在跑，
+      // 会话行上的「执行中」标记已经说了。顶部只保留"待审批"这一种行动信号。
+      expect(find.textContaining('个任务执行中'), findsNothing);
+      // 会话总数那枚也不回来 —— 它与每张卡片里的「共 N 个历史对话」重复。
       expect(find.textContaining('个历史会话'), findsNothing);
     });
 

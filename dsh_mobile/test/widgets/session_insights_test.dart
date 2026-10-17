@@ -322,7 +322,7 @@ void main() {
       expect(find.textContaining('第 0 轮'), findsNothing);
     });
 
-    testWidgets('超过上限时给"还有 N 个 · 查看全部"，点了走面板', (tester) async {
+    testWidgets('超过上限时标题行尾给"查看全部"，点了走面板', (tester) async {
       var showAll = 0;
       await pump(
         tester,
@@ -337,9 +337,12 @@ void main() {
       );
       expect(find.text('f1.txt'), findsOneWidget);
       expect(find.text('f4.txt'), findsNothing);
-      expect(find.text('还有 3 个 · 查看全部'), findsOneWidget);
+      // [fix 2026-10-17 用户反馈] 卡片降为行内紧凑条后，"查看全部"收进标题行尾，
+      // 隐藏数只以弱色文本提示。
+      expect(find.text('查看全部'), findsOneWidget);
+      expect(find.text('还有 3 个'), findsOneWidget);
 
-      await tester.tap(find.text('还有 3 个 · 查看全部'));
+      await tester.tap(find.text('查看全部'));
       await tester.pump();
       expect(showAll, 1);
     });

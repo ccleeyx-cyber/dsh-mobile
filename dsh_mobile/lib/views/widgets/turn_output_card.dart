@@ -121,9 +121,13 @@ class DeliverableRow extends StatelessWidget {
   }
 }
 
-/// 消息流里的「本轮产出」卡片——挂在**交付它的那一轮**之后。
+/// 消息流里的「本轮产出」条——挂在**交付它的那一轮**之后。
 ///
-/// 这是"事件进流"那一半：用户在"agent 说做完了"的那一刻要的是文件，所以卡片
+/// [fix 2026-10-17 用户反馈] 视觉形态从"独立卡片"降为**行内紧凑条**：无边框、
+/// 无独立背景，标题弱色小字，交付物行紧凑排列 —— 它是消息流的一部分，不是
+/// 一个插进来的块。
+///
+/// 这是"事件进流"那一半：用户在"agent 说做完了"的那一刻要的是文件，所以它
 /// 出现在消息流的那个位置，而不是某个需要跳过去的页面。用户一旦发出下一条消息，
 /// 它就不再是"刚刚发生的事"，由调用方把它摘掉（常驻记录在信息面板里）。
 ///
@@ -188,73 +192,74 @@ class TurnOutputCard extends StatelessWidget {
     final download = onDownload;
     final hasSecondAction = download != null && onOpen != null;
 
+    // [fix 2026-10-17 用户反馈] 卡片降为**行内紧凑条**：此前是带边框、带
+    // 背景的独立卡片横在消息流末尾，视觉上像一个突兀的消息气泡 —— 用户点名
+    // "单独一行太突兀"。现在无卡片边框、无独立背景，标题行缩为一枚小图标 +
+    // 弱色标题，交付物行去掉卡片式间距，整体像消息流的一部分而不是一个块。
     return Container(
       key: const ValueKey('turn-output-card'),
-      margin: const EdgeInsets.only(top: 8, bottom: 4),
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-      decoration: BoxDecoration(
-        color: context.c.surface,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: context.c.accent.withOpacity(0.35)),
-      ),
+      margin: const EdgeInsets.only(top: 2, bottom: 2),
+      padding: const EdgeInsets.fromLTRB(4, 4, 4, 2),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Icon(Icons.inventory_2_outlined, size: 15, color: context.c.accent),
-              const SizedBox(width: 6),
+              Icon(Icons.inventory_2_outlined, size: 13, color: context.c.textTertiary),
+              const SizedBox(width: 5),
               Expanded(
                 child: Text(
                   title,
-                  style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700, color: context.c.accent),
+                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: context.c.textTertiary),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
+              if (onShowAll != null)
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: onShowAll,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                    child: Text('查看全部',
+                        style: TextStyle(fontSize: 11, color: context.c.accent)),
+                  ),
+                ),
             ],
           ),
-          const SizedBox(height: 4),
           for (final item in shown)
             DeliverableRow(
               item: item,
+              dense: true,
               busy: busyPath != null && busyPath == item.path,
               trailingIcon: hasSecondAction ? Icons.visibility_rounded : null,
               onOpen: onOpen == null ? null : () => onOpen!(item),
               onLongPress: hasSecondAction ? () => download(item) : null,
             ),
           if (hidden > 0)
-            Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton(
-                onPressed: onShowAll,
-                style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                  minimumSize: Size.zero,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-                child: Text(
-                  '还有 $hidden 个 · 查看全部',
-                  style: TextStyle(fontSize: 11.5, color: context.c.accent),
-                ),
+            Padding(
+              padding: const EdgeInsets.only(left: 4),
+              child: Text(
+                '还有 $hidden 个',
+                style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
               ),
             ),
           if (hasSecondAction)
             Padding(
-              padding: const EdgeInsets.only(top: 2),
+              padding: const EdgeInsets.only(top: 1, left: 4),
               child: Text(
-                '点文件名就地预览 · 长按下载 / 用其它应用打开',
+                '点一下预览 · 长按下载',
                 key: const ValueKey('turn-output-hint'),
-                style: TextStyle(fontSize: 10.5, color: context.c.textTertiary),
+                style: TextStyle(fontSize: 10, color: context.c.textTertiary),
               ),
             ),
           if (errorText != null && errorText!.isNotEmpty)
             Padding(
-              padding: const EdgeInsets.only(top: 4),
+              padding: const EdgeInsets.only(top: 3, left: 4),
               child: Text(
                 errorText!,
                 key: const ValueKey('turn-output-error'),
-                style: TextStyle(fontSize: 11.5, color: context.c.danger),
+                style: TextStyle(fontSize: 11, color: context.c.danger),
               ),
             ),
         ],

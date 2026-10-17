@@ -676,12 +676,9 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
       return matchWs || matchSession;
     }).toList();
 
-    // 只统计"需要行动"的那个数字。会话总数不再统计 —— 它原本只用于顶部那枚
-    // 与卡片内容重复的计数 pill（已删除）。
-    int totalRunning = 0;
-    for (final w in workspaces) {
-      totalRunning += w.sessions.where((s) => _isSessionRunning(s, dsh)).length;
-    }
+    // [fix 2026-10-17 用户反馈] 顶部「N 个任务执行中」pill 已删除 —— 哪个会话
+    // 在跑，会话行上的「执行中」标记已经说了，顶部再报一遍是重复。页头现在只
+    // 剩"待审批"这一种需要行动的信号。
 
     return Scaffold(
       backgroundColor: context.c.surfaceMuted,
@@ -753,9 +750,13 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           // 像四块拼起来的（用户的原话："有点割裂"）。
           //
           // 那两枚计数还与内容重复：工作区数量在列表里一眼可数，"共 N 个历史对话"
-          // 每张卡片里都写着。真正需要主动提醒的只有下面这两件 —— 有任务在跑、
-          // 有待审批 —— 它们不出现时，这一整条不渲染，页头直接就是搜索。
-          if (totalRunning > 0 || dsh.pendingApprovals.isNotEmpty)
+          // 每张卡片里都写着。真正需要主动提醒的只有待审批 —— 它不出现时，这一
+          // 整条不渲染，页头直接就是搜索。
+          //
+          // [fix 2026-10-17 用户反馈] 「N 个任务执行中」pill 删除：哪个会话在跑，
+          // 会话行上的「执行中」标记已经说了（卡片边框也是亮的），顶部再说一遍
+          // 是同一个事实的第三种表述。用户点名去掉。
+          if (dsh.pendingApprovals.isNotEmpty)
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
               decoration: BoxDecoration(
@@ -766,21 +767,12 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 scrollDirection: Axis.horizontal,
                 child: Row(
                   children: [
-                    if (totalRunning > 0)
-                      _buildHeaderPill(
-                        icon: Icons.bolt_rounded,
-                        label: '$totalRunning 个任务执行中',
-                        color: context.c.accent,
-                        animate: true,
-                      ),
-                    if (totalRunning > 0 && dsh.pendingApprovals.isNotEmpty) const SizedBox(width: 8),
-                    if (dsh.pendingApprovals.isNotEmpty)
-                      _buildHeaderPill(
-                        icon: Icons.shield_outlined,
-                        label: '${dsh.pendingApprovals.length} 项待审批',
-                        color: context.c.warning,
-                        animate: true,
-                      ),
+                    _buildHeaderPill(
+                      icon: Icons.shield_outlined,
+                      label: '${dsh.pendingApprovals.length} 项待审批',
+                      color: context.c.warning,
+                      animate: true,
+                    ),
                   ],
                 ),
               ),
