@@ -344,8 +344,64 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
     );
   }
 
-  BoxDecoration _cardDecoration() {
-    return BoxDecoration(
+  /// 一张"跳去另一个页面"的行卡片：图标 + 标题 + 副标题 + 箭头。
+  ///
+  /// 与信息卡（键值对）刻意区分开：设置页里"显示一个值"和"去一个地方"是两类东西，
+  /// 混在同一张卡里最容易出现的问题就是用户不知道哪块能点。
+  Widget _navCard({
+    required Key key,
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        key: key,
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+          decoration: _cardDecoration(),
+          child: Row(
+            children: [
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  // 浅品牌色底 + 同色图标：与上面那张「安全策略与授权」卡片的
+                  // 图标方块保持同一套语言（纯灰底在设置页里只有"次要信息"才用）。
+                  color: context.c.accent.withOpacity(0.10),
+                  borderRadius: BorderRadius.circular(9),
+                ),
+                child: Icon(icon, size: 17, color: context.c.accent),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title,
+                        style: TextStyle(
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w600,
+                            color: context.c.textPrimary)),
+                    const SizedBox(height: 2),
+                    Text(subtitle,
+                        style: TextStyle(fontSize: 11.5, color: context.c.textTertiary)),
+                  ],
+                ),
+              ),
+              Icon(Icons.chevron_right_rounded, size: 20, color: context.c.textTertiary),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  BoxDecoration _cardDecoration() {    return BoxDecoration(
       color: context.c.surface,
       borderRadius: BorderRadius.circular(12),
       border: Border.all(color: context.c.border),
@@ -1030,42 +1086,34 @@ class _CustomSettingsViewState extends State<CustomSettingsView> {
                   ],
                 ),
                 const SizedBox(height: 12),
-                // [feat 2026-10-17] 「运维面板」入口从会话信息面板搬到这里。
-                //
-                // 它做的是**主机/引擎级**的活：跑白名单命令、浏览服务端文件、
-                // 看连接诊断、管目标板。挂在会话信息面板里等于把服务端运维伪装成
-                // "这个会话的功能"，而它真正被用到的时机恰恰是"连不上/引擎异常"——
-                // 也就是用户会来设置页排查的时候。
-                SizedBox(
-                  width: double.infinity,
-                  child: OutlinedButton.icon(
-                    key: const ValueKey('settings-open-host-ops'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: context.c.textPrimary,
-                      side: BorderSide(color: context.c.border),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                      padding: const EdgeInsets.symmetric(vertical: 10),
-                    ),
-                    icon: Icon(Icons.dns_outlined, size: 16, color: context.c.textSecondary),
-                    label: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text('运维面板',
-                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500)),
-                        Text('命令 / 文件 / 诊断',
-                            style: TextStyle(fontSize: 11, color: context.c.textTertiary)),
-                      ],
-                    ),
-                    onPressed: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(builder: (_) => const HostOpsView()),
-                      );
-                    },
-                  ),
-                ),
               ],
             ),
+          ),
+
+          const SizedBox(height: 10),
+
+          // [feat 2026-10-17] 「运维面板」入口从会话信息面板搬到这里。
+          //
+          // 它做的是**主机 / 引擎级**的活：跑白名单命令、浏览服务端文件、看连接
+          // 诊断、管目标板。挂在会话信息面板里等于把服务端运维伪装成"这个会话的
+          // 功能"，而它真正被用到的时机恰恰是"连不上 / 引擎异常"—— 也就是用户会
+          // 来设置页排查的时候。
+          //
+          // 形态做成一整张**行卡片**（图标 + 标题 + 副标题 + 箭头），而不是塞进上面
+          // 那张卡片底部的一个按钮：上面那张卡里全是"当前值"（地址、延迟、上游），
+          // 混一个"跳去另一个页面"的按钮会把只读的信息区和导航动作搅在一起。
+          // 独立成卡之后，它和上面那张是同级的两块，一眼能分清"这块是值，那块是门"。
+          _navCard(
+            key: const ValueKey('settings-open-host-ops'),
+            icon: Icons.dns_outlined,
+            title: '运维面板',
+            subtitle: '服务端命令 · 文件浏览 · 连接诊断 · 目标板',
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const HostOpsView()),
+              );
+            },
           ),
 
           const SizedBox(height: 24),

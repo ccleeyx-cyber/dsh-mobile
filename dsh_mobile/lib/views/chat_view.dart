@@ -1891,13 +1891,10 @@ class _ChatViewState extends State<ChatView> {
       section: section,
       deliverableBusy: _deliverableBusy,
       openDeliverable: (d, item) => _openDeliverable(d, item),
-      // 归属工作区名：面板的「切换工作区」行要显示"当前在哪"。
-      // 用 `workspaceOfCurrentSession` 而不是 `currentWorkspace` —— 从通知/深链接
-      // 直接按 id 打开的会话可能不属于任何已加载工作区，那时显示相邻工作区的名字
-      // 就是一个错误的事实（与顶栏第二行同一口径）。
-      workspaceLabel: dsh.workspaceOfCurrentSession?.title,
-      // 轨迹面板必须由这里传入：它的"跳到消息"要用本页的滚动与高亮能力。
-      onOpenTrajectory: () => _openTrajectory(dsh),
+      // [fix 2026-10-17] 面板不再有「会话操作」分区（工作区里都能点，且这里要
+      // 多两步），所以 workspaceLabel 与旧的 onOpenTrajectory 出口都不再需要：
+      // 轨迹是本面板的 tab。
+      //
       // 信息面板里的「轨迹」tab 用同一条跳转路径（与搜索、刻度跳转完全一致）。
       onJumpToMessage: (id, index, total) =>
           _highlightAndScrollToMessage(id, index: index, total: total),

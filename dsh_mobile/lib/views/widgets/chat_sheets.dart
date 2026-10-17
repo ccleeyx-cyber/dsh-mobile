@@ -847,14 +847,6 @@ Future<void> showChatSessionInfoSheet(
   required ValueNotifier<String?> deliverableBusy,
   required Future<void> Function(DshService d, DeliverableItem item) openDeliverable,
 
-  /// 归属工作区名（显示在「会话操作」分区的切换项副标题上）。
-  /// null 时该项仍可点，只是不显示"当前是哪个工作区"。
-  String? workspaceLabel,
-
-  /// 打开运行轨迹面板（旧入口，保留给"从消息长按菜单直接看轨迹"那种场景）。
-  /// 为 null 时不影响面板里的「轨迹」tab —— 那是内联渲染的。
-  Future<void> Function()? onOpenTrajectory,
-
   /// 轨迹 tab 里点"跳到消息"时的回调（同 `TrajectorySheet` 的签名）。
   ///
   /// 必须由父级传：滚动与高亮能力在 `chat_view` 手里。
@@ -921,25 +913,11 @@ Future<void> showChatSessionInfoSheet(
                   goalId: goal.goalId ?? '',
                   revision: goal.revision ?? 0,
                 ),
-            onRunDiagnostics: () => d.runDiagnostics(),
-            diagnostics: d.diagnostics,
-            diagnosticsBusy: d.diagnosticsBusy,
-            // [feat 2026-10-17] 「会话操作」分区：顶栏那个 8 项「更多」菜单被删掉后，
-            // 这些动作必须有新家 —— 它们都是**会话域**操作，信息面板正是会话域
-            // 的唯一总入口。每一项都为 null 时面板不渲染该行（不给死入口）。
-            modelLabel: d.currentModel.replaceFirst('cn:', ''),
-            permissionLabel: _getPolicyLabel(
-              d.getSessionPermission(d.currentSession?.sessionId ?? 'default'),
-            ),
-            workspaceLabel: workspaceLabel,
-            onNewSession: () async => d.createNewSession(),
-            onSwitchModel: () async => showChatModelSwitchSheet(context, d),
-            onEditPermission: () async => showChatPermissionSheet(context, d),
-            // 先 pop 面板再推下一个弹层（`SessionInfoSheet` 内部已保证这一点），
-            // 否则两个 bottom sheet 会叠在一起，返回时先看到的是被盖住的那个。
-            onSwitchWorkspace: () async => showChatWorkspaceSwitchSheet(context, d),
-            onDeleteSession: () async => showChatDeleteCurrentSessionDialog(context, d),
-            onOpenTrajectory: onOpenTrajectory,
+            // [fix 2026-10-17] 「会话操作」分区连同诊断 / 运维入口一起从本面板移除。
+            //
+            // 用户的原话：这些在工作区页都能点，而且在这里还要多操作两步才够得到。
+            // 面板从此只描述现状：用量、交付物、变更、作业、团队、子代理、定时。
+            // 模型 / 权限在输入栏，轨迹在本面板的 tab，运维在设置页。
             // [feat 2026-10-17] 轨迹 tab：把 TrajectorySheet 原样嵌进去。
             //
             // 复用而不是重写：空态、`—` 规则、进行中不封口、上下文块默认折叠、
@@ -960,12 +938,6 @@ Future<void> showChatSessionInfoSheet(
                       onJumpToMessage(id, index >= 0 ? index : null, d.messages.length);
                     },
             ),
-            // [fix 2026-10-17] 运维面板不再是会话信息面板的入口。
-            //
-            // 它是**主机/引擎级**的东西（白名单命令、文件浏览器、连接诊断、目标板），
-            // 与会话域无关；挂在会话面板里等于把"服务端运维"伪装成"这个会话的功能"。
-            // 已移到「设置 → 诊断与运维」，这里传 null = 该行不渲染。
-            onOpenHostOps: null,
           ),
         ),
       ),

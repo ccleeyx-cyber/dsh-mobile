@@ -1,12 +1,10 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../../models/bridge_extras.dart';
 import '../../models/task_center.dart';
 import '../../theme/app_colors.dart';
-import '../../theme/app_spacing.dart';
 import 'deliverable_preview_sheet.dart';
 import 'session_status_strip.dart';
 import 'turn_output_card.dart';
@@ -56,19 +54,6 @@ class SessionInfoSheet extends StatefulWidget {
     this.team,
     this.teamUnavailable = false,
     this.onControlGoal,
-    this.onRunDiagnostics,
-    this.diagnostics,
-    this.diagnosticsBusy = false,
-    this.modelLabel,
-    this.permissionLabel,
-    this.workspaceLabel,
-    this.onNewSession,
-    this.onSwitchModel,
-    this.onEditPermission,
-    this.onSwitchWorkspace,
-    this.onDeleteSession,
-    this.onOpenTrajectory,
-    this.onOpenHostOps,
     this.trajectoryTab,
   });
 
@@ -194,52 +179,15 @@ class SessionInfoSheet extends StatefulWidget {
   /// goal 操作（pause/resume/complete）。引擎拒绝时返回 false，界面提示。
   final Future<bool> Function(String action, GoalInfo goal)? onControlGoal;
 
-  /// 运行一键诊断。
-  final Future<DiagnosticsReport?> Function()? onRunDiagnostics;
-
-  /// 最近一次诊断报告。
-  final DiagnosticsReport? diagnostics;
-
-  final bool diagnosticsBusy;
-
-  // ---- [feat 2026-10-17 / Phase 3] 会话操作分区 ----
+  // [fix 2026-10-17] 面板里所有"会改变什么"的能力都移除了 —— 它现在只描述现状。
+  // 动作各自回到归属地：
+  //   * 新开 / 删除会话 → 工作区页（会话列表本身就在那里）
+  //   * 模型 / 对话权限 → 输入栏（与输入框并排，发之前随手确认）
+  //   * 运行轨迹 → 本面板顶部的 tab
+  //   * 运维面板 → 设置 → 网络与网关诊断
+  //   * 连接诊断 → 同上（那里能测速 / 重连 / 换服务器，这里只能看）
   //
-  // AppBar 的溢出菜单原来有 8 项，手机上要"点开菜单→扫一遍→找一项"。全部收敛到
-  // 这里之后，AppBar 只剩搜索 + 信息两个常驻 icon，而"会话级操作"回到了它本该
-  // 在的地方 —— 会话信息面板本来就是会话的总入口。
-  //
-  // 这个组件**依然是自包含的**：下面这些只有"显示什么"和"点了做什么"，
-  // 它自己不读 DshService、不构造任何弹层（弹层由宿主回调自己弹）。
-
-  /// 当前模型名（已去掉 `cn:` 前缀）。`null` = 不知道 → 整行不渲染。
-  final String? modelLabel;
-
-  /// 当前对话权限策略的可读名。`null` = 不知道 → 整行不渲染。
-  final String? permissionLabel;
-
-  /// 当前工作区标题。`null` = 不知道 → 整行不渲染。
-  final String? workspaceLabel;
-
-  /// 切换模型 / 编辑权限 / 切换工作区 / 删除会话。
-  ///
-  /// 任何一个为 null 时，对应的那一行**不渲染** —— 给一条点了没反应的"切换模型"
-  /// 比不给更糟（用户会以为它在工作，然后发现模型没变）。
-  final Future<void> Function()? onSwitchModel;
-
-  /// 新开一个会话。
-  ///
-  /// AppBar 上的「新建对话」按钮收敛到面板里来了（顶栏只留搜索 + 信息两个常驻
-  /// icon）。`null` 时这一行不渲染。
-  final Future<void> Function()? onNewSession;
-  final Future<void> Function()? onEditPermission;
-  final Future<void> Function()? onSwitchWorkspace;
-  final Future<void> Function()? onDeleteSession;
-
-  /// 「运行轨迹」「运维面板」两个入口（推入 `TrajectorySheet` / `HostOpsView`）。
-  ///
-  /// 它们是**页面级**的目的地，不是这里能内联渲染的数据，所以只给出口。
-  final Future<void> Function()? onOpenTrajectory;
-  final Future<void> Function()? onOpenHostOps;
+  // 用户原话：这些在工作区那里都能点，而且在面板里还要多操作两步才够得到。
 
   @override
   State<SessionInfoSheet> createState() => _SessionInfoSheetState();
@@ -307,7 +255,6 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       ),
     );
   }
-  final _diagnosticsKey = GlobalKey();
   bool _refreshing = false;
   String? _interruptingId;
   String? _goalActionInProgress;
@@ -542,18 +489,13 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
           mainAxisSize: MainAxisSize.min,
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(16, 10, 8, 6),
+              padding: const EdgeInsets.fromLTRB(16, 12, 8, 6),
               child: Row(
                 children: [
-                  Container(
-                    width: 32,
-                    height: 3,
-                    margin: const EdgeInsets.only(right: 10),
-                    decoration: BoxDecoration(
-                      color: context.c.border,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
+                  // [fix 2026-10-17] 标题左边那条 32×3 的灰白短横线（drag grabber）
+                  // 已删除：这个面板是 `isScrollControlled` 的 bottom sheet，本身
+                  // 不可拖动重定位，那条线只起到了"标题前面有个不明所以的小条"的
+                  // 作用（用户点名难看）。
                   Expanded(
                     child: Text(
                       '会话信息',
@@ -600,11 +542,12 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          // 会话操作（v1.27）：原来 AppBar 溢出菜单里的项。
-                          // 放在**最上面** —— 它是这个面板唯一"会改变什么"的部分，
-                          // 其余区块都是只读的现状描述。
-                          if (_hasSessionActions) _buildSessionActions(),
-                          if (widget.onOpenHostOps != null) _buildShortcuts(),
+                          // [fix 2026-10-17] 「会话操作」整块删除。
+                          //
+                          // 用户的原话：这些在工作区页都能点，而且在这里还要多操作
+                          // 两步（开会话信息 → 找到那一行）。一个只读的"现状描述"
+                          // 面板里混进"删除会话"这种不可撤销的动作，本来也危险。
+                          // 现在这个面板只描述现状，不改任何东西。
                           KeyedSubtree(key: _usageKey, child: _buildUsage()),
                           KeyedSubtree(
                               key: _deliverablesKey, child: _buildDeliverables()),
@@ -621,132 +564,14 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                                 key: _subagentsKey, child: _buildSubagents()),
                           KeyedSubtree(
                               key: _schedulesKey, child: _buildSchedules()),
-                          // [feat 2026-10-12] 一键连接诊断。
-                          KeyedSubtree(
-                              key: _diagnosticsKey, child: _buildDiagnostics()),
+                          // [fix 2026-10-17] 「连接诊断」区块删除：它把 ping/端口/
+                          // 网关版本这些一次性排查信息摆在会话面板里，而真正的排障
+                          // 入口是「设置 → 网络与网关诊断」（那里能测速、重连、换
+                          // 服务器）。同一件事两处，且这里那处只能看不能动。
                         ],
                       ),
                     ),
             ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // --------------------------------------------------- 会话操作 [v1.27] ----
-
-  bool get _hasSessionActions =>
-      widget.onSwitchModel != null ||
-      widget.onNewSession != null ||
-      widget.onEditPermission != null ||
-      widget.onSwitchWorkspace != null ||
-      widget.onDeleteSession != null;
-
-  /// 「会话操作」：原来 AppBar 溢出菜单里的四项（切换模型 / 对话权限 /
-  /// 切换工作区 / 删除会话）。
-  ///
-  /// 每一项都是"会改变什么"的动作，所以放在面板最上面；下面那些区块都是只读的
-  /// 现状描述。没有回调的项整行不渲染 —— 见字段注释里那条理由。
-  Widget _buildSessionActions() {
-    return _section(
-      title: '会话操作',
-      icon: Icons.tune_rounded,
-      children: [
-        if (widget.onNewSession != null)
-          _actionRow(
-            key: const ValueKey('session-action-new'),
-            icon: Icons.add_comment_outlined,
-            label: '新开会话',
-            value: '上下文快满时的出路',
-            onTap: widget.onNewSession!,
-          ),
-        // [fix 2026-10-17] 「切换模型」「对话权限」「切换工作区」三项从这里删除：
-        //   * 模型 / 权限搬进了输入栏（和输入框并排，发之前随手就能确认）；
-        //   * 切换工作区与底部「工作区」tab 的职责重复，用户明确要求去掉。
-        // 面板只留真正"会话级、且不常用"的两件事：新开 / 删除。
-        if (widget.onDeleteSession != null)
-          _actionRow(
-            key: const ValueKey('session-action-delete'),
-            icon: Icons.delete_outline_rounded,
-            label: '删除会话',
-            // 不可撤销的动作用 danger 标出来，和其它三项在视觉上分开。
-            danger: true,
-            onTap: widget.onDeleteSession!,
-          ),
-      ],
-    );
-  }
-
-  /// 「运维面板」入口。
-  ///
-  /// [feat 2026-10-17] 「运行轨迹」从这里删掉了 —— 它现在是面板顶部的同级 tab，
-  /// 再留一个"运行轨迹"行等于同一件事两个入口，而且是更深那个。
-  Widget _buildShortcuts() {
-    return _section(
-      title: '入口',
-      icon: Icons.open_in_new_rounded,
-      children: [
-        if (widget.onOpenHostOps != null)
-          _actionRow(
-            key: const ValueKey('session-entry-hostops'),
-            icon: Icons.dns_outlined,
-            label: '运维面板',
-            value: '主机与引擎状态',
-            onTap: widget.onOpenHostOps!,
-          ),
-      ],
-    );
-  }
-
-  /// 一行带箭头（和可选当前值）的动作。
-  ///
-  /// 点下去**先收起本面板**再执行：这些动作自己会再弹一层（模型清单 / 权限策略 /
-  /// 工作区列表 / 删除确认），叠在信息面板上会让人搞不清"我刚点的是哪一层的按钮"，
-  /// 而且删完会话之后底下的信息面板已经过期了。
-  Widget _actionRow({
-    required Key key,
-    required IconData icon,
-    required String label,
-    required Future<void> Function() onTap,
-    String? value,
-    bool danger = false,
-  }) {
-    final tone = danger ? context.c.danger : context.c.textPrimary;
-    return InkWell(
-      key: key,
-      borderRadius: BorderRadius.circular(8),
-      onTap: () async {
-        final action = onTap;
-        Navigator.of(context).maybePop();
-        await action();
-      },
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 2),
-        child: Row(
-          children: [
-            Icon(icon,
-                size: 15,
-                color: danger ? context.c.danger : context.c.textSecondary),
-            const SizedBox(width: AppSpace.m),
-            Expanded(
-              child: Text(label,
-                  style: TextStyle(fontSize: AppText.body, color: tone)),
-            ),
-            if (value != null && value.isNotEmpty)
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 140),
-                child: Text(
-                  value,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                      fontSize: AppText.caption, color: context.c.textTertiary),
-                ),
-              ),
-            const SizedBox(width: AppSpace.s),
-            Icon(Icons.chevron_right_rounded,
-                size: 16, color: context.c.textTertiary),
           ],
         ),
       ),
@@ -1977,128 +1802,6 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
       }
     } finally {
       if (mounted) setState(() => _interruptingId = null);
-    }
-  }
-
-  // ------------------------------------------------- 一键诊断 [feat 2026-10-12] ----
-
-  Widget _buildDiagnostics() {
-    final report = widget.diagnostics;
-    return _section(
-      title: '连接诊断',
-      icon: Icons.monitor_heart_rounded,
-      children: [
-        Row(
-          children: [
-            Expanded(
-              child: _hint('逐项检查网关、引擎 RPC、事件流与磁盘。全程只读、不泄露令牌与路径。'),
-            ),
-            TextButton.icon(
-              key: const ValueKey('run-diagnostics'),
-              onPressed: widget.diagnosticsBusy ? null : _runDiagnostics,
-              icon: widget.diagnosticsBusy
-                  ? const SizedBox(
-                      width: 12,
-                      height: 12,
-                      child: CircularProgressIndicator(strokeWidth: 2))
-                  : Icon(Icons.play_arrow_rounded,
-                      size: 16, color: context.c.accent),
-              label: Text(
-                  widget.diagnosticsBusy
-                      ? '检测中…'
-                      : (report == null ? '运行诊断' : '重新诊断'),
-                  style: TextStyle(fontSize: 12, color: context.c.accent)),
-            ),
-          ],
-        ),
-        if (report != null) ...[
-          const SizedBox(height: 8),
-          for (final c in report.checks)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 3),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  SizedBox(
-                    width: 18,
-                    child: Text(
-                      // ok 缺省（如 bridge_version）渲染成中性 •，不装作通过。
-                      c.ok == null ? '•' : (c.ok! ? '✓' : '✗'),
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.bold,
-                        color: c.ok == null
-                            ? context.c.textTertiary
-                            : (c.ok! ? context.c.success : context.c.danger),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  Expanded(
-                    child: Text.rich(
-                      TextSpan(
-                        text: c.label,
-                        style: TextStyle(
-                            fontSize: 12, color: context.c.textPrimary),
-                        children: [
-                          if (c.value != null && c.value!.isNotEmpty)
-                            TextSpan(
-                                text: '  ${c.value}',
-                                style: TextStyle(
-                                    fontSize: 11,
-                                    color: context.c.textTertiary)),
-                          if (c.detail != null &&
-                              c.detail!.isNotEmpty &&
-                              c.detail != 'ok')
-                            TextSpan(
-                                text: '  ${c.detail}',
-                                style: TextStyle(
-                                    fontSize: 11,
-                                    color: context.c.textTertiary)),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          Align(
-            alignment: Alignment.centerRight,
-            child: TextButton.icon(
-              key: const ValueKey('copy-diagnostics'),
-              onPressed: () async {
-                await Clipboard.setData(
-                    ClipboardData(text: report.toPlainText()));
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                    content: Text('诊断报告已复制'),
-                    duration: Duration(milliseconds: 900),
-                    behavior: SnackBarBehavior.floating,
-                  ));
-                }
-              },
-              icon: Icon(Icons.copy_rounded,
-                  size: 14, color: context.c.textSecondary),
-              label: Text('复制报告',
-                  style: TextStyle(
-                      fontSize: 11.5, color: context.c.textSecondary)),
-            ),
-          ),
-        ],
-      ],
-    );
-  }
-
-  Future<void> _runDiagnostics() async {
-    final runner = widget.onRunDiagnostics;
-    if (runner == null) return;
-    final report = await runner();
-    if (!mounted) return;
-    if (report == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text('诊断请求失败（网关不可达）'),
-        behavior: SnackBarBehavior.floating,
-      ));
     }
   }
 
