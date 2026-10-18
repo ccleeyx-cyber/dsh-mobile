@@ -75,7 +75,6 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
     required this.liveJobCount,
     required this.onOpenSessionInfo,
     required this.onToggleSearch,
-    required this.onBackToWorkspaces,
   });
 
   final DshService dsh;
@@ -89,12 +88,14 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
   final ValueChanged<SessionInsightSection> onOpenSessionInfo;
   final VoidCallback onToggleSearch;
 
-  /// 回到会话列表（工作区 tab）。
+  /// 回到会话列表（工作区 tab）的动作已经不再由顶栏承担。
   ///
-  /// 这个动作**早就存在**了：`main_shell.dart` 的 `PopScope` 把"对话页侧滑返回"
-  /// 映射成切到工作区 tab。只是界面上从来没有可见入口 —— 用户能做的事，看不见。
-  /// 现在它是顶栏左侧那个 48dp 按钮，与侧滑返回是同一件事。
-  final VoidCallback onBackToWorkspaces;
+  /// [fix 2026-10-18] 这里原先有一个 48dp 的左箭头（tooltip「会话列表」），
+  /// 点一下等价于切到底部「工作区」tab。它同时重复了两个已有入口：底部导航的
+  /// 工作区 tab（一直可见）与 Android 侧滑返回（`main_shell` 的 `PopScope` 把
+  /// "对话页侧滑"映射成切到工作区）。微信/Telegram 有返回箭头是因为会话是压在
+  /// 列表之上的**推入页**；本 App 的会话是一级 tab，箭头变成"从一个根跳到另一个
+  /// 根"，语义不成立。删掉后标题多出 48dp，长会话名不再那么早被省略。
 
   /// 工具栏高度。
   ///
@@ -136,18 +137,12 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
       toolbarHeight: toolbarHeight,
       elevation: 0,
       scrolledUnderElevation: 0,
-      // 48 而不是默认 56：给标题再多 8dp，而 48 已经满足最小触控。
-      leadingWidth: 48,
-      leading: IconButton(
-        key: const ValueKey('chat-back-to-sessions'),
-        tooltip: '会话列表',
-        iconSize: 22,
-        padding: EdgeInsets.zero,
-        icon: const Icon(Icons.arrow_back_rounded),
-        // 与 PopScope 同一条动线：离开会话 = 回工作区 tab。
-        onPressed: onBackToWorkspaces,
-      ),
-      titleSpacing: 8,
+      // 不显示返回箭头：本页是一级 tab，没有可 pop 的上一级（见上面那段说明）。
+      // automaticallyImplyLeading 关掉，防止将来被包进推入路由时又冒出一个
+      // 语义错误的箭头。
+      automaticallyImplyLeading: false,
+      // 去掉 48dp 的 leading 之后标题从这一侧开始，留 16dp 呼吸位。
+      titleSpacing: 16,
       title: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,

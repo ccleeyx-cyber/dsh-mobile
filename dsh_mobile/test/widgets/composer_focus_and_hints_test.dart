@@ -214,8 +214,13 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('composer-slash-button')));
     await tester.pumpAndSettle();
 
-    expect(find.text('本地快捷指令'), findsOneWidget, reason: '本地分组必须进「/」面板');
-    expect(find.text('我的周报'), findsOneWidget);
+    expect(find.text('我的周报'), findsOneWidget, reason: '本地条目必须进「/」面板');
+    // [fix 2026-10-18] 只有本地一组时不画分组标题 —— 标题只用来区分来源，
+    // 而弹层本身已经叫「命令与模板」。
+    expect(find.text('本地快捷指令'), findsNothing,
+        reason: '只有一组时不显示分组标题');
+    expect(find.text('网关模板'), findsNothing,
+        reason: '网关没下发模板时不能吊着一个空标题');
     // 带占位符的那条要有不同图标：点它会先弹一屏填参数，不是直接插入。
     expect(find.byIcon(Icons.edit_note_rounded), findsOneWidget);
 

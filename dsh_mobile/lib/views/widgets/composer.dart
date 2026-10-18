@@ -1720,6 +1720,12 @@ class _ChatComposerState extends State<ChatComposer> {
                     // 本地快捷指令排在最前（Phase 5.4）：自己写的那几条几乎总是
                     // 比网关下发的通用模板更常用。两者同名也不去重 —— 它们本来就是
                     // 两个来源，各自演化（见 `models/local_snippet.dart` 的文件头）。
+                    //
+                    // [fix 2026-10-18] 分组标题**只在两组都有内容时才画**。
+                    // 此前「提示词模板」是无条件渲染的标题：网关没下发模板（很常见）
+                    // 时，弹层最底部就吊着一行孤零零的字，看起来像界面坏了。
+                    // 只有一组时标题也是多余的 —— 它只说明来源，而这个弹层本身
+                    // 已经叫「命令与模板」。
                     if (_localSnippets.isEmpty)
                       // 本地一条都没有时**不能静默跳过这一组**：用户会以为这个
                       // 面板里根本没有他的东西。这里给一句解释 + 一个能去建条目的
@@ -1757,7 +1763,8 @@ class _ChatComposerState extends State<ChatComposer> {
                         ),
                       )
                     else ...[
-                      _sheetGroupLabel(sheetCtx, '本地快捷指令'),
+                      if (dsh.snippets.isNotEmpty)
+                        _sheetGroupLabel(sheetCtx, '本地快捷指令'),
                       for (final snip in _localSnippets)
                         ListTile(
                           dense: true,
@@ -1797,31 +1804,36 @@ class _ChatComposerState extends State<ChatComposer> {
                           },
                         ),
                     ],
-                    _sheetGroupLabel(sheetCtx, '提示词模板'),
-                    for (final snip in dsh.snippets)
-                      ListTile(
-                        dense: true,
-                        title: Text(
-                          snip.label,
-                          style: TextStyle(
-                              fontSize: AppText.title,
-                              color: sheetCtx.c.textPrimary),
+                    // 网关模板：**有才画标题**。空的时候什么都别留 —— 一行动词
+                    // 下面是空的，用户只会以为加载失败。
+                    if (dsh.snippets.isNotEmpty) ...[
+                      if (_localSnippets.isNotEmpty)
+                        _sheetGroupLabel(sheetCtx, '网关模板'),
+                      for (final snip in dsh.snippets)
+                        ListTile(
+                          dense: true,
+                          title: Text(
+                            snip.label,
+                            style: TextStyle(
+                                fontSize: AppText.title,
+                                color: sheetCtx.c.textPrimary),
+                          ),
+                          subtitle: Text(
+                            snip.text,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                                fontSize: AppText.subhead,
+                                color: sheetCtx.c.textTertiary),
+                          ),
+                          trailing: Icon(Icons.add_rounded,
+                              size: 18, color: sheetCtx.c.textTertiary),
+                          onTap: () {
+                            Navigator.of(sheetCtx).pop();
+                            _appendSnippetTemplate(dsh, snip.text);
+                          },
                         ),
-                        subtitle: Text(
-                          snip.text,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                              fontSize: AppText.subhead,
-                              color: sheetCtx.c.textTertiary),
-                        ),
-                        trailing: Icon(Icons.add_rounded,
-                            size: 18, color: sheetCtx.c.textTertiary),
-                        onTap: () {
-                          Navigator.of(sheetCtx).pop();
-                          _appendSnippetTemplate(dsh, snip.text);
-                        },
-                      ),
+                    ],
                     const SizedBox(height: AppSpace.m),
                   ],
                 ),

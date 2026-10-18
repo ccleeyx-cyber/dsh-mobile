@@ -38,21 +38,20 @@ import '../models/task_center.dart';
 import '../services/attachment_picker.dart';
 
 class ChatView extends StatefulWidget {
-  final VoidCallback? onOpenWorkspaces;
-
   /// 「去设置建一条快捷指令」——输入区模板面板空态里的出口。
   ///
   /// 只有 MainShell 能推设置里的二级页（它持有 Navigator 与 tab 状态），
   /// 所以这里只转发。为 null 时面板不画那个按钮。
   final VoidCallback? onOpenSnippets;
 
-  // 这里曾经还有 `onOpenSecurity`：安全策略页在一级 tab 时代的跳转回调。
-  // 它从未被任何一处 `widget.onOpenSecurity?.call()` 调用过（死参数），而且安全策略
-  // 现在是设置里的推入页（见 main_shell / custom_settings_view），连语义也不再成立。
+  // 这里曾经有两个回调：
+  //  * `onOpenWorkspaces` —— 顶栏左箭头「回会话列表」。箭头在 v1.34.1 删除
+  //    （它等价于底部「工作区」tab 与侧滑返回，属于从一个根跳到另一个根），
+  //    回调随之没有调用者，一并删掉；
+  //  * `onOpenSecurity` —— 安全策略页在一级 tab 时代的跳转回调，从未被调用。
 
   const ChatView({
     super.key,
-    this.onOpenWorkspaces,
     this.onOpenSnippets,
   });
 
@@ -789,9 +788,6 @@ class _ChatViewState extends State<ChatView> {
         liveJobCount: _liveJobCount(dsh),
         onOpenSessionInfo: (section) => _openSessionInfo(dsh, section: section),
         onToggleSearch: _toggleSearch,
-        // 与 `main_shell` 里 PopScope 的侧滑返回同一条动线：离开会话 = 回工作区 tab。
-        // 之前这条路径只存在于手势里，界面上没有可见入口。
-        onBackToWorkspaces: () => widget.onOpenWorkspaces?.call(),
       ),
       body: Column(
         children: [

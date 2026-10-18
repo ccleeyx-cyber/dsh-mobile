@@ -266,7 +266,6 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 ExcludeFocus(
                   excluding: _currentIndex != 0,
                   child: ChatView(
-                    onOpenWorkspaces: () => _setIndex(1),
                     // 输入区模板面板的「去新建」：直接推快捷指令二级页。
                     // 不先切到设置 tab 再让用户自己找 —— 他已经表达了"我要建一条"。
                     onOpenSnippets: () {

@@ -529,6 +529,16 @@ void main() {
   });
 
   group('输入框高度与焦点（v1.34 用户反馈）', () {
+    testWidgets('顶栏没有返回箭头（会话是一级 tab，不是推入页）', (tester) async {
+      // [fix 2026-10-18] 左箭头等价于底部「工作区」tab + 侧滑返回，属于
+      // "从一个根跳到另一个根"，语义不成立；删掉后标题也多出 48dp。
+      await pumpChat(tester);
+      expect(find.byKey(const ValueKey('chat-back-to-sessions')), findsNothing);
+      expect(find.byIcon(Icons.arrow_back_rounded), findsNothing,
+          reason: '一级 tab 的顶栏不该有返回箭头');
+      await teardown(tester);
+    });
+
     testWidgets('输入框默认两行高（一行看起来太窄）', (tester) async {
       await pumpChat(tester);
       final field = tester.widget<TextField>(find.byKey(const ValueKey('chat-input-field')));
