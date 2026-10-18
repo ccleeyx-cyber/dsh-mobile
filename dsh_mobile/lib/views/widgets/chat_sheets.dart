@@ -45,14 +45,14 @@ Future<void> showChatAttachSheet(
           ListTile(
             leading: Icon(Icons.image_outlined, color: context.c.accent),
             title: Text('图片', style: TextStyle(color: context.c.textPrimary, fontSize: 14)),
-            subtitle: Text('自动压缩到 1600px，agent 能直接看到',
+            subtitle: Text('可多选 · 自动压缩到 1600px，agent 能直接看到',
                 style: TextStyle(color: context.c.textTertiary, fontSize: 11.5)),
             onTap: () => Navigator.pop(ctx, 'image'),
           ),
           ListTile(
             leading: Icon(Icons.attach_file_rounded, color: context.c.accent),
             title: Text('文件', style: TextStyle(color: context.c.textPrimary, fontSize: 14)),
-            subtitle: Text('任意文件，上限 32MB',
+            subtitle: Text('可多选 · 单个上限 32MB',
                 style: TextStyle(color: context.c.textTertiary, fontSize: 11.5)),
             onTap: () => Navigator.pop(ctx, 'file'),
           ),

@@ -70,6 +70,13 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   }
 
   void _setIndex(int index) {
+    // [fix 2026-10-18] 离开对话页时先把焦点交出去。
+    //
+    // 真实的 bug：对话页的输入框保活在 IndexedStack 里，切到设置后它仍然是
+    // "最后一个获得焦点的可编辑控件"。用户从设置里的二级页（如「关于与更新」）
+    // 返回时，Flutter 会把焦点恢复到那个输入框 → 系统输入法自己弹出来，
+    // 而屏幕上根本没有可输入的框。
+    if (index != 0) FocusManager.instance.primaryFocus?.unfocus();
     setState(() {
       _currentIndex = index;
     });
@@ -250,12 +257,26 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             child: IndexedStack(
               index: _currentIndex,
               children: [
-                ChatView(
-                  onOpenWorkspaces: () => _setIndex(1),
-                  // 输入区模板面板的「去新建」：直接推快捷指令二级页。
-                  // 不先切到设置 tab 再让用户自己找 —— 他已经表达了"我要建一条"。
-                  onOpenSnippets: () => Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const SnippetsView()),
+                // ExcludeFocus：不在对话页时，这个子树的输入框**不允许**拿到焦点。
+                //
+                // 只靠切 tab 时 unfocus 不够 —— 推入设置里的页面再返回，焦点恢复
+                // 仍会落到"最后一个聚焦节点"上（就是这里的输入框），键盘随之弹出。
+                // 用 excluding 把这条通路彻底关掉，代价是切回对话页需要用户点一下
+                // 输入框（本来也不该自动弹键盘）。
+                ExcludeFocus(
+                  excluding: _currentIndex != 0,
+                  child: ChatView(
+                    onOpenWorkspaces: () => _setIndex(1),
+                    // 输入区模板面板的「去新建」：直接推快捷指令二级页。
+                    // 不先切到设置 tab 再让用户自己找 —— 他已经表达了"我要建一条"。
+                    onOpenSnippets: () {
+                      // 同一条焦点理由：从输入框旁的弹层推页面前先收键盘，
+                      // 返回时就不会把键盘再弹回来。
+                      FocusManager.instance.primaryFocus?.unfocus();
+                      Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const SnippetsView()),
+                      );
+                    },
                   ),
                 ),
                 WorkspacesView(

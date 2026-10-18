@@ -171,8 +171,12 @@ class _AboutViewState extends State<AboutView> {
     if (!context.mounted) return;
 
     if (check == null || check.verdict == UpdateVerdict.manifestRejected) {
+      // 把**具体原因**带出来：以前只有"读不到清单"，用户分不清是发布侧漏传了
+      // latest.json、还是手机到不了 GitHub。两者修法完全不同。
+      final detail = UpdateService.lastFailure;
       final why = check == null
           ? '读不到发布页同级的最新清单（latest.json）。'
+              '${detail.isEmpty ? '' : '\n具体：$detail'}'
           : '最新的清单不可信：${check.note}。';
       await _showUpdateDialog(
         context,

@@ -1384,7 +1384,9 @@ class _ChatComposerState extends State<ChatComposer> {
         focusNode: _inputFocusNode,
         style: TextStyle(color: context.c.textPrimary, fontSize: 14.5),
         maxLines: 5,
-        minLines: 1,
+        // [feat 2026-10-18] 默认两行（用户反馈：一行看起来太窄）。
+        // 只改 minLines：maxLines 仍是 5，超过才滚动，输入卡片不会无限长高。
+        minLines: 2,
         decoration: InputDecoration(
           // [fix 2026-10-17] 真机截图里 placeholder 是深色、还比正文大一号，
           // 看起来像"已经输入了内容"。原因是没有给 hintStyle，Flutter 就回落到

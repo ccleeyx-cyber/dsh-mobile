@@ -585,44 +585,89 @@ class _ChatViewState extends State<ChatView> {
     _showNotice('排队失败，内容已放回输入框', ok: false, action: NoticeAction.retrySend);
   }
 
-  /// 选取并挂载附件（§4.2）。
+  /// 选取并挂载附件（§4.2）。**支持多选**（v1.33.1）。
   ///
   /// 图片在挂载时就压好、编码好、验过大小；文件在挂载时就已经上传完、拿到凭据。
   /// 之所以都前移到"挂载"这一步而不是等发送：失败必须当场说清。用户挂上一张 8MB
   /// 的图、写了一大段话、点发送，才发现图没传上去 —— 那是最差的失败方式。
+  ///
+  /// ## 多选的失败语义
+  ///
+  /// 一批里有的成功、有的超限、有的上传被拒是常态。这里**不整批放弃**，也**不
+  /// 静默丢**：成功的照常挂上，最后用一条汇总说清"加了几个 / 跳过几个 / 为什么"。
+  /// 一次选 5 张，因为第 3 张太大就把前 2 张也丢掉，是比逐个重选更糟的体验。
   Future<void> _attach(DshService dsh, {required bool asFile}) async {
     try {
-      final media = asFile
-          ? await AttachmentPicker.instance.pickFile()
-          : await AttachmentPicker.instance.pickImage();
-      if (media == null) return; // 用户取消
+      final picked = asFile
+          ? await AttachmentPicker.instance.pickFiles()
+          : await AttachmentPicker.instance.pickImages();
+      if (picked.isEmpty) return; // 用户取消
 
-      if (media.bytes.length > AttachmentPicker.maxUploadBytes && asFile) {
-        final mb = (media.bytes.length / (1024 * 1024)).toStringAsFixed(1);
-        _toast('文件 ${mb}MB 超过上限 32MB');
-        return;
+      final uploadCount = picked.where((m) => asFile || !m.isImage).length;
+      // 只给一条起始提示：上传接口没有进度回调，编一个"1/4"是假信息。
+      if (uploadCount > 0) {
+        _toast(uploadCount == 1
+            ? '正在上传 ${picked.first.name}…'
+            : '正在上传 $uploadCount 个文件…');
       }
 
-      PendingAttachment? attachment;
-      if (asFile || !media.isImage) {
-        // 文件：先上传换凭据。这一步可能耗时，给个进度提示。
-        _toast('正在上传 ${media.name}…');
-        final receiptId =
-            await dsh.uploadAttachment(name: media.name, bytes: media.bytes);
-        attachment = PendingFile(
-          localId: _nextAttachmentId(),
-          name: media.name,
-          byteLength: media.bytes.length,
-          receiptId: receiptId,
-        );
-      } else {
-        // 图片：直接在本地编码成 image part，不发网络请求。
-        attachment = _prepareImageAttachment(media);
+      var added = 0;
+      var skippedTooLarge = 0;
+      var skippedBudget = 0;
+      String? firstError;
+
+      // 已挂上的图片 + 本批已接受的图片，累计原始字节。多选时单图上限不够用，
+      // 必须按整条消息的预算算（见 maxInlineTotalBytes）。
+      var inlineBytes = _pendingAttachments
+          .whereType<PendingImage>()
+          .fold<int>(0, (sum, a) => sum + a.byteLength);
+
+      for (final media in picked) {
+        if (asFile && media.bytes.length > AttachmentPicker.maxUploadBytes) {
+          skippedTooLarge++;
+          continue;
+        }
+        try {
+          PendingAttachment attachment;
+          if (asFile || !media.isImage) {
+            // 文件：先上传换凭据。这一步可能耗时。
+            final receiptId =
+                await dsh.uploadAttachment(name: media.name, bytes: media.bytes);
+            attachment = PendingFile(
+              localId: _nextAttachmentId(),
+              name: media.name,
+              byteLength: media.bytes.length,
+              receiptId: receiptId,
+            );
+          } else {
+            // 图片：直接在本地编码成 image part，不发网络请求。
+            final image = _prepareImageAttachment(media) as PendingImage;
+            if (inlineBytes + image.byteLength > maxInlineTotalBytes) {
+              // 整条消息的预算用完：剩下的图不挂，但要如实计数说明。
+              skippedBudget++;
+              continue;
+            }
+            inlineBytes += image.byteLength;
+            attachment = image;
+          }
+          if (!mounted) return;
+          setState(() => _pendingAttachments.add(attachment));
+          added++;
+        } on AttachmentError catch (e) {
+          // 单条失败不拖垮整批：记下第一条原因，继续装下一个。
+          firstError ??= e.message;
+        }
       }
 
       if (!mounted) return;
-      setState(() => _pendingAttachments.add(attachment!));
       ScaffoldMessenger.of(context).clearSnackBars();
+      final parts = <String>[
+        if (added > 0) '已添加 $added 个附件',
+        if (skippedTooLarge > 0) '跳过 $skippedTooLarge 个超过 32MB 的文件',
+        if (skippedBudget > 0) '跳过 $skippedBudget 张图片（本条消息内联图片总量已达上限）',
+        if (firstError != null) '部分失败：$firstError',
+      ];
+      if (parts.isNotEmpty) _toast(parts.join(' · '));
     } on AttachmentError catch (e) {
       // 面向用户的原因（太大 / 空文件 / 上传被拒），直接展示。
       _toast(e.message);

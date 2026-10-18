@@ -243,6 +243,23 @@ jobs:
             echo "CHANGELOG.md 里没有 $VERSION 小节，退回提交列表"
           fi
 
+      # v1.33.0 之前发布只传 APK，**没有任何人产出 latest.json** —— 于是 App 的
+      # 「检查更新」永远拿到 404，只能回退成"检查不可用"。这里补齐发布侧缺的那个
+      # 文件；字段与 dsh_mobile/lib/models/client_update.dart 的 UpdateManifest
+      # 一一对应，version/versionCode/packageName 仍从 pubspec 与 build.gradle 解析。
+      #
+      # 选 arm64-v8a 作为清单指向的包：绝大多数在用安卓机是 arm64。清单格式只有
+      # 一个 downloadUrl（schemaVersion 1），给"最常见的那一档"比给 fat APK 更省流量；
+      # 其余 ABI 仍然可以从发布页手动下载。
+      - name: Generate latest.json (client update manifest)
+        run: |
+          node scripts/latest-manifest.mjs \
+            --apk dist/app-arm64-v8a-release.apk \
+            --repository "$GITHUB_REPOSITORY" \
+            --notes notes.md \
+            --out dist/latest.json
+          cat dist/latest.json
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -255,4 +272,9 @@ jobs:
           # 不能同时给（那样正文后面会再缀一段自动列表，读起来像两份说明）。
           body_path: ${{ steps.notes.outputs.found == 'true' && 'notes.md' || '' }}
           generate_release_notes: ${{ steps.notes.outputs.found != 'true' }}
-          files: dist/*.apk
+          # latest.json 必须作为**资产**上传：App 读的是
+          # releases/latest/download/latest.json（GitHub 的 latest asset 别名）。
+          # 少了它，「检查更新」就退回"不可用"。
+          files: |
+            dist/*.apk
+            dist/latest.json

@@ -527,4 +527,74 @@ void main() {
       await teardown(tester);
     });
   });
+
+  group('输入框高度与焦点（v1.34 用户反馈）', () {
+    testWidgets('输入框默认两行高（一行看起来太窄）', (tester) async {
+      await pumpChat(tester);
+      final field = tester.widget<TextField>(find.byKey(const ValueKey('chat-input-field')));
+      expect(field.minLines, 2, reason: '空输入框也要有两行高度，否则视觉上像一条细缝');
+      expect(field.maxLines, 5, reason: '上限不变：超过 5 行才滚动');
+      await teardown(tester);
+    });
+
+    testWidgets('从设置二级页返回时焦点不落回输入框（否则输入法自己弹出）', (tester) async {
+      // 真实缺陷：对话输入框保活在 IndexedStack 里，切到设置后仍是"最后聚焦节点"；
+      // 从「关于与更新」返回时 Flutter 把焦点还给它 → 系统输入法弹出，屏幕上却没有
+      // 可输入的框。修复是三重保险（切 tab unfocus / 推页 unfocus / ExcludeFocus）。
+      tester.view.physicalSize = const Size(400, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      await tester.pumpWidget(
+        MultiProvider(
+          providers: [
+            ChangeNotifierProvider<DshService>.value(value: DshService()),
+            ChangeNotifierProvider<ThemeController>.value(value: ThemeController()),
+          ],
+          child: MaterialApp(
+            builder: (ctx, child) =>
+                ThemeScope(isDark: false, child: child ?? const SizedBox()),
+            home: const MainShell(),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      final field = find.byKey(const ValueKey('chat-input-field'));
+      await tester.tap(field);
+      await tester.pump();
+      // 抓住 FocusNode 本体：切走之后 IndexedStack 会把对话页标成 offstage，
+      // 默认的 finder 就看不见它了 —— 而这条用例要断言的正是那个节点的焦点状态。
+      final node = tester.widget<TextField>(field).focusNode!;
+      expect(node.hasFocus, isTrue, reason: '前置条件：用户刚在对话页打字');
+
+      final settingsTab = find.descendant(
+        of: find.byType(NavigationBar),
+        matching: find.text('设置'),
+      );
+      await tester.tap(settingsTab);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      expect(node.hasFocus, isFalse, reason: '离开对话 tab 就必须交还焦点');
+
+      // 进「关于与更新」再返回：这条路径是用户实际踩到的那个。
+      await tester.scrollUntilVisible(
+        find.byKey(const ValueKey('settings-open-about')),
+        300,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.tap(find.byKey(const ValueKey('settings-open-about')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.pageBack();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      expect(node.hasFocus, isFalse,
+          reason: '返回后焦点不能落回常驻的输入框，否则输入法会自己弹出来');
+
+      await teardown(tester);
+    });
+  });
 }

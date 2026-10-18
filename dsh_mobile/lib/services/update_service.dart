@@ -56,6 +56,13 @@ class UpdateService {
     'User-Agent': _userAgent,
   };
 
+  /// 最近一次 [check] 失败的具体原因（成功时清空）。
+  ///
+  /// 为什么要留这个：以前 check 失败只有 null 一种结果，界面只能说"检查不可用"，
+  /// 用户没法区分**清单没上传**（发布侧问题）、**网络到不了 GitHub**（网络问题）
+  /// 和 **JSON 坏了**（发布侧问题）。日志里有，但用户看不到日志。
+  static String lastFailure = '';
+
   /// 主动检查更新（用户点击触发）。返回 null = 清单不可用。
   ///
   /// 任何失败（404 没有这个 asset、超时、离线、JSON 坏了、字段不合法）都归到
@@ -63,16 +70,19 @@ class UpdateService {
   static Future<UpdateCheck?> check({http.Client? client}) async {
     final own = client == null ? http.Client() : null;
     final c = client ?? own!;
+    lastFailure = '';
     try {
       final res = await c
           .get(Uri.parse(AppVersion.latestJsonUrl), headers: _manifestHeaders)
           .timeout(_manifestTimeout);
       if (res.statusCode != 200) {
+        lastFailure = 'latest.json 返回 HTTP ${res.statusCode}';
         debugPrint('[UpdateService] latest.json HTTP ${res.statusCode} → 视为源不可用，回退发布页');
         return null;
       }
       final manifest = parseUpdateManifestJson(utf8.decode(res.bodyBytes));
       if (manifest == null) {
+        lastFailure = 'latest.json 解析不出可用清单（字段缺失或版本号不合法）';
         debugPrint('[UpdateService] latest.json 解析不出可用清单 → 回退发布页');
         return null;
       }
@@ -87,6 +97,7 @@ class UpdateService {
       );
       return check;
     } catch (e) {
+      lastFailure = '请求失败：$e';
       debugPrint('[UpdateService] 检查更新失败: $e');
       return null;
     } finally {

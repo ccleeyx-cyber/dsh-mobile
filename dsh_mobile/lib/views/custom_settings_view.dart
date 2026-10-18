@@ -44,6 +44,10 @@ class CustomSettingsView extends StatelessWidget {
   const CustomSettingsView({super.key, this.onOpenChat});
 
   void _push(BuildContext context, Widget page) {
+    // 推页面前把焦点交出去。设置 hub 自己没有输入框，但对话页的输入框仍活在
+    // IndexedStack 里 —— 从二级页返回时它会成为"焦点恢复"的目标，系统输入法
+    // 就会在设置页上弹出来（用户实测的 bug）。
+    FocusManager.instance.primaryFocus?.unfocus();
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => page));
   }
 

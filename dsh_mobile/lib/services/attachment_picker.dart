@@ -3,7 +3,7 @@ import 'package:image_picker/image_picker.dart';
 
 import '../models/pending_attachment.dart';
 
-/// 选取图片与文件（§4.2 上传图片/文件，v1.10.0）。
+/// 选取图片与文件（§4.2 上传图片/文件，v1.10.0；v1.33.1 起支持多选）。
 ///
 /// 这一层刻意只做"把系统选择器的结果变成字节 + 名字 + 媒体类型"这一件事，
 /// 不含任何压缩策略之外的业务判断、不发网络请求。原因有两个：
@@ -12,13 +12,19 @@ import '../models/pending_attachment.dart';
 /// * 选取要调原生插件、在单测里跑不起来，而"超限校验 / base64 编码"这些真正
 ///   容易出错的逻辑应该被测到 —— 所以它们放在 [PendingImage.fromPicked] 里，
 ///   这一层保持薄到没有可测的逻辑。
+///
+/// ## 为什么返回 List 而不是单个
+///
+/// 用户反馈"添加文件/图片没法多选"。真实使用场景就是一次挂 3~5 张截图给 agent
+/// 看，逐个重开系统选择器是纯摩擦。**取消选择返回空列表**（不是 null：调用方
+/// 只有一个分支要判断）。
 class AttachmentPicker {
   AttachmentPicker._();
   static final AttachmentPicker instance = AttachmentPicker._();
 
   final ImagePicker _imagePicker = ImagePicker();
 
-  /// 从相册选一张图片，**在选取阶段就压缩**。
+  /// 从相册选图（可多选），**在选取阶段就压缩**。
   ///
   /// 压缩参数不是随便定的：网关的 JSON 请求体上限 2MB，而图片要 base64 内联
   /// （只有 image part 能让模型看见图片）。手机直出照片通常 3~5MB，编码后
@@ -26,41 +32,50 @@ class AttachmentPicker {
   ///
   /// 只提供相册、不提供拍照：拍照需要在 manifest 里声明 CAMERA 权限，而多要一个
   /// 权限是有实际代价的（用户会看到、部分 ROM 会因此调整行为）。真要拍照，
-  /// 用户用系统相机拍完再从相册选，效果一样。等确实有人抱怨再开。
-  Future<PickedMedia?> pickImage() => _pickImage(ImageSource.gallery);
-
-  Future<PickedMedia?> _pickImage(ImageSource source) async {
-    final picked = await _imagePicker.pickImage(
-      source: source,
+  /// 用户用系统相机拍完再从相册选，效果一样。
+  ///
+  /// 逐张串行读取而不是 `Future.wait`：多张原图同时进内存会把低端机顶到 OOM，
+  /// 而串行读取每张只占用当前这一张的峰值。
+  Future<List<PickedMedia>> pickImages() async {
+    final picked = await _imagePicker.pickMultiImage(
       maxWidth: 1600,
       maxHeight: 1600,
       imageQuality: 80,
     );
-    if (picked == null) return null;
-    final bytes = await picked.readAsBytes();
-    // image_picker 在本机压缩后统一输出 JPEG（除非原图是 PNG 且未压缩），
-    // 所以按扩展名判断，兜底给 jpeg 而不是 octet-stream —— 后者会被引擎拒绝，
-    // 因为 image part 的 mediaType 必须是 image/*。
-    final mime = _mimeFor(picked.name, fallback: 'image/jpeg');
-    return PickedMedia(bytes: bytes, name: picked.name, mimeType: mime);
+    final result = <PickedMedia>[];
+    for (final file in picked) {
+      final bytes = await file.readAsBytes();
+      // image_picker 在本机压缩后统一输出 JPEG（除非原图是 PNG 且未压缩），
+      // 所以按扩展名判断，兜底给 jpeg 而不是 octet-stream —— 后者会被引擎拒绝，
+      // 因为 image part 的 mediaType 必须是 image/*。
+      final mime = _mimeFor(file.name, fallback: 'image/jpeg');
+      result.add(PickedMedia(bytes: bytes, name: file.name, mimeType: mime));
+    }
+    return result;
   }
 
-  /// 选任意文件。
+  /// 选任意文件（可多选）。
   ///
   /// 用 withData 直接把字节读进内存：走的是独立的原始字节上传路由（32MB 上限），
   /// 不经过 JSON，所以不需要压缩。代价是内存占用等于文件大小，
-  /// 由 [maxUploadBytes] 在上传前兜住。
-  Future<PickedMedia?> pickFile() async {
-    final result = await FilePicker.platform.pickFiles(withData: true);
-    final file = result?.files.single;
-    if (file == null) return null;
-    final bytes = file.bytes;
-    if (bytes == null) return null;
-    return PickedMedia(
-      bytes: bytes,
-      name: file.name,
-      mimeType: _mimeFor(file.name),
+  /// 由 [maxUploadBytes] 在上传前兜住（多选时逐个校验，超限的那个跳过并如实提示，
+  /// 不因为一个 40MB 的包把另外三个正常文件也一起丢掉）。
+  Future<List<PickedMedia>> pickFiles() async {
+    final picked = await FilePicker.platform.pickFiles(
+      withData: true,
+      allowMultiple: true,
     );
+    final result = <PickedMedia>[];
+    for (final file in picked?.files ?? const <PlatformFile>[]) {
+      final bytes = file.bytes;
+      if (bytes == null) continue;
+      result.add(PickedMedia(
+        bytes: bytes,
+        name: file.name,
+        mimeType: _mimeFor(file.name),
+      ));
+    }
+    return result;
   }
 
   /// 单次上传的字节上限，与网关侧的 MAX_UPLOAD_BYTES 保持一致。

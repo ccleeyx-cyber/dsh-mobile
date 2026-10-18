@@ -7,6 +7,44 @@
 
 ---
 
+## [1.34.0] - 2026-10-18
+
+### 修复（用户反馈：从「关于与更新」返回会弹出输入法）
+
+- 根因是**焦点恢复**：对话页的输入框保活在 `IndexedStack` 里，切到设置后它仍是
+  "最后一个获得焦点的可编辑控件"，从二级页返回时 Flutter 把焦点还给它 → 系统
+  输入法自己弹出，而屏幕上没有任何输入框。
+- 三处一起修：切 tab 时 `unfocus`；推设置二级页前 `unfocus`；不在对话页时用
+  `ExcludeFocus` 把整棵对话子树排除在焦点之外（防止任何路径再把焦点还回去）。
+
+### 修复（用户反馈：检查更新没用）
+
+- **真因在发布侧，不在客户端**：`build-apk.yml` 只上传 APK，从来没产出
+  `latest.json`，而 App 读的正是 `releases/latest/download/latest.json` —— 永远
+  404，只能回退成"更新检查不可用"。
+- 新增 `scripts/latest-manifest.mjs`：从 pubspec + build.gradle 解析
+  version / versionCode / packageName，对 `arm64-v8a` 包算 size 与 sha256，
+  产出与 `UpdateManifest` 一一对应的清单（含 releaseNotes）。
+- 发布 job 生成 `dist/latest.json` 并作为 release 资产上传；生成失败即 job 失败
+  （不允许"发了一个没有清单的版本"）。
+- 「更新检查不可用」对话框现在带出**具体原因**（HTTP 状态/解析失败/异常），
+  用户能分清是发布侧漏传还是手机到不了 GitHub。
+
+### 新增
+
+- **附件多选**：图片、文件都支持一次选多个；单条失败不拖垮整批，最后汇总
+  "加了几个 / 跳过几个 / 为什么"。
+- **内联图片总预算**：多选后按整条消息累计（`maxInlineTotalBytes` 1.4MB 原始
+  字节）判断，超出预算的图不挂上并明确说明 —— 否则会在发送时才撞网关 2MB 上限。
+- 输入框默认两行（`minLines: 2`），一行看起来太窄；超过 5 行才滚动。
+
+### 验证
+
+- `flutter analyze` 无问题；`flutter test` 全过。
+- `node scripts/latest-manifest.mjs` 本地跑通，字段与客户端解析一致。
+
+---
+
 ## [1.33.0] - 2026-10-18
 
 ### 修复（用户反馈：快捷指令"没地方使用"）
