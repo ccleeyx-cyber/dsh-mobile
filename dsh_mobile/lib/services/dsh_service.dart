@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show HttpClient, X509Certificate;
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
@@ -19,6 +20,7 @@ import 'draft_store.dart';
 import 'platform_services.dart';
 import 'storage_service.dart';
 import 'notification_service.dart';
+import 'cert_trust.dart';
 import '../models/audit_log.dart';
 import '../models/persona.dart';
 import '../models/gateway_features.dart';
@@ -934,6 +936,14 @@ class DshService extends ChangeNotifier {
     try {
       await _cleanTeardownSocket();
 
+      // [v1.35 / 1.4] WSS 时先装载 TOFU 信任视图（握手回调是同步的，不能
+      // 在里面读存储层）；HTTP 直连不需要，保持零开销。
+      _certGatewayId = _gatewayIdOf(config);
+      _pendingCertChange = null;
+      final tlsClient = config.effectiveUseHttps
+          ? await _prepareTlsClient(config)
+          : null;
+
       final uri = Uri.parse(config.wsUrl);
       // 鉴权走 header（不再放 URL query —— 代理日志会记录完整 URL）。
       // IOWebSocketChannel 是唯一带 headers 的 connect 变体；顶层
@@ -945,6 +955,7 @@ class DshService extends ChangeNotifier {
         // [fix 2026-10-17] SYN 黑洞时没有它要挂到 OS 级 TCP 超时（约 2 分钟）。
         // 与 _executeReconnect 对称。
         connectTimeout: const Duration(seconds: 10),
+        customClient: tlsClient,
         headers: {
           'Authorization': 'Bearer ${config.effectiveToken}',
           'x-dsh-token': config.effectiveToken,
@@ -960,6 +971,13 @@ class DshService extends ChangeNotifier {
         },
         onError: (error) {
           debugPrint('[DshService] WebSocket error: $error');
+          // [v1.35 / 1.4] 指纹不一致会以握手失败的形式冒到这里；它的处理与
+          // 普通网络错误完全不同（不重连、要用户确认），必须最先分流。
+          final certChange = _pendingCertChange;
+          if (certChange != null) {
+            _handleCertMismatch(certChange);
+            return;
+          }
           final errStr = error.toString().toLowerCase();
           if (errStr.contains('401') || errStr.contains('unauthorized')) {
             handleAuthFailure('WebSocket认证失败: 访问令牌无效');
@@ -3655,6 +3673,49 @@ class DshService extends ChangeNotifier {
 
   // ---- 一键诊断 / 子代理中断 / goal 控制 / slash 命令 [feat 2026-10-12] ----
 
+  // ---- [v1.35 / 1.5] 云隧道（cloudflared quick tunnel） ----
+
+  Map<String, dynamic>? _tunnelState;
+
+  /// 最近一次隧道状态（`{status, url, target, error}`）。null = 还没查过。
+  Map<String, dynamic>? get tunnelState => _tunnelState;
+
+  Future<Map<String, dynamic>?> _tunnelRequest(String path, {bool post = false}) async {
+    if (_currentConfig == null) return null;
+    final url = Uri.parse('${_currentConfig!.httpBaseUrl}$path');
+    try {
+      final res = post
+          // 下载 cloudflared 可能要几十秒，超时给足；失败也只是降级，不影响连接。
+          ? await _httpClient.post(url, headers: _authHeaders).timeout(const Duration(seconds: 90))
+          : await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return null;
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      if (data is Map) {
+        _tunnelState = Map<String, dynamic>.from(data);
+        notifyListeners();
+        return _tunnelState;
+      }
+      return null;
+    } catch (e) {
+      debugPrint('[DshService] tunnel request error ($path): $e');
+      _tunnelState = {
+        'ok': false,
+        'status': 'failed',
+        'error': '请求失败: $e',
+      };
+      notifyListeners();
+      return _tunnelState;
+    }
+  }
+
+  Future<Map<String, dynamic>?> refreshTunnel() => _tunnelRequest('/api/mobile/tunnel');
+
+  Future<Map<String, dynamic>?> startTunnel() =>
+      _tunnelRequest('/api/mobile/tunnel/start', post: true);
+
+  Future<Map<String, dynamic>?> stopTunnel() =>
+      _tunnelRequest('/api/mobile/tunnel/stop', post: true);
+
   /// 一键连接诊断。永不抛异常：网关保证各项 check 都有答案（引擎挂掉只让
   /// `engine_rpc` 变 ok:false），这里再把网络层异常兜成一份最小失败报告。
   Future<DiagnosticsReport?> runDiagnostics() async {
@@ -5125,6 +5186,95 @@ class DshService extends ChangeNotifier {
   }
 
   // Clean Socket Teardown (F4.4 / F3.1)
+  /* ------------------------------------------------------------------ *
+   * [v1.35 / 1.4] 自签证书 TOFU 校验
+   *
+   * 为什么必须在连接层做：网关的自签证书不在系统信任链里，Dart 默认会直接
+   * 拒绝握手。要么一律放行（等于没有校验，同网段任何人都能中间人），要么按
+   * 指纹记住它——后者就是 TOFU。策略实现在 services/cert_trust.dart。
+   * ------------------------------------------------------------------ */
+
+  HttpClient? _wsHttpClient;
+  String _certGatewayId = '';
+  CertTrustResult? _pendingCertChange;
+
+  /// 最近一次被拦下的证书变更（null = 正常）。UI 据此决定是否弹告警。
+  CertTrustResult? get pendingCertChange => _pendingCertChange;
+
+  static String _gatewayIdOf(ServerConfig config) {
+    final id = config.id.trim();
+    return id.isNotEmpty ? id : '${config.cleanHost}:${config.cleanPort}';
+  }
+
+  /// 装载同步信任视图并构造带指纹校验的 HttpClient。
+  ///
+  /// 公开 CA 证书（quick tunnel / 正式反代）根本不会触发
+  /// `badCertificateCallback`，走系统信任链；这里只接管自签场景。
+  Future<HttpClient> _prepareTlsClient(ServerConfig config) async {
+    await CertTrust.preload(gatewayId: _certGatewayId, channel: config.channel);
+    final client = HttpClient();
+    _wsHttpClient = client;
+    client.badCertificateCallback = (X509Certificate cert, String host, int port) {
+      final fp = CertTrust.fingerprintOfCertificate(cert);
+      final result = CertTrust.decideSync(
+        gatewayId: _certGatewayId,
+        fingerprint: fp,
+        channel: config.channel,
+      );
+      if (result.decision == CertTrustDecision.unavailable) {
+        // 读不到证书信息（极罕见）：宁可拒绝，也不静默降级成"不校验"。
+        return false;
+      }
+      if (result.decision == CertTrustDecision.mismatch) {
+        _pendingCertChange = result;
+        return false;
+      }
+      if (result.decision == CertTrustDecision.firstUse) {
+        // 握手路径不能 await：落盘挪到连接建立之后（fire-and-forget）。
+        unawaited(CertTrust.acceptChange(
+          gatewayId: _certGatewayId,
+          fingerprint: fp,
+          channel: config.channel,
+        ));
+      }
+      return true;
+    };
+    return client;
+  }
+
+  /// 证书指纹变化：拦住连接并给出可解释的错误，**不进自动重连**。
+  void _handleCertMismatch(CertTrustResult change) {
+    _status = ConnectionStatus.error;
+    _lastError = '网关证书指纹已变化，连接被阻止。'
+        '如果这是你刚换网络/重装网关，请在「连接与诊断」里确认新指纹后重连；'
+        '否则请停止连接并检查网络是否被劫持。';
+    _isReconnecting = false;
+    _stopHeartbeat();
+    notifyListeners();
+  }
+
+  /// 用户在告警页点了「我认识这次变更」：写入信任库并重连。
+  Future<void> trustPendingCertChange() async {
+    final pending = _pendingCertChange;
+    final config = _currentConfig;
+    if (pending == null || config == null) return;
+    await CertTrust.acceptChange(
+      gatewayId: _certGatewayId,
+      fingerprint: pending.fingerprint,
+      channel: config.channel,
+    );
+    _pendingCertChange = null;
+    _lastError = '';
+    await connect(config);
+  }
+
+  /// 用户点「不信任」：清掉本次待确认状态，保持断开。
+  void rejectPendingCertChange() {
+    _pendingCertChange = null;
+    _status = ConnectionStatus.disconnected;
+    notifyListeners();
+  }
+
   Future<void> _cleanTeardownSocket() async {
     _stopHeartbeat();
     await _channelSubscription?.cancel();
@@ -5144,10 +5294,22 @@ class DshService extends ChangeNotifier {
       }
       _channel = null;
     }
+    // [v1.35 / 1.4] 每次连接都会新建一个 HttpClient（指纹回调绑定当前网关），
+    // 旧实例必须关掉：它的 keep-alive 连接不会自己消失，长跑会耗尽句柄。
+    try {
+      _wsHttpClient?.close(force: true);
+    } catch (e) {
+      debugPrint('[DshService] HttpClient close notice: $e');
+    }
+    _wsHttpClient = null;
   }
 
   // Automatic Reconnection Loop with Exponential Backoff & Jitter (F3.1)
   void _scheduleReconnect({bool immediate = false}) {
+    // [v1.35 / 1.4] 证书指纹不一致时**不做自动重连**：指纹不变，重连必然再次
+    // 失败，只会每 12 秒刷一次日志并耗电。等用户在告警页确认（trustPendingCertChange）
+    // 或改成正确地址后再手动连。
+    if (_pendingCertChange != null) return;
     if (_isExplicitlyDisconnected || _isDisposed || _isTokenInvalid || _currentConfig == null) {
       return;
     }
@@ -5219,6 +5381,13 @@ class DshService extends ChangeNotifier {
     try {
       await _cleanTeardownSocket();
 
+      // [v1.35 / 1.4] 重连同样要装载信任视图：换网络后网关可能按新 SAN
+      // 重签了证书，这时应该给出「指纹变了」而不是一句「连接失败」。
+      _certGatewayId = _gatewayIdOf(_currentConfig!);
+      final reconnectClient = _currentConfig!.effectiveUseHttps
+          ? await _prepareTlsClient(_currentConfig!)
+          : null;
+
       final uri = Uri.parse(_currentConfig!.wsUrl);
       // [fix 2026-10-17] connectTimeout：SYN 黑洞（网关掉线/防火墙丢包）时
       // 没有它 ready 会挂到 OS 级 TCP 超时（约 2 分钟），期间 _isReconnecting
@@ -5226,6 +5395,7 @@ class DshService extends ChangeNotifier {
       _channel = IOWebSocketChannel.connect(
         uri,
         connectTimeout: const Duration(seconds: 10),
+        customClient: reconnectClient,
         headers: {
           'Authorization': 'Bearer ${_currentConfig!.effectiveToken}',
           'x-dsh-token': _currentConfig!.effectiveToken,
@@ -5250,6 +5420,11 @@ class DshService extends ChangeNotifier {
         },
         onError: (error) {
           debugPrint('[DshService] Reconnect socket error: $error');
+          final certChange = _pendingCertChange;
+          if (certChange != null) {
+            _handleCertMismatch(certChange);
+            return;
+          }
           final errStr = error.toString().toLowerCase();
           if (errStr.contains('401') || errStr.contains('unauthorized')) {
             handleAuthFailure('WebSocket认证失败: 访问令牌无效');

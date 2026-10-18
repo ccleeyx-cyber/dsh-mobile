@@ -18,6 +18,13 @@ class ServerConfig {
   String npsAddress;
   String authCode;
 
+  /// 连接通道：`lan`（局域网/直连）或 `remote`（公网隧道/反代）。
+  ///
+  /// v1.35 起 TLS 指纹按通道分开记（见 `services/cert_trust.dart`）：远程通道
+  /// 走 Cloudflare 这类公开证书，不参与 TOFU；局域网自签证书的轮换也不该让
+  /// 远程通道跟着弹告警。
+  String channel;
+
   /// 配对时网关分配的设备 id（dev_xxxxxxxx）。
   ///
   /// [feat 2026-10-12] 电脑端撤销设备会向**所有**在线客户端广播
@@ -35,6 +42,7 @@ class ServerConfig {
     this.npsAddress = '',
     this.authCode = '',
     this.deviceId = '',
+    this.channel = 'lan',
   });
 
   /// What the switcher shows. Falls back to the host so an unnamed gateway is
@@ -58,6 +66,7 @@ class ServerConfig {
         npsAddress: npsAddress,
         authCode: authCode,
         deviceId: deviceId,
+        channel: channel,
       );
 
   String get _normalizedHost {
@@ -126,6 +135,7 @@ class ServerConfig {
     'npsAddress': npsAddress,
     'authCode': authCode,
     'deviceId': deviceId,
+    'channel': channel,
   };
 
   // Tolerant readers. A config written by an older build has no id/name at all,
@@ -151,5 +161,7 @@ class ServerConfig {
     npsAddress: _str(json['npsAddress']),
     authCode: _str(json['authCode']),
     deviceId: _str(json['deviceId']),
+    // 老配置没有这个字段 → 一律按局域网处理（远程通道 1.35 才出现）。
+    channel: _str(json['channel']) == 'remote' ? 'remote' : 'lan',
   );
 }

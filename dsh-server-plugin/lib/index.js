@@ -52,6 +52,8 @@ import {
   extractToolCallFiles
 } from './extensions.mjs';
 import { discoverGitRepos } from './host-ops.mjs';
+import { ensureCertificate, localHosts } from './tls.mjs';
+import { ensureCloudflared, createQuickTunnel } from './tunnel.mjs';
 import {
   BRIDGE_VERSION,
   MAX_BODY_SIZE,
@@ -238,6 +240,20 @@ function readWebServerPort(ctx, logger) {
   }
 }
 
+/**
+ * TLS 监听端口。
+ *
+ * 只有环境变量一个开关：`BRIDGE_TLS_PORT=0` 关闭，未设置时默认 3443。
+ * 不做成 config.json 字段，是因为设置页还没有对应开关——一个用户看不见、
+ * 改不到的值放进去只会增加排查成本。
+ */
+export function resolveTlsPort(env = process.env) {
+  const raw = env.BRIDGE_TLS_PORT;
+  if (raw == null || String(raw).trim() === '') return 3443;
+  const n = Number(String(raw).trim());
+  return Number.isFinite(n) && n >= 0 && n <= 65535 ? n : 3443;
+}
+
 export function apply(ctx, config = {}, internals = {}) {
   const logger = ctx.logger?.(name) ?? console;
   const cfg = loadConfig();
@@ -269,6 +285,31 @@ export function apply(ctx, config = {}, internals = {}) {
   const dshHomeDir = dshHome();
 
   ensureDataDir();
+
+  /* ------------------------------------------------------------------ *
+   * [v1.35 / 1.1] 自签证书（幂等：存在且有效就复用）
+   *
+   * 放在最前面是因为配对二维码要带指纹（1.3），而二维码路由在 requestHandler
+   * 闭包里；提前算好也让 TLS 端口启动不必再读盘。
+   *
+   * 失败不 fatal：证书签发失败时 tlsPort 不会启动，但明文 3088 与所有既有
+   * 功能必须继续可用（降级优于连不上）。
+   * ------------------------------------------------------------------ */
+  let certFingerprint = '';
+  let tlsCert = null;
+  try {
+    tlsCert = ensureCertificate({ hosts: localHosts() });
+    certFingerprint = tlsCert.fingerprint;
+    if (tlsCert.regenerated) {
+      logger.info('dsh-mobile-bridge: 自签证书已签发/更新（%s）指纹 %s', tlsCert.reason, certFingerprint);
+      audit('tls/cert', { reason: tlsCert.reason, fingerprint: certFingerprint });
+    }
+  } catch (err) {
+    logger.warn('dsh-mobile-bridge: 自签证书初始化失败（%s），HTTPS/WSS 不可用', err?.message ?? err);
+  }
+
+  /** 0 = 关闭；默认 3443（见 resolveTlsPort）。 */
+  const tlsPort = resolveTlsPort();
 
   /**
    * Origins allowed to make credentialed cross-origin calls.
@@ -2690,7 +2731,62 @@ export function apply(ctx, config = {}, internals = {}) {
 
   // authenticateRequest now lives in core; call sites pass the parsed URL through.
 
-  const server = createServer(async (req, res) => {
+  /* ------------------------------------------------------------------ *
+   * [v1.35 / 1.5] 云隧道（cloudflared quick tunnel）
+   *
+   * 目标：用户在外面没有公网地址，也能连回这台机器。quick tunnel 免账号，
+   * 但地址每次重启都变，所以它被定位成「临时通道」，文案必须说清。
+   *
+   * 三条安全/可用性约束：
+   *   - 隧道只指向 TLS 端口：把明文 3088 暴露到公网等于让 token 裸奔，
+   *     因此 TLS 未启用时拒绝启动（明确报错，不静默降级）；
+   *   - 二进制下载失败只降级，不影响网关本体；
+   *   - 隧道进程随宿主退出（cleanupGateway 里 stop）。
+   * ------------------------------------------------------------------ */
+
+  let quickTunnel = null;
+
+  /** 一次性 HTTP(S) 下载（跟随 GitHub 的 302 到 objects.githubusercontent.com）。 */
+  function fetchUrlBytes(url, redirects = 3) {
+    return new Promise((resolve, reject) => {
+      let parsed;
+      try { parsed = new URL(url); } catch (err) { reject(err); return; }
+      const transport = parsed.protocol === 'https:' ? https : http;
+      const req = transport.get(parsed, { timeout: 30000 }, (res) => {
+        const status = res.statusCode ?? 0;
+        if ([301, 302, 303, 307, 308].includes(status) && res.headers.location && redirects > 0) {
+          res.resume();
+          resolve(fetchUrlBytes(String(new URL(res.headers.location, parsed)), redirects - 1));
+          return;
+        }
+        if (status !== 200) {
+          res.resume();
+          reject(new Error(`下载失败 HTTP ${status}`));
+          return;
+        }
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      });
+      req.on('error', reject);
+      req.on('timeout', () => { try { req.destroy(); } catch (_) {} reject(new Error('下载超时')); });
+    });
+  }
+
+  function tunnelPayload() {
+    return {
+      ok: true,
+      status: quickTunnel?.status ?? 'idle',
+      url: quickTunnel?.url ?? '',
+      target: tlsPort > 0 ? `https://127.0.0.1:${tlsPort}` : null,
+      error: quickTunnel?.lastError ?? ''
+    };
+  }
+
+  // [v1.35 / 1.2] 请求处理器提成具名变量：明文端口与 TLS 端口共用同一份路由与
+  // 鉴权栈。此前它内联在 createServer(...) 里，想加第二个监听面就只能复制整张
+  // 路由表 —— 那正是本仓库历史上「两份实现漂移」的老毛病。
+  const requestHandler = async (req, res) => {
     const parsedUrl = url.parse(req.url, true);
     const pathname = parsedUrl.pathname;
 
@@ -2796,6 +2892,10 @@ export function apply(ctx, config = {}, internals = {}) {
         authenticated: true,
         name: 'dsh-mobile-bridge',
         port: listenPort,
+        // [v1.35 / 1.2] TLS 端口与证书指纹：手机在「连接与诊断」页能直接看出
+        // 这台机器是否开了 HTTPS，以及当前证书是哪一张（指纹变化时对比用）。
+        tlsPort: tlsPort > 0 && tlsServer ? tlsPort : null,
+        certFingerprint: certFingerprint || null,
         dshPort: dshPort,
         version: BRIDGE_VERSION,
         time: new Date().toISOString()
@@ -2914,6 +3014,10 @@ export function apply(ctx, config = {}, internals = {}) {
         publicPort: pairPublicHost ? pairPublicPort : null,
         lanHosts: hosts,
         pairCode: code,
+        // [v1.35 / 1.3] 自签证书指纹：App 首次连接按 TOFU 记住它，之后指纹
+        // 变化必须由用户确认（lib/services/cert_trust.dart）。空串表示本机
+        // 证书不可用，App 应回落到「跳过校验并提示」而不是拒连。
+        certFingerprint,
         name: os.hostname()
       };
 
@@ -2975,7 +3079,10 @@ export function apply(ctx, config = {}, internals = {}) {
         publicHost: infoPublicHost || null,
         publicPort: infoPublicHost ? infoPublicPort : null,
         lanHosts: hosts,
-        pairCode: code, name: os.hostname(), expiresAt
+        pairCode: code,
+        // [v1.35 / 1.3] 与 /pair/qr 同一口径（TOFU 用）。
+        certFingerprint,
+        name: os.hostname(), expiresAt
       });
       return;
     }
@@ -3144,7 +3251,64 @@ export function apply(ctx, config = {}, internals = {}) {
       }
     }
 
-    // 5. 附件上传与读取（v1.10.0）
+    /* ---- [v1.35 / 1.5] 云隧道状态与控制 ---- */
+    if ((pathname === '/api/mobile/tunnel' || pathname === '/tunnel') && req.method === 'GET') {
+      sendJson(200, tunnelPayload());
+      return;
+    }
+    if (pathname === '/api/mobile/tunnel/start' && req.method === 'POST') {
+      if (tlsPort <= 0 || !tlsServer) {
+        // 明确拒绝而不是"帮你改成明文暴露"：quick tunnel 会把流量放到公网，
+        // 明文 HTTP 上的 token 等于公开。
+        sendJson(409, { ok: false, error: 'TLS 端口未启用，无法开启公网隧道（隧道必须指向 HTTPS）' });
+        return;
+      }
+      if (quickTunnel && (quickTunnel.status === 'ready' || quickTunnel.status === 'starting')) {
+        sendJson(200, tunnelPayload());
+        return;
+      }
+      try {
+        const bin = await ensureCloudflared({ fetchBytes: fetchUrlBytes });
+        quickTunnel = createQuickTunnel({
+          binary: bin.path,
+          target: `https://127.0.0.1:${tlsPort}`,
+          onUrl: (url) => {
+            audit('tunnel/url', { url });
+            // 地址变化要立刻广播：手机拿着旧地址重连只会得到"连不上"，
+            // 而它没法自己发现新地址。
+            broadcastToMobileClients({ type: 'tunnel_url', url, channel: 'remote' });
+          },
+          onExit: (info) => {
+            audit('tunnel/exit', { code: info.code, error: info.error });
+            broadcastToMobileClients({ type: 'tunnel_url', url: '', channel: 'remote' });
+          },
+          logger
+        });
+        quickTunnel.start();
+        audit('tunnel/start', { target: `https://127.0.0.1:${tlsPort}`, binary: bin.path });
+        sendJson(200, tunnelPayload());
+      } catch (err) {
+        // 下载失败 / 校验失败都在这里：只降级，不影响局域网与明文端口。
+        logger.warn('[dsh-mobile-bridge] 云隧道启动失败: %s', err?.message ?? err);
+        sendJson(500, {
+          ok: false,
+          status: 'failed',
+          error: err?.message ?? String(err),
+          hint: '可手动安装 cloudflared 后重试，或改用 Tailscale/自有反代'
+        });
+      }
+      return;
+    }
+    if (pathname === '/api/mobile/tunnel/stop' && req.method === 'POST') {
+      quickTunnel?.stop();
+      audit('tunnel/stop', {});
+      sendJson(200, tunnelPayload());
+      return;
+    }
+
+  /* ------------------------------------------------------------------ *
+   * 附件上传与读取（v1.10.0）
+   * ------------------------------------------------------------------ */
     //
     // 这两条必须在下面的 jsonBody 读取**之前**处理：上传是原始字节流，而那个
     // 读取器有 2MB 上限且按 JSON 解析。
@@ -4286,11 +4450,14 @@ export function apply(ctx, config = {}, internals = {}) {
       logger.error('[dsh-mobile-bridge] API error:', pathname, err);
       sendJson(500, { error: err?.message || 'Internal server error' });
     }
-  });
+  };
+
+  const server = createServer(requestHandler);
 
   const wss = new WebSocket.Server({ noServer: true });
 
-  server.on('upgrade', (req, socket, head) => {
+  // [v1.35 / 1.2] upgrade 处理器同样具名，明文与 TLS 两个服务共用。
+  const handleUpgrade = (req, socket, head) => {
     const parsed = url.parse(req.url, true);
     const pathname = parsed.pathname;
 
@@ -4318,7 +4485,46 @@ export function apply(ctx, config = {}, internals = {}) {
 
     socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
     socket.destroy();
-  });
+  };
+
+  server.on('upgrade', handleUpgrade);
+
+  /* ------------------------------------------------------------------ *
+   * [v1.35 / 1.2] TLS 监听端口（HTTPS + WSS）
+   *
+   * 明文 3088 保持原样、可继续使用：过渡期必须让老配置零回归，TLS 是**新增
+   * 端口**而不是替换（全局约束 7）。开关只有环境变量 BRIDGE_TLS_PORT
+   * （0 = 关闭，默认 3443）—— 不放进 config.json，是因为设置页还没有 TLS
+   * 开关，多一个可写入口只会让「为什么没生效」更不可诊断。
+   *
+   * 端口占用绝不 fatal：宿主上 3443 可能被别的服务占着，而明文端口仍然是
+   * 可用的降级路径。失败只 warn + 审计，不阻断 listenPort 的启动。
+   * ------------------------------------------------------------------ */
+  let tlsServer = null;
+  if (tlsPort > 0) {
+    if (!tlsCert) {
+      logger.warn('dsh-mobile-bridge: 自签证书不可用，TLS 端口未启动（明文端口不受影响）');
+    } else {
+      try {
+        tlsServer = https.createServer({ key: tlsCert.key, cert: tlsCert.cert }, requestHandler);
+        tlsServer.on('upgrade', handleUpgrade);
+        tlsServer.on('error', (err) => {
+          if (err?.code === 'EADDRINUSE') {
+            logger.warn('dsh-mobile-bridge: TLS 端口 %d 已被占用，HTTPS/WSS 未启用（明文端口不受影响）', tlsPort);
+          } else {
+            logger.warn('dsh-mobile-bridge: TLS 端口异常 %s', err?.message ?? err);
+          }
+        });
+        tlsServer.listen(tlsPort, bindHost, () => {
+          logger.info('dsh-mobile-bridge: TLS 网关就绪 https://%s:%d（证书指纹 %s）', bindHost, tlsPort, certFingerprint);
+          audit('tls/start', { port: tlsPort, fingerprint: certFingerprint });
+        });
+      } catch (err) {
+        logger.warn('dsh-mobile-bridge: TLS 端口启动失败（%s），HTTPS/WSS 不可用', err?.message ?? err);
+        tlsServer = null;
+      }
+    }
+  }
 
   // Heartbeat & dead socket tracking interval (F3.5) — constant lives in core.
   const heartbeatInterval = setInterval(() => {
@@ -4584,6 +4790,9 @@ export function apply(ctx, config = {}, internals = {}) {
         publicPort: publicHost ? publicPort : null,
         lanHosts: hosts,
         pairCode: code,
+        // [v1.35 / 1.3] 设置页二维码与 HTTP /pair/qr 必须是同一份载荷口径，
+        // 否则两条配对路径的 TOFU 行为会不一致。
+        certFingerprint,
         name: os.hostname(),
         expiresAt,
         ttlMs: pairCodeTtlMs()
@@ -4610,6 +4819,10 @@ export function apply(ctx, config = {}, internals = {}) {
     if (isDisposed) return;
     isDisposed = true;
     logger.info('dsh-mobile-bridge: 正在关闭网关服务...');
+    // [v1.35 / 1.5] 隧道进程必须随宿主一起收：留在宿主机上的 cloudflared
+    // 会继续占着一条公网隧道，而已经没人知道它的地址了。
+    try { quickTunnel?.stop(); } catch (_) {}
+    quickTunnel = null;
     if (muxReconnectTimer) { clearTimeout(muxReconnectTimer); muxReconnectTimer = null; }
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     try { upstreamMuxWs?.removeAllListeners(); } catch (_) {}
@@ -4629,13 +4842,17 @@ export function apply(ctx, config = {}, internals = {}) {
     questionSubscribers.clear();
     try { wss.close(); } catch (_) {}
     try { server.closeAllConnections?.(); } catch (_) {}
-    await new Promise((resolve) => {
-      server.close(() => resolve());
+    try { tlsServer?.closeAllConnections?.(); } catch (_) {}
+    // 明文与 TLS 两个监听面一起收，任何一个漏关都会让宿主进程挂着一个句柄。
+    const closeServer = (srv) => new Promise((resolve) => {
+      if (!srv) return resolve();
+      srv.close(() => resolve());
       setTimeout(() => {
-        try { server.closeAllConnections?.(); } catch (_) {}
+        try { srv.closeAllConnections?.(); } catch (_) {}
         resolve();
       }, 1000).unref?.();
     });
+    await Promise.all([closeServer(server), closeServer(tlsServer)]);
     await disposeRpc();
     activePrompts.clear();
     sessionFollowers.clear();

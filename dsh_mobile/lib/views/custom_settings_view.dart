@@ -11,6 +11,7 @@ import 'security_permissions_view.dart';
 import 'settings/about_view.dart';
 import 'settings/connectivity_view.dart';
 import 'settings/push_settings_view.dart';
+import 'settings/remote_access_view.dart';
 import 'settings/settings_widgets.dart';
 import 'settings/snippets_view.dart';
 
@@ -29,6 +30,7 @@ import 'settings/snippets_view.dart';
 ///
 /// 二级页：
 ///  * [ConnectivityView] —— 原「网关健康」+「网络与网关诊断」合并；
+///  * [RemoteAccessView] —— v1.35 新增：证书指纹、隧道开关、远程地址；
 ///  * [PushSettingsView] —— 原内联的 ntfy 表单；
 ///  * [SnippetsView] —— 原内联的快捷指令列表与编辑器；
 ///  * [AboutView] —— 版本、检查更新、发布页。
@@ -93,6 +95,16 @@ class CustomSettingsView extends StatelessWidget {
             subtitleColor: dsh.isConnected ? null : _connectionColor(context, dsh),
             badge: waiting > 0 ? '$waiting 项待处理' : null,
             onTap: () => _push(context, const ConnectivityView()),
+          ),
+          const SizedBox(height: AppSpace.m),
+          // [v1.35] 远程访问：出门在外的第二条腿（自签 TLS + quick tunnel）。
+          // 与「连接与诊断」同级，因为它们在回答同一类问题：我现在能不能连上。
+          SettingsNavCard(
+            key: const ValueKey('settings-open-remote'),
+            icon: Icons.cloud_outlined,
+            title: '远程访问',
+            subtitle: '证书指纹与临时公网通道',
+            onTap: () => _push(context, const RemoteAccessView()),
           ),
           const SizedBox(height: AppSpace.xl),
 
