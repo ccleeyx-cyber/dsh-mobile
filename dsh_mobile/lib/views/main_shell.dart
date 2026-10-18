@@ -6,6 +6,7 @@ import 'chat_view.dart';
 import 'workspaces_view.dart';
 import 'custom_settings_view.dart';
 import 'config_page.dart';
+import 'settings/snippets_view.dart';
 import '../theme/app_colors.dart';
 
 class MainShell extends StatefulWidget {
@@ -251,6 +252,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               children: [
                 ChatView(
                   onOpenWorkspaces: () => _setIndex(1),
+                  // 输入区模板面板的「去新建」：直接推快捷指令二级页。
+                  // 不先切到设置 tab 再让用户自己找 —— 他已经表达了"我要建一条"。
+                  onOpenSnippets: () => Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const SnippetsView()),
+                  ),
                 ),
                 WorkspacesView(
                   onSwitchToChat: () => _setIndex(0),

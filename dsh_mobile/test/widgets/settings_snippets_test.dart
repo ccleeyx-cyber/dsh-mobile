@@ -11,12 +11,15 @@ import 'package:dsh_mobile/models/gateway_features.dart';
 import 'package:dsh_mobile/services/dsh_service.dart';
 import 'package:dsh_mobile/services/storage_service.dart';
 import 'package:dsh_mobile/theme/app_colors.dart';
-import 'package:dsh_mobile/views/custom_settings_view.dart';
+import 'package:dsh_mobile/views/settings/snippets_view.dart';
 
-/// 设置页「快捷指令」分区的界面测试（Phase 5.4）。
+/// 设置里「快捷指令」页的界面测试（Phase 5.4；v1.33 从设置首页搬成独立页）。
 ///
 /// 钉住的是**合并展示**这条规则：本地条目排前面、带「本地」徽标、可改可删可排序；
 /// 网关下发的条目只读（没有编辑/删除按钮，而不是给一个点了没反应的图标）。
+///
+/// v1.33 起这一页是 `SnippetsView`（从设置 hub 推入），测试直接 pump 它；
+/// 入口可达性由 `settings_hub_test.dart` 单独钉。
 ///
 /// 全部走内存：网关条目从 `debugRemoteSnippets` 注入、本地条目摆进
 /// `SharedPreferences` 的内存 mock —— 不打真实网关、不写真实存储。
@@ -61,7 +64,7 @@ void main() {
               child: content,
             );
           },
-          home: CustomSettingsView(debugRemoteSnippets: remote),
+          home: SnippetsView(debugRemoteSnippets: remote),
         ),
       ),
     );

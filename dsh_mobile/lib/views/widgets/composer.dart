@@ -200,6 +200,7 @@ class ChatComposer extends StatefulWidget {
     this.onRevealBlocked,
     this.policyLabel,
     this.onPickPermission,
+    this.onOpenSnippets,
   });
 
   final DshService dsh;
@@ -240,6 +241,14 @@ class ChatComposer extends StatefulWidget {
 
   /// 点权限胶囊。为 null 时同样不渲染。
   final VoidCallback? onPickPermission;
+
+  /// 「去设置建一条」——面板空态里的逃生口。
+  ///
+  /// 为什么需要：快捷指令面板以前在"本地和网关都空"时直接退化成只有斜杠命令的
+  /// 老面板，一句解释都没有。用户建完指令回到对话页看不到它（缓存没刷新），
+  /// 打开面板又只有一堆 `/命令`，结论自然是"这功能没地方用"。
+  /// 为 null 时不画这个按钮（不让用户点一个没反应的入口）。
+  final VoidCallback? onOpenSnippets;
 
   @override
   State<ChatComposer> createState() => _ChatComposerState();
@@ -436,15 +445,30 @@ class _ChatComposerState extends State<ChatComposer> {
   // 重建（流式消息推进时尤其频繁），一次 await 就等于把打字区挂起一帧。
   List<LocalSnippet> _localSnippets = const [];
 
+  /// 模板/命令面板是否已经打开（防止连续按键把弹层叠起来）。
+  bool _snippetSheetOpen = false;
+
+  /// 从本地存储读一份快捷指令。
+  ///
+  /// **[fix 2026-10-18] 必须在面板打开时再读一次，不能只靠 initState 那一次。**
+  /// 真实缺陷：本组件常驻在 IndexedStack 里（`main_shell` 的三个一级页都保活），
+  /// State 永不复建，于是 initState 读到的是**App 启动那一刻**的快照。用户在
+  /// 「设置 → 快捷指令」里新建/删除之后回到对话页，面板里看到的还是旧列表 ——
+  /// 新建的看不到、删掉的还在。用户的原话是"快捷指令没地方使用"，根因就在这里。
+  ///
+  /// 读失败时**保留现有列表**（不清空）：一次瞬时 IO 失败不该让用户以为自己的
+  /// 指令没了。
   Future<void> _loadLocalSnippets() async {
+    List<LocalSnippet> list;
     try {
-      final list = await StorageService.loadLocalSnippets();
-      if (!mounted || list.isEmpty) return;
-      setState(() => _localSnippets = list);
+      list = await StorageService.loadLocalSnippets();
     } catch (_) {
-      // 读不出来就当没有：本地条目是**增量**能力，它读不出来不该影响网关下发的
-      // 那批模板与斜杠命令，也不该在输入区弹一个用户无法处理的错误。
+      // 读不出来就维持现状：本地条目是**增量**能力，它读不出来不该影响网关下发
+      // 的那批模板与斜杠命令，也不该在输入区弹一个用户无法处理的错误。
+      return;
     }
+    if (!mounted) return;
+    setState(() => _localSnippets = list);
   }
 
   @override
@@ -1379,7 +1403,15 @@ class _ChatComposerState extends State<ChatComposer> {
           isDense: true,
           contentPadding: const EdgeInsets.fromLTRB(6, 4, 6, 8),
         ),
-        onChanged: (v) => dsh.updateDraft(v),
+        onChanged: (v) {
+          dsh.updateDraft(v);
+          // [feat 2026-10-18] 打一个 `/` 就等于点了斜杠按钮：面板自己弹出来。
+          //
+          // 那个 ⚡ 图标没有文字，是这套功能唯一的入口 —— 用户找不到入口，
+          // 就等于功能不存在。斜杠是用户本来就有的习惯（Slack/Discord/命令
+          // 行），用它把面板带出来，比再加一行 chips 便宜得多。
+          if (v == '/') _maybeOpenSheetOnSlash(dsh);
+        },
         onSubmitted: (_) => _sendMessage(dsh),
       ),
     );
@@ -1564,6 +1596,36 @@ class _ChatComposerState extends State<ChatComposer> {
   ///   模板以前是输入区下方一整条常驻 chips 行，而它属于"想起来才会用"的功能，
   ///   不值得为它常驻一行（那正是改造前打字区被压扁的原因之一）。
   Future<void> _openCommandOrSnippetSheet(DshService dsh) async {
+    // 弹层不可重入：`_snippetSheetOpen` 挡住"打斜杠自动弹 + 立刻再点按钮"
+    // 这种叠层（叠起来的样子是遮罩变深、用户以为界面卡了）。
+    if (_snippetSheetOpen) return;
+    _snippetSheetOpen = true;
+    try {
+      await _openCommandOrSnippetSheetImpl(dsh);
+    } finally {
+      _snippetSheetOpen = false;
+    }
+  }
+
+  /// 输入框里刚打出一个 `/`：把同一个面板带出来。
+  ///
+  /// 放在 postFrame 里是为了不打断这一帧的文本编辑（directly opening a modal
+  /// route mid-onChanged 会让 iOS 输入法状态错乱）。
+  void _maybeOpenSheetOnSlash(DshService dsh) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(_openCommandOrSnippetSheet(dsh));
+    });
+  }
+
+  Future<void> _openCommandOrSnippetSheetImpl(DshService dsh) async {
+    // [fix 2026-10-18] 每次打开都重读一次本地条目。
+    //
+    // 这里多花的是一次本地 IO（毫秒级），换来的是"设置里改完，回对话页立刻
+    // 可用"。此前只在 initState 读一次，本 State 又常驻不重建 —— 于是新建的
+    // 指令要重启 App 才出现在面板里（用户反馈的"没地方使用"）。
+    await _loadLocalSnippets();
+    if (!mounted) return;
     // 两个来源都空时完全走原来的命令面板（行为零变化）；只要有一个有内容，
     // 就进这个合并面板。
     if (dsh.snippets.isEmpty && _localSnippets.isEmpty) {
@@ -1656,7 +1718,43 @@ class _ChatComposerState extends State<ChatComposer> {
                     // 本地快捷指令排在最前（Phase 5.4）：自己写的那几条几乎总是
                     // 比网关下发的通用模板更常用。两者同名也不去重 —— 它们本来就是
                     // 两个来源，各自演化（见 `models/local_snippet.dart` 的文件头）。
-                    if (_localSnippets.isNotEmpty) ...[
+                    if (_localSnippets.isEmpty)
+                      // 本地一条都没有时**不能静默跳过这一组**：用户会以为这个
+                      // 面板里根本没有他的东西。这里给一句解释 + 一个能去建条目的
+                      // 出口（键名供测试定位）。
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 8, 8, 4),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                '还没有本地快捷指令（只在这台手机上）。',
+                                style: TextStyle(
+                                    fontSize: AppText.caption, color: sheetCtx.c.textTertiary),
+                              ),
+                            ),
+                            if (widget.onOpenSnippets != null)
+                              TextButton(
+                                key: const ValueKey('snippet-sheet-open-settings'),
+                                style: TextButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                                  minimumSize: Size.zero,
+                                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                ),
+                                onPressed: () {
+                                  Navigator.of(sheetCtx).pop();
+                                  widget.onOpenSnippets?.call();
+                                },
+                                child: Text(
+                                  '去新建',
+                                  style: TextStyle(
+                                      fontSize: AppText.body, color: sheetCtx.c.accent),
+                                ),
+                              ),
+                          ],
+                        ),
+                      )
+                    else ...[
                       _sheetGroupLabel(sheetCtx, '本地快捷指令'),
                       for (final snip in _localSnippets)
                         ListTile(
@@ -1792,7 +1890,8 @@ class _ChatComposerState extends State<ChatComposer> {
   }
 
   /// 把模板文字 **追加**到输入框（不覆盖已有内容 —— 用户可能已经打了半句）。
-  void _appendSnippetTemplate(DshService dsh, String text) {    final cur = _inputController.text;
+  void _appendSnippetTemplate(DshService dsh, String text) {
+    final cur = _inputController.text;
     _inputController.text = cur.isEmpty ? text : '$cur\n$text';
     _inputController.selection = TextSelection.fromPosition(
       TextPosition(offset: _inputController.text.length),

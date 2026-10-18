@@ -40,6 +40,12 @@ import '../services/attachment_picker.dart';
 class ChatView extends StatefulWidget {
   final VoidCallback? onOpenWorkspaces;
 
+  /// 「去设置建一条快捷指令」——输入区模板面板空态里的出口。
+  ///
+  /// 只有 MainShell 能推设置里的二级页（它持有 Navigator 与 tab 状态），
+  /// 所以这里只转发。为 null 时面板不画那个按钮。
+  final VoidCallback? onOpenSnippets;
+
   // 这里曾经还有 `onOpenSecurity`：安全策略页在一级 tab 时代的跳转回调。
   // 它从未被任何一处 `widget.onOpenSecurity?.call()` 调用过（死参数），而且安全策略
   // 现在是设置里的推入页（见 main_shell / custom_settings_view），连语义也不再成立。
@@ -47,6 +53,7 @@ class ChatView extends StatefulWidget {
   const ChatView({
     super.key,
     this.onOpenWorkspaces,
+    this.onOpenSnippets,
   });
 
   @override
@@ -890,6 +897,8 @@ class _ChatViewState extends State<ChatView> {
             onPickAttach: () => _showAttachSheet(dsh),
             onPickCommand: () => _showCommandSheet(dsh),
             onPickModel: () => showChatModelSwitchSheet(context, dsh),
+            // 模板面板空态里的「去新建」：设置页的快捷指令二级页。
+            onOpenSnippets: widget.onOpenSnippets,
             // [feat 2026-10-17] 对话权限搬进输入栏（与模型胶囊并排），
             // 会话信息面板的「会话操作」里不再重复它。
             policyLabel: _policyShortLabel(policy),

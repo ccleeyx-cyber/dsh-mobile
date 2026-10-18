@@ -6,9 +6,9 @@ import 'package:dsh_mobile/main.dart';
 import 'package:dsh_mobile/models/task_center.dart';
 import 'package:dsh_mobile/services/dsh_service.dart';
 import 'package:dsh_mobile/theme/app_colors.dart';
-import 'package:dsh_mobile/views/custom_settings_view.dart';
+import 'package:dsh_mobile/views/settings/push_settings_view.dart';
 
-/// 设置页「离线推送 (ntfy)」区块的界面回归测试（v1.14）。
+/// 「离线推送（ntfy）」页的界面回归测试（v1.14；v1.33 搬成设置里的二级页）。
 ///
 /// 钉住的是**用户须知**那一条：网关里填好地址与 topic 只决定"往哪儿发"，
 /// ntfy 是发布/订阅模型 —— 手机上还得有一个客户端订阅同一个 topic，否则
@@ -32,7 +32,7 @@ void main() {
         ],
         child: MaterialApp(
           builder: (ctx, c) => ThemeScope(isDark: false, child: c ?? const SizedBox()),
-          home: const CustomSettingsView(),
+          home: const PushSettingsView(),
         ),
       ),
     );
@@ -47,7 +47,7 @@ void main() {
 
   Future<void> scrollToPush(WidgetTester tester) async {
     await tester.scrollUntilVisible(
-      find.byKey(CustomSettingsView.pushRequirementNoteKey),
+      find.byKey(PushSettingsView.pushRequirementNoteKey),
       400,
       scrollable: find.byType(Scrollable).first,
     );
@@ -60,7 +60,7 @@ void main() {
     await tester.pump();
     await scrollToPush(tester);
 
-    expect(find.byKey(CustomSettingsView.pushRequirementNoteKey), findsOneWidget);
+    expect(find.byKey(PushSettingsView.pushRequirementNoteKey), findsOneWidget);
 
     // 三件用户必须知道的事，逐条断言（少一条这个区块就等于没说）。
     expect(
@@ -109,11 +109,11 @@ void main() {
     expect(find.text('推送已开启'), findsOneWidget);
     // 断言 controller 的值而不是 hint：hint 也是 Text，会被 widgetWithText 误命中。
     expect(
-      tester.widget<TextField>(find.byKey(CustomSettingsView.pushUrlFieldKey)).controller?.text,
+      tester.widget<TextField>(find.byKey(PushSettingsView.pushUrlFieldKey)).controller?.text,
       'https://ntfy.sh',
     );
     expect(
-      tester.widget<TextField>(find.byKey(CustomSettingsView.pushTopicFieldKey)).controller?.text,
+      tester.widget<TextField>(find.byKey(PushSettingsView.pushTopicFieldKey)).controller?.text,
       'my-topic',
     );
     await teardown(tester);
@@ -129,7 +129,7 @@ void main() {
 
     expect(find.text('已保存，留空表示不改动'), findsOneWidget);
     // 网关从不下发 token 本身：字段必须为空、且是密码型。
-    final token = tester.widget<TextField>(find.byKey(CustomSettingsView.pushTokenFieldKey));
+    final token = tester.widget<TextField>(find.byKey(PushSettingsView.pushTokenFieldKey));
     expect(token.controller?.text, '', reason: '已保存的 token 不得回显到界面');
     expect(token.obscureText, isTrue);
     await teardown(tester);

@@ -5,7 +5,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:dsh_mobile/models/local_snippet.dart';
 import 'package:dsh_mobile/services/dsh_service.dart';
+import 'package:dsh_mobile/services/storage_service.dart';
 import 'package:dsh_mobile/services/voice_input_service.dart';
 import 'package:dsh_mobile/theme/app_colors.dart';
 import 'package:dsh_mobile/views/chat_view.dart';
@@ -223,6 +225,52 @@ void main() {
     final controller = tester.widget<TextField>(fieldFinder).controller!;
     expect(controller.text, '已有内容\n总结这周的进展',
         reason: '插入必须**追加**在已有草稿后面，不能覆盖用户打的半句话');
+
+    await teardown(tester);
+  });
+
+  testWidgets('设置里新建的指令不需要重启就出现在面板里（缓存过期回归）', (tester) async {
+    // [regression 2026-10-18] 真实缺陷：本组件常驻在 IndexedStack 里、State 永不
+    // 复建，本地指令只在 initState 读一次 —— 用户在设置里新建之后回到对话页，
+    // 面板里还是空的（或还是旧的那几条），要重启 App 才出现。用户当时的描述
+    // 就是"快捷指令没地方使用"。
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    await pumpChat(tester);
+    await clearField(tester);
+    await tester.pumpAndSettle();
+
+    // 模拟"在设置 → 快捷指令里新建一条"：写入方是另一个页面，与这里不共享 State。
+    await StorageService.saveLocalSnippets(const [
+      LocalSnippet(id: 'l9', label: '刚建的', text: '按这个来'),
+    ]);
+
+    // 不重启、不重新挂载，直接点开面板。
+    await tester.tap(find.byKey(const ValueKey('composer-slash-button')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('刚建的'), findsOneWidget,
+        reason: '面板打开时必须重读本地条目，否则新建的指令要重启才可见');
+
+    await teardown(tester);
+  });
+
+  testWidgets('输入框里打一个 / 自动弹出模板面板（入口不用去找那个 ⚡）', (tester) async {
+    SharedPreferences.setMockInitialValues(<String, Object>{
+      'dsh_local_snippets': jsonEncode([
+        {'id': 'l1', 'label': '周报', 'text': '总结这周的进展', 'tag': ''},
+      ]),
+    });
+    await pumpChat(tester);
+    await clearField(tester);
+    await tester.pumpAndSettle();
+
+    await tester.enterText(fieldFinder, '/');
+    await tester.pump();
+    await tester.pumpAndSettle();
+
+    expect(find.text('命令与模板'), findsOneWidget,
+        reason: '斜杠是用户本来就有的习惯，用它把面板带出来，比再加一行常驻 chips 便宜');
+    expect(find.text('周报'), findsOneWidget);
 
     await teardown(tester);
   });
