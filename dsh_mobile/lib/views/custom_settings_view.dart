@@ -7,6 +7,8 @@ import '../services/dsh_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_spacing.dart';
 import '../main.dart';
+import 'alerts_view.dart';
+import 'runbook_view.dart';
 import 'security_permissions_view.dart';
 import 'settings/about_view.dart';
 import 'settings/connectivity_view.dart';
@@ -108,6 +110,33 @@ class CustomSettingsView extends StatelessWidget {
           ),
           const SizedBox(height: AppSpace.xl),
 
+          // [v1.35] 运维入口：Runbook 与告警。它们回答的是"人不在电脑前，
+          // 还能不能把机器照顾好"，与"连接是否通畅"是同一层的问题。
+          SettingsSectionHeader(
+            title: '运维',
+            icon: Icons.build_outlined,
+            color: context.c.warning,
+          ),
+          const SizedBox(height: AppSpace.m),
+          SettingsNavCard(
+            key: const ValueKey('settings-open-runbook'),
+            icon: Icons.terminal_rounded,
+            title: 'Runbook',
+            subtitle: '电脑上写好的排障指令，手机一键执行',
+            onTap: () => _push(context, const RunbookView()),
+          ),
+          const SizedBox(height: AppSpace.m),
+          SettingsNavCard(
+            key: const ValueKey('settings-open-alerts'),
+            icon: Icons.notification_important_outlined,
+            title: '告警',
+            subtitle: dsh.alertUnread > 0
+                ? '${dsh.alertUnread} 条未读'
+                : '回合失败 / 引擎掉线 / 作业失败',
+            badge: dsh.alertUnread > 0 ? '${dsh.alertUnread}' : null,
+            onTap: () => _push(context, const AlertsView()),
+          ),
+          const SizedBox(height: AppSpace.xl),
           // 1. 通知：本地通知状态与离线推送**必须挨着**。它们是同一件事的两条
           //    路径（App 活着时本地弹，App 死了走 ntfy），旧版被安全策略卡隔开，
           //    用户在两张卡之间来回看也拼不出完整因果。

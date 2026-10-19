@@ -3779,6 +3779,108 @@ class DshService extends ChangeNotifier {
     }
   }
 
+  // ---- [v1.35 / 3.1 + 3.3] Runbook 与告警 ----
+
+  List<Map<String, dynamic>> _runbooks = const [];
+  List<Map<String, dynamic>> _alerts = const [];
+  int _alertUnread = 0;
+  String? _runbookError;
+
+  List<Map<String, dynamic>> get runbooks => _runbooks;
+  List<Map<String, dynamic>> get alerts => _alerts;
+  int get alertUnread => _alertUnread;
+  String? get runbookError => _runbookError;
+
+  /// 拉 Runbook 列表。返回错误文案（成功为 null）。
+  Future<String?> refreshRunbooks() async {
+    if (_currentConfig == null) return '尚未连接网关';
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/runbooks');
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return '认证失败';
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      final list = (data['runbooks'] as List<dynamic>? ?? const [])
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList(growable: false);
+      _runbooks = list;
+      _runbookError = data['error']?.toString();
+      notifyListeners();
+      return _runbookError;
+    } catch (e) {
+      debugPrint('[DshService] refreshRunbooks error: $e');
+      _runbookError = '$e';
+      notifyListeners();
+      return _runbookError;
+    }
+  }
+
+  /// 执行一条 Runbook。返回网关原始结果（含 outputTail / exitCode / code）。
+  Future<Map<String, dynamic>?> runRunbookCommand(String id, {bool confirm = false, String? sessionId}) async {
+    if (_currentConfig == null) return null;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/runbooks/run');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: {..._authHeaders, 'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'id': id,
+              if (confirm) 'confirm': true,
+              if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
+            }),
+          )
+          .timeout(const Duration(seconds: 40));
+      if (_checkResponseAuth(res)) return {'ok': false, 'code': 'auth'};
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      return data is Map ? Map<String, dynamic>.from(data) : null;
+    } catch (e) {
+      debugPrint('[DshService] runRunbookCommand error: $e');
+      return {'ok': false, 'code': 'network', 'error': '$e'};
+    }
+  }
+
+  Future<void> refreshAlerts() async {
+    if (_currentConfig == null) return;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/alerts');
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return;
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      _alerts = (data['alerts'] as List<dynamic>? ?? const [])
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList(growable: false);
+      _alertUnread = data['unread'] is int ? data['unread'] as int : 0;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('[DshService] refreshAlerts error: $e');
+    }
+  }
+
+  Future<int> markAlertsRead({List<String> ids = const [], bool all = false}) async {
+    if (_currentConfig == null) return 0;
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/alerts/read');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: {..._authHeaders, 'Content-Type': 'application/json'},
+            body: jsonEncode({'ids': ids, 'all': all}),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return 0;
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      final changed = data['changed'] is int ? data['changed'] as int : 0;
+      _alertUnread = data['unread'] is int ? data['unread'] as int : _alertUnread;
+      notifyListeners();
+      return changed;
+    } catch (e) {
+      debugPrint('[DshService] markAlertsRead error: $e');
+      return 0;
+    }
+  }
+
   // ---- 一键诊断 / 子代理中断 / goal 控制 / slash 命令 [feat 2026-10-12] ----
 
   // ---- [v1.35 / 1.5] 云隧道（cloudflared quick tunnel） ----

@@ -51,9 +51,11 @@ import {
   claimsExtensionRoute,
   extractToolCallFiles
 } from './extensions.mjs';
-import { discoverGitRepos } from './host-ops.mjs';
+import { discoverGitRepos, runQuickCommand } from './host-ops.mjs';
 import { ensureCertificate, localHosts } from './tls.mjs';
 import { ensureCloudflared, createQuickTunnel } from './tunnel.mjs';
+import { loadRunbooksFile, runRunbook, allowedBinariesFromEnv } from './runbook.mjs';
+import { createAlertEngine } from './alerts.mjs';
 import {
   BRIDGE_VERSION,
   MAX_BODY_SIZE,
@@ -285,6 +287,9 @@ export function apply(ctx, config = {}, internals = {}) {
     ?? process.env.BRIDGE_HOST
     ?? '127.0.0.1';
   const dshHomeDir = dshHome();
+
+  /** [v1.35 / 3.1] Runbook 数据文件（用户可直接编辑）。 */
+  const runbookFile = path.join(dshHomeDir, 'mobile-access', 'runbooks.yaml');
 
   ensureDataDir();
 
@@ -940,6 +945,23 @@ export function apply(ctx, config = {}, internals = {}) {
       logger
     }).catch((err) => logger.warn('[dsh-mobile-bridge] ntfy 推送异常: %s', err?.message || err));
   }
+
+  /* ------------------------------------------------------------------ *
+   * [v1.35 / 3.3] 告警引擎
+   *
+   * critical 走 ntfy（只有它值得把人吵醒），warning 只进收件箱。
+   * 去重与容量都在 alerts.mjs 里，这里只提供落盘路径与推送出口。
+   * ------------------------------------------------------------------ */
+
+  const alertEngine = createAlertEngine({
+    stateFile: path.join(dshHomeDir, 'mobile-access', 'alerts-state.json'),
+    push: (alert) => pushNtfy('alert', {
+      title: alert.title,
+      summary: alert.message,
+      sessionId: alert.sessionId
+    }),
+    logger
+  });
 
   /**
    * Send a test push; returns whether ntfy accepted it.
@@ -2136,6 +2158,12 @@ export function apply(ctx, config = {}, internals = {}) {
       muxReconnectTimer = setTimeout(connectUpstreamMux, 3000);
       // Don't hold the event loop open just to retry an upstream link.
       muxReconnectTimer.unref?.();
+      // [v1.35 / 3.3] 引擎连接丢失是 critical：手机在外面收不到任何会话事件，
+      // 而界面上只表现为"没动静"。10 分钟去重窗口覆盖正常的重连抖动。
+      alertEngine.ingest({
+        rule: 'heartbeat_lost',
+        message: '与引擎的上游连接断开，正在重试'
+      });
     });
 
     upstreamMuxWs.on('error', (err) => {
@@ -2261,6 +2289,12 @@ export function apply(ctx, config = {}, internals = {}) {
                 error: end.text || '本轮执行失败',
                 errorCode: end.code || 'UNKNOWN',
                 turnEnded: true
+              });
+              // [v1.35 / 3.3] 回合失败进告警收件箱（10 分钟内同会话只记一条）。
+              alertEngine.ingest({
+                rule: 'turn_error',
+                sessionId: sId,
+                message: end.text || '本轮执行失败'
               });
             }
             broadcastToMobileClients({ type: 'done', sessionId: sId, reason: end.kind, message: end.text });
@@ -3675,6 +3709,107 @@ export function apply(ctx, config = {}, internals = {}) {
 
 
     try {
+      // [v1.35 / 3.3] 告警收件箱
+      if (pathname === '/api/mobile/alerts' && req.method === 'GET') {
+        sendJson(200, {
+          ok: true,
+          alerts: alertEngine.list(),
+          unread: alertEngine.unreadCount
+        });
+        return;
+      }
+      if (pathname === '/api/mobile/alerts/read' && req.method === 'POST') {
+        const payload = jsonBody || {};
+        const changed = alertEngine.markRead(
+          Array.isArray(payload.ids) ? payload.ids.map(String) : [],
+          { all: payload.all === true }
+        );
+        sendJson(200, { ok: true, changed, unread: alertEngine.unreadCount });
+        return;
+      }
+
+      // [v1.35 / 3.1] Runbook：手机上一键执行电脑上写好的排障命令。
+      // 执行走 host-ops 的既有执行器（无 shell、有超时与输出上限），
+      // 命令本身在 runbook.mjs 里过白名单与元字符检查。
+      if (pathname === '/api/mobile/runbooks' && req.method === 'GET') {
+        const loaded = loadRunbooksFile(runbookFile, {
+          parseYaml: (text) => YAML.parse(text),
+          allowedBinaries: allowedBinariesFromEnv()
+        });
+        sendJson(200, {
+          ok: loaded.ok !== false,
+          runbooks: (loaded.entries || []).map((e) => ({
+            id: e.id,
+            name: e.name,
+            description: e.description,
+            command: e.command,
+            danger: e.danger,
+            confirmRequired: e.confirmRequired,
+            outputTail: e.outputTail
+          })),
+          errors: loaded.errors || [],
+          error: loaded.error || null
+        });
+        return;
+      }
+
+      if (pathname === '/api/mobile/runbooks/run' && req.method === 'POST') {
+        const payload = jsonBody || {};
+        const wanted = String(payload.id || '').trim();
+        if (!wanted) {
+          sendJson(400, { ok: false, error: '缺少 id' });
+          return;
+        }
+        const loaded = loadRunbooksFile(runbookFile, {
+          parseYaml: (text) => YAML.parse(text),
+          allowedBinaries: allowedBinariesFromEnv()
+        });
+        if (loaded.ok === false && !(loaded.entries || []).length) {
+          sendJson(500, { ok: false, error: loaded.error || 'Runbook 不可用' });
+          return;
+        }
+        const entry = (loaded.entries || []).find((e) => e.id === wanted || e.name === wanted);
+        if (!entry) {
+          sendJson(404, { ok: false, error: '没有这条 Runbook' });
+          return;
+        }
+        // 高危条目必须显式确认：App 侧弹窗后把 confirm:true 带上来。
+        if (entry.confirmRequired && payload.confirm !== true) {
+          sendJson(409, {
+            ok: false,
+            code: 'confirm-required',
+            error: '这条命令需要二次确认',
+            entry: { id: entry.id, name: entry.name, command: entry.command, danger: entry.danger }
+          });
+          return;
+        }
+
+        const sessionId = String(payload.sessionId || '').trim();
+        const cwd = (sessionId && readSessionCwd(sessionId)) || dshHomeDir;
+        const result = await runRunbook(cwd, entry, {
+          run: runQuickCommand,
+          timeoutMs: 20000,
+          maxBytes: 256 * 1024
+        });
+        audit('runbook/run', {
+          id: entry.id,
+          name: entry.name,
+          ok: result.ok,
+          exitCode: result.exitCode ?? null
+        });
+        sendJson(200, {
+          ok: result.ok,
+          code: result.error || null,
+          exitCode: result.exitCode ?? null,
+          timedOut: result.timedOut === true,
+          durationMs: result.durationMs ?? null,
+          outputTail: result.outputTail ?? '',
+          truncated: result.truncated === true,
+          entry: { id: entry.id, name: entry.name, command: entry.command }
+        });
+        return;
+      }
+
       // [v1.35 / 2.1] 通知栏一键审批。必须在 jsonBody 解析之后注册。
       // 只读设备由上面的 deny-by-default 闸门挡住（POST 一律拒绝）。
       if (pathname === '/api/mobile/approvals/decide' && req.method === 'POST') {
