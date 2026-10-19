@@ -1002,6 +1002,85 @@ export function createFollowerRegistry({ map = new Map(), onSubscribe } = {}) {
  * ------------------------------------------------------------------ */
 
 /**
+ * 单次审批令牌的生命周期（v1.35 / 2.1）。
+ *
+ * 为什么要有它：锁屏通知上的「批准」按钮需要一条能在**没有会话上下文**的情况
+ * 下发出、又只对某一条审批有效的凭据。设备 token 太宽（能批准任何一条、直到
+ * 被撤销），一次性令牌把爆炸半径限制在「这一条 + 15 分钟」。
+ *
+ * 设计约束：
+ *  - 明文令牌只在铸造时返回一次，存储层只留 SHA-256（进程内 Map，不落盘）；
+ *  - 消费后同向重复请求返回 consumed（幂等），反向请求是冲突 —— 因为一个通知
+ *    可能被连点两下，但「先批后拒」不该悄悄生效；
+ *  - 过期与消费是两件事：过期后连幂等都不成立。
+ *
+ * 抽成纯工厂是为了可单测（注入 now），不依赖网关闭包。
+ */
+export const APPROVAL_TOKEN_TTL_MS = 15 * 60 * 1000;
+
+export function createApprovalTokens({ ttlMs = APPROVAL_TOKEN_TTL_MS, now = () => Date.now() } = {}) {
+  const secrets = new Map();
+  const digest = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
+
+  return {
+    /** 铸一枚一次性令牌，返回明文（调用方负责只发给授权客户端）。 */
+    mint(id) {
+      const token = crypto.randomBytes(24).toString('base64url');
+      secrets.set(id, {
+        hash: digest(token),
+        expiresAt: now() + ttlMs,
+        consumedAt: 0,
+        decision: ''
+      });
+      return token;
+    },
+
+    /**
+     * 校验（不消费）。
+     * @returns {{ok: boolean, code: 'ok'|'unknown'|'expired'|'mismatch'|'consumed', decision?: string}}
+     */
+    check(id, token) {
+      const s = secrets.get(id);
+      if (!s) return { ok: false, code: 'unknown' };
+      if (now() > s.expiresAt) return { ok: false, code: 'expired' };
+      if (s.hash !== digest(token ?? '')) return { ok: false, code: 'mismatch' };
+      if (s.consumedAt) return { ok: false, code: 'consumed', decision: s.decision };
+      return { ok: true, code: 'ok' };
+    },
+
+    /** 标记消费（'approve' | 'deny'）。不存在返回 false。 */
+    consume(id, decision) {
+      const s = secrets.get(id);
+      if (!s) return false;
+      s.consumedAt = now();
+      s.decision = decision;
+      return true;
+    },
+
+    /** 清掉过期超过一分钟的条目，避免长跑进程中 map 无限增长。 */
+    prune() {
+      const t = now();
+      for (const [key, s] of secrets) {
+        if (s.expiresAt + 60_000 < t) secrets.delete(key);
+      }
+    },
+
+    get size() { return secrets.size; }
+  };
+}
+
+/**
+ * 哪些审批允许「通知栏一键批准」。
+ *
+ * `danger-full-access` 下命令不再逐条确认，如果通知栏还能一键放行，一次误触
+ * 就等于让 Agent 在完全访问策略里执行任意命令。所以这类审批**不铸令牌**，
+ * 必须回 App 内看清命令原文再确认。
+ */
+export function isSensitiveApprovalPolicy(policy) {
+  return String(policy || '').trim() === 'danger-full-access';
+}
+
+/**
  * Pending approvals queue.
  *
  * `map` may be injected so an entry keeps ownership of the live collection it

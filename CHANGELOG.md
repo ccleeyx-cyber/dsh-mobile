@@ -7,6 +7,87 @@
 
 ---
 
+## [1.35.0] - 2026-10-19
+
+一个「出门也能干活」的版本：加密通道、锁屏一键审批、Runbook 与告警收件箱。
+四个功能都是同一个问题的不同侧面 —— 人不在电脑前时，Agent 还能不能继续跑。
+
+> ⚠️ **网关侧改动需重启 dsh web 后生效**：TLS 监听与证书、配对指纹下发、
+> cloudflared 托管、Runbook 路由、告警引擎、审批令牌与 decide 端点。App 侧
+> 改动随本版 APK 生效。
+
+### 新增（安全通道 · 网关侧）
+
+- **自签 TLS（3443）+ TOFU 指纹**：`lib/tls.mjs` 零依赖签发 ECDSA P-256 自签证书
+  （幂等复用、SAN 变化重签、旧证书备份、私钥 0600）；`/health` 回 `tlsPort` 与
+  `certFingerprint`；`/pair/qr`、`/pair/info`、设置页二维码统一携带指纹。
+  - 明文 3088 **行为不变**：TLS 是新增端口不是替换，老配置零回归。
+  - `BRIDGE_TLS_PORT=0` 可关闭；端口被占用只 warn，不阻断明文端口。
+- **App 侧 TOFU**：`services/cert_trust.dart` 三态（首次信任 / 匹配 / 变更需确认），
+  按「网关 × 通道」分条存 Keystore；指纹变化时**拦截连接并停止自动重连**，
+  在「远程访问」页面展示新旧指纹供用户判断。
+- **cloudflared quick tunnel 托管**：`lib/tunnel.mjs` 固定版本下载（sha256 或
+  头部校验、失败不阻塞启动、系统 curl 兜底）、地址解析、进程随宿主退出。
+  - 就绪判定以 `Registered tunnel connection` 为准：先打印域名再连边缘，
+    边缘握手失败时域名是死的（访问会得到 Cloudflare 1033），不能报 ready。
+  - `DSH_CLOUDFLARED_PATH` 可直接复用已装好的二进制。
+- **「远程访问」二级页**：隧道开关与当前地址、远程地址配置（**强制 https**，
+  明文远程直接拒绝）、证书指纹与变更确认。远程保存在独立 profile
+  （`<id>-remote`）里，局域网那条仍然保留，可一键切回。
+
+### 新增（锁屏即时审批 · 网关侧 + App）
+
+- **单次审批令牌**：审批入队时铸造 24 字节令牌（15 分钟 TTL、只存 SHA-256），
+  新增 `POST /api/mobile/approvals/decide`，结构化错误码
+  `unknown / expired / mismatch / consumed / conflict / sensitive / engine-rejected`。
+  同向重复请求幂等（`alreadyApplied`），反向请求 409。
+- **敏感审批不给令牌**：`danger-full-access` 策略下的审批 `approvalToken: null`，
+  通知不出现批准按钮，必须回 App 看命令原文 —— 一次误触不该等于无确认执行。
+- **通知动作按钮**：审批通知带 批准 / 拒绝 / 稍后 三个动作；动作直接调 decide
+  端点（不经过 device token），结果显示为一条简短通知。稍后只收起通知、不答复
+  网关，回 App 里仍能看到审批。
+- **审计不含明文令牌**：`approval/requested` 记录会剥掉 token。
+
+### 新增（运维台 · 网关侧 + App）
+
+- **Runbook**：`lib/runbook.mjs` + `~/.dsh/mobile-access/runbooks.yaml`。
+  命令在网关侧执行，**不过 shell**：管道/重定向/连接符一律拒绝，二进制走白名单
+  （`DSH_RUNBOOK_ALLOW` 可扩展），`danger: high` 强制二次确认，输出只回尾部 N 行。
+  改完 YAML 刷新即生效。App 侧「Runbook」页展示命令原文、高危弹确认、结果带
+  退出码与耗时。
+- **告警引擎**：`lib/alerts.mjs` + `~/.dsh/mobile-access/alerts-state.json`。
+  四条规则（回合失败 / 上下文过高 / 引擎掉线 / 作业失败），10 分钟去重窗口，
+  只有 critical 走 ntfy 推送。App 侧新增「告警」收件箱与未读徽标。
+
+### 修复（真机验证中暴露）
+
+- **下载通道单点**：Node 的 https 在 `release-assets.githubusercontent.com`
+  上被 EOF 断开（curl 可下），下载增加文件直写与系统 curl 兜底。
+- **隧道状态撒谎**：此前解析到域名就报「已开通」，边缘连不上时用户看到的是一个
+  永远打不开的地址；现在边缘失败如实降级并保留原因，status 端点也不再把失败
+  回落成 idle。
+
+### 验证
+
+- 网关：`npm test` 491 项，489 通过（2 项 POSIX 权限用例在 Windows 跳过）。
+- App：`flutter analyze` 零问题；`flutter test` 全绿。
+- 真机（2026-10-19，用户执行重启后）：HTTPS 3443 健康检查通过、配对指纹三处
+  一致、明文 3088 零回归、WSS 真实握手成功。
+
+### 已知边界
+
+- **桌面小组件（原计划 3.5）本期未交付**：需要 Android SDK 编译与真机渲染验证，
+  当前环境两者都不具备。按仓库自身纪律（v1.27.1 的教训：没上真机就发版会出事），
+  不盲写原生代码，留到下一版。
+- **quick tunnel 在受限网络不可用**：本机到 Cloudflare 边缘的 TLS 握手被 EOF
+  断开（QUIC 与 http2、直连与本地代理都试过）。功能实现完整，换网络即可用；
+  国内长期使用建议 Tailscale 或自有反向代理（把 NPS 目标改到 3443 的 TLS
+  端口即可让现有隧道变成 HTTPS）。
+- **App 侧动作按钮未做真机验证**：无 SDK 无法出包，随本版发布后由用户验证。
+  客户端逻辑已有单测覆盖（令牌解析、按钮门槛、错误码文案）。
+
+---
+
 ## [1.34.1] - 2026-10-18
 
 ### 修复（用户反馈：⚡ 面板最底下吊着一行「提示词模板」）

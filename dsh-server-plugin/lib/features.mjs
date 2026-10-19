@@ -1209,6 +1209,15 @@ export function pushForEvent(kind, detail = {}) {
         tags: ['warning'],
         sessionId: detail.sessionId
       };
+    case 'alert':
+      // 告警引擎已按严重级筛过：只有 critical 才会走到这里（v1.35 / 3.3）。
+      return {
+        title: detail.title || '网关告警',
+        body: detail.summary || '需要你查看',
+        priority: 5,
+        tags: ['rotating_light'],
+        sessionId: detail.sessionId
+      };
     default:
       return null;
   }
