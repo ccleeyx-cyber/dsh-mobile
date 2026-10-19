@@ -56,6 +56,7 @@ import { ensureCertificate, localHosts } from './tls.mjs';
 import { ensureCloudflared, createQuickTunnel } from './tunnel.mjs';
 import { loadRunbooksFile, runRunbook, allowedBinariesFromEnv } from './runbook.mjs';
 import { createAlertEngine } from './alerts.mjs';
+import { ensureApk } from './apk-source.mjs';
 import {
   BRIDGE_VERSION,
   MAX_BODY_SIZE,
@@ -2895,6 +2896,10 @@ export function apply(ctx, config = {}, internals = {}) {
   /** 最近一次隧道启动失败的原因（status 如实上报，避免 App 显示成 idle）。 */
   let lastTunnelError = '';
 
+  /* ---- [v1.35 / W-A] APK 自动取回的并发与冷却 ---- */
+  let apkFetchInFlight = null;
+  let apkFetchFailedAt = 0;
+
   /** 用系统 curl 下载（另一套 TLS 栈，用来绕过 Node 的握手被断）。 */
   function curlDownload(url, file) {
     return new Promise((resolve, reject) => {
@@ -3134,11 +3139,36 @@ export function apply(ctx, config = {}, internals = {}) {
       );
 
       if (!fs.existsSync(apkPath)) {
-        sendJson(404, {
-          error: 'APK file not found on server',
-          hint: 'public/dsh-agent.apk 未投放（APK 不入版本库，需手动或 CI 放置）'
-        });
-        return;
+        // [v1.35 / W-A] 分发单真源：本地没有包时从最新 Release 自动取回并校验缓存。
+        // 这是 1.31.1「Release 更新了、网关还在发旧包」的正面修复。
+        //
+        // 防滥用：同一时刻只允许一个取回任务（并发请求共享它），失败后 60 秒内
+        // 不再重试（否则任何人反复请求这个公开路由都能把 GitHub 拖成放大器）。
+        if (!apkFetchInFlight && Date.now() - apkFetchFailedAt > 60_000) {
+          apkFetchInFlight = ensureApk({
+            dest: apkPath,
+            fetchText: async (u) => (await fetchUrlBytes(u)).toString('utf8'),
+            downloadToFile
+          }).then((r) => {
+            if (!r.ok) apkFetchFailedAt = Date.now();
+            else audit('apk/auto_fetch', {
+              version: r.manifest?.version || '',
+              size: fs.existsSync(apkPath) ? fs.statSync(apkPath).size : null
+            });
+            return r;
+          }).finally(() => { apkFetchInFlight = null; });
+        }
+        const fetched = apkFetchInFlight
+          ? await apkFetchInFlight
+          : { ok: false, error: '刚刚取回失败，60 秒后自动重试' };
+
+        if (!fetched.ok) {
+          sendJson(404, {
+            error: 'APK file not found on server',
+            hint: `${fetched.error || '本地没有安装包'}；也可手动放置 public/dsh-agent.apk`
+          });
+          return;
+        }
       }
 
       // [fix 2026-10-11] This whole block sits OUTSIDE the big try below, and
