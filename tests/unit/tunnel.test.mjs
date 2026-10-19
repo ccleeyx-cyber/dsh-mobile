@@ -144,9 +144,51 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
     fake.stderr.emit('data', Buffer.from('INF Starting tunnel\n'));
     fake.stderr.emit('data', Buffer.from('INF |  https://alpha-beta-77.trycloudflare.com  |\n'));
 
-    assert.equal(tunnel.status, 'ready');
+    // 只拿到域名不算 ready：quick tunnel 先打印域名、再去连边缘，域名可能死。
+    assert.equal(tunnel.status, 'starting');
     assert.equal(tunnel.url, 'https://alpha-beta-77.trycloudflare.com');
     assert.deepEqual(urls, ['https://alpha-beta-77.trycloudflare.com']);
+
+    fake.stderr.emit('data', Buffer.from('INF Registered tunnel connection connIndex=0\n'));
+    assert.equal(tunnel.status, 'ready');
+  });
+
+  it('边缘握手失败要如实降级为 failed 并保留原因', () => {
+    const fake = new EventEmitter();
+    fake.stdout = new EventEmitter();
+    fake.stderr = new EventEmitter();
+    fake.kill = () => {};
+
+    const tunnel = createQuickTunnel({
+      binary: '/fake/cloudflared',
+      spawnFn: () => fake,
+      logger: { warn() {} }
+    });
+    tunnel.start();
+    fake.stderr.emit('data', Buffer.from('https://dead-addr.trycloudflare.com'));
+    fake.stderr.emit('data', Buffer.from(
+      'ERR Unable to establish connection with Cloudflare edge error="TLS handshake with edge error: EOF" connIndex=0\n'
+    ));
+
+    assert.equal(tunnel.status, 'failed');
+    assert.equal(tunnel.url, '', '连不上边缘的域名不能继续广播');
+    assert.match(tunnel.lastError, /TLS handshake with edge error/);
+  });
+
+  it('默认启动参数带 http2 与 IPv4 边缘', () => {
+    const spawned = [];
+    const fake = new EventEmitter();
+    fake.stdout = new EventEmitter();
+    fake.stderr = new EventEmitter();
+    fake.kill = () => {};
+    createQuickTunnel({
+      binary: '/fake/cloudflared',
+      spawnFn: (_bin, args) => { spawned.push(args); return fake; },
+      logger: { warn() {} }
+    }).start();
+    assert.equal(spawned.length, 1);
+    assert.ok(spawned[0].includes('--protocol') && spawned[0].includes('http2'));
+    assert.ok(spawned[0].includes('--edge-ip-version') && spawned[0].includes('4'));
   });
 
   it('进程退出后地址作废并回调 onExit', () => {

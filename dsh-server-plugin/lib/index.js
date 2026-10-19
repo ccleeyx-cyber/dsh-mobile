@@ -2745,8 +2745,74 @@ export function apply(ctx, config = {}, internals = {}) {
    * ------------------------------------------------------------------ */
 
   let quickTunnel = null;
+  /** 最近一次隧道启动失败的原因（status 如实上报，避免 App 显示成 idle）。 */
+  let lastTunnelError = '';
 
-  /** 一次性 HTTP(S) 下载（跟随 GitHub 的 302 到 objects.githubusercontent.com）。 */
+  /** 用系统 curl 下载（另一套 TLS 栈，用来绕过 Node 的握手被断）。 */
+  function curlDownload(url, file) {
+    return new Promise((resolve, reject) => {
+      const bin = process.platform === 'win32' ? 'curl.exe' : 'curl';
+      execFile(bin, ['-sSL', '--max-time', '300', '--retry', '1', '-o', file, url], {
+        windowsHide: true,
+        maxBuffer: 1024 * 1024
+      }, (error, _stdout, stderr) => {
+        if (error) {
+          const detail = String(stderr || error.message || '').trim().slice(0, 200);
+          reject(new Error(`curl 下载失败：${detail || '未知错误'}`));
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * 下载 60MB 的 cloudflared 到文件。
+   *
+   * 为什么要 curl 兜底：本机实测 Node 的 https 在
+   * `release-assets.githubusercontent.com` 上会被网络中断
+   * （Client network socket disconnected before secure TLS connection was
+   * established），而同一台机器上的 curl 能完整下载。这不是代码 bug，是两条
+   * 网络路径的差异——但用户要的是「隧道能用」，所以退化到系统 curl 是正确取舍。
+   */
+  async function downloadToFile(url, file) {
+    try {
+      await new Promise((resolve, reject) => {
+        const attempt = (u, redirects = 3) => {
+          let parsed;
+          try { parsed = new URL(u); } catch (err) { reject(err); return; }
+          const transport = parsed.protocol === 'https:' ? https : http;
+          const req = transport.get(parsed, { timeout: 60000 }, (res) => {
+            const status = res.statusCode ?? 0;
+            if ([301, 302, 303, 307, 308].includes(status) && res.headers.location && redirects > 0) {
+              res.resume();
+              attempt(String(new URL(res.headers.location, parsed)), redirects - 1);
+              return;
+            }
+            if (status !== 200) {
+              res.resume();
+              reject(new Error(`下载失败 HTTP ${status}`));
+              return;
+            }
+            const out = fs.createWriteStream(file);
+            res.pipe(out);
+            out.on('finish', () => out.close(() => resolve()));
+            out.on('error', reject);
+            res.on('error', reject);
+          });
+          req.on('error', reject);
+          req.on('timeout', () => { try { req.destroy(); } catch (_) {} reject(new Error('下载超时')); });
+        };
+        attempt(url);
+      });
+    } catch (err) {
+      logger.warn('[dsh-mobile-bridge] Node 下载 cloudflared 失败（%s），改用 curl 兜底', err?.message ?? err);
+      try { fs.rmSync(file, { force: true }); } catch (_) {}
+      await curlDownload(url, file);
+    }
+  }
+
+  /** 一次性 HTTP(S) 下载（跟随 GitHub 的 302 到 release-assets/objects）。 */
   function fetchUrlBytes(url, redirects = 3) {
     return new Promise((resolve, reject) => {
       let parsed;
@@ -2779,7 +2845,9 @@ export function apply(ctx, config = {}, internals = {}) {
       status: quickTunnel?.status ?? 'idle',
       url: quickTunnel?.url ?? '',
       target: tlsPort > 0 ? `https://127.0.0.1:${tlsPort}` : null,
-      error: quickTunnel?.lastError ?? ''
+      // 上一次启动失败的原因要一直挂着，直到下一次尝试：否则 App 只能看到
+      // idle，用户会以为「没点成功」，而不是「点了但下载/启动失败」。
+      error: quickTunnel?.lastError ?? lastTunnelError ?? ''
     };
   }
 
@@ -3268,7 +3336,8 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
       try {
-        const bin = await ensureCloudflared({ fetchBytes: fetchUrlBytes });
+        lastTunnelError = '';
+        const bin = await ensureCloudflared({ fetchToFile: downloadToFile });
         quickTunnel = createQuickTunnel({
           binary: bin.path,
           target: `https://127.0.0.1:${tlsPort}`,
@@ -3289,7 +3358,8 @@ export function apply(ctx, config = {}, internals = {}) {
         sendJson(200, tunnelPayload());
       } catch (err) {
         // 下载失败 / 校验失败都在这里：只降级，不影响局域网与明文端口。
-        logger.warn('[dsh-mobile-bridge] 云隧道启动失败: %s', err?.message ?? err);
+        lastTunnelError = err?.message ?? String(err);
+        logger.warn('[dsh-mobile-bridge] 云隧道启动失败: %s', lastTunnelError);
         sendJson(500, {
           ok: false,
           status: 'failed',

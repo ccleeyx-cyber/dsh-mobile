@@ -77,6 +77,8 @@ function sha256File(file) {
  */
 export async function ensureCloudflared({
   fetchBytes,
+  fetchToFile,
+  binaryPath,
   expectedSha256,
   version = CLOUDFLARED_VERSION,
   platform = process.platform,
@@ -104,6 +106,17 @@ export async function ensureCloudflared({
     return 'header';
   };
 
+  // 0) 用户已经装好了 cloudflared（scoop / choco / 手工下载）：直接用，不下载。
+  //    这是「下载通道被拦」时唯一可靠的出路——实测本机 Node 的 https 在
+  //    release-assets.githubusercontent.com 上握手会被断开，而 curl 能下。
+  const override = String(binaryPath ?? process.env.DSH_CLOUDFLARED_PATH ?? '').trim();
+  if (override) {
+    if (!fs.existsSync(override)) {
+      throw new Error(`DSH_CLOUDFLARED_PATH 指向的文件不存在：${override}`);
+    }
+    return { path: override, downloaded: false, verifiedBy: verify(override) };
+  }
+
   if (fs.existsSync(dest)) {
     try {
       const verifiedBy = verify(dest);
@@ -114,23 +127,31 @@ export async function ensureCloudflared({
     }
   }
 
-  if (typeof fetchBytes !== 'function') {
+  if (typeof fetchBytes !== 'function' && typeof fetchToFile !== 'function') {
     throw new Error('云隧道需要 cloudflared，但当前环境没有下载实现（离线/测试环境）');
   }
 
   fs.mkdirSync(dir, { recursive: true });
   const url = releaseUrl(version, platform);
-  const bytes = await fetchBytes(url);
-  if (!bytes || bytes.length < 1024) {
-    throw new Error(`cloudflared 下载内容过小（${bytes ? bytes.length : 0} 字节），疑似被拦截`);
-  }
 
   // 先写临时文件再 rename：中途失败不会留下一个"看起来存在但只能跑一半"的
   // 可执行文件，下一次启动也就不会误判为已安装。
   const tmp = `${dest}.part`;
-  fs.writeFileSync(tmp, bytes, { mode: 0o755 });
   let verifiedBy;
   try {
+    if (typeof fetchToFile === 'function') {
+      // 60MB 的二进制走文件直写：不经过内存，也方便用 curl 兜底。
+      await fetchToFile(url, tmp);
+    } else {
+      const bytes = await fetchBytes(url);
+      if (!bytes || bytes.length < 1024) {
+        throw new Error(`cloudflared 下载内容过小（${bytes ? bytes.length : 0} 字节），疑似被拦截`);
+      }
+      fs.writeFileSync(tmp, bytes, { mode: 0o755 });
+    }
+    if (!fs.existsSync(tmp) || fs.statSync(tmp).size < 1024) {
+      throw new Error('cloudflared 下载内容过小，疑似被拦截');
+    }
     verifiedBy = verify(tmp);
   } catch (err) {
     // 校验失败必须把 .part 删掉：留着的坏文件既占空间，也让下次安装的
@@ -164,19 +185,46 @@ export function createQuickTunnel({
   let status = 'idle'; // idle | starting | ready | stopped | failed
   let lastError = '';
   let restartTimer = null;
+  let registered = false;
+
+  /**
+   * 只拿到地址不等于隧道可用（实测教训）。
+   *
+   * quick tunnel 会先打印 trycloudflare 域名，然后才尝试连 Cloudflare 边缘；
+   * 在某些网络里边缘的 TLS 握手会被 EOF 断开（本机实测 QUIC 与 http2 都一样），
+   * 此时域名是死的，访问只会得到 Cloudflare 1033。所以 ready 必须以
+   * 「Registered tunnel connection」为准，而不是「解析到域名」。
+   */
+  const EDGE_FAIL = /unable to establish connection with cloudflare edge/i;
+  const REGISTERED = /registered tunnel connection/i;
 
   const emit = (next) => {
     if (next === url) return;
     url = next;
     if (url) {
-      status = 'ready';
+      // 地址变化本身要立刻广播（手机需要知道新域名），但状态仍是 starting，
+      // 直到边缘连接注册成功。
       try { onUrl(url); } catch (err) { logger.warn?.('[tunnel] onUrl 回调异常', err?.message || err); }
     }
   };
 
   const feed = (chunk) => {
-    const found = parseTunnelUrl(String(chunk));
+    const text = String(chunk);
+    const found = parseTunnelUrl(text);
     if (found) emit(found);
+    if (REGISTERED.test(text)) {
+      registered = true;
+      status = 'ready';
+      lastError = '';
+    }
+    if (EDGE_FAIL.test(text)) {
+      // 边缘不可达：把错误如实留住，状态降为 failed（域名留着也没用）。
+      const line = text.split('\n').find((l) => EDGE_FAIL.test(l)) || '';
+      lastError = (line.match(/error="([^"]+)"/)?.[1] || line).trim() || '无法连接 Cloudflare 边缘';
+      status = 'failed';
+      url = '';
+      registered = false;
+    }
   };
 
   function start() {
@@ -188,8 +236,13 @@ export function createQuickTunnel({
     }
     status = 'starting';
     lastError = '';
+    registered = false;
     try {
-      child = spawnFn(binary, args || ['tunnel', '--no-autoupdate', '--url', target], {
+      // --protocol http2：QUIC 在受限网络里常被丢包；--edge-ip-version 4：
+      // 避开不可用的 IPv6 边缘地址（两者都是纯经验值，失败只是更慢，不会更坏）。
+      child = spawnFn(binary, args || [
+        'tunnel', '--no-autoupdate', '--protocol', 'http2', '--edge-ip-version', '4', '--url', target
+      ], {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
         detached: false
@@ -228,6 +281,7 @@ export function createQuickTunnel({
     if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
     status = 'stopped';
     url = '';
+    registered = false;
     if (!child) return;
     try { child.kill('SIGTERM'); } catch (err) { logger.warn?.('[tunnel] kill 失败: %s', err?.message || err); }
     child = null;
