@@ -159,6 +159,35 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
+        // 桌面小组件（v1.35 / 3.5）：Dart 侧推状态快照，原生落盘并刷新部件。
+        // 只有 update / clear 两个动作 —— 部件上的点击一律"打开 App"，
+        // 不存在"从部件直接批准"的入口（见 StatusWidgetProvider 的说明）。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_WIDGET)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "update" -> {
+                        try {
+                            StatusWidgetProvider.save(
+                                applicationContext,
+                                call.arguments as? Map<*, *> ?: emptyMap<String, Any>()
+                            )
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.success(false)
+                        }
+                    }
+                    "clear" -> {
+                        try {
+                            StatusWidgetProvider.clear(applicationContext)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.success(false)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
         // 打开外部 URL（APK 下载直链等）。Dart 侧没有内建的系统浏览器出口，
         // 也不用 url_launcher —— 只为一个动线加一个插件不值。
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_URL)
@@ -290,6 +319,9 @@ class MainActivity : FlutterActivity() {
 
         /** 敏感字段加密存取；实现见 SecureStoreBridge。 */
         private const val CHANNEL_SECURE = "dsh_mobile/secure"
+
+        /** 桌面小组件状态推送（v1.35 / 3.5）。 */
+        private const val CHANNEL_WIDGET = "dsh_mobile/widget"
     }
 }
 

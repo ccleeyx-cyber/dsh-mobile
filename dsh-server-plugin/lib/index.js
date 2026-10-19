@@ -2160,10 +2160,14 @@ export function apply(ctx, config = {}, internals = {}) {
       muxReconnectTimer.unref?.();
       // [v1.35 / 3.3] 引擎连接丢失是 critical：手机在外面收不到任何会话事件，
       // 而界面上只表现为"没动静"。10 分钟去重窗口覆盖正常的重连抖动。
-      alertEngine.ingest({
-        rule: 'heartbeat_lost',
-        message: '与引擎的上游连接断开，正在重试'
-      });
+      // 主动关闭（重启 dsh web）不算故障：否则每次重启都会记一条"引擎丢失"，
+      // 收件箱里堆满自己重启造成的噪音，真出问题时反而看不出来。
+      if (!isDisposed) {
+        alertEngine.ingest({
+          rule: 'heartbeat_lost',
+          message: '与引擎的上游连接断开，正在重试'
+        });
+      }
     });
 
     upstreamMuxWs.on('error', (err) => {

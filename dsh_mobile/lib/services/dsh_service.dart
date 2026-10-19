@@ -20,6 +20,7 @@ import 'draft_store.dart';
 import 'platform_services.dart';
 import 'storage_service.dart';
 import 'notification_service.dart';
+import 'widget_bridge.dart';
 import 'cert_trust.dart';
 import '../models/audit_log.dart';
 import '../models/persona.dart';
@@ -286,6 +287,36 @@ class DshService extends ChangeNotifier {
     // 这个回调要用本类持有的网关配置与 token，且测试里 new DshService() 也应
     // 处于同一条链路上。
     notifications.onNotificationAction = _handleNotificationAction;
+  }
+
+  /// [v1.35 / 3.5] 任何状态变化都顺带喂一次桌面小组件。
+  ///
+  /// 挂在 notifyListeners 而不是散落在十几个状态写入点：漏一个写入点，小组件
+  /// 就会长期显示旧状态，而这种"看起来没事"的陈旧数据比不显示更危险。
+  /// 节流与去重都在 WidgetBridge 里（5 秒 + 内容相同不重复推）。
+  @override
+  void notifyListeners() {
+    super.notifyListeners();
+    _pushWidgetSnapshot();
+  }
+
+  void _pushWidgetSnapshot() {
+    try {
+      final pct = _sessionStats?.contextFraction;
+      final approvals = _pendingApprovals.length;
+      final status = !isConnected
+          ? '未连接'
+          : (isSessionRunning ? '执行中' : '空闲');
+      unawaited(WidgetBridge.push({
+        'title': _currentSession?.title ?? '',
+        'status': status,
+        'context': pct == null ? '' : '${(pct * 100).round()}%',
+        'approvals': approvals,
+      }, force: approvals > 0));
+    } catch (e) {
+      // 小组件是增强能力，任何异常都不能影响主链路。
+      debugPrint('[DshService] 小组件快照失败: $e');
+    }
   }
 
   /// App 是否在前台。由 UI 层的生命周期回调维护。

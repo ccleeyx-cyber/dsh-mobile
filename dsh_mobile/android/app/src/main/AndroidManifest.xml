@@ -114,6 +114,21 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- 桌面小组件（v1.35 / 3.5）：只读展示"有没有活要处理"，点击打开 App。
+             数据由 Flutter 侧经 dsh_mobile/widget 通道推入 SharedPreferences，
+             exported=false：系统桌面能投递 APPWIDGET_UPDATE，其它应用不能。
+             系统重建宿主进程时也能渲染，因为数据不依赖 Dart 侧存活。 -->
+        <receiver
+            android:name=".StatusWidgetProvider"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_status_info" />
+        </receiver>
+
         <!-- 推送通道：低重要性（默认渠道），避免每次事件都弹出横幅打断操作。
              高重要性渠道只在用户主动开启"重要提醒"时使用。 -->
         <meta-data
