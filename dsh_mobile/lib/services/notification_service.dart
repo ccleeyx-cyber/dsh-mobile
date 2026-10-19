@@ -51,6 +51,13 @@ class NotificationService {
   /// MainShell 更早、且不依赖 BuildContext 的位置（main() 里）。
   void Function(String payload)? onSelectNotification;
 
+  /// 通知动作按钮被点按时的回调（v1.35 / 2.3）。
+  ///
+  /// [actionId] 是 approve / deny / defer；[payload] 形如
+  /// `approval:<approvalId>:<token>`。与 [onSelectNotification] 分开是因为语义
+  /// 不同：点按是"打开看看"，动作是"替我做一个有后果的决定"。
+  void Function(String actionId, String payload)? onNotificationAction;
+
   /// 是否已拉起前台保活服务。
   bool get backgroundEnabled => _backgroundOn;
 
@@ -102,10 +109,16 @@ class NotificationService {
           iOS: DarwinInitializationSettings(),
         ),
         onDidReceiveNotificationResponse: (response) {
+          final payload = response.payload ?? '';
+          final actionId = response.actionId;
+          // 动作按钮：用户已经做了决定，直接派发给服务层，不再走"打开会话"。
+          if (actionId != null && actionId.isNotEmpty) {
+            onNotificationAction?.call(actionId, payload);
+            return;
+          }
           // 点按通知 → 回调（App 在前台/后台运行时走这里；冷启动的终止态
           // 由原生 launch intent 携带，见 MainActivity 的处理）。
-          final payload = response.payload;
-          if (payload != null && payload.isNotEmpty) {
+          if (payload.isNotEmpty) {
             onSelectNotification?.call(payload);
           }
         },
@@ -201,6 +214,7 @@ class NotificationService {
     NotificationKind kind = NotificationKind.info,
     bool onlyWhenBackground = true,
     String? payloadSessionId,
+    NotificationApprovalActions? approval,
   }) async {
     if (!_granted) {
       _lastError = '没有通知权限，通知未发出';
@@ -232,11 +246,32 @@ class NotificationService {
             priority: kind == NotificationKind.actionRequired ? Priority.high : Priority.low,
             // 审批/提问是"正在等你"，点进去要能直接处理。
             autoCancel: true,
+            // [v1.35 / 2.3] 锁屏一键裁决。只有拿到一次性令牌的审批才带按钮：
+            // 完全访问策略的审批网关刻意不铸令牌（approval 为 null），
+            // 这类必须进 App 看命令原文。
+            actions: approval == null
+                ? null
+                : [
+                    const AndroidNotificationAction(
+                      'approve', '批准',
+                      showsUserInterface: false, cancelNotification: true,
+                    ),
+                    const AndroidNotificationAction(
+                      'deny', '拒绝',
+                      showsUserInterface: false, cancelNotification: true,
+                    ),
+                    const AndroidNotificationAction(
+                      'defer', '稍后',
+                      showsUserInterface: false, cancelNotification: true,
+                    ),
+                  ],
           ),
         ),
-        payload: payloadSessionId != null && payloadSessionId.isNotEmpty
-            ? 'session:${kind.name}:$payloadSessionId'
-            : kind.name,
+        payload: approval != null
+            ? approval.encodePayload()
+            : (payloadSessionId != null && payloadSessionId.isNotEmpty
+                ? 'session:${kind.name}:$payloadSessionId'
+                : kind.name),
       );
       _lastError = null;
     } catch (e) {
@@ -291,6 +326,32 @@ class NotificationService {
     _backgroundOn = false;
     _lastError = null;
     _seq = 0;
+  }
+}
+
+/// 通知的动作按钮需要的审批凭据（v1.35 / 2.3）。
+///
+/// 只在这里放**一次性令牌**，不放设备 token：通知会被截图、投屏、锁屏预览，
+/// 它承载的权限必须只够处理这一条审批。
+class NotificationApprovalActions {
+  const NotificationApprovalActions({required this.approvalId, required this.token});
+
+  final String approvalId;
+  final String token;
+
+  /// 通知 payload。token 是 base64url（A-Za-z0-9_-），不含冒号，所以
+  /// `approval:<id>:<token>` 三段切分是安全的。
+  String encodePayload() => 'approval:$approvalId:$token';
+
+  /// 反向解析；格式不对返回 null（点按普通通知也会走到解析处）。
+  static NotificationApprovalActions? decodePayload(String payload) {
+    if (!payload.startsWith('approval:')) return null;
+    final parts = payload.split(':');
+    if (parts.length < 3) return null;
+    final id = parts[1].trim();
+    final token = parts.sublist(2).join(':').trim();
+    if (id.isEmpty || token.isEmpty) return null;
+    return NotificationApprovalActions(approvalId: id, token: token);
   }
 }
 

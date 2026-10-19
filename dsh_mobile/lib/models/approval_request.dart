@@ -13,6 +13,15 @@ class ApprovalRequest {
   final List<dynamic>? options;
   final int createdAt;
 
+  /// 通知栏一键批准的一次性令牌（v1.35 / 2.1）。
+  ///
+  /// null 有两种含义：老网关不下发，或这条审批属于完全访问策略（网关刻意不铸）。
+  /// 两者在 UI 上表现一致：不给一键批准按钮，必须回 App 里确认。
+  final String? approvalToken;
+
+  /// 网关标记的敏感审批（完全访问策略下）。
+  final bool sensitive;
+
   ApprovalRequest({
     required this.id,
     required this.eventId,
@@ -25,6 +34,8 @@ class ApprovalRequest {
     this.input,
     this.options,
     required this.createdAt,
+    this.approvalToken,
+    this.sensitive = false,
   });
 
   factory ApprovalRequest.fromJson(Map<String, dynamic> json) {
@@ -60,6 +71,12 @@ class ApprovalRequest {
       input: rawInput,
       options: json['options'] is List ? json['options'] as List<dynamic> : null,
       createdAt: json['createdAt'] is int ? json['createdAt'] as int : DateTime.now().millisecondsSinceEpoch,
+      // [v1.35 / 2.1] 老网关没有这两个字段：token 为 null 时通知不带动作按钮，
+      // 行为与升级前一致（点通知进 App）。
+      approvalToken: (json['approvalToken']?.toString().trim().isEmpty ?? true)
+          ? null
+          : json['approvalToken'].toString().trim(),
+      sensitive: json['sensitive'] == true,
     );
   }
 

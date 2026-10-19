@@ -62,6 +62,8 @@ import {
   noteAuthFailure,
   clearAuthFailures,
   createApprovalQueue,
+  createApprovalTokens,
+  isSensitiveApprovalPolicy,
   createFollowerRegistry,
   createTurnRegistry,
   createPersonaStore,
@@ -2542,7 +2544,7 @@ export function apply(ctx, config = {}, internals = {}) {
                 error: e?.message,
                 outcome: 'downgraded-to-manual'
               });
-              const approval = {
+              const approval = mintApproval({
                 id: eventId,
                 eventId,
                 clientId: currentEventsClientId,
@@ -2551,11 +2553,10 @@ export function apply(ctx, config = {}, internals = {}) {
                 reason,
                 callId,
                 input,
-                options,
-                createdAt: Date.now()
-              };
+                options
+              });
               coreApprovals.put(approval);
-              audit('approval/requested', approval);
+              auditApproval(approval);
               broadcastToMobileClients({ type: 'approval_request', approval });
               pushNtfy('approval', {
                 sessionId,
@@ -2567,7 +2568,7 @@ export function apply(ctx, config = {}, internals = {}) {
             return;
           }
 
-          const approval = {
+          const approval = mintApproval({
             id: eventId,
             eventId,
             clientId: currentEventsClientId,
@@ -2576,12 +2577,11 @@ export function apply(ctx, config = {}, internals = {}) {
             reason,
             callId,
             input,
-            options,
-            createdAt: Date.now()
-          };
+            options
+          });
 
           coreApprovals.put(approval);
-          audit('approval/requested', approval);
+          auditApproval(approval);
           broadcastToMobileClients({
             type: 'approval_request',
             approval
@@ -2613,7 +2613,7 @@ export function apply(ctx, config = {}, internals = {}) {
         });
       } else if (ev.type === 'approval_request' || ev.name === 'approval_request') {
         const eventId = ev.id || ev.eventId || `appr_${approvalCounter++}`;
-        const approval = {
+        const approval = mintApproval({
           id: eventId,
           eventId,
           clientId: currentEventsClientId,
@@ -2622,15 +2622,14 @@ export function apply(ctx, config = {}, internals = {}) {
           reason: ev.reason || ev.command || '申请工具执行权限',
           callId: ev.callId || '',
           input: ev.input || ev.command || '',
-          options: ev.options || null,
-          createdAt: Date.now()
-        };
+          options: ev.options || null
+        });
         coreApprovals.put(approval);
         broadcastToMobileClients({
           type: 'approval_request',
           approval
         });
-        audit('approval/requested', approval);
+        auditApproval(approval);
       } else if (ev.type === 'session_status') {
         const isCancelled = coreTurns.getCancelledSeq(sId) > 0 && (Date.now() - coreTurns.getLastCancelTime(sId) < 1000);
         const follower = getSessionFollower(sId);
@@ -2642,6 +2641,116 @@ export function apply(ctx, config = {}, internals = {}) {
         });
       }
     }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * [v1.35 / 2.1] 单次审批令牌
+   *
+   * 锁屏通知只能拿到「这条审批」的一枚一次性凭据，而不是设备 token 那种宽权限。
+   * 存储与校验逻辑在 core（createApprovalTokens，纯函数、可注入时钟）；这里只负责
+   * 铸造时机（入队时）、敏感策略判定、以及把它接到既有 handleApprovalRespond 上。
+   * ------------------------------------------------------------------ */
+
+  const approvalTokens = createApprovalTokens();
+
+  function approvalPolicyOf(sessionId) {
+    try {
+      return getSessionPermission(sessionId)?.executionPolicy
+        || globalPermissions.executionPolicy
+        || 'ask';
+    } catch {
+      return 'ask';
+    }
+  }
+
+  /** 构造待审批记录；非敏感策略附带 approvalToken。 */
+  function mintApproval(fields) {
+    const approval = { ...fields, createdAt: fields.createdAt || Date.now() };
+    const sensitive = isSensitiveApprovalPolicy(approvalPolicyOf(approval.sessionId));
+    approval.sensitive = sensitive;
+    if (sensitive) {
+      // 完全访问策略下命令不再逐条确认：通知栏再给一键放行，一次误触就等于
+      // 让 Agent 无确认执行任意命令。这类审批必须回 App 里看命令原文。
+      approval.approvalToken = null;
+    } else {
+      approval.approvalToken = approvalTokens.mint(approval.eventId || approval.id);
+    }
+    return approval;
+  }
+
+  /** 审计里绝不能出现明文令牌（/audit-logs 会把它读出去）。 */
+  function auditApproval(approval) {
+    const { approvalToken, ...rest } = approval;
+    audit('approval/requested', rest);
+  }
+
+  /**
+   * 通知栏一键裁决。
+   *
+   * @returns {{status:number, body:object}} 直接可回给 HTTP 的状态与载荷
+   */
+  async function decideApproval({ approvalId, decision, token, reason }) {
+    const wanted = String(approvalId || '').trim();
+    const normalized = (decision === 'approve' || decision === 'allow')
+      ? 'approve'
+      : (decision === 'deny' || decision === 'reject') ? 'deny' : '';
+    if (!wanted || !normalized) {
+      return { status: 400, body: { ok: false, code: 'bad-request', error: '缺少 approvalId，或 decision 不是 approve/deny' } };
+    }
+
+    const appr = coreApprovals.get(wanted);
+    if (!appr) {
+      return { status: 404, body: { ok: false, code: 'unknown', error: '审批不存在或已处理' } };
+    }
+    if (appr.sensitive) {
+      return { status: 409, body: { ok: false, code: 'sensitive', error: '该审批属于完全访问策略，请打开 App 确认' } };
+    }
+
+    const id = appr.eventId || appr.id;
+    const verdict = approvalTokens.check(id, token);
+    if (!verdict.ok) {
+      if (verdict.code === 'consumed') {
+        // 幂等：通知被连点两下时，同向重复请求不该报错。
+        if (verdict.decision === normalized) {
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              alreadyApplied: true,
+              code: 'consumed',
+              outcome: normalized === 'approve' ? 'allowed-once' : 'rejected'
+            }
+          };
+        }
+        return { status: 409, body: { ok: false, code: 'conflict', error: '该审批已按相反决定处理过' } };
+      }
+      if (verdict.code === 'expired') {
+        return { status: 410, body: { ok: false, code: 'expired', error: '审批已过期（15 分钟）' } };
+      }
+      if (verdict.code === 'mismatch') {
+        return { status: 403, body: { ok: false, code: 'mismatch', error: '审批令牌不匹配' } };
+      }
+      return { status: 404, body: { ok: false, code: 'unknown', error: '审批令牌已失效' } };
+    }
+
+    const result = await handleApprovalRespond(id, normalized, reason || '通知栏一键处理');
+    if (!result.ok) {
+      return { status: 502, body: { ok: false, code: 'engine-rejected', error: result.error || '引擎拒绝了这次回传' } };
+    }
+
+    approvalTokens.consume(id, normalized);
+    approvalTokens.prune();
+
+    // 让 App 内 UI 与电脑端同步（App 的审批 dock 收到这条就自己消失）。
+    broadcastToMobileClients({
+      type: 'approval_decided',
+      approvalId: id,
+      eventId: id,
+      decision: normalized,
+      source: 'notification'
+    });
+
+    return { status: 200, body: { ok: true, code: 'applied', outcome: result.outcome } };
   }
 
   async function handleApprovalRespond(eventId, outcome, reason = '') {
@@ -3566,6 +3675,25 @@ export function apply(ctx, config = {}, internals = {}) {
 
 
     try {
+      // [v1.35 / 2.1] 通知栏一键审批。必须在 jsonBody 解析之后注册。
+      // 只读设备由上面的 deny-by-default 闸门挡住（POST 一律拒绝）。
+      if (pathname === '/api/mobile/approvals/decide' && req.method === 'POST') {
+        const payload = jsonBody || {};
+        const out = await decideApproval({
+          approvalId: payload.approvalId || payload.eventId || '',
+          decision: payload.decision || '',
+          token: payload.approvalToken || '',
+          reason: payload.reason || ''
+        });
+        audit('approval/decide', {
+          approvalId: String(payload.approvalId || payload.eventId || '').slice(0, 64),
+          decision: String(payload.decision || '').slice(0, 16),
+          code: out.body.code
+        });
+        sendJson(out.status, out.body);
+        return;
+      }
+
       // 4.0 设备管理（v1.15）：列表 + 撤销
       //
       // [feat 2026-10-12] 撤销要求 write/admin（走 WRITE_PATHS 同款 roleCanWrite

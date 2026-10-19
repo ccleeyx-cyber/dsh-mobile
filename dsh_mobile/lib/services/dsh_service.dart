@@ -281,6 +281,13 @@ class DshService extends ChangeNotifier {
   /// 事件通知（§4.2 推送通知）。单例，便于 UI 直接开关与查询状态。
   final NotificationService notifications = NotificationService.instance;
 
+  DshService() {
+    // [v1.35 / 2.3] 通知动作按钮 → 本服务。挂在构造函数里而不是 main()：
+    // 这个回调要用本类持有的网关配置与 token，且测试里 new DshService() 也应
+    // 处于同一条链路上。
+    notifications.onNotificationAction = _handleNotificationAction;
+  }
+
   /// App 是否在前台。由 UI 层的生命周期回调维护。
   bool _isAppForeground = true;
 
@@ -2349,6 +2356,107 @@ class DshService extends ChangeNotifier {
       }
     } catch (e) {
       debugPrint('[DshService] fetchApprovals error: $e');
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * [v1.35 / 2.3] 锁屏通知一键裁决
+   *
+   * 通知栏上的 approve/deny 走的是网关的一次性令牌端点，不是设备 token：
+   * 通知会被截图/投屏，它承载的权限必须只够这一条审批。
+   * ------------------------------------------------------------------ */
+
+  /// 通知动作回调（由构造时挂到 NotificationService 上）。
+  Future<void> _handleNotificationAction(String actionId, String payload) async {
+    final target = NotificationApprovalActions.decodePayload(payload);
+    if (target == null) return;
+    final approvalId = target.approvalId;
+    final token = target.token;
+
+    if (actionId == 'defer') {
+      // 延后只收起通知，不答复网关：审批仍在等，用户回 App 里还能看到。
+      return;
+    }
+    final decision = actionId == 'approve' ? 'approve' : 'deny';
+    final result = await decideApprovalFromNotification(
+      approvalId: approvalId,
+      token: token,
+      decision: decision,
+    );
+    final ok = result['ok'] == true;
+    final already = result['alreadyApplied'] == true;
+    final message = ok
+        ? (already ? '这本就是你要的结果，无需重复操作' : (decision == 'approve' ? '已批准 · 会话继续' : '已拒绝 · 会话不会执行'))
+        : approvalNoticeForResult(result);
+    await notifications.show(
+      title: ok ? '审批已处理' : '审批未生效',
+      body: message,
+      kind: NotificationKind.info,
+      onlyWhenBackground: false,
+    );
+  }
+
+  /// 是否给这条审批配「通知栏一键批准」按钮。
+  ///
+  /// 只有拿到一次性令牌的才配：完全访问策略（sensitive）网关刻意不铸令牌。
+  @visibleForTesting
+  static bool shouldOfferQuickActions(ApprovalRequest req) =>
+      req.approvalToken != null && !req.sensitive;
+
+  /// 把网关的结构化错误码翻成人话（2.1 的 expired/consumed/conflict/sensitive）。
+  @visibleForTesting
+  static String approvalNoticeForResult(Map<String, dynamic> result) {
+    switch (result['code']?.toString() ?? '') {
+      case 'expired':
+        return '这条审批已过期（15 分钟），请打开 App 处理';
+      case 'sensitive':
+        return '敏感审批需要打开 App 确认';
+      case 'conflict':
+        return '这条审批已被相反决定处理过';
+      case 'consumed':
+        return '这条审批已处理过';
+      case 'mismatch':
+        return '审批令牌不匹配，请打开 App 处理';
+      case 'engine-rejected':
+        return '网关没能回传引擎：${result['error'] ?? '未知原因'}';
+      case 'offline':
+        return '尚未连接网关，请打开 App 处理';
+      default:
+        return result['error']?.toString() ?? '请打开 App 处理';
+    }
+  }
+
+  /// POST /api/mobile/approvals/decide。永不抛异常，失败返回 `{ok:false, code}`。
+  Future<Map<String, dynamic>> decideApprovalFromNotification({
+    required String approvalId,
+    required String token,
+    required String decision,
+  }) async {
+    if (_currentConfig == null) {
+      return {'ok': false, 'code': 'offline', 'error': '尚未连接网关'};
+    }
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approvals/decide');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: {..._authHeaders, 'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'approvalId': approvalId,
+              'approvalToken': token,
+              'decision': decision,
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) {
+        return {'ok': false, 'code': 'auth', 'error': '认证失败，请重新配对'};
+      }
+      final data = jsonDecode(utf8.decode(res.bodyBytes));
+      if (data is Map) return Map<String, dynamic>.from(data);
+      return {'ok': false, 'code': 'bad-response'};
+    } catch (e) {
+      debugPrint('[DshService] decideApprovalFromNotification error: $e');
+      return {'ok': false, 'code': 'network', 'error': '$e'};
     }
   }
 
@@ -4561,11 +4669,22 @@ class DshService extends ChangeNotifier {
           // 待授权是"agent 已经停下等你"的时刻，必须能打断 —— 静默处理等于
           // 让会话永远卡住。所以用高重要性渠道，会弹横幅。
           if (shouldNotify) {
+            // [v1.35 / 2.3] 有一次性令牌才给动作按钮。完全访问策略的审批
+            // 网关刻意不铸令牌（sensitive），这类必须进 App 看命令原文。
+            final quickAct = shouldOfferQuickActions(req);
             notifications.show(
               title: '需要你授权',
-              body: '${req.toolName}：${req.reason}',
+              body: quickAct
+                  ? '${req.toolName}：${req.reason}'
+                  : '${req.toolName}：${req.reason}（敏感操作，请打开 App 确认）',
               kind: NotificationKind.actionRequired,
               payloadSessionId: req.sessionId,
+              approval: quickAct
+                  ? NotificationApprovalActions(
+                      approvalId: req.eventId.isNotEmpty ? req.eventId : req.id,
+                      token: req.approvalToken!,
+                    )
+                  : null,
             );
           }
         }
