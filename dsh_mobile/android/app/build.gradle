@@ -27,7 +27,10 @@ if (hasReleaseKeystore) {
 
 android {
     namespace = "com.example.dsh_mobile"
-    compileSdk = flutter.compileSdkVersion
+    // [fix 2026-10-20] 显式写 35，不再跟随 flutter.compileSdkVersion（当前解析为 34）。
+    // flutter_plugin_android_lifecycle 已要求 compileSdk ≥ 35，构建时会打警告；
+    // 依赖继续升级就会从警告变成硬失败。向后兼容，不改变 minSdk(21)。
+    compileSdk = 35
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
