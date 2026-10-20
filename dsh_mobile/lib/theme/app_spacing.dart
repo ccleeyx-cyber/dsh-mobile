@@ -81,6 +81,60 @@ class AppSpace {
   static const double xl = 16;
 }
 
+/// 最小可点区域包装器（44×44dp）。
+///
+/// [add 2026-10-20] 审计发现一批自绘可点区域（裸 `Icon` + `GestureDetector`）
+/// 命中区只有 13~20dp：工作区路径的复制图标 13dp、错误横幅的关闭图标 16dp、
+/// 代码查看器的复制 21dp。视觉尺寸**不该**变大（它们在密集行里本来就该小），
+/// 缺的只是能被手指点中的面积。
+///
+/// 用法：`MinimumTouchTarget(onTap: ..., child: Icon(Icons.copy, size: 13))`。
+/// 视觉不变，命中区扩到 44×44（Android 无障碍基线 48dp 的务实取值 —— 48 在
+/// 这些密集行里会把行高顶起来）。
+///
+/// 注意：它会把**布局盒**撑到 44，所以只能放在 Row/Column 里有余量的位置；
+/// 若父级高度被写死且小于 44，请改用带 padding 的扩容而不是本组件。
+class MinimumTouchTarget extends StatelessWidget {
+  final Widget child;
+  final double size;
+  final VoidCallback? onTap;
+
+  /// 语义标签。给了就走 `Semantics(button: true)`，读屏能念出这是干什么的。
+  final String? semanticLabel;
+
+  const MinimumTouchTarget({
+    super.key,
+    required this.child,
+    this.size = 44,
+    this.onTap,
+    this.semanticLabel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    Widget tappable = SizedBox(
+      width: size,
+      height: size,
+      child: Center(child: child),
+    );
+    if (onTap != null) {
+      tappable = GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: tappable,
+      );
+    }
+    if (semanticLabel != null) {
+      tappable = Semantics(
+        button: onTap != null,
+        label: semanticLabel,
+        child: tappable,
+      );
+    }
+    return tappable;
+  }
+}
+
 /// 系统字号的可控放大区间。
 ///
 /// Flutter 默认跟随系统字号无上限。1.0~1.3 之间是可用的：更大的取值会让大量固定

@@ -169,6 +169,28 @@ class AppColors {
   static const Color warning = Color(0xFFD97706);
   static const Color warningDark = Color(0xFFFBBF24);
 
+  // ---- 实心色块上的前景（对比度 token）----
+  //
+  // [add 2026-10-20 全面审查] 此前调用方一律写死 `Colors.white` 压在 accent /
+  // warning 上，共 33 处。问题在于两种主题的同名色明度差极大：
+  //
+  // - accent 浅色 #3F5AF0（深蓝）白字 5.34:1 达标；深色 #6E8BFF（提亮浅蓝）
+  //   白字只有 2.6:1，正文 AA 要求 4.5:1 —— 深色下所有主按钮文字都偏淡。
+  // - warning 两侧都是亮琥珀：#D97706 白字 3.16:1、#FBBF24 白字仅 1.65:1，
+  //   连非文本 3:1 都不到，角标上的数字会糊成一块白斑。
+  //
+  // 结论：这两种底在**两种主题下都必须用深色前景**。取值已按 WCAG 公式复核：
+  // onAccent 深色 #161B22 对 #6E8BFF 5.60:1；onWarning 浅色 #111827 对 #D97706
+  // 5.62:1、深色 #161B22 对 #FBBF24 10.5:1。
+
+  /// 实心 accent（品牌蓝）上的前景色。
+  static const Color onAccent = Color(0xFFFFFFFF);
+  static const Color onAccentDark = Color(0xFF161B22);
+
+  /// 警告色（琥珀）上的前景色。
+  static const Color onWarning = Color(0xFF111827);
+  static const Color onWarningDark = Color(0xFF161B22);
+
   static const Color purple = Color(0xFF7C3AED);
   static const Color purpleDark = Color(0xFFA78BFA);
 
@@ -280,6 +302,12 @@ class ThemeScope extends InheritedWidget {
   Color get warning => isDark ? AppColors.warningDark : AppColors.warning;
   Color get purple => isDark ? AppColors.purpleDark : AppColors.purple;
   Color get orange => isDark ? AppColors.orangeDark : AppColors.orange;
+
+  /// 实心 accent 上的前景色（深色侧必须是近黑，见 [AppColors.onAccent]）。
+  Color get onAccent => isDark ? AppColors.onAccentDark : AppColors.onAccent;
+
+  /// 警告色上的前景色（两侧都是亮琥珀，故两侧都用深色，见 [AppColors.onWarning]）。
+  Color get onWarning => isDark ? AppColors.onWarningDark : AppColors.onWarning;
 
   // 带色底（tint）
   Color get dangerSurface => isDark ? AppColors.dangerSurfaceDark : AppColors.dangerSurface;
