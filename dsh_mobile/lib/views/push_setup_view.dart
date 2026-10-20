@@ -410,7 +410,7 @@ class _PushSetupViewState extends State<PushSetupView> {
           FilledButton.icon(
             style: FilledButton.styleFrom(
               backgroundColor: context.c.accent,
-              foregroundColor: Colors.white,
+              foregroundColor: context.c.onAccent,
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
             ),
@@ -542,7 +542,7 @@ class _PushSetupViewState extends State<PushSetupView> {
               FilledButton.icon(
                 style: FilledButton.styleFrom(
                   backgroundColor: context.c.accent,
-                  foregroundColor: Colors.white,
+                  foregroundColor: context.c.onAccent,
                   padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                 ),
@@ -716,7 +716,7 @@ class _PushSetupViewState extends State<PushSetupView> {
               FilledButton.icon(
                 style: FilledButton.styleFrom(
                   backgroundColor: context.c.accent,
-                  foregroundColor: Colors.white,
+                  foregroundColor: context.c.onAccent,
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                 ),
                 onPressed: _saveBusy ? null : _saveManual,

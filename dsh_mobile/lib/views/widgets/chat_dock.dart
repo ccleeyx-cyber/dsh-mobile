@@ -1068,9 +1068,15 @@ class _ChatBlockerDockState extends State<ChatBlockerDock> {
   /// 580）—— 那正是 v1.9.0 修过的"输入框下方一条空白"缺陷。
   @override
   Widget build(BuildContext context) {
+    // [fix 2026-10-20] 原来的上限按**全屏**高度算（`MediaQuery.sizeOf`），而 chat 页
+    // 已关掉 `resizeToAvoidBottomInset`（键盘由输入卡片自己的 Padding 消化）。于是
+    // 小屏 + 键盘时，dock 仍可占全屏的 45%，与增高后的输入卡片叠加会把消息区挤到
+    // 很小甚至溢出。这里先扣掉键盘占位，再按比例限高。
+    final media = MediaQuery.of(context);
+    final usableHeight = media.size.height - media.viewInsets.bottom;
     return ConstrainedBox(
       constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * _dockMaxHeightFraction,
+        maxHeight: usableHeight * _dockMaxHeightFraction,
       ),
       child: SingleChildScrollView(
         child: Column(

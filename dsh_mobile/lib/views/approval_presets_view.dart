@@ -216,7 +216,7 @@ class _ApprovalPresetsViewState extends State<ApprovalPresetsView> {
             child: FilledButton.icon(
               style: FilledButton.styleFrom(
                 backgroundColor: context.c.accent,
-                foregroundColor: Colors.white,
+                foregroundColor: context.c.onAccent,
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
               ),

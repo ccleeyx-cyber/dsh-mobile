@@ -556,7 +556,7 @@ class _SnippetsViewState extends State<SnippetsView> {
           ElevatedButton(
             style: ElevatedButton.styleFrom(
               backgroundColor: context.c.accent,
-              foregroundColor: Colors.white,
+              foregroundColor: context.c.onAccent,
               elevation: 0,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
             ),

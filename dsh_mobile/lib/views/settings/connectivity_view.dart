@@ -213,7 +213,7 @@ class _ConnectivityViewState extends State<ConnectivityView> {
                       child: ElevatedButton.icon(
                         style: ElevatedButton.styleFrom(
                           backgroundColor: context.c.accent,
-                          foregroundColor: Colors.white,
+                          foregroundColor: context.c.onAccent,
                           elevation: 0,
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                           padding: const EdgeInsets.symmetric(vertical: 10),

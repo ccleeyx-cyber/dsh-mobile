@@ -49,10 +49,31 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      Provider.of<DshService>(context, listen: false).fetchWorkspaces();
+      _loadWorkspaces();
       Provider.of<DshService>(context, listen: false).fetchApprovals();
     });
     _syncRefreshTimer();
+  }
+
+  /// [fix 2026-10-20] 三态加载状态。
+  ///
+  /// 此前只有「有列表 / 没列表」两个分支，空列表一律说「没有找到匹配的工作区」。
+  /// 冷启动或断网那次请求还没回来时，用户没有做任何搜索，却看到这句 —— 会读成
+  /// 「我的工作区丢了」。现在拆成 加载中 / 失败(带重试) / 真空 三态。
+  bool _loading = true;
+  String _loadError = '';
+
+  /// 首次/重试加载工作区；只有列表真的为空时才把 lastError 当作「加载失败」，
+  /// 避免一次无关的失败把工作区页整页变成错误态。
+  Future<void> _loadWorkspaces() async {
+    final dsh = Provider.of<DshService>(context, listen: false);
+    await dsh.fetchWorkspaces();
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _loadError =
+          dsh.workspaces.isEmpty && dsh.lastError.isNotEmpty ? dsh.lastError : '';
+    });
   }
 
   @override
@@ -305,7 +326,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 key: const ValueKey('workspace-create-submit'),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: context.c.accent,
-                  foregroundColor: Colors.white,
+                  foregroundColor: context.c.onAccent,
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                   elevation: 0,
                 ),
@@ -361,7 +382,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           ElevatedButton(
             style: ElevatedButton.styleFrom(
               backgroundColor: context.c.accent,
-              foregroundColor: Colors.white,
+              foregroundColor: context.c.onAccent,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
               elevation: 0,
             ),
@@ -455,6 +476,9 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     final content = await dsh.fetchWorkspaceMemory(ws.path);
     final textController = TextEditingController(text: content);
     final sheetError = ValueNotifier<String?>(null);
+    // [fix 2026-10-20] 保存按钮的 in-flight 状态。必须在 showModalBottomSheet 之外
+    // 声明 —— whenComplete 里要 dispose 它，而那时 builder 内的局部变量已不在作用域。
+    final saving = ValueNotifier<bool>(false);
 
     if (!context.mounted) {
       textController.dispose();
@@ -469,6 +493,11 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (ctx) {
+        // [fix 2026-10-20] 编辑器高度不再写死 220：按「屏高 - 键盘」的 34% 自适应
+        // （下限 120，上限仍是原来的 220），并为保存按钮补 in-flight 状态。
+        final bottomInset = MediaQuery.of(ctx).viewInsets.bottom;
+        final editorH =
+            ((MediaQuery.of(ctx).size.height - bottomInset) * 0.34).clamp(120.0, 220.0);
         return SafeArea(
           child: Padding(
             padding: EdgeInsets.only(
@@ -477,7 +506,11 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
               top: 16,
               bottom: MediaQuery.of(context).viewInsets.bottom + 20,
             ),
-            child: Column(
+            // [fix 2026-10-20] 整层可滚：原来是 Column(mainAxisSize.min) 直接放固定
+            // 220 高的编辑器，没有滚动容器 —— 640dp 小屏 + 键盘（约 300dp）时可用
+            // 高度不足，必然 RenderFlex 溢出。
+            child: SingleChildScrollView(
+              child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -515,7 +548,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                 ),
                 const SizedBox(height: 16),
                 Container(
-                  height: 220,
+                  height: editorH,
                   decoration: BoxDecoration(
                     color: context.c.surfaceMuted,
                     borderRadius: BorderRadius.circular(8),
@@ -543,36 +576,56 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   builder: (ctx2, err, __) =>
                       err == null ? const SizedBox.shrink() : InlineErrorBar(message: err, dense: true),
                 ),
-                SizedBox(
-                  width: double.infinity,
-                  height: 46,
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: context.c.accent,
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                      elevation: 0,
+                // [fix 2026-10-20] 补 in-flight 保护：原先 onPressed 直接 await，
+                // 弱网下连点两次 = 两次 PUT。禁用 + 转圈，与同文件「新建工作区」一致。
+                ValueListenableBuilder<bool>(
+                  valueListenable: saving,
+                  builder: (_, isSaving, __) => SizedBox(
+                    width: double.infinity,
+                    height: 46,
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: context.c.accent,
+                        foregroundColor: context.c.onAccent,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        elevation: 0,
+                      ),
+                      onPressed: isSaving
+                          ? null
+                          : () async {
+                              saving.value = true;
+                              try {
+                                final ok = await dsh.saveWorkspaceMemory(ws.path, textController.text);
+                                if (!ctx.mounted) return;
+                                if (!ok) {
+                                  sheetError.value =
+                                      '保存失败：${dsh.lastError.isEmpty ? '请检查网络连接' : dsh.lastError}';
+                                  return;
+                                }
+                                Navigator.pop(ctx);
+                                messenger.showSnackBar(
+                                  const SnackBar(
+                                    content: Text('项目记忆已保存'),
+                                    duration: Duration(milliseconds: 1200),
+                                    behavior: SnackBarBehavior.floating,
+                                  ),
+                                );
+                              } finally {
+                                saving.value = false;
+                              }
+                            },
+                      child: isSaving
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Text('保存项目记忆', style: TextStyle(fontWeight: FontWeight.bold)),
                     ),
-                    onPressed: () async {
-                      final ok = await dsh.saveWorkspaceMemory(ws.path, textController.text);
-                      if (!context.mounted) return;
-                      if (!ok) {
-                        sheetError.value = '保存失败：${dsh.lastError.isEmpty ? '请检查网络连接' : dsh.lastError}';
-                        return;
-                      }
-                      Navigator.pop(ctx);
-                      messenger.showSnackBar(
-                        const SnackBar(
-                          content: Text('项目记忆已保存'),
-                          duration: Duration(milliseconds: 1200),
-                          behavior: SnackBarBehavior.floating,
-                        ),
-                      );
-                    },
-                    child: const Text('保存项目记忆', style: TextStyle(fontWeight: FontWeight.bold)),
                   ),
                 ),
               ],
+              ),
             ),
           ),
         );
@@ -580,6 +633,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
     ).whenComplete(() {
       textController.dispose();
       sheetError.dispose();
+      saving.dispose();
     });
   }
 
@@ -860,9 +914,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           // Workspace List
           Expanded(
             child: filteredWorkspaces.isEmpty
-                ? Center(
-                    child: Text('没有找到匹配的工作区', style: TextStyle(color: context.c.textTertiary)),
-                  )
+                ? _buildWorkspacesEmpty(context, dsh)
                 : ListView.builder(
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
                     itemCount: filteredWorkspaces.length,
@@ -874,6 +926,68 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 空列表的三种真实情况（[fix 2026-10-20]）。
+  ///
+  /// 关键区别：只有当用户**输入了搜索词**才说「没有找到匹配」；否则说「还没有
+  /// 工作区」。加载中与加载失败各自有独立的可见信号，不再共用一句「没找到」。
+  ///
+  /// 注意 `_loading` 只在**一次数据都没有**时才算加载中：只要有 workspaces，
+  /// 就立刻按正常列表渲染（否则首帧会被加载态占掉，注入数据的测试与快速返回
+  /// 的真实路径都会白等一帧）。
+  Widget _buildWorkspacesEmpty(BuildContext context, DshService dsh) {
+    if (_loading && dsh.workspaces.isEmpty) {
+      return Center(
+        child: SizedBox(
+          width: 22,
+          height: 22,
+          child: CircularProgressIndicator(strokeWidth: 2.4, color: context.c.accent),
+        ),
+      );
+    }
+    if (_loadError.isNotEmpty && dsh.workspaces.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.cloud_off_rounded, size: 30, color: context.c.textTertiary),
+              const SizedBox(height: 10),
+              Text('工作区加载失败',
+                  style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: context.c.textPrimary)),
+              const SizedBox(height: 4),
+              Text(
+                _loadError,
+                textAlign: TextAlign.center,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 11.5, color: context.c.textSecondary),
+              ),
+              const SizedBox(height: 14),
+              OutlinedButton.icon(
+                onPressed: () {
+                  setState(() {
+                    _loading = true;
+                    _loadError = '';
+                  });
+                  _loadWorkspaces();
+                },
+                icon: const Icon(Icons.refresh_rounded, size: 16),
+                label: const Text('重试', style: TextStyle(fontSize: 12.5)),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    return Center(
+      child: Text(
+        _searchFilter.isEmpty ? '还没有工作区' : '没有找到匹配的工作区',
+        style: TextStyle(color: context.c.textTertiary),
       ),
     );
   }
@@ -1042,6 +1156,10 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const SizedBox(height: 3),
+              // [fix 2026-10-20] 复制路径的可点区域原本只有那个 13×13dp 的图标本身
+              // （裸 GestureDetector，未设 behavior），真机上要瞄。这里用
+              // MinimumTouchTarget 把命中区放大到 38dp；**不能**把整行改成可点 ——
+              // 那样 ExpansionTile 的中心会落进复制区，点卡片就变成复制而不是展开。
               Row(
                 children: [
                   Expanded(
@@ -1052,7 +1170,9 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                       overflow: TextOverflow.ellipsis,
                     ),
                   ),
-                  GestureDetector(
+                  MinimumTouchTarget(
+                    size: 38,
+                    semanticLabel: '复制工作区路径',
                     onTap: () {
                       Clipboard.setData(ClipboardData(text: ws.path));
                       ScaffoldMessenger.of(context).showSnackBar(
@@ -1092,7 +1212,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                     child: ElevatedButton.icon(
                       style: ElevatedButton.styleFrom(
                         backgroundColor: context.c.accent,
-                        foregroundColor: Colors.white,
+                        foregroundColor: context.c.onAccent,
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                         padding: const EdgeInsets.symmetric(vertical: 6),
                         elevation: 0,

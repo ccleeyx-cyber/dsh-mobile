@@ -139,8 +139,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
             constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
             child: Text(
               count > 9 ? '9+' : '$count',
-              style: const TextStyle(
-                color: Colors.white,
+              style: TextStyle(
+                // [fix 2026-10-20] 原为写死 Colors.white：深色侧底是 #FBBF24（亮琥珀），
+                // 白字对比度仅 1.65:1，数字糊成一块白斑。改用 onWarning（两侧深色前景）。
+                color: context.c.onWarning,
                 fontSize: 9.5,
                 fontWeight: FontWeight.bold,
                 height: 1.0,

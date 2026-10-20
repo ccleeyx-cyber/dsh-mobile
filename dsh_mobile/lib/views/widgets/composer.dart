@@ -1571,7 +1571,7 @@ class _ChatComposerState extends State<ChatComposer> {
             child: ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
                 backgroundColor: context.c.accent,
-                foregroundColor: Colors.white,
+                foregroundColor: context.c.onAccent,
                 elevation: 0,
                 shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(9)),
@@ -2384,19 +2384,27 @@ class _ChatComposerState extends State<ChatComposer> {
             alignment: Alignment.center,
             children: [
               Positioned.fill(
-                child: InkWell(
-                  key: const ValueKey('chat-send-button'),
-                  onTap: canSend ? () => _sendMessage(dsh) : null,
-                  borderRadius: BorderRadius.circular(22),
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: canSend ? context.c.accent : context.c.border,
-                      shape: BoxShape.circle,
-                    ),
-                    child: Icon(
-                      Icons.arrow_upward_rounded,
-                      size: 22,
-                      color: canSend ? Colors.white : context.c.textTertiary,
+                // [fix 2026-10-20] 补语义标签：发送键是图标按钮，读屏此前只念
+                // 「按钮」。同时把实心 accent 上的前景色换成 onAccent —— 深色下
+                // Colors.white 对 #6E8BFF 只有 2.6:1。
+                child: Semantics(
+                  button: true,
+                  enabled: canSend,
+                  label: dsh.isSessionRunning ? '排队发送' : '发送',
+                  child: InkWell(
+                    key: const ValueKey('chat-send-button'),
+                    onTap: canSend ? () => _sendMessage(dsh) : null,
+                    borderRadius: BorderRadius.circular(22),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: canSend ? context.c.accent : context.c.border,
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        Icons.arrow_upward_rounded,
+                        size: 22,
+                        color: canSend ? context.c.onAccent : context.c.textTertiary,
+                      ),
                     ),
                   ),
                 ),
@@ -2420,10 +2428,12 @@ class _ChatComposerState extends State<ChatComposer> {
                     child: Text(
                       '$queued',
                       textAlign: TextAlign.center,
-                      style: const TextStyle(
+                      style: TextStyle(
                           fontSize: 9.5,
                           fontWeight: FontWeight.bold,
-                          color: Colors.white),
+                          // [fix 2026-10-20] 底下是亮琥珀，白字在深色模式下只有
+                          // 1.65:1（队列数字读不出来）。
+                          color: context.c.onWarning),
                     ),
                   ),
                 ),

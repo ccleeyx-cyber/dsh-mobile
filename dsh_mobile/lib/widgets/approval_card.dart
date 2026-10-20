@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -109,6 +110,30 @@ class ApprovalCard extends StatefulWidget {
 
 class _ApprovalCardState extends State<ApprovalCard> {
   bool _isInputExpanded = false;
+
+  /// [fix 2026-10-20] 已发出决定、等待卡片撤场。
+  ///
+  /// 三个出口（拒绝 / 批准 / 长按直接拒绝）原先都没有 in-flight 保护：弱网下连点
+  /// 会发两条 respond，第二条落在 alreadyGone 上 —— 用户看到的是「我按了批准但它
+  /// 报错」。8 秒兜底，事件丢失时恢复可点，不至于永久禁用。
+  bool _responding = false;
+  Timer? _respondTimeout;
+
+  void _respond(VoidCallback fire) {
+    if (_responding) return;
+    fire();
+    setState(() => _responding = true);
+    _respondTimeout?.cancel();
+    _respondTimeout = Timer(const Duration(seconds: 8), () {
+      if (mounted) setState(() => _responding = false);
+    });
+  }
+
+  @override
+  void dispose() {
+    _respondTimeout?.cancel();
+    super.dispose();
+  }
 
   String _formatInput(dynamic input) {
     if (input == null) return '';
@@ -717,10 +742,13 @@ class _ApprovalCardState extends State<ApprovalCard> {
                       child: Tooltip(
                         message: '轻触选择拒绝理由，长按直接拒绝',
                         child: OutlinedButton.icon(
-                          onPressed: () => _showRejectReasonSheet(context),
-                          onLongPress: () {
-                            HapticFeedback.heavyImpact();
-                            widget.onRespond(req, 'rejected', null);
+                          onPressed:
+                              _responding ? null : () => _showRejectReasonSheet(context),
+                          onLongPress: _responding
+                              ? null
+                              : () {
+                                  HapticFeedback.heavyImpact();
+                                  _respond(() => widget.onRespond(req, 'rejected', null));
                             ScaffoldMessenger.of(context).showSnackBar(
                               const SnackBar(
                                 content: Text('已直接拒绝工具执行'),
@@ -760,10 +788,12 @@ class _ApprovalCardState extends State<ApprovalCard> {
                     const SizedBox(width: AppSpace.l),
                     Expanded(
                       child: FilledButton.icon(
-                        onPressed: () {
-                          HapticFeedback.mediumImpact();
-                          widget.onRespond(req, 'allowed-once', null);
-                        },
+                        onPressed: _responding
+                            ? null
+                            : () {
+                                HapticFeedback.mediumImpact();
+                                _respond(() => widget.onRespond(req, 'allowed-once', null));
+                              },
                         icon: Icon(Icons.check_rounded, size: 16, color: onAccent),
                         label: Text(
                           '批准',

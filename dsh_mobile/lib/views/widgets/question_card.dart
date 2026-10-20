@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../models/user_question.dart';
@@ -41,6 +43,12 @@ class _QuestionCardState extends State<QuestionCard> {
   final Map<String, String> _customs = {};
   bool _submitting = false;
 
+  /// [fix 2026-10-20] 提交后的兜底计时器，见 [_submit]。
+  Timer? _submitTimeout;
+
+  /// 超时没等到网关 `question_settled` 时置真，用于给出「可重试」的提示。
+  bool _retryHint = false;
+
   bool _isAnswered(AskUserQuestionItem item) {
     if ((_selections[item.id] ?? const <String>[]).isNotEmpty) return true;
     return (_customs[item.id] ?? '').trim().isNotEmpty;
@@ -66,11 +74,38 @@ class _QuestionCardState extends State<QuestionCard> {
 
   Future<void> _submit() async {
     if (!_allAnswered || _submitting) return;
-    setState(() => _submitting = true);
+    setState(() {
+      _submitting = true;
+      _retryHint = false;
+    });
     final ok = widget.onSubmit(Map.of(_selections), Map.of(_customs));
     // 不在这里清卡片：网关的 question_settled 才是权威信号。乐观移除会在提交
     // 失败时把唯一的重试入口也一起弄丢。
-    if (!ok && mounted) setState(() => _submitting = false);
+    if (!ok) {
+      if (mounted) setState(() => _submitting = false);
+      return;
+    }
+
+    // [fix 2026-10-20] 只依赖 settled 事件，等于把这张卡押在「事件一定送达」上。
+    // 重连 / 切后台 / 网关重启都会丢事件，卡片就永久停在「发送中…」且按钮禁用：
+    // 用户既不能重发也不能改答，而 agent 侧一直阻塞。
+    //
+    // 兜底 8 秒：到时卡片仍在本树里（说明没收到 settled）就恢复可点，并提示可重试。
+    // 真正的成功路径不受影响 —— settled 到达后卡片会被移除，这个 timer 随 dispose 取消。
+    _submitTimeout?.cancel();
+    _submitTimeout = Timer(const Duration(seconds: 8), () {
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _retryHint = true;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _submitTimeout?.cancel();
+    super.dispose();
   }
 
   @override
@@ -157,13 +192,19 @@ class _QuestionCardState extends State<QuestionCard> {
               children: [
                 Expanded(
                   child: Text(
-                    _allAnswered
-                        ? '将把回答发送给 Agent'
-                        // 旧文案只说「请回答上面每一道题」，但没告诉用户漏选时
-                        // 怎么办 —— 结果就是按钮一直灰着、看不出出路。直接把
-                        // 出路写出来。
-                        : '每道题都要有答复：选项、或者下面那句话${q.questions.length > 1 ? '（共 ${q.questions.length} 道）' : ''}',
-                    style: TextStyle(fontSize: 11, color: context.c.orange),
+                    // [fix 2026-10-20] 超时未收到确认时的出口提示（见 _submit 的兜底）。
+                    _retryHint && _allAnswered && widget.canAnswer
+                        ? '没收到确认，可再点一次提交'
+                        : _allAnswered
+                            ? '将把回答发送给 Agent'
+                            // 旧文案只说「请回答上面每一道题」，但没告诉用户漏选时
+                            // 怎么办 —— 结果就是按钮一直灰着、看不出出路。直接把
+                            // 出路写出来。
+                            : '每道题都要有答复：选项、或者下面那句话${q.questions.length > 1 ? '（共 ${q.questions.length} 道）' : ''}',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: _retryHint && _allAnswered ? context.c.danger : context.c.orange,
+                    ),
                   ),
                 ),
                 const SizedBox(width: 8),

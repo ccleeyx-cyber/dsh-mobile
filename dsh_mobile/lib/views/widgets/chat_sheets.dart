@@ -264,7 +264,7 @@ void showChatPermissionSheet(BuildContext context, DshService dsh) {
                     child: ElevatedButton(
                       style: ElevatedButton.styleFrom(
                         backgroundColor: context.c.accent,
-                        foregroundColor: Colors.white,
+                        foregroundColor: context.c.onAccent,
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                         elevation: 0,
                       ),

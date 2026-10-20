@@ -874,7 +874,7 @@ class _ChatViewState extends State<ChatView> {
               showScrollToBottom: _scroll.showScrollToBottom,
               onScrollToBottom: _scroll.scrollToBottom,
               workspaceName: currentWs?.title,
-              onInsertSuggestion: (text) => _inputController.text = text,
+              onInsertSuggestion: (text) => _insertSuggestion(dsh, text),
             ),
           ),
 
@@ -1593,19 +1593,25 @@ class _ChatViewState extends State<ChatView> {
 
   /// 消息的「⋯」入口（点一下 = 同一个 action sheet）。
   Widget _messageMoreButton(String messageId, VoidCallback onTap) {
-    return InkResponse(
-      key: ValueKey('message-more-$messageId'),
-      onTap: onTap,
-      radius: 16,
-      // [fix 2026-10-17] 命中区补到 32px（此前 ≈24px 含 padding）。
-      child: SizedBox(
-        width: 32,
-        height: 32,
-        child: Center(
-          child: Icon(
-            Icons.more_horiz_rounded,
-            size: 15,
-            color: context.c.textTertiary,
+    // [fix 2026-10-20] 补语义标签：此前读屏软件只会念「按钮」，说不出这是
+    // 复制/重发/删除的入口。命中区保持 32px（见下方 fix 说明）。
+    return Semantics(
+      button: true,
+      label: '消息操作',
+      child: InkResponse(
+        key: ValueKey('message-more-$messageId'),
+        onTap: onTap,
+        radius: 16,
+        // [fix 2026-10-17] 命中区补到 32px（此前 ≈24px 含 padding）。
+        child: SizedBox(
+          width: 32,
+          height: 32,
+          child: Center(
+            child: Icon(
+              Icons.more_horiz_rounded,
+              size: 15,
+              color: context.c.textTertiary,
+            ),
           ),
         ),
       ),
@@ -1945,6 +1951,28 @@ class _ChatViewState extends State<ChatView> {
   /// 当前 build 中实际注册过 key 的消息 id（跨会话清理的保留名单，
   /// 由 `_keyForMessage` 维护）。
   final Set<String> _messageIdsInCurrentBuild = {};
+
+  /// [fix 2026-10-20] 把一条推荐问题插入输入框。
+  ///
+  /// 原实现是 `_inputController.text = text`，漏了别处都在做的两件事：
+  ///
+  /// 1. **不写草稿**：全项目另外三处写输入框的地方（`:1723` / `:2124` / `:2130`）
+  ///    都成对调 `dsh.updateDraft(...)`，只有这一处漏了 —— 文本不在 DraftStore 里，
+  ///    就会被系统杀进程/重启后丢掉（切会话不会丢，切换路径会把正文写回上一会话槽）。
+  /// 2. **不设 selection**：直接赋 `.text` 后光标位置无效，用户插入后要再点一次
+  ///    输入框才能接着打字。
+  ///
+  /// 语义与 composer 的 `_appendSnippetTemplate` 保持一致：追加而不是覆盖。
+  void _insertSuggestion(DshService dsh, String text) {
+    final cur = _inputController.text;
+    final next = cur.trim().isEmpty ? text : '$cur\n$text';
+    _inputController.value = TextEditingValue(
+      text: next,
+      selection: TextSelection.collapsed(offset: next.length),
+    );
+    dsh.updateDraft(next);
+    _inputFocusNode.requestFocus();
+  }
 
   void _toast(String msg) {
     if (!mounted) return;
