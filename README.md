@@ -96,12 +96,18 @@ scripts/await-apk.mjs <commit>    # 等 CI 出包并下载
 ```
 
 仓库里**不留历史 APK**：根目录原本堆的 5 个（v1.0.0~v1.3.0，约 112 MiB）与
-`dsh-server-plugin/public/` 里的 6 个（v1.2.1~v1.2.6，约 135 MiB）均已删除，
-只保留 `public/dsh-agent.apk`（网关与 App 都按这个固定名分发；网关的下载路由
-只认这一个位置，缺了直接 404）。历史版本走 GitHub Releases。
+`dsh-server-plugin/public/` 里的 6 个（v1.2.1~v1.2.6，约 135 MiB）均已删除。
 
-注意 APK 被 `.gitignore` 的 `**/*.apk` 排除：**全新克隆上 `public/dsh-agent.apk`
-不存在**，`/dsh-agent.apk` 会是 404，需手动或由 CI 投放。
+**2026-10-21 起网关也不再托管安装包**：`/dsh-agent.apk` 与
+`/api/mobile/download/apk` 两个路由已移除，`public/` 里不留任何 APK，网关也不再
+从 Release 抓包回本地。安装包的唯一来源是 **GitHub Releases** —— App 的更新检查
+直接读 `releases/latest/download/latest.json`（见 `models/update_service.dart`），
+DSH 设置页与网关首页只给 Releases 链接。
+
+之所以把「自动从 Release 取回本地缓存」一起删掉：那层缓存必须与远端版本对齐，
+一旦某次忘记刷新就会长期静默发旧包（1.31.1 事故），而它本身不带来任何业务价值。
+
+历史版本走 GitHub Releases。
 
 ---
 

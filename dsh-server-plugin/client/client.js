@@ -130,8 +130,9 @@ window.__ModuleLoader__.load({
       };
 
       const npsScheme = useHttps ? 'https' : 'http';
-      const npsApkUrl = `${npsScheme}://${npsHost}:${npsPort}/dsh-agent.apk`;
-      const localApkUrl = `http://${config?.localIp || '127.0.0.1'}:${port}/dsh-agent.apk`;
+      // [cleanup 2026-10-21] 网关不再托管安装包，原先这里还有 npsApkUrl /
+      // localApkUrl 两个指向 /dsh-agent.apk 的变量（已是死代码）。安装包只认
+      // GitHub Releases。
       const RELEASES_URL = 'https://github.com/ccleeyx-cyber/dsh-mobile/releases';
       // 手机真正在用的公网地址 = NPS 穿透地址（config 里用户自己填的）。
       const publicHost = npsHost;

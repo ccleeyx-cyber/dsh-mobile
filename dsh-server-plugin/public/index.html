@@ -91,13 +91,16 @@
           <span>{{ pendingApprovals.length }} 项待审批</span>
         </button>
 
+        <!-- [cleanup 2026-10-21] 安装包只认 GitHub Releases：网关不再托管
+             /dsh-agent.apk（本地留包会静默发旧包，见 1.31.1 事故）。 -->
         <a 
-          href="/dsh-agent.apk"
-          download
+          href="https://github.com/ccleeyx-cyber/dsh-mobile/releases/latest"
+          target="_blank"
+          rel="noopener"
           class="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white text-xs font-medium transition shadow-md shadow-blue-500/10"
         >
           <i class="fa-brands fa-android text-sm"></i>
-          <span>下载手机 App (APK)</span>
+          <span>下载手机 App (GitHub)</span>
         </a>
 
         <button 
@@ -523,28 +526,30 @@
             <i class="fa-solid fa-mobile-screen-button text-blue-400"></i>
             <span>手机端 App 配对与一键安装</span>
           </h2>
-          <p class="text-xs text-slate-400 mt-1">使用手机浏览器扫描下方二维码即可直接下载安装包，或复制连接参数进入 App</p>
+          <p class="text-xs text-slate-400 mt-1">安装包始终从 GitHub Releases 取最新版；下方参数用于在 App 内连入本机</p>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <!-- 二维码与下载卡 -->
+          <!-- 安装包下载卡 -->
+          <!-- [cleanup 2026-10-21] 原来这里是一张「APK 二维码 + 直接下载」卡，指向网关
+               自己的 /dsh-agent.apk，并写死了版本与大小（早已是 v1.1.0 / 22.28MB 的
+               陈旧值）。网关不再托管安装包，改为指向 GitHub Releases，版本信息由
+               发布页自己维护，页面不再有会过期的数字。 -->
           <div class="p-6 rounded-2xl bg-slate-900/60 border border-slate-800 flex flex-col items-center text-center space-y-4">
-            <h3 class="font-bold text-white text-base">安卓 APK 安装包下载</h3>
-            <!-- 二维码画布 -->
-            <div class="p-3 bg-white rounded-xl shadow-lg">
-              <canvas id="apkQrCanvas" class="w-48 h-48"></canvas>
-            </div>
-            <div class="space-y-1">
-              <p class="text-xs text-slate-400">支持 Android 8.0+ 手机/平板</p>
-              <p class="text-xs font-mono text-emerald-400 font-semibold">版本: v1.1.0 • 大小: 22.28 MB</p>
-            </div>
+            <h3 class="font-bold text-white text-base">安卓 APK 安装包</h3>
+            <p class="text-sm text-slate-300 leading-relaxed">
+              安装包由 GitHub Releases 统一发布，永不在本机留副本 ——
+              每次打开都是当前最新版，不会出现「网关还在发旧包」。
+            </p>
+            <p class="text-xs text-slate-400">支持 Android 8.0+ 手机/平板</p>
             <a 
-              href="/dsh-agent.apk"
-              download
+              href="https://github.com/ccleeyx-cyber/dsh-mobile/releases/latest"
+              target="_blank"
+              rel="noopener"
               class="w-full py-3 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-semibold text-sm transition shadow-lg shadow-blue-500/20 flex items-center justify-center gap-2"
             >
-              <i class="fa-solid fa-download"></i>
-              <span>直接下载 APK 安装文件</span>
+              <i class="fa-brands fa-github"></i>
+              <span>前往 GitHub 下载最新版</span>
             </a>
           </div>
 
@@ -814,18 +819,8 @@
           initData();
         }
 
-        function generateApkQr() {
-          nextTick(() => {
-            const canvas = document.getElementById('apkQrCanvas');
-            if (canvas && window.QRCode) {
-              const apkUrl = window.location.origin + '/dsh-agent.apk';
-              QRCode.toCanvas(canvas, apkUrl, { width: 192, margin: 1 }, function (error) {
-                if (error) console.error(error);
-              });
-            }
-          });
-        }
-
+        // [cleanup 2026-10-21] 删掉 generateApkQr()：它给 /dsh-agent.apk 生成二维码，
+        // 而网关已不再托管安装包（安装包只认 GitHub Releases）。
         // 初始化 WebSocket 实时监听审批流
         function initWebSocket() {
           const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -852,7 +847,6 @@
 
         async function initData() {
           await Promise.all([fetchSettings(), fetchWorkspaces(), fetchApprovals()]);
-          generateApkQr();
         }
 
         onMounted(() => {

@@ -3,9 +3,14 @@
 // 职责：
 //   1. 作为 DSH 原生 Cordis 插件，在 DSH 进程内原生启动移动网关（默认端口 3088）。
 //   2. 挂载 /api/mobile/* REST API 与 WebSocket 实时双工流式中继，供 Android App（DSH Mobile）调用。
-//   3. 静态托管最新 Android APK 安装包（/dsh-agent.apk），支持在电脑端与手机端随时下载更新。
-//   4. 设备配对（6 位码握手）+ 令牌摘要存储 + 角色权限控制（只读 / 读写）+ 访问审计日志。
-//   5. 无缝集成 DSH 设置页：在「设置 → 移动终端」中可视化管理移动网关、配对设备、NPS 隧道与安装包。
+//   3. 设备配对（6 位码握手）+ 令牌摘要存储 + 角色权限控制（只读 / 读写）+ 访问审计日志。
+//   4. 无缝集成 DSH 设置页：在「设置 → 移动终端」中可视化管理移动网关、配对设备、NPS 隧道。
+//
+// 安装包分发**不在本插件的职责内**（2026-10-21 移除）：网关不再托管、也不再自动
+// 抓取 APK。一切安装包以 GitHub Releases 为唯一来源 —— App 内的更新检查直接读
+// `releases/latest/download/latest.json`，设置页与首页只给 Releases 链接。
+// 之所以删掉这条通路：网关分发需要本地留一份包并与远端版本对齐，一旦忘记刷新就
+// 会长期静默发旧包（1.31.1 事故），而这层缓存本身没有任何业务价值。
 
 import { createServer } from 'node:http';
 import http from 'node:http';
@@ -56,7 +61,6 @@ import { ensureCertificate, localHosts } from './tls.mjs';
 import { ensureCloudflared, createQuickTunnel } from './tunnel.mjs';
 import { loadRunbooksFile, runRunbook, allowedBinariesFromEnv } from './runbook.mjs';
 import { createAlertEngine } from './alerts.mjs';
-import { ensureApk } from './apk-source.mjs';
 import {
   BRIDGE_VERSION,
   MAX_BODY_SIZE,
@@ -2896,10 +2900,6 @@ export function apply(ctx, config = {}, internals = {}) {
   /** 最近一次隧道启动失败的原因（status 如实上报，避免 App 显示成 idle）。 */
   let lastTunnelError = '';
 
-  /* ---- [v1.35 / W-A] APK 自动取回的并发与冷却 ---- */
-  let apkFetchInFlight = null;
-  let apkFetchFailedAt = 0;
-
   /** 用系统 curl 下载（另一套 TLS 栈，用来绕过 Node 的握手被断）。 */
   function curlDownload(url, file) {
     return new Promise((resolve, reject) => {
@@ -3123,83 +3123,7 @@ export function apply(ctx, config = {}, internals = {}) {
       return;
     }
 
-    // 2. APK 客户端静态下载
-    //
-    // [cleanup 2026-10-17] 这里原有一条三候选回退链：
-    //   public/dsh-agent.apk → ../dsh-agent-v1.2.6.apk（插件根）→ ../../dsh-agent-v1.2.0.apk（仓库根）
-    // 后两条是重构前的错位路径（一个指向插件根、一个指向仓库根，都不是 public/），
-    // 且版本早已失效、文件也已从磁盘删除。existsSync 的静默回退意味着"没找到就下
-    // 一个更旧的老包"，用户看不出差别。现在只认 public/dsh-agent.apk 这一个位置
-    // （网关与 App 都按这个固定名分发，见下方 Content-Disposition）；
-    // APK 被 .gitignore 的 `**/*.apk` 排除，全新克隆上本来就没有该文件 → 诚实 404。
-    if (pathname === '/dsh-agent.apk' || pathname === '/api/mobile/download/apk') {
-      const apkPath = path.join(
-        import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)),
-        '..', 'public', 'dsh-agent.apk'
-      );
-
-      if (!fs.existsSync(apkPath)) {
-        // [v1.35 / W-A] 分发单真源：本地没有包时从最新 Release 自动取回并校验缓存。
-        // 这是 1.31.1「Release 更新了、网关还在发旧包」的正面修复。
-        //
-        // 防滥用：同一时刻只允许一个取回任务（并发请求共享它），失败后 60 秒内
-        // 不再重试（否则任何人反复请求这个公开路由都能把 GitHub 拖成放大器）。
-        if (!apkFetchInFlight && Date.now() - apkFetchFailedAt > 60_000) {
-          apkFetchInFlight = ensureApk({
-            dest: apkPath,
-            fetchText: async (u) => (await fetchUrlBytes(u)).toString('utf8'),
-            downloadToFile
-          }).then((r) => {
-            if (!r.ok) apkFetchFailedAt = Date.now();
-            else audit('apk/auto_fetch', {
-              version: r.manifest?.version || '',
-              size: fs.existsSync(apkPath) ? fs.statSync(apkPath).size : null
-            });
-            return r;
-          }).finally(() => { apkFetchInFlight = null; });
-        }
-        const fetched = apkFetchInFlight
-          ? await apkFetchInFlight
-          : { ok: false, error: '刚刚取回失败，60 秒后自动重试' };
-
-        if (!fetched.ok) {
-          sendJson(404, {
-            error: 'APK file not found on server',
-            hint: `${fetched.error || '本地没有安装包'}；也可手动放置 public/dsh-agent.apk`
-          });
-          return;
-        }
-      }
-
-      // [fix 2026-10-11] This whole block sits OUTSIDE the big try below, and
-      // existsSync→statSync→createReadStream is a TOCTOU chain: if the APK is
-      // swapped/removed in between, the throw escapes as an unhandled
-      // rejection and (Node ≥15) kills the entire dsh web process. Contain it.
-      let stat;
-      try {
-        stat = fs.statSync(apkPath);
-      } catch (e) {
-        sendJson(404, { error: 'APK file not found on server' });
-        return;
-      }
-      res.writeHead(200, {
-        'Content-Type': 'application/vnd.android.package-archive',
-        'Content-Length': stat.size,
-        'Content-Disposition': 'attachment; filename="dsh-agent.apk"',
-        'Cache-Control': 'no-cache'
-      });
-      if (req.method === 'HEAD') { res.end(); return; }
-      const apkStream = fs.createReadStream(apkPath);
-      apkStream.on('error', (e) => {
-        logger.error('[dsh-mobile-bridge] APK stream failed:', e?.message || e);
-        try { res.destroy(); } catch (_) {}
-      });
-      apkStream.pipe(res);
-      audit('apk/download', { ip: req.socket?.remoteAddress, size: stat.size });
-      return;
-    }
-
-    // 2b. 扫码配对：二维码 / 兜底 JSON
+    // 2. 扫码配对：二维码 / 兜底 JSON
     //
     // [feat 2026-10-12] 安全模型：二维码内容是**一次性 6 位配对码**（复用现有
     // pairSession 体系），绝不内嵌长期 token —— 屏幕上的二维码会被拍照/截图留存，
@@ -4703,33 +4627,18 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
 
-      // ---- 应用内更新检查 ----
+      // ---- 网关版本探测 ----
       //
-      // App 拿自己的 version/build 与这里比对；latestVersion 取 DSH_LATEST_APP_VERSION
-      // 环境变量（运维发布新 APK 时顺手改），没配则回落到 BRIDGE_VERSION，
-      // 并附 APK 直链与最近一次请求时的 Content-Length（有 APK 时）。
+      // [cleanup 2026-10-21] 原先这里兼作「应用内更新检查」：回 apkUrl /
+      // apkSize / apkMtime，让 App 从网关下载安装包。该能力已移除 ——
+      // 安装包只认 GitHub Releases（App 直接读 `releases/latest/download/
+      // latest.json`，见 `models/update_service.dart`），网关既不留包也不转发包。
+      // 现在这条路由只剩「这个网关跑的是哪个版本的插件」，用于排障与能力对齐。
       if (pathname === '/api/mobile/version' && req.method === 'GET') {
-        const apkCandidates = [
-          path.join(import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)), '..', 'public', 'dsh-agent.apk')
-        ];
-        let apkSize = 0;
-        let apkMtime = null;
-        for (const c of apkCandidates) {
-          try {
-            const st = fs.statSync(c);
-            apkSize = st.size;
-            apkMtime = st.mtimeMs;
-            break;
-          } catch { /* not shipped */ }
-        }
         sendJson(200, {
           ok: true,
           code: 0,
           bridgeVersion: BRIDGE_VERSION,
-          latestVersion: process.env.DSH_LATEST_APP_VERSION || null,
-          apkUrl: '/dsh-agent.apk',
-          apkSize,
-          apkMtime,
           time: Date.now()
         });
         return;
@@ -5115,7 +5024,6 @@ export function apply(ctx, config = {}, internals = {}) {
     });
   });
 
-  const apkFilePath = path.join(import.meta.dirname ?? path.dirname(url.fileURLToPath(import.meta.url)), '..', 'public', 'dsh-agent.apk');
   // 诊断锚点（2026-10-15）：apply() 走到这里就证明插件确实被加载了。与下面
   // installRpc 里的注册日志配对，两行合起来能唯一区分"插件没加载"与
   // "加载了但 connection 没注入"——这正是 405 一直查不下去的原因。

@@ -207,8 +207,8 @@ async function dispatch(endpoint, payload, deps) {
         localIp,
         localUrl: `http://${localIp}:${cfg.port}`,
         npsUrl: `${npsScheme}://${cfg.npsHost}:${cfg.npsPort}`,
-        apkUrl: `http://${localIp}:${cfg.port}/dsh-agent.apk`,
-        npsApkUrl: `${npsScheme}://${cfg.npsHost}:${cfg.npsPort}/dsh-agent.apk`,
+        // [cleanup 2026-10-21] 不再回 apkUrl / npsApkUrl：网关不托管安装包，
+        // 一切以 GitHub Releases 为准（设置页自己给 Releases 链接）。
         version: BRIDGE_VERSION
       };
     }
@@ -220,9 +220,7 @@ async function dispatch(endpoint, payload, deps) {
         ok: true,
         config: updated,
         localUrl: `http://${localIp}:${updated.port}`,
-        npsUrl: `${npsScheme}://${updated.npsHost}:${updated.npsPort}`,
-        apkUrl: `http://${localIp}:${updated.port}/dsh-agent.apk`,
-        npsApkUrl: `${npsScheme}://${updated.npsHost}:${updated.npsPort}/dsh-agent.apk`
+        npsUrl: `${npsScheme}://${updated.npsHost}:${updated.npsPort}`
       };
     }
 
