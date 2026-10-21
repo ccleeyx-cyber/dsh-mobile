@@ -338,6 +338,24 @@ test('skills: real engine catalog passed through, whenToUse fills an empty descr
     { name: 'ponytail-help', description: 'Quick-reference card', source: 'filesystem' },
     { name: 'skill-creator', description: '当用户要新建技能时', source: 'builtin' }
   ]);
+  // 入参形状的钉子：skills/list 的参数是 `request`（source: json），
+  // 和 commands/list 的 `agentId`（source: lookup）**不一样**。
+  // 少了这层 request，引擎拿到 undefined → 抛错 → 手机上只剩"没有可用技能"。
+  assert.deepEqual(calls.rpc[0].payload, { args: { request: { sessionId: 'session-1' } } });
+});
+
+test('skills: engine failure is logged on the host, never forwarded to the phone', async () => {
+  const { deps, calls } = makeDeps({
+    pathname: '/api/mobile/sessions/skills',
+    parsedUrl: { query: { sessionId: 'session-1' } },
+    callDshRpc: async () => { throw new Error('request.sessionId is required'); }
+  });
+  await handleFeatureRoute(deps);
+  assert.equal(calls.status, 200);
+  assert.deepEqual(calls.body.skills, []);
+  // 响应只说"引擎不可用"，不带原始错误文本。
+  assert.equal(calls.body.degraded, 'engine rpc not available');
+  assert.equal(JSON.stringify(calls.body).includes('request.sessionId'), false);
 });
 
 test('skills: tolerates the engine wrapping the catalog in value{}', async () => {

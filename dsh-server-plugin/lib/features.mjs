@@ -2160,7 +2160,14 @@ export async function handleFeatureRoute(deps) {
     const sessionId = String(deps.parsedUrl.query?.sessionId || '').trim();
     if (!sessionId) { sendJson(400, { ok: false, error: 'sessionId is required' }); return true; }
     try {
-      const raw = await callDshRpc('skills/list', { args: { sessionId } });
+      // ⚠️ 入参形状与 commands/list **不一样**，别照抄：
+      //   commands/list → 参数 agent，wire: 'agentId'，source: lookup
+      //                   ⇒ payload = { args: { agentId } }
+      //   skills/list   → 参数 request，wire: 'request'，source: json
+      //                   ⇒ payload = { args: { request: { sessionId } } }
+      // 少包一层 request 时引擎拿到 undefined 直接抛错，路由只会回空表 ——
+      // 真机表现就是打 `/` 只有「当前工作区没有可用技能」（2026-10-21 踩过）。
+      const raw = await callDshRpc('skills/list', { args: { request: { sessionId } } });
       // 引擎可能回 { skills: [...] }、{ value: { skills: [...] } } 或直接数组，
       // 三种都吃 —— 这一层不该把引擎的包装形态变成客户端的硬依赖。
       const list = Array.isArray(raw) ? raw
@@ -2182,6 +2189,12 @@ export async function handleFeatureRoute(deps) {
     } catch (err) {
       // 与 commands 一致：不给静态兜底。硬编码的 skill 名字会教用户输引擎不认的
       // 命令；空列表 + 原因，客户端据此显示"没有可用技能"。
+      //
+      // [fix 2026-10-21] 失败原因**必须进日志**：上一次入参少包了一层 request，
+      // 路由静默回空表，只能靠手机上一句"没有可用技能"反推，而日志里什么都没有。
+      // 这条 warn 是那次排查空缺的直接修复 —— 引擎侧的错误文本只留在宿主日志，
+      // 不下发给客户端（诊断接口的既有纪律：不把原始引擎错误递给手机）。
+      deps.logger?.warn?.(`[dsh-mobile-bridge] skills/list failed: ${err?.message || err}`);
       sendJson(200, { ok: true, code: 0, skills: [], degraded: 'engine rpc not available' });
     }
     return true;
