@@ -813,18 +813,28 @@ class DshService extends ChangeNotifier {
   }
 
   bool _checkResponseAuth(http.Response res) {
-    if (res.statusCode == 401 || res.statusCode == 403) {
+    // 只有 401 是鉴权失败。
+    //
+    // [fix 2026-10-21] 这里原来把 403 也当鉴权失败（`401 || 403`），后果比措辞不
+    // 准严重得多：网关**从不**用 403 表达鉴权问题（它自己的拒绝一律 401，见
+    // lib/core.mjs 的 authenticateRequest 与 index.js 的统一鉴权门），而 403 是
+    // 它对**资源级**拒绝的答复。于是下面三种正常拒绝都会被读成"Token 已失效"，
+    // 进而清凭据、把用户踢回配对页，并给出一条完全错误的原因：
+    //   * 点开一个不在本会话交付物清单里的文件（交付物下载/预览）
+    //   * 删除内置审批预设（features/extensions 都回 403）
+    //   * 读写会话工作区之外的路径（mapWorkspaceFileError → 403）
+    // 调用方本来就会把非 200 的 body['error'] 显示出来，所以放开 403 之后
+    // 用户看到的是"该文件不在清单中"这类真话，而不是被登出。
+    if (res.statusCode == 401) {
       // [feat 2026-10-12] 401 + device_revoked：电脑端把这台手机踢了。
       // 清凭据 + 停连接；UI 层据 lastAuthFailureWasDeviceRevoked 弹提示并跳配置页。
-      if (res.statusCode == 401) {
-        try {
-          final body = jsonDecode(utf8.decode(res.bodyBytes));
-          if (body is Map && (body['device_revoked'] == true || body['code2'] == 'device_revoked')) {
-            unawaited(handleDeviceRevoked());
-            return true;
-          }
-        } catch (_) {/* 非 JSON 401 走通用分支 */}
-      }
+      try {
+        final body = jsonDecode(utf8.decode(res.bodyBytes));
+        if (body is Map && (body['device_revoked'] == true || body['code2'] == 'device_revoked')) {
+          unawaited(handleDeviceRevoked());
+          return true;
+        }
+      } catch (_) {/* 非 JSON 401 走通用分支 */}
       handleAuthFailure('Token已失效或无访问权限 (HTTP ${res.statusCode})');
       return true;
     }
@@ -3555,11 +3565,15 @@ class DshService extends ChangeNotifier {
     });
   }
 
-  /// 本次任务改动的文件（git 工作树）。
+  /// 本次任务改动的文件（git 工作树 + 本轮归属）。
   ///
-  /// ⚠️ 这**不是**"本轮改了哪些文件"：`git status` 给的是工作区的**累计**真值，
-  /// 没有轮次归属（引擎自己的 `workspace/changes` 事件只带轮号、快照留在 Host
-  /// 侧不可回放）。所以变更只能按"当前状态"展示，不能拆到每轮消息后面。
+  /// 清单本身仍是 `git status` 的**当前工作树**真值（累计未提交状态），但每行多了
+  /// `thisTurn`：网关按「最新 `user/message` 之后的 `tool/call`」判定该文件是否属于
+  /// 本轮，并把本轮的排在最前（[fix 2026-10-21]）。三态语义见 [WorkspaceChange
+  /// .thisTurn]：`null` = 无法判定，界面不显示标记。
+  ///
+  /// 仍然拿不到的是**按轮拆分的历史**：引擎的 `workspace/changes` 事件只带轮号、
+  /// 快照留在 Host 侧不可回放，所以变更清单不会像交付物那样挂到每轮消息后面。
   ///
   /// 带 [_sessionLoadSeq] 守卫。
   Future<void> fetchWorkspaceChanges() async {

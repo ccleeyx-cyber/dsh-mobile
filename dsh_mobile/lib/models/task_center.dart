@@ -137,6 +137,17 @@ class WorkspaceChange {
   /// 触发这行的工具名（`write` / `edit`），仅 [fromToolCall] 时有值。
   final String? tool;
 
+  /// 这个文件是否由**本轮**改动。
+  ///
+  /// 网关按「最新 `user/message` 之后的 `tool/call`」判定，所以这是真的轮次归属，
+  /// 不是"最近改过"。三态而非二态是刻意的：
+  ///   * `true` / `false` — 判定成立；
+  ///   * `null` — 无法判定（取到的事件窗口里没有人类消息，通常是极长的一轮），
+  ///     界面**不得**因此声称它属于本轮。
+  ///
+  /// `git status` 本身回答不了这个问题：它给的是工作树**累计**未提交改动。
+  final bool? thisTurn;
+
   const WorkspaceChange({
     required this.path,
     required this.status,
@@ -146,6 +157,7 @@ class WorkspaceChange {
     this.binary = false,
     this.fromToolCall = false,
     this.tool,
+    this.thisTurn,
   });
 
   factory WorkspaceChange.fromJson(Map<String, dynamic> json) => WorkspaceChange(
@@ -157,6 +169,9 @@ class WorkspaceChange {
         binary: json['binary'] == true,
         fromToolCall: json['fromToolCall'] == true,
         tool: json['tool']?.toString(),
+        // 只有真的布尔值才算判定：缺字段/类型不对一律 null（未知），
+        // 不能落成 false —— 那是在断言"不是本轮改的"。
+        thisTurn: json['thisTurn'] is bool ? json['thisTurn'] as bool : null,
       );
 
   String get label {

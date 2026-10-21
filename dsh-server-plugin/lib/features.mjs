@@ -24,11 +24,17 @@ import os from 'node:os';
 import {
   classifyHarnessNotice,
   coerceToolInput,
+  describeDeliverableRefusal,
   describeTurnEnd,
+  extractDeliverables,
   isCarriedContext,
   isFailedTurnEnd,
-  readUserMessageSource
+  readUserMessageSource,
+  resolveDeliverable
 } from './core.mjs';
+
+// Re-exported for the callers and tests that used to import them from here.
+export { extractDeliverables, resolveDeliverable };
 
 import {
   normalizeAgentTeam,
@@ -113,62 +119,13 @@ export function normalizeQueueAction(raw) {
 
 /* ------------------------------------------------------------------ *
  * 2. Deliverables (present tool)
+ *
+ * `extractDeliverables` / `resolveDeliverable` now live in core.mjs: this module
+ * and extensions.mjs both need them, and this module already imports
+ * extensions.mjs, so the shared half cannot live here without a cycle. They are
+ * re-exported at the bottom of this import block so every existing importer —
+ * including the unit tests — keeps working unchanged.
  * ------------------------------------------------------------------ */
-
-/**
- * Collect every `deliverables/presented` declaration from session records.
- *
- * Newest declaration wins per path: a file presented in two turns is one row,
- * attributed to the later turn. Paths are resolved to absolute form for the
- * download route, while `display` keeps the relative label the phone shows.
- *
- * @param records - `session/page` records (`{ event }` entries).
- * @param cwd - the session's working directory, used to resolve relatives.
- * @returns deliverable rows, newest first.
- */
-export function extractDeliverables(records, cwd) {
-  if (!Array.isArray(records)) return [];
-  const byPath = new Map();
-  for (const record of records) {
-    const ev = record?.event;
-    if (!ev || ev.type !== 'deliverables/presented') continue;
-    const files = Array.isArray(ev.data?.files) ? ev.data.files : [];
-    for (const file of files) {
-      const raw = typeof file?.path === 'string' ? file.path.trim() : '';
-      if (!raw) continue;
-      const absolute = path.isAbsolute(raw) ? raw : path.resolve(cwd || '.', raw);
-      byPath.set(absolute, {
-        path: absolute,
-        display: raw,
-        description: typeof file.description === 'string' ? file.description : '',
-        turn: ev.data?.turn ?? null,
-        seq: typeof ev.seq === 'number' ? ev.seq : null,
-        time: typeof ev.time === 'number' ? ev.time : null
-      });
-    }
-  }
-  return [...byPath.values()].sort((a, b) => (b.seq ?? 0) - (a.seq ?? 0));
-}
-
-/**
- * Resolve a download request against the declared deliverables.
- *
- * Only paths the session actually presented may be downloaded — the phone
- * cannot turn this route into an arbitrary file read, and a path traversal in
- * the query is rejected by exact membership rather than by string filtering.
- *
- * @param deliverables - rows from {@link extractDeliverables}.
- * @param requested - the path the client asked for.
- * @returns the matching row, or null.
- */
-export function resolveDeliverable(deliverables, requested) {
-  if (!requested || typeof requested !== 'string') return null;
-  const wanted = path.resolve(requested);
-  for (const row of deliverables) {
-    if (path.resolve(row.path) === wanted) return row;
-  }
-  return null;
-}
 
 /* ------------------------------------------------------------------ *
  * 2b. Session event-log paging (the deliverable scan's data source)
@@ -1837,10 +1794,21 @@ export async function handleFeatureRoute(deps) {
     const wanted = String(deps.parsedUrl.query?.path || '').trim();
     if (!sessionId || !wanted) { sendJson(400, { ok: false, error: 'sessionId and path are required' }); return true; }
     const { records, cwd } = await readSessionRecords(sessionId);
-    const row = resolveDeliverable(extractDeliverables(records, cwd), wanted);
+    const presented = extractDeliverables(records, cwd);
+    const row = resolveDeliverable(presented, wanted);
     if (!row) {
-      // Exact membership in the presented set, never a string filter.
-      sendJson(403, { ok: false, code: 403, error: '该文件不在本会话的交付物清单中' });
+      // Exact membership in the presented set, never a string filter. The reason
+      // is reported so "I can't open my file" stops looking like a permission
+      // problem when it is really an unresolvable relative path.
+      const refusal = describeDeliverableRefusal({ presented, cwd });
+      sendJson(refusal.status, {
+        ok: false,
+        code: refusal.status,
+        reason: refusal.code,
+        error: refusal.error,
+        hint: refusal.hint,
+        presentedCount: refusal.presentedCount
+      });
       return true;
     }
     // `sendFile` answers false when the declared file is gone or unreadable. It

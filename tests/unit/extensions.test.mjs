@@ -17,6 +17,12 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  describeDeliverableRefusal,
+  extractDeliverables,
+  resolveDeliverable
+} from '../../dsh-server-plugin/lib/core.mjs';
+
+import {
   QUICK_COMMANDS,
   contentTypeFor,
   discoverGitRepos,
@@ -36,6 +42,7 @@ import {
   extractToolCallFiles,
   generatePushTopic,
   handleExtensionRoute,
+  lastUserTurnStartSeq,
   normalizeJob,
   normalizeJobChunk,
   normalizePresetCatalog,
@@ -325,6 +332,52 @@ test('extractToolCallFiles: drops paths outside the workspace and unparsable arg
   ];
   const { changed } = extractToolCallFiles(records, ws);
   assert.deepEqual(changed.map((c) => c.display), ['inside.txt']);
+});
+
+/* ---- turn membership (the "what did THIS turn change" half of the diff) ---- */
+
+test('lastUserTurnStartSeq: answers the NEWEST human message, not the first', () => {
+  const records = [
+    rec('user/message', 5, {}),
+    rec('tool/call', 10, { name: 'write', arguments: { file_path: 'a.txt' } }),
+    rec('user/message', 30, {}),
+    rec('tool/call', 40, { name: 'write', arguments: { file_path: 'b.txt' } })
+  ];
+  assert.equal(lastUserTurnStartSeq(records), 30);
+});
+
+test('lastUserTurnStartSeq: null when the window holds no human message', () => {
+  assert.equal(lastUserTurnStartSeq([rec('tool/call', 10, { name: 'write' })]), null);
+  assert.equal(lastUserTurnStartSeq([]), null);
+  assert.equal(lastUserTurnStartSeq(null), null);
+});
+
+test('extractToolCallFiles: marks only post-message calls as this turn', (t) => {
+  const { ws } = makeWorkspace(t);
+  const records = [
+    rec('tool/call', 10, { name: 'write', arguments: { file_path: 'src/old.dart' } }),
+    rec('user/message', 30, {}),
+    rec('tool/call', 40, { name: 'write', arguments: { file_path: 'src/new.dart' } })
+  ];
+  const { changed, turnStartSeq } = extractToolCallFiles(records, ws);
+
+  assert.equal(turnStartSeq, 30);
+  assert.equal(changed.find((c) => c.display === 'src/new.dart').thisTurn, true);
+  assert.equal(changed.find((c) => c.display === 'src/old.dart').thisTurn, false);
+});
+
+test('extractToolCallFiles: unknown boundary is null, never an implicit true', (t) => {
+  // The regression this guards: treating "no user/message in the window" as
+  // "everything belongs to this turn" would relabel a repository's entire
+  // uncommitted backlog as this turn's work, which is exactly the wrong answer.
+  const { ws } = makeWorkspace(t);
+  const records = [
+    rec('tool/call', 10, { name: 'write', arguments: { file_path: 'src/a.dart' } })
+  ];
+  const { changed, turnStartSeq } = extractToolCallFiles(records, ws);
+
+  assert.equal(turnStartSeq, null);
+  assert.equal(changed[0].thisTurn, null);
 });
 
 /* ------------------------------------------------------------------ *
@@ -920,6 +973,47 @@ test('deliverables/text: a path outside the declared set is refused', async () =
   });
   assert.equal(await result, true);
   assert.equal(calls[0].status, 403);
+  // The harness records no cwd, so the honest reason is "could not resolve",
+  // not "not in the list" — the distinction the audit asked for.
+  assert.equal(calls[0].body.reason, 'deliverable-cwd-unknown');
+  assert.match(String(calls[0].body.hint), /不是权限问题/);
+});
+
+/* ---- refusal reasons (a resolution failure must not look like a permission one) ---- */
+
+test('describeDeliverableRefusal: unknown cwd is reported as a resolution failure', () => {
+  const refusal = describeDeliverableRefusal({ presented: [{ path: 'x' }], cwd: null });
+  assert.equal(refusal.code, 'deliverable-cwd-unknown');
+  assert.equal(refusal.status, 403);
+  assert.match(refusal.hint, /不是权限问题/);
+});
+
+test('describeDeliverableRefusal: an empty listing says nothing was declared', () => {
+  const refusal = describeDeliverableRefusal({ presented: [], cwd: '/ws' });
+  assert.equal(refusal.code, 'deliverable-none-presented');
+  assert.equal(refusal.presentedCount, 0);
+});
+
+test('describeDeliverableRefusal: a real set reports its size, never the paths', () => {
+  const presented = [{ path: '/ws/a.xlsx' }, { path: '/ws/b.docx' }];
+  const refusal = describeDeliverableRefusal({ presented, cwd: '/ws' });
+  assert.equal(refusal.code, 'deliverable-not-in-set');
+  assert.equal(refusal.presentedCount, 2);
+  // A refusal must not become a file-enumeration surface.
+  assert.doesNotMatch(refusal.hint, /a\.xlsx/);
+  assert.doesNotMatch(refusal.error, /b\.docx/);
+});
+
+test('extractDeliverables/resolveDeliverable: exported from core and matched exactly', () => {
+  const records = [
+    { event: { type: 'deliverables/presented', seq: 10, data: { files: [{ path: 'out/report.xlsx' }] } } }
+  ];
+  const rows = extractDeliverables(records, '/ws');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].path, path.resolve('/ws', 'out/report.xlsx'));
+  assert.equal(resolveDeliverable(rows, path.resolve('/ws', 'out/report.xlsx'))?.display, 'out/report.xlsx');
+  // Traversal never resolves to a declared row.
+  assert.equal(resolveDeliverable(rows, '/ws/../../etc/passwd'), null);
 });
 
 test('deliverables/text: a binary deliverable says so instead of rendering mojibake', async (t) => {

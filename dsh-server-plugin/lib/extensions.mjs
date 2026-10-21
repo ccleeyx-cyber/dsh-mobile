@@ -17,7 +17,7 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 
-import { classifyHarnessNotice } from './core.mjs';
+import { classifyHarnessNotice, describeDeliverableRefusal, extractDeliverables } from './core.mjs';
 
 import {
   contentTypeFor,
@@ -58,6 +58,37 @@ const MUTATING_TOOLS = new Set(['write', 'edit']);
 const READING_TOOLS = new Set(['read']);
 
 /**
+ * Sequence number at which the CURRENT turn began — the newest human message.
+ *
+ * Why this exists: `git status` answers "what is uncommitted in the working
+ * tree", which is NOT the question the diff panel asks ("what did this turn
+ * change?"). A repository with 30 stale uncommitted files would list all 30 and
+ * give the phone no way to tell which 3 belong to the turn it just ran.
+ *
+ * The turn boundary is in the session log, not in git: every `tool/call` after
+ * the newest `user/message` belongs to the turn the user just triggered, and
+ * everything before it belongs to an earlier turn.
+ *
+ * Returns null when the fetched window holds no human message at all (a very
+ * long turn whose start predates the pages we read). null means **unknown, not
+ * "everything"** — callers must never claim turn membership they cannot prove.
+ *
+ * @param records - `session/page` records, ascending by seq.
+ * @returns {number|null} the boundary seq, or null when undeterminable.
+ */
+export function lastUserTurnStartSeq(records) {
+  if (!Array.isArray(records)) return null;
+  let start = null;
+  for (const record of records) {
+    const ev = record?.event;
+    if (!ev || ev.type !== 'user/message') continue;
+    if (typeof ev.seq !== 'number') continue;
+    if (start === null || ev.seq > start) start = ev.seq;
+  }
+  return start;
+}
+
+/**
  * Every file path the agent named in a `tool/call`, newest first.
  *
  * Why this exists: `workspace/changes` in the engine carries only a turn number
@@ -67,16 +98,25 @@ const READING_TOOLS = new Set(['read']);
  * the other half of the truth — they are exactly what the agent meant to do,
  * recorded durably in the session log — so they are the honest fallback.
  *
+ * Each row carries `thisTurn`:
+ *   * `true`  — the call happened after the newest `user/message`, so it belongs
+ *               to the turn the phone user just triggered;
+ *   * `false` — it belongs to an earlier turn in the same session;
+ *   * `null`  — the window holds no human message, so membership is unknown.
+ * A caller that only wants "this turn" must treat null as unknown, not as true.
+ *
  * @param records - `session/page` records (`{ event }` entries).
  * @param cwd - session working directory, used to resolve relative paths.
- * @returns `{ changed, read }` — arrays of `{ path, display, tool, seq, time }`,
- *   newest first. `changed` are mutating calls; `read` are observations.
+ * @returns `{ changed, read, turnStartSeq }` — arrays of
+ *   `{ path, display, tool, seq, time, thisTurn }`, newest first. `changed` are
+ *   mutating calls; `read` are observations.
  */
 export function extractToolCallFiles(records, cwd) {
   const changed = new Map();
   const read = new Map();
-  if (!Array.isArray(records)) return { changed: [], read: [] };
+  if (!Array.isArray(records)) return { changed: [], read: [], turnStartSeq: null };
   const base = typeof cwd === 'string' && cwd ? cwd : null;
+  const turnStartSeq = lastUserTurnStartSeq(records);
 
   for (const record of records) {
     const ev = record?.event;
@@ -113,7 +153,11 @@ export function extractToolCallFiles(records, cwd) {
         : rawPath,
       tool: name,
       seq: typeof ev.seq === 'number' ? ev.seq : null,
-      time: typeof ev.time === 'number' ? ev.time : null
+      time: typeof ev.time === 'number' ? ev.time : null,
+      // Membership is only claimed when the boundary is actually known.
+      thisTurn: turnStartSeq === null || typeof ev.seq !== 'number'
+        ? null
+        : ev.seq > turnStartSeq
     };
     const bucket = isChange ? changed : read;
     // Newest call wins for one path: that is the one whose result the phone
@@ -126,7 +170,8 @@ export function extractToolCallFiles(records, cwd) {
   const byNewest = (a, b) => (b.seq ?? 0) - (a.seq ?? 0);
   return {
     changed: [...changed.values()].sort(byNewest),
-    read: [...read.values()].sort(byNewest)
+    read: [...read.values()].sort(byNewest),
+    turnStartSeq
   };
 }
 
@@ -832,7 +877,17 @@ export async function handleExtensionRoute(deps) {
     // index.js because it also owns deliverable extraction.
     const resolved = await deps.resolveDeliverableFile(s.id, wanted);
     if (!resolved) {
-      sendJson(403, { ok: false, code: 403, error: '该文件不在本会话的交付物清单中' });
+      // Report WHY. `presented` comes from the records already fetched above, so
+      // distinguishing "no cwd" from "not in a non-empty list" costs no extra RPC.
+      const refusal = describeDeliverableRefusal({ presented: extractDeliverables(records, cwd), cwd });
+      sendJson(refusal.status, {
+        ok: false,
+        code: refusal.status,
+        reason: refusal.code,
+        error: refusal.error,
+        hint: refusal.hint,
+        presentedCount: refusal.presentedCount
+      });
       return true;
     }
     const maxBytes = Number(q.max) || undefined;

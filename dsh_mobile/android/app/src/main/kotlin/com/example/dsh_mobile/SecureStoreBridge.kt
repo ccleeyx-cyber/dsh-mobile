@@ -6,6 +6,7 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import android.util.Log
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.security.KeyStore
@@ -41,19 +42,30 @@ class SecureStoreBridge(private val context: Context) : MethodChannel.MethodCall
 
     @SuppressLint("NewApi") // onMethodCall 里已判 SDK_INT；见类注释「版本兼容」
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        // 观测点：README §4 说这套 Keystore 代码"未经真机验证"，所以每一步都要
+        // 能在 `adb logcat -s DshSecure` 里看见。**只记长度与结果，绝不记内容** ——
+        // logcat 是任何拿到 USB 调试权限的人都能读的。
+        Log.i(TAG, "call=${call.method} sdk=${Build.VERSION.SDK_INT}")
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
             // 能力不存在：ping 如实回 false 让 Dart 侧立刻降级；其余方法回错误，
             // 由 Dart 侧的兜底逻辑处理（它不会把异常抛给业务代码）。
             if (call.method == "ping") {
+                Log.i(TAG, "ping=false reason=below-api-23（Dart 侧将降级为明文兜底）")
                 result.success(false)
             } else {
+                Log.w(TAG, "refused method=${call.method} reason=below-api-23")
                 result.error("secure-unavailable", "AndroidKeyStore AES 需要 API 23+", null)
             }
             return
         }
         try {
             when (call.method) {
-                "ping" -> result.success(true)
+                "ping" -> {
+                    // 顺手把密钥是否已存在也记下来：这是"改锁屏密码后密钥被清掉"
+                    // 这类现场唯一能复现的证据。
+                    Log.i(TAG, "ping=true keyExists=${keyExists()}")
+                    result.success(true)
+                }
 
                 "write" -> {
                     val key = call.argument<String>("key")
@@ -75,6 +87,7 @@ class SecureStoreBridge(private val context: Context) : MethodChannel.MethodCall
                                 Base64.encodeToString(ct, Base64.NO_WRAP)
                         )
                         .apply()
+                    Log.i(TAG, "write ok key=$key plainBytes=${value.length} ivBytes=${iv.size} ctBytes=${ct.size}")
                     result.success(true)
                 }
 
@@ -84,7 +97,9 @@ class SecureStoreBridge(private val context: Context) : MethodChannel.MethodCall
                         result.error("bad-args", "key is required", null)
                         return
                     }
-                    result.success(read(key))
+                    val value = read(key)
+                    Log.i(TAG, "read key=$key hit=${value != null} plainBytes=${value?.length ?: 0}")
+                    result.success(value)
                 }
 
                 "delete" -> {
@@ -94,6 +109,7 @@ class SecureStoreBridge(private val context: Context) : MethodChannel.MethodCall
                         return
                     }
                     prefs().edit().remove(PREFIX + key).apply()
+                    Log.i(TAG, "delete key=$key")
                     result.success(true)
                 }
 
@@ -102,8 +118,19 @@ class SecureStoreBridge(private val context: Context) : MethodChannel.MethodCall
         } catch (e: Exception) {
             // 任何失败都如实回给 Dart 侧：它会降级到内存/明文路径，
             // 绝不因为加密不可用就丢掉用户的网关凭据。
+            // 这里连同异常类型一起记 —— GCM 认证失败（密钥被换掉）与
+            // KeyStoreException（provider 故障）是完全不同的两种现场。
+            Log.w(TAG, "failed method=${call.method} ${e.javaClass.simpleName}: ${e.message}")
             result.error("secure-failed", e.message ?: e.javaClass.simpleName, null)
         }
+    }
+
+    /** 主密钥当前是否存在于 Keystore（只读探测，不生成）。 */
+    private fun keyExists(): Boolean = try {
+        val ks = KeyStore.getInstance(KEYSTORE).apply { load(null) }
+        ks.containsAlias(KEY_ALIAS)
+    } catch (e: Exception) {
+        false
     }
 
     /**
@@ -161,6 +188,9 @@ class SecureStoreBridge(private val context: Context) : MethodChannel.MethodCall
     private fun prefs() = context.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
 
     companion object {
+        /** logcat 标签：`adb logcat -s DshSecure` 就是完整的验证流水。 */
+        private const val TAG = "DshSecure"
+
         /** AndroidKeyStore 是平台固定的 provider 名，不是可配置项。 */
         private const val KEYSTORE = "AndroidKeyStore"
 

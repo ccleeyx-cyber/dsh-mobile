@@ -217,6 +217,19 @@ function resolveInternalSecret() {
  */
 export const MAX_CLIENT_BUFFER_BYTES = 8 * 1024 * 1024;
 
+/**
+ * Page budget for the "which files did THIS TURN change" scan.
+ *
+ * `workspace/changes` is answered right after a turn ends, so the turn being
+ * displayed is always inside the newest couple of pages. Scanning the full
+ * history budget (8 pages) to answer a question about the last turn would put a
+ * multi-page RPC on the turn-end path for no extra truth.
+ *
+ * This is only used when git itself answers; a non-repository workspace uses the
+ * full budget because there the tool-call rows are the entire answer.
+ */
+export const WORKSPACE_CHANGES_TURN_PAGES = 2;
+
 export function shouldDivertForBackpressure(bufferedAmount) {
   return typeof bufferedAmount === 'number'
     && Number.isFinite(bufferedAmount)
@@ -545,15 +558,26 @@ export function apply(ctx, config = {}, internals = {}) {
    * gateway: a session holding a real `deliverables/presented` event still
    * answered `{"deliverables":[]}`.
    */
-  async function readSessionRecords(sessionId) {
+  async function readSessionRecords(sessionId, { maxPages } = {}) {
     const cwd = readSessionCwd(sessionId);
     try {
       const { records, pages, truncated } = await collectSessionRecords({
         callDshRpc,
-        sessionId: toFullSessionId(sessionId)
+        sessionId: toFullSessionId(sessionId),
+        // Callers that only need "the current turn" pass a small budget: the
+        // newest one or two pages already hold every event of the turn being
+        // displayed, and this route is on the phone's hot path at turn end.
+        ...(typeof maxPages === 'number' && maxPages > 0 ? { maxPages } : {})
       });
       if (truncated) {
-        logger.warn('[dsh-mobile-bridge] 交付物扫描未走完全部历史 %s（%d 页）', sessionId, pages);
+        // Only worth a warning on a full-budget scan: those callers asked for the
+        // whole history and did not get it (a deliverable list may then be
+        // incomplete). A deliberately bounded scan (`maxPages`) truncates by
+        // design, so warning on it would put a misleading "交付物扫描未走完"
+        // line in the log at every turn end.
+        if (!(typeof maxPages === 'number' && maxPages > 0)) {
+          logger.warn('[dsh-mobile-bridge] 交付物扫描未走完全部历史 %s（%d 页）', sessionId, pages);
+        }
       }
       return { records, cwd, truncated };
     } catch (err) {
@@ -590,7 +614,16 @@ export function apply(ctx, config = {}, internals = {}) {
    */
   async function readWorkspaceChanges(sessionId, wantedPath) {
     const cwd = readSessionCwd(sessionId);
-    if (!cwd) return { available: false, reason: 'no-workspace', files: [], source: 'none' };
+    if (!cwd) {
+      return {
+        available: false,
+        reason: 'no-workspace',
+        code: 'no-cwd',
+        hint: '该会话没有记录工作目录（可能是很旧的会话）。会话日志建立之前的记录无法回溯 cwd。',
+        files: [],
+        source: 'none'
+      };
+    }
 
     const runGit = (args, gitCwd = cwd) => new Promise((resolve) => {
       execFile('git', args, { cwd: gitCwd, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, stdout) => {
@@ -602,26 +635,42 @@ export function apply(ctx, config = {}, internals = {}) {
     const inside = await runGit(['rev-parse', '--is-inside-work-tree']);
     const isRepo = inside !== null && inside.trim() === 'true';
 
-    // The tool-call fallback is computed on every path: when git answers it is
-    // shown as a supplement (a file the agent wrote may be outside the repo, or
-    // gitignored), and when git cannot answer it is the whole answer.
-    let fallback = { changed: [], read: [] };
-    if (wantedPath || !isRepo) {
-      try {
-        const { records } = await readSessionRecords(sessionId);
-        fallback = extractToolCallFiles(records, cwd);
-      } catch (err) {
-        logger.warn('[dsh-mobile-bridge] tool/call fallback failed %s: %s', sessionId, err?.message || err);
-      }
+    // The tool-call fallback is computed on every path, and it now carries turn
+    // membership — the thing git cannot express:
+    //   * git answers "what is uncommitted in the working tree", which on a
+    //     long-lived repo is everything accumulated since the last commit;
+    //   * the phone's question is "what did THIS turn change", so a file is only
+    //     honest to mark as this-turn when a `tool/call` for it happened after
+    //     the newest `user/message`.
+    //
+    // Cost is bounded on the git path (a couple of pages) because that route
+    // runs at every turn end; on a non-repository workspace the rows ARE the
+    // answer, so the full budget is used there.
+    let fallback = { changed: [], read: [], turnStartSeq: null };
+    try {
+      const { records } = await readSessionRecords(
+        sessionId,
+        isRepo ? { maxPages: WORKSPACE_CHANGES_TURN_PAGES } : undefined
+      );
+      fallback = extractToolCallFiles(records, cwd);
+    } catch (err) {
+      logger.warn('[dsh-mobile-bridge] tool/call fallback failed %s: %s', sessionId, err?.message || err);
     }
+    // `null` means "the fetched window held no human message" — unknown, never
+    // an implicit yes. Callers must keep that distinction visible.
+    const turnStartSeq = fallback.turnStartSeq ?? null;
 
     if (!isRepo) {
       const repos = discoverGitRepos(cwd);
       return {
         available: false,
         reason: 'not-a-git-repository',
+        code: 'not-a-git-repository',
         source: fallback.changed.length ? 'tool-calls' : 'none',
         cwdKnown: true,
+        turnStartSeq,
+        thisTurnKnown: turnStartSeq !== null,
+        thisTurnCount: fallback.changed.filter((row) => row.thisTurn === true).length,
         files: fallback.changed.map((row) => ({
           // Workspace-relative on purpose: git rows use the same spelling, and
           // the per-file diff route round-trips `path` verbatim, so mixing an
@@ -634,12 +683,14 @@ export function apply(ctx, config = {}, internals = {}) {
           deleted: null,
           binary: false,
           fromToolCall: true,
+          thisTurn: row.thisTurn,
           tool: row.tool,
           seq: row.seq
         })),
-        readFiles: fallback.read.map((row) => ({ display: row.display, tool: row.tool, seq: row.seq })),
+        readFiles: fallback.read.map((row) => ({ display: row.display, tool: row.tool, seq: row.seq, thisTurn: row.thisTurn })),
         repoCandidates: repos.children.map((c) => ({ name: c.name, path: c.name })),
         ancestorRepos: repos.ancestors.length,
+        primaryRoot: repos.primaryRoot,
         note: repositionNote(fallback.changed.length, repos.children.length)
       };
     }
@@ -666,6 +717,20 @@ export function apply(ctx, config = {}, internals = {}) {
     const numstat = await runGit(['diff', '--numstat', 'HEAD']);
     const gitFiles = combineChanges(parsePorcelain(porcelain ?? ''), parseNumstat(numstat ?? ''));
 
+    // Absolute paths of the files a tool call touched during the current turn.
+    // Compared resolved so `./a/b` and `a/b` cannot disagree.
+    const thisTurnResolved = new Set(
+      fallback.changed
+        .filter((row) => row.thisTurn === true)
+        .map((row) => path.resolve(cwd, row.display || row.path))
+    );
+    const tagGit = (file) => ({
+      ...file,
+      thisTurn: turnStartSeq === null
+        ? null
+        : thisTurnResolved.has(path.resolve(cwd, file.path))
+    });
+
     // Union with the tool-call rows, git first (it has real counts), and mark the
     // rows only the log knows about so the App can explain the missing counts.
     const seen = new Set(gitFiles.map((f) => path.resolve(cwd, f.path)));
@@ -679,16 +744,27 @@ export function apply(ctx, config = {}, internals = {}) {
         deleted: null,
         binary: false,
         fromToolCall: true,
+        thisTurn: row.thisTurn,
         tool: row.tool,
         seq: row.seq
       }));
+
+    const files = [...gitFiles.map(tagGit), ...extras];
+    // This turn first. The panel is opened right after a turn ends, so what that
+    // turn touched must not be buried under stale edits that were already
+    // uncommitted before the session ever started. `sort` is stable, so the
+    // relative order git gave within each group is preserved.
+    files.sort((a, b) => Number(b.thisTurn === true) - Number(a.thisTurn === true));
 
     return {
       available: true,
       source: extras.length ? 'git+tool-calls' : 'git',
       cwd,
-      files: [...gitFiles, ...extras],
-      readFiles: fallback.read.slice(0, 40).map((row) => ({ display: row.display, tool: row.tool, seq: row.seq }))
+      turnStartSeq,
+      thisTurnKnown: turnStartSeq !== null,
+      thisTurnCount: files.filter((f) => f.thisTurn === true).length,
+      files,
+      readFiles: fallback.read.slice(0, 40).map((row) => ({ display: row.display, tool: row.tool, seq: row.seq, thisTurn: row.thisTurn }))
     };
   }
 

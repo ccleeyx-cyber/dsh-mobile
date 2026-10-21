@@ -7,6 +7,74 @@
 
 ---
 
+## [1.38.0] - 2026-10-21
+
+按 2026-10-21 的优化清单执行。清单里 7 项有 5 项经核实**早已在代码里修好**
+（队列路由顺序、投影缓存两种拼写、交付物全量翻页、cwd 父目录回溯、ntfy 去重+
+audit），这次只做真正还缺的部分。
+
+### 新增：diff 能区分「本轮改了哪些文件」
+
+以前只能把 `git status` 的**累计**未提交改动整列出来 —— 一个积压了 30 个未提交
+文件的仓库会把这 30 个全列上，手机端没法知道哪 3 个是刚跑完那一轮改的。
+
+- 网关取会话日志里**最新一条 `user/message` 之后**的 `tool/call`，据此给每条变更打
+  `thisTurn` 三态：`true` / `false` / `null`（`null` = 窗口里没有人类消息，无法判定，
+  **绝不**当成 `true` —— 那样会把整个积压说成本轮的工作）。
+- 本轮的行排在最前（`sort` 稳定，组内仍按 git 顺序）。
+- App 侧在变更行上显示「本轮」小标；`false` 与 `null` 都不显示。
+- 扫描有界：git 能回答时只取最新 2 页（`WORKSPACE_CHANGES_TURN_PAGES`），因为这个
+  接口在每轮结束时都会打一次；非 git 工作区仍用完整预算，那里 tool-call 就是答案。
+- `lastUserTurnStartSeq()` / `thisTurn` 有单测，其中一条专门锁「未知 ≠ 是」。
+
+### 修复：交付物「点不开」被说成权限问题
+
+`resolveDeliverable` 查不到时一律回 403「该文件不在本会话的交付物清单中」，把三种
+完全不同的原因混成一句：
+
+| 真实原因 | 现在的回答 |
+|---|---|
+| 会话没记录 cwd，相对路径解析不到（多为很旧的会话） | `reason: deliverable-cwd-unknown` + 提示「不是权限问题」 |
+| 这个会话根本没声明过交付物 | `reason: deliverable-none-presented` |
+| 声明过，但请求的路径不在其中 | `reason: deliverable-not-in-set` + 已声明项数 |
+
+回包新增 `reason` / `hint` / `presentedCount`，**不回传清单里的具体路径**（否则拒绝
+接口就成了文件枚举口）。`extractDeliverables` / `resolveDeliverable` 下沉到
+`core.mjs`，`features.mjs` 原样再导出 —— `features.mjs` 本来就 import
+`extensions.mjs`，反向 import 会成环。
+
+### 修复：App 把所有 403 当成 Token 失效
+
+`_checkResponseAuth` 原来判 `401 || 403`，于是**任何资源级拒绝**都会走
+`handleAuthFailure()`：清凭据、把用户踢回配对页，并给出「Token已失效或无访问权限」。
+网关自己的鉴权拒绝**一律是 401**（`core.mjs` 的 `authenticateRequest` 与 `index.js`
+的统一鉴权门），403 从来只表示"这个资源不许"：
+
+- 点开不在清单里的交付物
+- 删除内置审批预设
+- 读写会话工作区之外的路径
+
+现在只有 401 触发鉴权失败；403 交给各调用方把 `body['error']` 显示出来（它们本来
+就会这么做）。这条不改的话，前面那条"更准确的错误原因"根本到不了用户眼前。
+
+### 新增：SecureStore 的观测点与真机验收清单
+
+`SecureStoreBridge.kt` 每个方法都打出 `DshSecure` 标签的 logcat 记录
+（**只打长度与结果，不打凭据内容**），`ping` 额外报 `keyExists` —— 这是"改锁屏密码
+后密钥被清掉"这类现场唯一能复现的证据。
+
+验收步骤写在 [docs/securestore-device-verification.md](docs/securestore-device-verification.md)：
+**那是待办清单，还没有执行记录**（本机没有 Android SDK）。
+
+### 验证
+
+- 网关 `npm test`：**535 项 / 533 过** / 2 跳过 / 0 失败（较 v1.37.2 的 527 项新增 8 条：
+  轮次归属 4 条、交付物拒绝原因 4 条）。
+- App：`flutter analyze` / `flutter test` **未跑**（本机无 Flutter SDK），Dart 侧改动
+  为新增可选字段 + 一处条件渲染 + 一处鉴权判定收窄，需在有 Flutter 的机器上补跑。
+
+---
+
 ## [1.37.2] - 2026-10-21
 
 真机反馈两件事：**扫码配对仍失败**（手动填 host+端口可以），**提问卡的「提交回答」

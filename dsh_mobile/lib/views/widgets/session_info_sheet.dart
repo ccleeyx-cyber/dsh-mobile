@@ -1020,14 +1020,16 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
 
   // --------------------------------------------------------- 变更 ----
 
-  /// 本次变更**只能**按"当前工作区状态"处理，不能按轮拆分。
+  /// 本次变更按"当前工作区状态"展示，并为每行标注是否属于**本轮**。
   ///
-  /// 这是数据事实，不是取舍：`GET /api/mobile/workspace/changes` 返回的是
-  /// `git status` 的**当前工作树**真值（整个工作区的累计状态），而引擎自己的
-  /// `workspace/changes` 事件只带一个轮号、快照留在 Host 侧不可回放。也就是说
-  /// "第 3 轮改了哪两个文件"这个数据在当前架构里**不存在**。所以变更清单只出现在
-  /// 状态层（状态条计数 + 这里），不会像交付物那样拆到每轮消息后面 —— 那样做
-  /// 等于编数据。
+  /// 清单本体仍是 `git status` 的**当前工作树**真值（整个工作区的累计状态）：
+  /// 引擎自己的 `workspace/changes` 事件只带一个轮号、快照留在 Host 侧不可回放，
+  /// 所以"第 3 轮改了哪两个文件"这种**历史拆分**在当前架构里不存在，变更清单也
+  /// 不会像交付物那样挂到每轮消息后面 —— 那样做等于编数据。
+  ///
+  /// [fix 2026-10-21] 但"本轮改了哪些"是答得出的：网关取会话日志里最新一条
+  /// `user/message` 之后的 `tool/call`，据此给每行 `thisTurn` 三态，并把本轮的
+  /// 排在最前。这一行显示「本轮」小标；`false`/`null` 都不显示。
   Widget _buildChanges() {
     final note = widget.changesNote.trim();
     final children = <Widget>[];
@@ -1216,6 +1218,21 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
               ),
             ),
             const SizedBox(width: 6),
+            // 「本轮」标记：只有网关真的判定为 true 才显示。
+            // `null`（未知：窗口里没有人类消息）与 `false` 都不显示 ——
+            // 把"不是本轮改的"写成标签只会增加噪音，而"未知"更不能显示成"是"。
+            if (change.thisTurn == true) ...[
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                decoration: BoxDecoration(
+                  color: context.c.accent.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text('本轮',
+                    style: TextStyle(fontSize: 9.5, color: context.c.accent)),
+              ),
+              const SizedBox(width: 4),
+            ],
             Text(delta,
                 style:
                     TextStyle(fontSize: 10.5, color: context.c.textTertiary)),

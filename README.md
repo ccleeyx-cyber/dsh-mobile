@@ -144,6 +144,10 @@ MethodChannel 就绕开了整条链，所以那个版本钉可以继续留着，
   "换证书 / 重装网关"的用户彻底连不上；要做必须先有 TOFU 首次信任 + 指纹变更告警。
 - **未经真机验证**：本机没有 Android SDK，`SecureStoreBridge.kt` 只经过人工审查，
   Keystore 的真实行为（密钥生成、GCM、改锁屏密码后密钥失效等）需要在真机上验一次。
+  代码侧已埋好观测点：`adb logcat -s DshSecure` 会打出每次 ping/write/read/delete
+  的结果与字节数（**只打长度，不打内容**）。验收步骤见
+  [docs/securestore-device-verification.md](docs/securestore-device-verification.md)
+  —— 那是**待办清单**，还没有执行记录。
 
 ---
 

@@ -1395,6 +1395,124 @@ export function parseJsonBody(raw) {
  * Returns { ok, archived, detached, cacheRemoved, error } — callers must surface
  * failures instead of claiming success.
  */
+/* ------------------------------------------------------------------ *
+ * Deliverables: extraction + membership
+ *
+ * These live here rather than in features.mjs because BOTH features.mjs and
+ * extensions.mjs must answer "which files did this session present?", and
+ * features.mjs already imports extensions.mjs — so extensions cannot import
+ * features without creating a cycle. features.mjs re-exports both names, so
+ * existing importers and tests keep working unchanged.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Collect every `deliverables/presented` declaration from session records.
+ *
+ * Newest declaration wins per path: a file presented in two turns is one row,
+ * attributed to the later turn. Paths are resolved to absolute form for the
+ * download route, while `display` keeps the relative label the phone shows.
+ *
+ * @param records - `session/page` records (`{ event }` entries).
+ * @param cwd - the session's working directory, used to resolve relatives.
+ * @returns deliverable rows, newest first.
+ */
+export function extractDeliverables(records, cwd) {
+  if (!Array.isArray(records)) return [];
+  const byPath = new Map();
+  for (const record of records) {
+    const ev = record?.event;
+    if (!ev || ev.type !== 'deliverables/presented') continue;
+    const files = Array.isArray(ev.data?.files) ? ev.data.files : [];
+    for (const file of files) {
+      const raw = typeof file?.path === 'string' ? file.path.trim() : '';
+      if (!raw) continue;
+      const absolute = path.isAbsolute(raw) ? raw : path.resolve(cwd || '.', raw);
+      byPath.set(absolute, {
+        path: absolute,
+        display: raw,
+        description: typeof file.description === 'string' ? file.description : '',
+        turn: ev.data?.turn ?? null,
+        seq: typeof ev.seq === 'number' ? ev.seq : null,
+        time: typeof ev.time === 'number' ? ev.time : null
+      });
+    }
+  }
+  return [...byPath.values()].sort((a, b) => (b.seq ?? 0) - (a.seq ?? 0));
+}
+
+/**
+ * Resolve a download request against the declared deliverables.
+ *
+ * Only paths the session actually presented may be downloaded — the phone
+ * cannot turn this route into an arbitrary file read, and a path traversal in
+ * the query is rejected by exact membership rather than by string filtering.
+ *
+ * @param deliverables - rows from {@link extractDeliverables}.
+ * @param requested - the path the client asked for.
+ * @returns the matching row, or null.
+ */
+export function resolveDeliverable(deliverables, requested) {
+  if (!requested || typeof requested !== 'string') return null;
+  const wanted = path.resolve(requested);
+  for (const row of deliverables) {
+    if (path.resolve(row.path) === wanted) return row;
+  }
+  return null;
+}
+
+/**
+ * Explain WHY a deliverable request was refused, in a way the phone can act on.
+ *
+ * The audit called this out and it was still true: a path that could not be
+ * RESOLVED (the session recorded no cwd, so a relative declaration resolved
+ * against the gateway process's own working directory) produced the exact same
+ * 403 as a path that was never presented. That is "解析问题伪装成了权限问题" — the
+ * user goes looking for a permission problem that does not exist.
+ *
+ * Two things are deliberately NOT done here:
+ *   * `status` stays 403. The sets differ in cause, not in authority: none of
+ *     these is allowed through, and the App shows `error` verbatim.
+ *   * `presented` paths are never echoed back. The caller already has the listing
+ *     from the deliverables route; repeating it here would turn a refusal into a
+ *     file-enumeration surface for any path the client invents.
+ *
+ * Lives in core.mjs because both features.mjs and extensions.mjs refuse
+ * deliverables, and features.mjs already imports extensions.mjs — importing one
+ * from the other would be a cycle.
+ *
+ * @param deps - `{ presented, cwd }`. `presented` is the declared listing (used
+ *   for its length only); `cwd` is the session workspace, or null when unknown.
+ * @returns `{ status, code, error, hint, presentedCount }`.
+ */
+export function describeDeliverableRefusal({ presented = [], cwd = null } = {}) {
+  const count = Array.isArray(presented) ? presented.length : 0;
+  if (!cwd) {
+    return {
+      status: 403,
+      code: 'deliverable-cwd-unknown',
+      error: '该会话没有记录工作目录，无法解析交付物的相对路径',
+      hint: '这是会话元数据缺失（多为很旧的会话），不是权限问题。改用清单里的绝对路径重试。',
+      presentedCount: count
+    };
+  }
+  if (count === 0) {
+    return {
+      status: 403,
+      code: 'deliverable-none-presented',
+      error: '该会话还没有声明过任何交付物',
+      hint: 'agent 需要用 present 声明文件后，它才会出现在清单里。',
+      presentedCount: 0
+    };
+  }
+  return {
+    status: 403,
+    code: 'deliverable-not-in-set',
+    error: '该文件不在本会话的交付物清单中',
+    hint: `本会话已声明 ${count} 项交付物，请从清单中选择（路径需与声明时完全一致）。`,
+    presentedCount: count
+  };
+}
+
 /**
  * [P0] Session ids reach the filesystem, so they have to be shape-checked first.
  *
