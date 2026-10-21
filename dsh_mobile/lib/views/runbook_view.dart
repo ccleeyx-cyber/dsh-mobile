@@ -18,8 +18,26 @@ import '../../theme/app_spacing.dart';
 /// 命令在网关侧执行，白名单与"不许 shell 元字符"都在网关（runbook.mjs）判定。
 /// 本页只负责两件事：高危条目**必须弹窗展示命令原文**再确认；结果如实展示
 /// 退出码与输出尾部（不美化失败）。
+///
+/// ## 为什么现在是「会话信息里的一个 tab」
+///
+/// [move 2026-10-21] 这个功能原本挂在「设置 → 运维」下。问题是**命令要在哪个目录
+/// 跑**：网关的规则是「会话给了 cwd 就用会话的，否则回落到 ~/.dsh」。设置页那条
+/// 入口没有会话上下文，于是 `git log` / `git status` 一律 `fatal: not a git
+/// repository`（真机实测 exit 128）—— 而默认模板三条里两条是 git。
+///
+/// 搬进会话信息面板后，[sessionId] 由宿主带上，cwd 就是那个会话的工作区，命令
+/// 落在他正在干活的那个仓库里。这也是它本来该在的位置：runbook 是"对我这个会话
+/// 的工程跑一条命令"，不是全局运维。
 class RunbookView extends StatefulWidget {
-  const RunbookView({super.key});
+  const RunbookView({super.key, this.sessionId, this.embedded = false});
+
+  /// 当前会话 id。网关用它解析 cwd（`readSessionCwd`）；为空时回落到 `~/.dsh`，
+  /// git 类命令会失败 —— 所以嵌入模式下宿主必须传。
+  final String? sessionId;
+
+  /// 嵌入模式：不画自己的 Scaffold/AppBar，只出列表本体（给会话信息面板当 tab）。
+  final bool embedded;
 
   @override
   State<RunbookView> createState() => _RunbookViewState();
@@ -94,6 +112,9 @@ class _RunbookViewState extends State<RunbookView> {
     final result = await dsh.runRunbookCommand(
       item['id']?.toString() ?? '',
       confirm: needsConfirm,
+      // [fix 2026-10-21] 必须带会话 id：网关拿它解析 cwd，否则回落到 ~/.dsh，
+      // git 类命令一律 "not a git repository"。
+      sessionId: widget.sessionId,
     );
     if (!mounted) return;
     setState(() => _runningId = null);
@@ -167,9 +188,10 @@ class _RunbookViewState extends State<RunbookView> {
 
   @override
   Widget build(BuildContext context) {
-    final dsh = context.watch<DshService>();
-    final items = dsh.runbooks;
-
+    final body = _buildBody(context);
+    // [move 2026-10-21] 嵌入模式只出列表本体：会话信息面板已经提供了 Scaffold、
+    // 标题栏和滚动上下文，再来一层就是双层标题。
+    if (widget.embedded) return body;
     return Scaffold(
       backgroundColor: context.c.surfaceMuted,
       appBar: AppBar(
@@ -179,42 +201,60 @@ class _RunbookViewState extends State<RunbookView> {
         surfaceTintColor: Colors.transparent,
         title: const Text('Runbook'),
       ),
-      body: RefreshIndicator(
-        onRefresh: _load,
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 14, 16, 28),
-          children: [
-            Text(
-              '这些命令来自电脑上的 ~/.dsh/mobile-access/runbooks.yaml，改完刷新即可生效。'
-              '高危命令会先展示原文再执行。',
-              style: TextStyle(fontSize: 13, height: 1.5, color: context.c.textSecondary),
-            ),
-            const SizedBox(height: AppSpace.m),
-            if (_error != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: AppSpace.m),
-                child: Text(
-                  _error!,
-                  style: TextStyle(fontSize: 12.5, color: context.c.danger, height: 1.45),
-                ),
-              ),
-            if (_loading)
-              const Padding(
-                padding: EdgeInsets.all(24),
-                child: Center(child: CircularProgressIndicator()),
-              )
-            else if (items.isEmpty)
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 24),
-                child: Text(
-                  '还没有 Runbook。到电脑上编辑 runbooks.yaml，或在网关首次启动时使用默认模板。',
-                  style: TextStyle(fontSize: 13, color: context.c.textSecondary, height: 1.5),
-                ),
-              )
-            else
-              ...items.map((item) => _card(context, item)),
-          ],
+      body: body,
+    );
+  }
+
+  Widget _buildBody(BuildContext context) {
+    final dsh = context.watch<DshService>();
+    final items = dsh.runbooks;
+
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView(
+        padding: EdgeInsets.fromLTRB(
+          widget.embedded ? 14 : 16,
+          widget.embedded ? 12 : 14,
+          widget.embedded ? 14 : 16,
+          widget.embedded ? 12 : 28,
         ),
+        children: [
+          // 嵌入时这条说明压到一句：面板里空间要留给命令本身。
+          Text(
+            widget.embedded
+                ? '命令在电脑上执行，工作目录取当前会话的工作区。'
+                : '这些命令来自电脑上的 ~/.dsh/mobile-access/runbooks.yaml，改完刷新即可生效。'
+                    '高危命令会先展示原文再执行。',
+            style: TextStyle(
+                fontSize: widget.embedded ? 11.5 : 13,
+                height: 1.5,
+                color: context.c.textSecondary),
+          ),
+          const SizedBox(height: AppSpace.m),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: AppSpace.m),
+              child: Text(
+                _error!,
+                style: TextStyle(fontSize: 12.5, color: context.c.danger, height: 1.45),
+              ),
+            ),
+          if (_loading)
+            const Padding(
+              padding: EdgeInsets.all(24),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (items.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 24),
+              child: Text(
+                '还没有 Runbook。到电脑上编辑 runbooks.yaml，或在网关首次启动时使用默认模板。',
+                style: TextStyle(fontSize: 13, color: context.c.textSecondary, height: 1.5),
+              ),
+            )
+          else
+            ...items.map((item) => _card(context, item)),
+        ],
       ),
     );
   }

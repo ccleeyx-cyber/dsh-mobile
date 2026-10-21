@@ -55,28 +55,35 @@ void main() {
         ),
       );
 
-  testWidgets('设置页有 Runbook 与告警入口，且能点进去', (tester) async {
+  testWidgets('设置页有告警入口，且 Runbook 已搬走（不再有独立入口）', (tester) async {
     await pumpHub(tester);
 
-    final runbookEntry = find.byKey(const ValueKey('settings-open-runbook'));
     final alertsEntry = find.byKey(const ValueKey('settings-open-alerts'));
-    expect(runbookEntry, findsOneWidget);
     expect(alertsEntry, findsOneWidget);
-
-    await tester.scrollUntilVisible(runbookEntry, 300, scrollable: find.byType(Scrollable).first);
-    await tester.tap(runbookEntry);
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 300));
-    expect(find.byType(RunbookView), findsOneWidget);
-
-    await tester.pageBack();
-    await tester.pumpAndSettle();
+    // [move 2026-10-21] Runbook 移到会话信息面板的 tab。
+    //
+    // 这里刻意断言"设置页不再有它"：设置页没有会话上下文，网关拿不到 cwd 会回落
+    // 到 ~/.dsh，git 类命令一律 not a git repository。谁想加回这个入口，得先解决
+    // 目录问题，否则加回来的就是一个必然报错的按钮。
+    expect(find.byKey(const ValueKey('settings-open-runbook')), findsNothing);
 
     await tester.scrollUntilVisible(alertsEntry, 300, scrollable: find.byType(Scrollable).first);
     await tester.tap(alertsEntry);
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
     expect(find.byType(AlertsView), findsOneWidget);
+
+    await teardown(tester);
+  });
+
+  testWidgets('Runbook 嵌入模式不画自己的 AppBar（面板里不该有双层标题）', (tester) async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    await tester.pumpWidget(wrap(const RunbookView(embedded: true)));
+    await tester.pump();
+
+    expect(find.byType(AppBar), findsNothing);
+    expect(find.byType(Scaffold), findsNothing);
+    expect(tester.takeException(), isNull);
 
     await teardown(tester);
   });

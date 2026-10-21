@@ -855,6 +855,12 @@ Future<void> showChatSessionInfoSheet(
   ///
   /// 必须由父级传：滚动与高亮能力在 `chat_view` 手里。
   void Function(String messageId, int? index, int total)? onJumpToMessage,
+
+  /// 「Runbook」tab 的内容（[move 2026-10-21] 由宿主注入）。
+  ///
+  /// 传 Widget 而不是在这里 import `views/` 的页面：本文件属于 widgets 层，反向
+  /// 依赖视图层会绕成环。宿主（chat_view）知道当前会话 id，也只有它该知道。
+  Widget? runbookTab,
 }) async {
     // 下面这些动作都在**弹层关掉之后**执行，所以要提前取好 Navigator：弹层的
     // context 在 pop 之后已失效。取外层 `context` 的 Navigator 才是安全的。
@@ -942,6 +948,8 @@ Future<void> showChatSessionInfoSheet(
                       onJumpToMessage(id, index >= 0 ? index : null, d.messages.length);
                     },
             ),
+            // [move 2026-10-21] Runbook（会话上下文版）。
+            runbookTab: runbookTab,
           ),
         ),
       ),

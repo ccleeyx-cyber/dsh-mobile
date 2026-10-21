@@ -8,7 +8,6 @@ import '../theme/app_colors.dart';
 import '../theme/app_spacing.dart';
 import '../main.dart';
 import 'alerts_view.dart';
-import 'runbook_view.dart';
 import 'security_permissions_view.dart';
 import 'settings/about_view.dart';
 import 'settings/connectivity_view.dart';
@@ -110,20 +109,17 @@ class CustomSettingsView extends StatelessWidget {
           ),
           const SizedBox(height: AppSpace.xl),
 
-          // [v1.35] 运维入口：Runbook 与告警。它们回答的是"人不在电脑前，
-          // 还能不能把机器照顾好"，与"连接是否通畅"是同一层的问题。
+          // [v1.35] 运维入口：告警。它回答的是"人不在电脑前，还能不能把机器
+          // 照顾好"，与"连接是否通畅"是同一层的问题。
+          //
+          // [move 2026-10-21] Runbook 已从本页移除，改为**会话信息面板**里的一个
+          // tab。原因是它依赖会话上下文：网关按「会话 cwd」执行命令，而这个入口
+          // 没有会话，cwd 回落到 ~/.dsh，`git log` / `git status` 一律报
+          // not a git repository（默认模板三条里两条是 git）—— 等于功能不可用。
           SettingsSectionHeader(
             title: '运维',
             icon: Icons.build_outlined,
             color: context.c.warning,
-          ),
-          const SizedBox(height: AppSpace.m),
-          SettingsNavCard(
-            key: const ValueKey('settings-open-runbook'),
-            icon: Icons.terminal_rounded,
-            title: 'Runbook',
-            subtitle: '电脑上写好的排障指令，手机一键执行',
-            onTap: () => _push(context, const RunbookView()),
           ),
           const SizedBox(height: AppSpace.m),
           SettingsNavCard(

@@ -29,6 +29,7 @@ import 'widgets/chat_sheets.dart';
 import 'widgets/composer.dart';
 import 'widgets/message_action_sheet.dart';
 import 'code_viewer_page.dart';
+import 'runbook_view.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_spacing.dart';
 import '../services/platform_services.dart';
@@ -2041,6 +2042,13 @@ class _ChatViewState extends State<ChatView> {
       // 信息面板里的「轨迹」tab 用同一条跳转路径（与搜索、刻度跳转完全一致）。
       onJumpToMessage: (id, index, total) =>
           _highlightAndScrollToMessage(id, index: index, total: total),
+      // [move 2026-10-21] Runbook 从设置页搬进本面板。**必须带会话 id**：网关
+      // 拿它解析 cwd（没有就回落 ~/.dsh，`git status` 之类会直接 not a git
+      // repository）。嵌在会话里也才符合它的语义 —— 对当前工程跑一条命令。
+      runbookTab: RunbookView(
+        embedded: true,
+        sessionId: dsh.currentSession?.sessionId,
+      ),
     );
   }
 

@@ -298,5 +298,29 @@ void main() {
 
       await teardown(tester);
     });
+
+    testWidgets('信息面板里有 Runbook tab（[move 2026-10-21] 从设置页搬进来）', (tester) async {
+      VoiceInputService.instance.debugSetAvailable(false);
+      await pumpChat(tester);
+
+      await tester.tap(find.byKey(const ValueKey('chat-open-session-info')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      final runbookTab = find.byKey(const ValueKey('session-info-tab-runbook'));
+      expect(runbookTab, findsOneWidget,
+          reason: 'Runbook 必须和会话上下文在同一个面板里 —— 网关要靠会话 id 解析 cwd');
+      await tester.tap(runbookTab);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      // 离线（没有 config）时拉不到清单，但要给出嵌入模式的那句说明与引导，
+      // 而不是一片空白。
+      expect(find.text('命令在电脑上执行，工作目录取当前会话的工作区。'), findsOneWidget);
+      expect(find.byType(AppBar), findsOneWidget,
+          reason: '嵌入模式不该再叠一层 AppBar（这里那一个是面板自己的）');
+
+      await teardown(tester);
+    });
   });
 }

@@ -55,6 +55,7 @@ class SessionInfoSheet extends StatefulWidget {
     this.teamUnavailable = false,
     this.onControlGoal,
     this.trajectoryTab,
+    this.runbookTab,
   });
 
   /// 「轨迹」tab 的内容（由宿主构建，本组件不认识 Trajectory 数据模型）。
@@ -63,6 +64,12 @@ class SessionInfoSheet extends StatefulWidget {
   /// 跳到消息的回调全部已经有实现（`TrajectorySheet`），再在这里复写一遍就是
   /// 第二套会漂移的规则。为 null 时不渲染 tab 条（宿主没这个能力）。
   final Widget? trajectoryTab;
+
+  /// 「Runbook」tab 的内容（[move 2026-10-21] 从设置页搬进来）。
+  ///
+  /// 同样是由宿主注入 Widget：它需要一个**会话上下文**（网关靠会话 id 解析
+  /// 工作目录），而面板本身不认识 DshService 的会话模型。为 null 时不出这个 tab。
+  final Widget? runbookTab;
 
   /// 用量 / 上下文 / goal。`null` 表示还没取到。
   final SessionStats? stats;
@@ -249,7 +256,12 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         child: Row(
           children: [
             tab('概览', 0, const ValueKey('session-info-tab-overview')),
-            tab('轨迹', 1, const ValueKey('session-info-tab-trajectory')),
+            if (widget.trajectoryTab != null)
+              tab('轨迹', 1, const ValueKey('session-info-tab-trajectory')),
+            // [move 2026-10-21] Runbook 从设置页搬到这里：它要在**当前会话的工作区**
+            // 里跑命令，没有会话上下文时 git 类命令只会报 not a git repository。
+            if (widget.runbookTab != null)
+              tab('Runbook', 2, const ValueKey('session-info-tab-runbook')),
           ],
         ),
       ),
@@ -552,10 +564,12 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
             // 轨迹以前要经过 面板 → 「运行轨迹」行 → 又一层底部弹层，用户明确说
             // "入口太深"。它和这一堆状态指标本来就是同一件事的两个视角（一个是
             // 汇总、一个是逐轮明细），放在同一层做 tab 才对得上心智。
-            if (widget.trajectoryTab != null) _buildTabs(context),            Flexible(
+            if (widget.trajectoryTab != null || widget.runbookTab != null) _buildTabs(context),            Flexible(
               child: _tab == 1 && widget.trajectoryTab != null
                   ? widget.trajectoryTab!
-                  : SingleChildScrollView(
+                  : _tab == 2 && widget.runbookTab != null
+                      ? widget.runbookTab!
+                      : SingleChildScrollView(
                       padding: const EdgeInsets.fromLTRB(14, 12, 14, 20),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
