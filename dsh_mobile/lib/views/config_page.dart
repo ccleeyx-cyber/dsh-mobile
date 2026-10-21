@@ -286,6 +286,10 @@ class _ConfigPageState extends State<ConfigPage> {
     }
     final port = payload?['port'];
     final pairCode = payload?['pairCode']?.toString() ?? payload?['code']?.toString() ?? '';
+    // [fix 2026-10-21] scheme 与局域网端口由网关下发：公网档可能是 https（NPS 开
+    // TLS 或 cloudflared），而局域网回退永远走明文 + 网关自己的监听端口。
+    final publicScheme = payload?['scheme']?.toString() ?? 'http';
+    final lanPort = payload?['lanPort'] is int ? payload!['lanPort'] as int : (port is int ? port : 3088);
     // [fix 2026-10-12] hosts 列表现在按「公网在前、局域网在后」排列（v1.15.1
     // 网关）。逐个尝试配对：家里 Wi-Fi 下公网地址也通，在外面时局域网地址
     // 不通自动落到下一个 —— 哪个先配对成功用哪个。
@@ -304,12 +308,25 @@ class _ConfigPageState extends State<ConfigPage> {
     final attempted = <String>[]; // [fix 2026-10-12] 每个地址的尝试结果，失败时全量展示，绝不静默
     String? rejectReason; // 网关明确拒绝（换地址也没用的那类）
     String? usedHost;
-    final candidates = <String>{firstHost, ...hosts};
-    for (final host in candidates) {
-      attempted.add(host);
+    var usedPort = port;
+    var usedHttps = false;
+
+    // [fix 2026-10-21] 候选带自己的 scheme/端口：
+    //   * 首选地址（公网或首选局域网）用网关下发的 scheme + port；
+    //   * 局域网回退一律明文 http + 网关的局域网端口。
+    //
+    // 此前这里硬编码 `http://$host:$port`，而公网档可能是 https（NPS 开 TLS 或
+    // cloudflared），于是扫公网二维码必然连不上 —— 页面上还只显示"配对失败"。
+    final targets = <({String host, String scheme, int port})>[
+      (host: firstHost, scheme: publicScheme, port: port),
+      for (final h in hosts)
+        if (h != firstHost) (host: h, scheme: 'http', port: lanPort),
+    ];
+    for (final t in targets) {
+      attempted.add('${t.scheme}://${t.host}:${t.port}');
       try {
         final res = await http.post(
-          Uri.parse('http://$host:$port/__mobile/pair'),
+          Uri.parse('${t.scheme}://${t.host}:${t.port}/__mobile/pair'),
           headers: const {'Content-Type': 'application/json'},
           body: jsonEncode({'code': pairCode, 'name': payload?['name']?.toString() ?? '扫码配对的手机', 'platform': 'android'}),
         ).timeout(const Duration(seconds: 8));
@@ -317,7 +334,9 @@ class _ConfigPageState extends State<ConfigPage> {
         if (res.statusCode == 200 && body is Map && body['ok'] == true) {
           token = body['token']?.toString();
           deviceId = body['deviceId']?.toString();
-          usedHost = host;
+          usedHost = t.host;
+          usedPort = t.port;
+          usedHttps = t.scheme == 'https';
           break;
         } else {
           // 网关明确拒绝（如配对码错/过期）——换地址也没用，直接报错。
@@ -340,7 +359,8 @@ class _ConfigPageState extends State<ConfigPage> {
 
     setState(() {
       _hostController.text = usedHost ?? firstHost;
-      _portController.text = port.toString();
+      _portController.text = usedPort.toString();
+      _useHttps = usedHttps;
       _tokenController.text = token!;
       _pairedDeviceId = deviceId ?? '';
     });

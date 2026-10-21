@@ -1,7 +1,7 @@
 // dsh-server-plugin RPC 通道：为 DSH 设置页提供网关、授权码与 NPS 配置管理
-import os from 'node:os';
 import { loadConfig, saveConfig, generateToken, loadDevices, revokeDevice, newPairCode, pairCodeTtlMs } from './store.mjs';
 import { BRIDGE_VERSION } from './core.mjs';
+import { primaryLanAddress } from './net-address.mjs';
 
 export const RPC_CHANNEL = '/dsh-mobile-bridge';
 
@@ -21,15 +21,10 @@ export const ENDPOINTS = {
 };
 
 function getLocalIp() {
-  const nets = os.networkInterfaces();
-  for (const name of Object.keys(nets)) {
-    for (const net of nets[name] || []) {
-      if (net.family === 'IPv4' && !net.internal) {
-        return net.address;
-      }
-    }
-  }
-  return '127.0.0.1';
+  // [fix 2026-10-21] 与网关侧同一套判定：不能取"第一个非 internal IPv4"，那会
+  // 拿到 Clash TUN / WSL 虚拟网卡的地址（真机实测 172.19.0.1、172.20.128.1），
+  // 手机连不上，而页面看不出是地址挑错了。判定见 net-address.mjs。
+  return primaryLanAddress() || '127.0.0.1';
 }
 
 export function installRpc(ctx, deps = {}) {

@@ -172,4 +172,40 @@ describe('remote access routes', () => {
     assert.equal(r.status, 400);
     assert.match(r.parsed.error, /none \/ nps \/ cloudflared/);
   });
+
+  /* ---- [fix 2026-10-21] 配对载荷必须服从 provider ---- */
+
+  it('provider=nps：二维码用公网地址，scheme/端口跟着配置走', async () => {
+    await req('/api/mobile/remote-access', {
+      method: 'POST',
+      body: { provider: 'nps', nps: { host: 'n.example.com', port: 3443, useHttps: true } }
+    });
+    const r = await req('/pair/info');
+    assert.equal(r.status, 200);
+    assert.equal(r.parsed.host, 'n.example.com');
+    assert.equal(r.parsed.scheme, 'https', '公网是 https 时必须下发 scheme，否则 App 用 http 配对必然失败');
+    assert.equal(r.parsed.port, 3443);
+    assert.equal(r.parsed.reach, 'public');
+    assert.equal(r.parsed.publicHost, 'n.example.com');
+  });
+
+  it('provider=none：二维码绝不能再带公网域名（真机 bug：配过 NPS 就会一直带）', async () => {
+    // 先把 NPS 地址填上（模拟"曾经用过 NPS"），再切到仅局域网。
+    await req('/api/mobile/remote-access', {
+      method: 'POST',
+      body: { provider: 'nps', nps: { host: 'n.example.com', port: 3443, useHttps: true } }
+    });
+    await req('/api/mobile/remote-access', { method: 'POST', body: { provider: 'none' } });
+
+    const r = await req('/pair/info');
+    assert.equal(r.status, 200);
+    assert.notEqual(r.parsed.host, 'n.example.com',
+      '仅局域网时 npsHost 只是"留着以后切回去用"，不能当成对外地址');
+    assert.equal(r.parsed.reach, 'lan');
+    assert.equal(r.parsed.publicHost, null);
+    assert.equal(r.parsed.publicPort, null);
+    assert.equal(r.parsed.scheme, 'http');
+    // 局域网回退端口必须是网关自己的监听端口，而不是反代映射出来的端口
+    assert.equal(typeof r.parsed.lanPort, 'number');
+  });
 });

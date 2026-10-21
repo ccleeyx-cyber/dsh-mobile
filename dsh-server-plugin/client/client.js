@@ -201,15 +201,15 @@ window.__ModuleLoader__.load({
         copyText(text, 'fullConfig');
       };
 
-      const npsScheme = useHttps ? 'https' : 'http';
       // [cleanup 2026-10-21] 网关不再托管安装包，原先这里还有 npsApkUrl /
       // localApkUrl 两个指向 /dsh-agent.apk 的变量（已是死代码）。安装包只认
       // GitHub Releases。
       const RELEASES_URL = 'https://github.com/ccleeyx-cyber/dsh-mobile/releases';
       // 手机真正在用的公网地址：nps 档 = 用户填的穿透地址；cloudflared 档只有
       // 网关知道（每次建立都不同），所以优先用实时状态里的值。
+      // （npsScheme / publicPort 两个变量随「连接参数」卡改造一起删掉了 ——
+      // 地址与端口现在都直接显示 raState 给的完整 URL。）
       const publicHost = provider === 'nps' ? npsHost : (raState?.publicUrl || '');
-      const publicPort = provider === 'nps' ? npsPort : '';
 
       // ---- 扫码配对卡片状态 [feat 2026-10-12] ----
       const [qr, setQr] = useState(null);            // {qrDataUrl, pairCode, host, port, expiresAt, ttlMs}
@@ -229,7 +229,13 @@ window.__ModuleLoader__.load({
         }
       }, [call]);
 
-      const qrText = qr ? `Host: ${qr.host}:${qr.port}\n配对码: ${qr.pairCode}\n${qr.ttlMs / 60000 | 0} 分钟内有效` : '';
+      // [fix 2026-10-21] 复制内容带上 scheme 与可达范围：只有 host:port 的话，
+      // 用户不知道是该在外面用还是连同一个 Wi-Fi。
+      const qrText = qr
+        ? `地址: ${qr.scheme || 'http'}://${qr.host}:${qr.port}\n`
+          + `可达: ${qr.reach === 'public' ? '任何网络' : '同一局域网'}\n`
+          + `配对码: ${qr.pairCode}\n${qr.ttlMs / 60000 | 0} 分钟内有效`
+        : '';
       const copyQr = () => { copyText(qrText, 'qrText'); setQrCopied(true); setTimeout(() => setQrCopied(false), 2500); };
 
       // ---- 设备管理卡片状态 ----
@@ -418,8 +424,33 @@ window.__ModuleLoader__.load({
             }, raBusy ? '刷新中...' : '🔄 刷新')
           ),
           h('div', { style: { ...S.subtitle, marginBottom: 12 } },
-            '切换方式或保存后看这里：cloudflared 需要先拿到域名、再连上 Cloudflare 边缘才算就绪。'
+            '通道由网关自动建立：申请域名 → 等 Cloudflare 边缘注册 → 就绪。'
           ),
+          // [fix 2026-10-21] 阶段进度：一个"未就绪"对用户没有信息量，卡在哪一步
+          // 才决定该怎么办（申请阶段失败=出网断了；边缘阶段失败=7844 被阻断）。
+          raState && raState.stage && raState.stage !== 'ready' && raState.stage !== 'failed'
+            ? h('div', { style: { marginBottom: 12 } },
+              h('div', {
+                style: {
+                  height: 4, borderRadius: 2, background: '#e5e7eb', overflow: 'hidden'
+                }
+              },
+                h('div', {
+                  style: {
+                    height: '100%',
+                    width: ({ requesting: '30%', requested: '65%', connecting: '85%' })[raState.stage] || '10%',
+                    background: '#2563eb',
+                    transition: 'width .4s ease'
+                  }
+                })
+              ),
+              h('div', { style: { ...S.helpText, marginTop: 6 } },
+                `${raState.stageLabel || raState.stage}`
+                + (raState.attempts ? ` · 第 ${raState.attempts} 次重试` : '')
+                + (raState.elapsedMs ? ` · 已用时 ${Math.round(raState.elapsedMs / 1000)}s` : '')
+              )
+            )
+            : null,
           h('div', { style: S.grid },
             h('div', { style: S.metricCard },
               h('div', { style: S.metricLabel }, '当前方式'),
@@ -427,18 +458,21 @@ window.__ModuleLoader__.load({
             ),
             h('div', { style: S.metricCard },
               h('div', { style: S.metricLabel }, '公网地址'),
-              h('div', { style: S.metricValue }, raState?.publicUrl || '（尚未分配）'),
+              h('div', { style: S.metricValue }, raState?.publicUrl || '（无）'),
             ),
             h('div', { style: S.metricCard },
-              h('div', { style: S.metricLabel }, '就绪'),
+              h('div', { style: S.metricLabel }, '局域网地址'),
+              h('div', { style: S.metricValue }, raState?.localUrl || '（未识别）'),
+            ),
+            h('div', { style: S.metricCard },
+              h('div', { style: S.metricLabel }, '手机现在该走'),
               h('div', {
-                style: { ...S.metricValue, color: raState?.ready ? '#059669' : '#b45309' }
-              }, raState ? (raState.ready ? '✅ 已就绪' : '⏳ 未就绪') : '未知'),
+                style: { ...S.metricValue, color: raState?.ready || raState?.reach === 'lan' ? '#059669' : '#b45309' }
+              }, raState?.reach === 'public' ? '公网' : '局域网'),
             ),
-            h('div', { style: S.metricCard },
-              h('div', { style: S.metricLabel }, '出口由谁提供'),
-              h('div', { style: S.metricValue }, managedLabel(raState?.managed)),
-            ),
+          ),
+          h('div', { style: { ...S.helpText, marginTop: 8 } },
+            '“仅局域网”档下没有公网地址，二维码会编码局域网地址 —— 手机需与电脑同一 Wi-Fi。'
           ),
           raState && raState.reason
             ? h('div', { style: { ...S.helpText, marginTop: 10, color: '#b45309' } }, raState.reason)
@@ -469,20 +503,20 @@ window.__ModuleLoader__.load({
 
           h('div', { style: S.grid },
             h('div', { style: S.metricCard },
-              h('div', { style: S.metricLabel }, '公网穿透 Host'),
-              h('div', { style: S.metricValue }, publicHost || '（由网关下发）'),
+              h('div', { style: S.metricLabel }, '公网地址'),
+              h('div', { style: S.metricValue }, raState?.publicUrl || publicHost || '（无）'),
             ),
             h('div', { style: S.metricCard },
-              h('div', { style: S.metricLabel }, '公网穿透 Port'),
-              h('div', { style: S.metricValue }, publicPort ? String(publicPort) : '（由网关下发）'),
+              h('div', { style: S.metricLabel }, '局域网地址'),
+              h('div', { style: S.metricValue }, raState?.localUrl || (config?.localIp ? `http://${config.localIp}:${config.port}` : '（未识别）')),
             ),
             h('div', { style: S.metricCard },
               h('div', { style: S.metricLabel }, '授权码 (Token)'),
               h('div', { style: S.metricValue }, token || '未生成'),
             ),
             h('div', { style: S.metricCard },
-              h('div', { style: S.metricLabel }, '局域网 Host (本地测试)'),
-              h('div', { style: S.metricValue }, config?.localIp || '127.0.0.1'),
+              h('div', { style: S.metricLabel }, '手机现在该走'),
+              h('div', { style: S.metricValue }, raState?.reach === 'public' ? '公网' : '局域网'),
             ),
           ),
         ),
@@ -510,11 +544,19 @@ window.__ModuleLoader__.load({
               ),
               h('div', { style: S.metricCard },
                 h('div', { style: S.metricLabel }, '二维码里的地址'),
-                h('div', { style: S.metricValue }, `${qr.host}:${qr.port}`)
+                h('div', { style: S.metricValue }, `${qr.scheme || 'http'}://${qr.host}:${qr.port}`)
               ),
-              (qr.host !== publicHost && publicHost)
+              h('div', { style: S.metricCard },
+                h('div', { style: S.metricLabel }, '扫码的手机需在'),
+                h('div', { style: S.metricValue },
+                  qr.reach === 'public' ? '任何网络（走公网）' : '同一局域网（同一 Wi-Fi）')
+              ),
+              // [fix 2026-10-21] 这里的判断以前是 `qr.host !== publicHost` —— 而
+              // publicHost 在非 nps 档已不再伪造，提示也就跟着对了：只在"当前
+              // 出口是公网、但隧道还没就绪"时提醒一句。
+              (qr.reach !== 'public' && raState?.provider === 'cloudflared' && !raState?.ready)
                 ? h('div', { style: { ...S.noticeBox, marginTop: 0 } },
-                    `手机在外面时请手动填公网地址 ${publicHost}:${publicPort}，再用上面的配对码配对（二维码里是局域网地址，出门连不上）。`)
+                    '隧道还没就绪，二维码里是局域网地址。等它就绪后重新生成，二维码才会带上公网地址。')
                 : null,
               h('div', { style: S.metricCard },
                 h('div', { style: S.metricLabel }, '过期时间'),

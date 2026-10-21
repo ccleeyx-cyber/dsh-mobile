@@ -7,6 +7,48 @@
 
 ---
 
+## [1.37.0] - 2026-10-21
+
+### 修复（设置页整体逻辑：**对外宣称的地址只有单一来源了**）
+
+用户实测三连问，逐条查下来是同一个病根：**"这台机器叫什么地址"被四个地方各写了
+一遍**，谁也不看 provider。
+
+| 现象 | 真因 |
+|---|---|
+| 选「仅内网」，二维码里还是公网域名 | 配对载荷**无条件**用 `cfg.npsHost`（三处各写一份：`/pair/qr`、`/pair/info`、设置页 RPC） |
+| 局域网地址是 `172.19.0.1` / `172.20.128.1` | `getLocalIp`/`primaryLanIpv4` 取「第一个非 internal IPv4」——那是最先枚举到的 Clash TUN 与 WSL 虚拟网卡；真实网卡是 `10.49.80.16` |
+| 只有「未就绪」，没有进度 | 服务端只回 `status: starting`，界面无法区分「申请域名 / 等边缘 / 边缘重试中」 |
+
+### 改法
+
+- **新增 `lib/net-address.mjs`**：按「虚拟网卡判死 + 真实网卡加分 + 网段排序
+  （192.168 > 10 > 172.16-31、APIPA 排最后）」挑选局域网地址。`/health`、配对
+  载荷、`remote-access`、设置页 RPC 全部改用它 —— 不再有第二套算法。
+- **新增 `advertise()`**：对外地址的唯一来源。`provider=none` 时 **publicUrl 恒为
+  null**；`nps` 用配置拼；`cloudflared` 只在边缘注册成功后才有值。
+- **三个配对载荷入口合并成 `buildPairPayload()`**：`/pair/qr`、`/pair/info`、设置
+  页 RPC 共用一份（此前是三份拷贝，细节各不相同：一份有 `expiresAt`、一份没有）。
+- **配对载荷新增 `scheme` 与 `lanPort`**：公网可能是 https（NPS 开 TLS 或
+  cloudflared），而 App 之前硬编码 `http://$host:$port` 去配对 —— 扫公网二维码
+  必然失败。现在 App 按 `scheme` 配对，局域网回退一律 http + 网关监听端口。
+- **进度可视化**：`tunnel.mjs` 暴露 `stage` / `attempts` / `startedAt`，服务端转成
+  `stage / stageLabel / attempts / elapsedMs`；电脑端设置页有阶段进度条（申请
+  30% → 等边缘 65% → 重试 85%）+ 「第 N 次重试 · 已用时 12s」，手机端有
+  `LinearProgressIndicator` + 同样的阶段文案，并在建立中每 3 秒自动轮询。
+- 设置页两张卡都改成如实显示：**公网地址 / 局域网地址 / 手机现在该走哪条**；
+  二维码卡显示「二维码里的地址（含 scheme）」与「扫码的手机需在同一局域网」。
+
+### 验证
+
+- 网关 `npm test`：**517 项 / 515 过** / 2 跳过 / 0 失败。新增 8 条 `net-address`
+  用例（真机形态：WSL 排在前面仍要挑出真实网卡；Clash TUN 不能当首选；APIPA 排
+  最后）与 2 条载荷用例（**provider=none 时二维码绝不能再带公网域名** ← 这次
+  报的 bug；provider=nps 时 scheme/端口跟着配置走）。
+- App：`flutter analyze` 零问题；`flutter test` **834 全绿**。
+
+---
+
 ## [1.36.4] - 2026-10-21
 
 ### 补丁（同日 · 仅网关，重启 dsh web 生效，不需要重装 App）

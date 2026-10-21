@@ -60,6 +60,7 @@ import {
 import { discoverGitRepos, runQuickCommand } from './host-ops.mjs';
 import { ensureCertificate, localHosts } from './tls.mjs';
 import { ensureCloudflared, createQuickTunnel } from './tunnel.mjs';
+import { lanCandidates, primaryLanAddress } from './net-address.mjs';
 import { loadRunbooksFile, runRunbook, allowedBinariesFromEnv } from './runbook.mjs';
 import { createAlertEngine } from './alerts.mjs';
 import {
@@ -3004,14 +3005,98 @@ export function apply(ctx, config = {}, internals = {}) {
     };
   }
 
-  /** 首个非回环 IPv4（局域网地址；拿不到就退回 127.0.0.1）。 */
-  function primaryLanIpv4() {
-    for (const list of Object.values(os.networkInterfaces())) {
-      for (const ni of list || []) {
-        if (ni.family === 'IPv4' && !ni.internal) return ni.address;
-      }
+  /** 隧道阶段的中文标签（客户端不该自己从 status 猜进度）。 */
+  const STAGE_LABELS = {
+    idle: '未启动',
+    requesting: '正在申请隧道域名',
+    requested: '已拿到域名，等待边缘注册',
+    connecting: '正在连接 Cloudflare 边缘',
+    ready: '已就绪',
+    failed: '启动失败',
+    stopped: '已停止'
+  };
+
+  /**
+   * 「对外宣称的地址」的**唯一来源**（[refactor 2026-10-21]）。
+   *
+   * 四个消费者都必须从这里取：/health、配对二维码（两条路由）、
+   * /api/mobile/remote-access、设置页 RPC。
+   *
+   * 为什么必须唯一：之前二维码在 `provider=none` 时照样塞公网域名，就是因为它
+   * 自己算了一套（无条件用 `cfg.npsHost`）。而 `npsHost` 为了"切回去不用重填"
+   * 在非 nps 档下**也保留着值**，于是"配置里有"被当成了"当前在用"。
+   */
+  function advertise() {
+    const cfg = loadConfig();
+    const ra = cfg.remoteAccess || { provider: 'none', nps: { host: '', port: listenPort, useHttps: false } };
+    const provider = ra.provider || 'none';
+    const lanAddress = primaryLanAddress();
+    const lanUrl = lanAddress ? `http://${lanAddress}:${listenPort}` : null;
+
+    let publicUrl = null;
+    if (provider === 'nps' && ra.nps.host) {
+      const scheme = ra.nps.useHttps ? 'https' : 'http';
+      publicUrl = `${scheme}://${ra.nps.host}:${ra.nps.port}`;
+    } else if (provider === 'cloudflared' && quickTunnel?.status === 'ready' && quickTunnel.url) {
+      publicUrl = quickTunnel.url.startsWith('http') ? quickTunnel.url : `https://${quickTunnel.url}`;
     }
-    return '127.0.0.1';
+
+    return {
+      provider,
+      lanAddress: lanAddress || null,
+      lanUrl,
+      publicUrl,
+      // 二维码/配对用哪个：有公网就用公网（扫码的手机多半在外面），
+      // 没有就老实给局域网 —— 不再出现"仅内网却编码了公网域名"。
+      qrUrl: publicUrl || lanUrl,
+      reach: publicUrl ? 'public' : 'lan'
+    };
+  }
+
+  /**
+   * 配对载荷（两条路由共用一份实现）。
+   *
+   * 之前 `/pair/qr` 与设置页 RPC 各复制了一遍构造逻辑（注释里还写着"必须同一份
+   * 口径"）—— 复制就必须漂移：一条带 expiresAt、另一条不带。
+   */
+  function buildPairPayload(code, expiresAt) {
+    const adv = advertise();
+    let scheme = 'http';
+    let host = '';
+    let port = listenPort;
+    if (adv.qrUrl) {
+      try {
+        const uri = new URL(adv.qrUrl);
+        scheme = uri.protocol.replace(':', '') || 'http';
+        host = uri.hostname;
+        port = Number(uri.port) || (scheme === 'https' ? 443 : listenPort);
+      } catch { /* 地址畸形时退回局域网 */ }
+    }
+    const lanHosts = lanCandidates().map((c) => c.address);
+    if (!host) host = lanHosts[0] || '';
+    const others = lanHosts.filter((h) => h !== host);
+    return {
+      v: 1,
+      // hosts[0] 仍是"首选地址"，其余是可回退候选（旧 App 只读 hosts/host）。
+      hosts: [host, ...others].filter(Boolean),
+      host,
+      port,
+      // [fix 2026-10-21] scheme 必须下发：公网档可能是 https（NPS 开 TLS 或
+      // cloudflared），而 App 之前硬编码 `http://$host:$port` 去配对。
+      scheme,
+      // 局域网回退要用网关自己的监听端口（公网端口可能被反代映射成别的值，
+      // 443 之类直接拿来连局域网一定失败）。
+      lanPort: listenPort,
+      reach: adv.reach, // 'public' | 'lan'
+      publicHost: adv.reach === 'public' ? host : null,
+      publicPort: adv.reach === 'public' ? port : null,
+      lanHosts,
+      pairCode: code,
+      certFingerprint,
+      name: os.hostname(),
+      expiresAt,
+      ttlMs: pairCodeTtlMs()
+    };
   }
 
   /**
@@ -3027,13 +3112,15 @@ export function apply(ctx, config = {}, internals = {}) {
   function remoteAccessPayload() {
     const cfg = loadConfig();
     const ra = cfg.remoteAccess || { provider: 'none', nps: { host: '', port: listenPort, useHttps: false } };
+    const adv = advertise();
     const provider = ra.provider || 'none';
-    const lanIp = primaryLanIpv4();
-    const localUrl = `http://${lanIp}:${listenPort}`;
     const base = {
       ok: true,
       provider,
-      localUrl,
+      localUrl: adv.lanUrl,
+      lanAddress: adv.lanAddress,
+      // 客户端不需要自己推"现在该连哪儿"：这里直接给结论。
+      reach: adv.reach,
       tlsPort,
       certFingerprint: certFingerprint || null
     };
@@ -3045,7 +3132,7 @@ export function apply(ctx, config = {}, internals = {}) {
         // managed: external —— 出口是用户自己的反代，网关只能"知道自己挂在哪"，
         // 没有能力验证它到底通不通。所以 ready 只代表"配置完整"。
         managed: 'external',
-        publicUrl: `${scheme}://${ra.nps.host}:${ra.nps.port}`,
+        publicUrl: adv.publicUrl || `${scheme}://${ra.nps.host}:${ra.nps.port}`,
         ready: true,
         reason: ra.nps.useHttps ? '' : 'NPS 走明文：token 会裸露在公网，建议在 NPS 上启用 HTTPS'
       };
@@ -3053,20 +3140,32 @@ export function apply(ctx, config = {}, internals = {}) {
 
     if (provider === 'cloudflared') {
       const status = quickTunnel?.status ?? 'idle';
+      const stage = quickTunnel?.stage ?? 'idle';
       const raw = quickTunnel?.url ?? '';
       const publicUrl = raw
         ? (raw.startsWith('http') ? raw : `https://${raw}`)
         : null;
+      const startedAt = quickTunnel?.startedAt ?? 0;
       return {
         ...base,
         // managed: gateway —— 进程由网关自己拉起与回收。
         managed: 'gateway',
-        publicUrl,
+        publicUrl: adv.publicUrl || publicUrl,
         ready: status === 'ready',
         status,
+        // [fix 2026-10-21] 进度而不是一个布尔：requesting（申请域名）→
+        // requested（拿到域名，等边缘）→ connecting（边缘重试中，带第几次）→
+        // ready / failed。界面据此显示进度条与"已用时 12s"。
+        stage,
+        stageLabel: STAGE_LABELS[stage] || stage,
+        attempts: quickTunnel?.attempts ?? 0,
+        elapsedMs: startedAt > 0 ? Math.max(0, Date.now() - startedAt) : 0,
         reason: status === 'ready' ? ''
           : (quickTunnel?.lastError || lastTunnelError
-            || (status === 'starting' ? '隧道正在建立（等 Cloudflare 边缘注册成功）' : '隧道未启动'))
+            || (stage === 'requesting' ? '正在向 Cloudflare 申请隧道域名…'
+              : stage === 'requested' ? '已拿到域名，正在等 Cloudflare 边缘注册…'
+                : stage === 'connecting' ? `正在连接 Cloudflare 边缘（第 ${quickTunnel?.attempts ?? 0} 次重试）…`
+                  : '隧道未启动'))
       };
     }
 
@@ -3304,33 +3403,12 @@ export function apply(ctx, config = {}, internals = {}) {
       pairSession = { code, expiresAt };
       audit('pair/qr-generated', { expiresAt, ip: req.socket?.remoteAddress });
 
-      // 本机非内部 IPv4 列表：手机在局域网内需要知道打哪个地址。
-      const hosts = [];
-      for (const list of Object.values(os.networkInterfaces())) {
-        for (const ni of list || []) {
-          if (ni.family === 'IPv4' && !ni.internal) hosts.push(ni.address);
-        }
-      }
-      // [fix 2026-10-12] 配置了 nps 公网地址时它优先 —— 扫码的手机多半在外面。
-      const cfgForPair = loadConfig();
-      const pairPublicHost = (cfgForPair.npsHost || '').trim();
-      const pairPublicPort = Number(cfgForPair.npsPort) || listenPort;
-      const pairPrimaryHost = pairPublicHost || hosts[0] || '';
-      const payload = {
-        v: 1,
-        hosts: [pairPrimaryHost, ...hosts].filter(Boolean),
-        host: pairPrimaryHost,
-        port: pairPublicHost ? pairPublicPort : listenPort,
-        publicHost: pairPublicHost || null,
-        publicPort: pairPublicHost ? pairPublicPort : null,
-        lanHosts: hosts,
-        pairCode: code,
-        // [v1.35 / 1.3] 自签证书指纹：App 首次连接按 TOFU 记住它，之后指纹
-        // 变化必须由用户确认（lib/services/cert_trust.dart）。空串表示本机
-        // 证书不可用，App 应回落到「跳过校验并提示」而不是拒连。
-        certFingerprint,
-        name: os.hostname()
-      };
+      // [fix 2026-10-21] 载荷只从 buildPairPayload 来。
+      //
+      // 这里原本自己拼一遍：局域网 IP 取"第一个非 internal IPv4"（真机拿到的是
+      // TUN 的 172.19.0.1），公网地址无条件用 `cfg.npsHost`（provider=仅内网也
+      // 照样塞公网域名）。同一份载荷设置页那边还有第二份拷贝 —— 两份必然漂移。
+      const payload = buildPairPayload(code, expiresAt);
 
       // 依赖纯 JS 的 `qrcode` 包（无原生模块）。装不了时退化为 JSON，
       // 让客户端自己显示 6 位数字配对码（见 GET /pair/info）。
@@ -3371,30 +3449,10 @@ export function apply(ctx, config = {}, internals = {}) {
       const expiresAt = Date.now() + pairCodeTtlMs();
       pairSession = { code, expiresAt };
       audit('pair/info-generated', { expiresAt, ip: req.socket?.remoteAddress });
-      const hosts = [];
-      for (const list of Object.values(os.networkInterfaces())) {
-        for (const ni of list || []) {
-          if (ni.family === 'IPv4' && !ni.internal) hosts.push(ni.address);
-        }
-      }
-      // [fix 2026-10-12] 与 /pair/qr 同步：配置了 nps 公网地址时它优先。
-      const cfgForInfo = loadConfig();
-      const infoPublicHost = (cfgForInfo.npsHost || '').trim();
-      const infoPublicPort = Number(cfgForInfo.npsPort) || listenPort;
-      const infoPrimaryHost = infoPublicHost || hosts[0] || '';
-      sendJson(200, {
-        v: 1,
-        hosts: [infoPrimaryHost, ...hosts].filter(Boolean),
-        host: infoPrimaryHost,
-        port: infoPublicHost ? infoPublicPort : listenPort,
-        publicHost: infoPublicHost || null,
-        publicPort: infoPublicHost ? infoPublicPort : null,
-        lanHosts: hosts,
-        pairCode: code,
-        // [v1.35 / 1.3] 与 /pair/qr 同一口径（TOFU 用）。
-        certFingerprint,
-        name: os.hostname(), expiresAt
-      });
+      // [fix 2026-10-21] 这是**第三处**手写的配对载荷（前两处：/pair/qr 与设置页
+      // RPC）。三份拷贝、三种细节（一份没有 expiresAt、一份没有 ttlMs），统一到
+      // buildPairPayload —— 地址来源也就跟着统一了。
+      sendJson(200, buildPairPayload(code, expiresAt));
       return;
     }
 
@@ -5235,37 +5293,12 @@ export function apply(ctx, config = {}, internals = {}) {
       const expiresAt = Date.now() + pairCodeTtlMs();
       pairSession = { code, expiresAt };
       audit('pair/qrdata-generated', { expiresAt });
-      const hosts = [];
-      for (const list of Object.values(os.networkInterfaces())) {
-        for (const ni of list || []) {
-          if (ni.family === 'IPv4' && !ni.internal) hosts.push(ni.address);
-        }
-      }
-      // [fix 2026-10-12] The phone that scans this QR is usually OUTSIDE the
-      // LAN (nps tunnel), so the configured public host leads the candidate
-      // list; a phone on the same Wi-Fi falls through to the LAN addresses.
-      // The QR carries only the FIRST host — pick by where the user actually
-      // connects, per the settings page's own config.
-      const cfg = loadConfig();
-      const publicHost = (cfg.npsHost || '').trim();
-      const publicPort = Number(cfg.npsPort) || Number(listenPort) || listenPort;
-      const primaryHost = publicHost || hosts[0] || '';
-      return {
-        v: 1,
-        hosts: [primaryHost, ...hosts].filter(Boolean),
-        host: primaryHost,
-        port: publicHost ? publicPort : listenPort,
-        publicHost: publicHost || null,
-        publicPort: publicHost ? publicPort : null,
-        lanHosts: hosts,
-        pairCode: code,
-        // [v1.35 / 1.3] 设置页二维码与 HTTP /pair/qr 必须是同一份载荷口径，
-        // 否则两条配对路径的 TOFU 行为会不一致。
-        certFingerprint,
-        name: os.hostname(),
-        expiresAt,
-        ttlMs: pairCodeTtlMs()
-      };
+      // [fix 2026-10-21] 与 HTTP /pair/qr 共用 buildPairPayload。
+      //
+      // 原来这里也自己拼一遍，且无条件用 `cfg.npsHost` 当公网地址 —— 于是在
+      // 「仅内网」档下，设置页的二维码仍然编码着一个公网域名，手机拿去连必然
+      // 失败，而页面上看不出任何异常。
+      return buildPairPayload(code, expiresAt);
     }
   });
 

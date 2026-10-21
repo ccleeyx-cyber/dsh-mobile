@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -12,15 +14,20 @@ import 'settings_widgets.dart';
 
 /// 「远程访问」——v1.35 新增的二级页。
 ///
+/// [refactor 2026-10-21] 这一页的定位变了：**只读状态 + 记录"怎么连"**。
+///
 /// ## 它解决什么
 ///
-/// 网关直到 v1.34 只有局域网明文 HTTP，人一出门就断联。v1.35 给了两条腿：
-/// TLS 端口（自签证书 + TOFU）和 cloudflared quick tunnel（免账号的临时公网
-/// 通道）。这一页是它们的**唯一操作面**：
+/// 网关直到 v1.34 只有局域网明文 HTTP，人一出门就断联。之后给了两条腿：TLS
+/// 端口（自签证书 + TOFU）与 cloudflared quick tunnel。**通道类型在电脑端选**
+/// （NPS / cloudflared / 不开，严格互斥），这一页只负责：
 ///
-///  * 隧道开关与当前公网地址（地址每次重启都变，文案必须说清）；
-///  * 远程通道配置（一条 `https://…` 地址，保存成独立 profile）；
+///  * 显示当前通道与进度（申请域名 → 等待边缘注册 → 已就绪 / 失败原因）；
+///  * 远程地址配置（一条 `https://…` 地址，保存成独立 profile）；
 ///  * 证书指纹展示 + 变更确认（TOFU 的"人"这一环）。
+///
+/// 启停不在这里 —— 隧道没开时手机根本连不上，那个按钮点不到（上一版设计的
+/// 死循环）。
 ///
 /// ## 产品取舍
 ///
@@ -45,6 +52,10 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
   bool _saving = false;
   String? _error;
 
+  /// [fix 2026-10-21] 通道还在建立时自己轮询：用户在等"成没成"，让他反复进来
+  /// 刷新等于把结果变成猜谜。
+  Timer? _pollTimer;
+
   @override
   void initState() {
     super.initState();
@@ -53,6 +64,7 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
 
   @override
   void dispose() {
+    _pollTimer?.cancel();
     _urlController.dispose();
     super.dispose();
   }
@@ -80,7 +92,23 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
     }
     // 通道状态：连不上网关就保留上一次快照，不弹错误（这一页可能就是在断网时打开的）。
     await _dsh.refreshRemoteAccess();
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {});
+    _schedulePoll();
+  }
+
+  /// 还在建立中 → 3 秒后再拉一次；就绪/失败/未启动就停。
+  void _schedulePoll() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    if (!(_dsh.remoteAccess?.inProgress ?? false)) return;
+    _pollTimer = Timer(const Duration(seconds: 3), () async {
+      if (!mounted) return;
+      await _dsh.refreshRemoteAccess();
+      if (!mounted) return;
+      setState(() {});
+      _schedulePoll();
+    });
   }
 
   String _currentChannel(ServerConfig cfg) => cfg.channel == 'remote' ? '远程' : '局域网';
@@ -237,14 +265,47 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
                   style: TextStyle(fontSize: 12.5, height: 1.5, color: context.c.textSecondary),
                 ),
                 const SizedBox(height: AppSpace.m),
+                const SizedBox(height: AppSpace.m),
+                // [fix 2026-10-21] 建立中要有进度，而不是一个"未就绪"干等。
+                if (ra != null && ra.inProgress) ...[
+                  LinearProgressIndicator(
+                    key: const ValueKey('remote-access-progress'),
+                    minHeight: 3,
+                    backgroundColor: context.c.surfaceMuted,
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          ra.stageLabel.isEmpty ? '正在建立通道…' : ra.stageLabel,
+                          style: TextStyle(
+                              fontSize: 12.5, color: context.c.textPrimary, height: 1.4),
+                        ),
+                      ),
+                      if (ra.attempts > 0)
+                        Text('第 ${ra.attempts} 次重试',
+                            style: TextStyle(fontSize: 11.5, color: context.c.warning)),
+                      if (ra.elapsedLabel.isNotEmpty) ...[
+                        const SizedBox(width: 8),
+                        Text(ra.elapsedLabel,
+                            style: TextStyle(fontSize: 11.5, color: context.c.textSecondary)),
+                      ],
+                    ],
+                  ),
+                  const SizedBox(height: AppSpace.s),
+                ],
                 _row(context, '通道', ra?.providerLabel ?? '未知'),
                 const SizedBox(height: 8),
                 _row(context, '由谁提供', ra?.managedLabel ?? '未知'),
                 const SizedBox(height: 8),
+                _row(context, '公网地址', ra?.publicUrl ?? '未提供', mono: true),
+                const SizedBox(height: 8),
+                // 局域网地址永远展示：通道没起来时它就是唯一能用的那条。
                 _row(
                   context,
-                  '公网地址',
-                  ra?.publicUrl ?? '未提供',
+                  '局域网地址',
+                  (ra?.localUrl.isNotEmpty ?? false) ? ra!.localUrl : '未知',
                   mono: true,
                 ),
                 if (ra?.publicUrl != null) ...[

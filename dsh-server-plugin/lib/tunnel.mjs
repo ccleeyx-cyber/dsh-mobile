@@ -188,6 +188,8 @@ export function createQuickTunnel({
   let registered = false;
   /// 「Retrying connection」出现次数（见 EDGE_RETRY 的说明）。注册成功后不再计数。
   let edgeRetries = 0;
+  /// 本次启动的时刻（ms），用于界面上"已用时"。
+  let startedAt = 0;
 
   /**
    * 只拿到地址不等于隧道可用（实测教训）。
@@ -261,6 +263,7 @@ export function createQuickTunnel({
     lastError = '';
     registered = false;
     edgeRetries = 0;
+    startedAt = Date.now();
     try {
       // --protocol http2：QUIC 在受限网络里常被丢包；--edge-ip-version 4：
       // 避开不可用的 IPv6 边缘地址（两者都是纯经验值，失败只是更慢，不会更坏）。
@@ -324,6 +327,25 @@ export function createQuickTunnel({
     restart,
     get url() { return url; },
     get status() { return status; },
-    get lastError() { return lastError; }
+    get lastError() { return lastError; },
+    /** 边缘重试次数（给"正在连接边缘（第 N 次）"这种进度用）。 */
+    get attempts() { return edgeRetries; },
+    /** 启动时刻（ms）。界面据此显示"已用时 12s"，比干等一个"未就绪"有用。 */
+    get startedAt() { return startedAt; },
+    /**
+     * 人话阶段：客户端不该自己从 status 猜进度。
+     *
+     * starting 里其实有三个截然不同的阶段 —— 申请域名 / 拿到域名等边缘 / 边缘
+     * 注册中。之前只回 `status: 'starting'`，界面上只能显示"未就绪"，用户根本
+     * 不知道卡在哪一步。
+     */
+    get stage() {
+      if (status === 'ready') return 'ready';
+      if (status === 'failed') return 'failed';
+      if (status === 'stopped') return 'stopped';
+      if (status === 'idle') return 'idle';
+      if (!url) return 'requesting';       // 还没拿到域名 = 正在向 Cloudflare 申请
+      return edgeRetries > 0 ? 'connecting' : 'requested';
+    }
   };
 }

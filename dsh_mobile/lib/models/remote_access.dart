@@ -31,6 +31,17 @@ class RemoteAccessState {
   /// 没就绪（或有风险）的原因。空串表示没有问题。
   final String reason;
 
+  /// [fix 2026-10-21] 建立进度。一个 `ready` 布尔对用户没有信息量 ——
+  /// cloudflared 要经过「申请域名 → 拿到域名 → 连边缘（可能重试）」，卡在不同
+  /// 阶段该给的话完全不同：申请阶段失败是网络出不去，边缘阶段失败是被阻断。
+  final String stage; // requesting | requested | connecting | ready | failed | idle | stopped
+  final String stageLabel; // 服务端给的中文标签
+  final int attempts; // 边缘重试次数
+  final int elapsedMs; // 本次建立已用时
+
+  /// 'public' | 'lan'：现在手机该走哪条路（由服务端判定，客户端不自己推）。
+  final String reach;
+
   final int tlsPort;
   final String? certFingerprint;
 
@@ -43,6 +54,11 @@ class RemoteAccessState {
     required this.reason,
     required this.tlsPort,
     required this.certFingerprint,
+    this.stage = 'idle',
+    this.stageLabel = '',
+    this.attempts = 0,
+    this.elapsedMs = 0,
+    this.reach = 'lan',
   });
 
   factory RemoteAccessState.fromJson(Map<String, dynamic> json) {
@@ -58,7 +74,22 @@ class RemoteAccessState {
       certFingerprint: (json['certFingerprint']?.toString() ?? '').isEmpty
           ? null
           : json['certFingerprint'].toString(),
+      stage: json['stage']?.toString() ?? 'idle',
+      stageLabel: json['stageLabel']?.toString() ?? '',
+      attempts: json['attempts'] is num ? (json['attempts'] as num).toInt() : 0,
+      elapsedMs: json['elapsedMs'] is num ? (json['elapsedMs'] as num).toInt() : 0,
+      reach: json['reach']?.toString() ?? 'lan',
     );
+  }
+
+  /// 是否还在建立中（界面据此画进度条并继续轮询）。
+  bool get inProgress =>
+      !ready && stage != 'failed' && stage != 'stopped' && stage != 'idle';
+
+  /// 'now 8s' 这类已用时文案。
+  String get elapsedLabel {
+    final s = (elapsedMs / 1000).round();
+    return s <= 0 ? '' : '已用时 ${s}s';
   }
 
   /// 供 UI 直接显示的中文名。

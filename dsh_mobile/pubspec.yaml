@@ -1,7 +1,7 @@
 name: dsh_mobile
 description: "A modern Android client for DeepSeek Harness (DSH)"
 publish_to: "none"
-version: 1.36.4+84
+version: 1.37.0+85
 
 environment:
   sdk: ">=3.0.0 <4.0.0"
