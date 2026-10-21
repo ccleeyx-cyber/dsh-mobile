@@ -27,6 +27,7 @@ import '../models/persona.dart';
 import '../models/gateway_features.dart';
 import '../models/task_center.dart';
 import '../models/bridge_extras.dart';
+import '../models/remote_access.dart';
 
 enum ConnectionStatus {
   disconnected,
@@ -3914,48 +3915,41 @@ class DshService extends ChangeNotifier {
 
   // ---- 一键诊断 / 子代理中断 / goal 控制 / slash 命令 [feat 2026-10-12] ----
 
-  // ---- [v1.35 / 1.5] 云隧道（cloudflared quick tunnel） ----
+  // ---- [refactor 2026-10-21] 远程接入（取代旧的「云隧道开关」）----
+  //
+  // NPS 与 cloudflared 是同一职责的两种 provider，严格互斥；启停由网关按配置
+  // 自动处理（cloudflared 随网关启动拉起、退出回收）。客户端**没有**开关，
+  // 只有状态 —— 上一版把隧道启停放在手机上是个死循环：隧道没开时手机根本
+  // 连不上，那个按钮点不到。
 
-  Map<String, dynamic>? _tunnelState;
+  RemoteAccessState? _remoteAccess;
 
-  /// 最近一次隧道状态（`{status, url, target, error}`）。null = 还没查过。
-  Map<String, dynamic>? get tunnelState => _tunnelState;
+  /// 最近一次远程接入状态。null = 还没查过。
+  RemoteAccessState? get remoteAccess => _remoteAccess;
 
-  Future<Map<String, dynamic>?> _tunnelRequest(String path, {bool post = false}) async {
+  Future<RemoteAccessState?> refreshRemoteAccess() async {
     if (_currentConfig == null) return null;
-    final url = Uri.parse('${_currentConfig!.httpBaseUrl}$path');
+    final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/remote-access');
     try {
-      final res = post
-          // 下载 cloudflared 可能要几十秒，超时给足；失败也只是降级，不影响连接。
-          ? await _httpClient.post(url, headers: _authHeaders).timeout(const Duration(seconds: 90))
-          : await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return null;
-      final data = jsonDecode(utf8.decode(res.bodyBytes));
-      if (data is Map) {
-        _tunnelState = Map<String, dynamic>.from(data);
-        notifyListeners();
-        return _tunnelState;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        if (data is Map) {
+          _remoteAccess = RemoteAccessState.fromJson(Map<String, dynamic>.from(data));
+          notifyListeners();
+          return _remoteAccess;
+        }
       }
-      return null;
     } catch (e) {
-      debugPrint('[DshService] tunnel request error ($path): $e');
-      _tunnelState = {
-        'ok': false,
-        'status': 'failed',
-        'error': '请求失败: $e',
-      };
-      notifyListeners();
-      return _tunnelState;
+      // 连不上网关时保留上一次的快照：这一页本身可能就是断网时打开的，
+      // 清空只会让用户连"上次是什么状态"都看不到。
+      debugPrint('[DshService] refreshRemoteAccess error: $e');
     }
+    return _remoteAccess;
   }
-
-  Future<Map<String, dynamic>?> refreshTunnel() => _tunnelRequest('/api/mobile/tunnel');
-
-  Future<Map<String, dynamic>?> startTunnel() =>
-      _tunnelRequest('/api/mobile/tunnel/start', post: true);
-
-  Future<Map<String, dynamic>?> stopTunnel() =>
-      _tunnelRequest('/api/mobile/tunnel/stop', post: true);
 
   /// 一键连接诊断。永不抛异常：网关保证各项 check 都有答案（引擎挂掉只让
   /// `engine_rpc` 变 ok:false），这里再把网络层异常兜成一份最小失败报告。

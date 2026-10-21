@@ -201,12 +201,18 @@ async function dispatch(endpoint, payload, deps) {
         port: cfg.port,
         dshPort,
         token: cfg.token,
+        // [refactor 2026-10-21] 远程接入的**模型**（provider + nps 子对象）。
+        // 下面三个顶层字段是派生值，只为兼容旧面板/旧客户端；新代码认这一份。
+        remoteAccess: cfg.remoteAccess,
         npsHost: cfg.npsHost,
         npsPort: cfg.npsPort,
         useHttps: cfg.useHttps,
         localIp,
         localUrl: `http://${localIp}:${cfg.port}`,
-        npsUrl: `${npsScheme}://${cfg.npsHost}:${cfg.npsPort}`,
+        // npsUrl 只在 provider=nps 时有意义；其余档公网地址由网关运行时决定。
+        npsUrl: cfg.remoteAccess?.provider === 'nps'
+          ? `${npsScheme}://${cfg.npsHost}:${cfg.npsPort}`
+          : null,
         // [cleanup 2026-10-21] 不再回 apkUrl / npsApkUrl：网关不托管安装包，
         // 一切以 GitHub Releases 为准（设置页自己给 Releases 链接）。
         version: BRIDGE_VERSION

@@ -29,6 +29,7 @@ import {
   loadConfig, saveConfig, verifyToken, findDeviceByToken, ensureDataDir, dshHome, audit, readAudit,
   loadDevices, saveDevices, touchDevice, revokeDevice,
   newPairCode, pairCodeTtlMs, newToken, hashToken, roleCanWrite,
+  REMOTE_PROVIDERS,
   loadPermissions, savePermissions, permissionsFile
 } from './store.mjs';
 import { installRpc, RPC_CHANNEL, ENDPOINTS } from './rpc.mjs';
@@ -3003,6 +3004,147 @@ export function apply(ctx, config = {}, internals = {}) {
     };
   }
 
+  /** 首个非回环 IPv4（局域网地址；拿不到就退回 127.0.0.1）。 */
+  function primaryLanIpv4() {
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const ni of list || []) {
+        if (ni.family === 'IPv4' && !ni.internal) return ni.address;
+      }
+    }
+    return '127.0.0.1';
+  }
+
+  /**
+   * 「远程接入」的统一视图（[refactor 2026-10-21]）。
+   *
+   * 三种 provider **严格互斥**，这里把它们归一成手机端唯一需要的东西：
+   * 现在走哪条路、公网地址是什么、能不能用、为什么不能用。
+   *
+   * 为什么这层逻辑不能放客户端：NPS 的地址来自配置（固定），cloudflared 的地址
+   * 来自进程运行时（每次重连都变），两者的就绪判定也不同 —— 前者只能"已配置"，
+   * 后者必须等到 `Registered tunnel connection`。放两头必然漂移。
+   */
+  function remoteAccessPayload() {
+    const cfg = loadConfig();
+    const ra = cfg.remoteAccess || { provider: 'none', nps: { host: '', port: listenPort, useHttps: false } };
+    const provider = ra.provider || 'none';
+    const lanIp = primaryLanIpv4();
+    const localUrl = `http://${lanIp}:${listenPort}`;
+    const base = {
+      ok: true,
+      provider,
+      localUrl,
+      tlsPort,
+      certFingerprint: certFingerprint || null
+    };
+
+    if (provider === 'nps') {
+      const scheme = ra.nps.useHttps ? 'https' : 'http';
+      return {
+        ...base,
+        // managed: external —— 出口是用户自己的反代，网关只能"知道自己挂在哪"，
+        // 没有能力验证它到底通不通。所以 ready 只代表"配置完整"。
+        managed: 'external',
+        publicUrl: `${scheme}://${ra.nps.host}:${ra.nps.port}`,
+        ready: true,
+        reason: ra.nps.useHttps ? '' : 'NPS 走明文：token 会裸露在公网，建议在 NPS 上启用 HTTPS'
+      };
+    }
+
+    if (provider === 'cloudflared') {
+      const status = quickTunnel?.status ?? 'idle';
+      const raw = quickTunnel?.url ?? '';
+      const publicUrl = raw
+        ? (raw.startsWith('http') ? raw : `https://${raw}`)
+        : null;
+      return {
+        ...base,
+        // managed: gateway —— 进程由网关自己拉起与回收。
+        managed: 'gateway',
+        publicUrl,
+        ready: status === 'ready',
+        status,
+        reason: status === 'ready' ? ''
+          : (quickTunnel?.lastError || lastTunnelError
+            || (status === 'starting' ? '隧道正在建立（等 Cloudflare 边缘注册成功）' : '隧道未启动'))
+      };
+    }
+
+    return {
+      ...base,
+      provider: 'none',
+      managed: 'none',
+      publicUrl: null,
+      ready: false,
+      reason: '未选择远程通道：只有同一局域网内的手机能连'
+    };
+  }
+
+  /**
+   * 拉起 quick tunnel（幂等）。返回 { ok, error? } 而不是直接写响应 —— 启动路由与
+   * provider 对账都要用同一条实现，复制一份必然漂移。
+   */
+  async function startQuickTunnel() {
+    if (quickTunnel && (quickTunnel.status === 'ready' || quickTunnel.status === 'starting')) {
+      return { ok: true };
+    }
+    if (tlsPort <= 0 || !tlsServer) {
+      // 明确拒绝而不是"帮你改成明文暴露"：quick tunnel 会把流量放到公网，
+      // 明文 HTTP 上的 token 等于公开。
+      return { ok: false, code: 'tls-disabled', error: 'TLS 端口未启用，无法开启公网隧道（隧道必须指向 HTTPS）' };
+    }
+    try {
+      lastTunnelError = '';
+      const bin = await ensureCloudflared({ fetchToFile: downloadToFile });
+      quickTunnel = createQuickTunnel({
+        binary: bin.path,
+        target: `https://127.0.0.1:${tlsPort}`,
+        onUrl: (url) => {
+          audit('tunnel/url', { url });
+          // 地址变化要立刻广播：手机拿着旧地址重连只会得到"连不上"，
+          // 而它没法自己发现新地址。
+          broadcastToMobileClients({ type: 'tunnel_url', url, channel: 'remote' });
+        },
+        onExit: (info) => {
+          audit('tunnel/exit', { code: info.code, error: info.error });
+          broadcastToMobileClients({ type: 'tunnel_url', url: '', channel: 'remote' });
+        },
+        logger
+      });
+      quickTunnel.start();
+      audit('tunnel/start', { target: `https://127.0.0.1:${tlsPort}`, binary: bin.path });
+      return { ok: true };
+    } catch (err) {
+      // 下载失败 / 校验失败都在这里：只降级，不影响局域网与明文端口。
+      lastTunnelError = err?.message ?? String(err);
+      logger.warn('[dsh-mobile-bridge] 云隧道启动失败: %s', lastTunnelError);
+      return { ok: false, error: lastTunnelError };
+    }
+  }
+
+  /**
+   * 让运行时状态跟上 provider —— **严格互斥的执行点**。
+   *
+   * 唯一允许 cloudflared 存活的条件是 `provider === 'cloudflared'`。切到 nps /
+   * none 时必须把它停掉，否则两条出口同时对外，用户面对的是一个说不清的地址
+   * 集合（这也是本次重构要消灭的那个状态）。
+   */
+  async function reconcileRemoteAccess() {
+    const cfg = loadConfig();
+    const provider = cfg.remoteAccess?.provider || 'none';
+    if (provider !== 'cloudflared') {
+      if (quickTunnel) {
+        try { quickTunnel.stop(); } catch (_) { /* best effort */ }
+        quickTunnel = null;
+        lastTunnelError = '';
+        audit('tunnel/stop', { reason: `provider=${provider}` });
+        broadcastToMobileClients({ type: 'tunnel_url', url: '', channel: 'remote' });
+      }
+      return { ok: true };
+    }
+    return startQuickTunnel();
+  }
+
   // [v1.35 / 1.2] 请求处理器提成具名变量：明文端口与 TLS 端口共用同一份路由与
   // 鉴权栈。此前它内联在 createServer(...) 里，想加第二个监听面就只能复制整张
   // 路由表 —— 那正是本仓库历史上「两份实现漂移」的老毛病。
@@ -3420,59 +3562,47 @@ export function apply(ctx, config = {}, internals = {}) {
       }
     }
 
-    /* ---- [v1.35 / 1.5] 云隧道状态与控制 ---- */
+    /* ---- 兼容端点：隧道手动控制（只对 provider=cloudflared 有意义）----
+     *
+     * 「远程接入」的权威入口是 `GET/POST /api/mobile/remote-access`（在 jsonBody
+     * 解析之后注册 —— POST 要用 body）。这里只留两条手动控制，供排障时重连。
+     */
     if ((pathname === '/api/mobile/tunnel' || pathname === '/tunnel') && req.method === 'GET') {
       sendJson(200, tunnelPayload());
       return;
     }
     if (pathname === '/api/mobile/tunnel/start' && req.method === 'POST') {
-      if (tlsPort <= 0 || !tlsServer) {
-        // 明确拒绝而不是"帮你改成明文暴露"：quick tunnel 会把流量放到公网，
-        // 明文 HTTP 上的 token 等于公开。
-        sendJson(409, { ok: false, error: 'TLS 端口未启用，无法开启公网隧道（隧道必须指向 HTTPS）' });
-        return;
-      }
-      if (quickTunnel && (quickTunnel.status === 'ready' || quickTunnel.status === 'starting')) {
-        sendJson(200, tunnelPayload());
-        return;
-      }
-      try {
-        lastTunnelError = '';
-        const bin = await ensureCloudflared({ fetchToFile: downloadToFile });
-        quickTunnel = createQuickTunnel({
-          binary: bin.path,
-          target: `https://127.0.0.1:${tlsPort}`,
-          onUrl: (url) => {
-            audit('tunnel/url', { url });
-            // 地址变化要立刻广播：手机拿着旧地址重连只会得到"连不上"，
-            // 而它没法自己发现新地址。
-            broadcastToMobileClients({ type: 'tunnel_url', url, channel: 'remote' });
-          },
-          onExit: (info) => {
-            audit('tunnel/exit', { code: info.code, error: info.error });
-            broadcastToMobileClients({ type: 'tunnel_url', url: '', channel: 'remote' });
-          },
-          logger
+      const provider = loadConfig().remoteAccess?.provider || 'none';
+      if (provider !== 'cloudflared') {
+        sendJson(409, {
+          ok: false,
+          code: 'provider-not-managed',
+          error: `当前远程通道是 ${provider}，cloudflared 不参与（严格互斥）。改 provider 请用 POST /api/mobile/remote-access`,
+          state: remoteAccessPayload()
         });
-        quickTunnel.start();
-        audit('tunnel/start', { target: `https://127.0.0.1:${tlsPort}`, binary: bin.path });
+        return;
+      }
+      const started = await startQuickTunnel();
+      if (started.ok) {
         sendJson(200, tunnelPayload());
-      } catch (err) {
-        // 下载失败 / 校验失败都在这里：只降级，不影响局域网与明文端口。
-        lastTunnelError = err?.message ?? String(err);
-        logger.warn('[dsh-mobile-bridge] 云隧道启动失败: %s', lastTunnelError);
+      } else if (started.code === 'tls-disabled') {
+        // 409 = 当前配置不让做这件事（而不是"做了但失败了"）。
+        sendJson(409, { ok: false, code: started.code, error: started.error });
+      } else {
         sendJson(500, {
           ok: false,
           status: 'failed',
-          error: err?.message ?? String(err),
+          error: started.error,
           hint: '可手动安装 cloudflared 后重试，或改用 Tailscale/自有反代'
         });
       }
       return;
     }
     if (pathname === '/api/mobile/tunnel/stop' && req.method === 'POST') {
+      // 注意：这里**不改 provider**。停进程只是"暂时断开"，状态会如实显示
+      // ready:false；真正关掉远程访问是把 provider 改成 none / nps。
       quickTunnel?.stop();
-      audit('tunnel/stop', {});
+      audit('tunnel/stop', { reason: 'manual' });
       sendJson(200, tunnelPayload());
       return;
     }
@@ -3667,6 +3797,57 @@ export function apply(ctx, config = {}, internals = {}) {
 
 
     try {
+      // [refactor 2026-10-21] 「远程接入」统一状态与切换。
+      //
+      // NPS 与 cloudflared 是**同一职责的两种 provider**（让手机从公网到达本机），
+      // 严格互斥：同一时刻只有一条公网出口。客户端只需要读「现在走哪条、地址是
+      // 什么、就绪了吗、为什么没就绪」，不需要知道进程怎么起。
+      //
+      // ⚠️ 这两条必须放在 `jsonBody` 解析**之后**（POST 要用它）。放在前面会命中
+      // TDZ：`Cannot access 'jsonBody' before initialization`，请求永不返回。
+      if (pathname === '/api/mobile/remote-access' && req.method === 'GET') {
+        sendJson(200, remoteAccessPayload());
+        return;
+      }
+      if (pathname === '/api/mobile/remote-access' && req.method === 'POST') {
+        const body = jsonBody || {};
+        const provider = String(body.provider || '').trim().toLowerCase();
+        if (!REMOTE_PROVIDERS.includes(provider)) {
+          sendJson(400, {
+            ok: false,
+            error: `provider 必须是 ${REMOTE_PROVIDERS.join(' / ')}`
+          });
+          return;
+        }
+        const patch = { remoteAccess: { provider } };
+        if (body.nps && typeof body.nps === 'object') patch.remoteAccess.nps = body.nps;
+        if (provider === 'nps') {
+          const host = String(
+            (body.nps && body.nps.host) || loadConfig().remoteAccess.nps.host || ''
+          ).trim();
+          if (!host) {
+            sendJson(400, { ok: false, error: 'provider=nps 需要提供 nps.host' });
+            return;
+          }
+        }
+        const saved = saveConfig(patch);
+        audit('remote-access/set', {
+          provider: saved.remoteAccess.provider,
+          npsHost: saved.remoteAccess.nps.host || undefined
+        });
+        // 互斥在这里落地：改完配置要立刻对进程生效，否则会出现"界面说走 NPS，
+        // cloudflared 还在后台占着一条公网隧道"。
+        //
+        // ⚠️ **不能 await**：切到 cloudflared 时这一步会去下载 60MB 的二进制
+        // （首次），await 等于让"点一下切换"卡几分钟。切换只负责落配置与发起，
+        // 是否就绪由 GET 的 ready/reason 如实反映。
+        reconcileRemoteAccess().catch((err) => {
+          logger.warn('[dsh-mobile-bridge] 远程接入对账失败: %s', err?.message ?? err);
+        });
+        sendJson(200, remoteAccessPayload());
+        return;
+      }
+
       // [v1.35 / 3.3] 告警收件箱
       if (pathname === '/api/mobile/alerts' && req.method === 'GET') {
         sendJson(200, {
@@ -4794,6 +4975,16 @@ export function apply(ctx, config = {}, internals = {}) {
         tlsServer.listen(tlsPort, bindHost, () => {
           logger.info('dsh-mobile-bridge: TLS 网关就绪 https://%s:%d（证书指纹 %s）', bindHost, tlsPort, certFingerprint);
           audit('tls/start', { port: tlsPort, fingerprint: certFingerprint });
+          // [refactor 2026-10-21] provider=cloudflared 时随网关自动拉起隧道。
+          //
+          // 通道是**服务端能力**，不该等某台手机来点按钮 —— 而且隧道没开时手机
+          // 根本连不上，那个按钮点不到（上一版在这里是死循环）。失败只 degrade：
+          // 隧道起不来不影响局域网与明文端口。
+          setTimeout(() => {
+            reconcileRemoteAccess().catch((err) => {
+              logger.warn('[dsh-mobile-bridge] 远程接入对账失败: %s', err?.message ?? err);
+            });
+          }, 0);
         });
       } catch (err) {
         logger.warn('dsh-mobile-bridge: TLS 端口启动失败（%s），HTTPS/WSS 不可用', err?.message ?? err);

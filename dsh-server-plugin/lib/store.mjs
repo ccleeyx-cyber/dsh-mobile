@@ -47,9 +47,16 @@ const configFile = () => path.join(dataDir(), 'config.json');
 const DEFAULT_CONFIG = {
   token: '',
   port: 3088,
-  npsHost: 'n.cnm.asia',
+  // [refactor 2026-10-21] 旧的三个 NPS 字段保留**派生只读**语义：真正的模型是
+  // `remoteAccess`（见下），顶层这三个只是给旧读者（client.js 面板、旧版 App）
+  // 的兼容字段，始终跟着 remoteAccess.nps 同步。
+  npsHost: '',
   npsPort: 3088,
   useHttps: false,
+  remoteAccess: {
+    provider: 'none',
+    nps: { host: '', port: 3088, useHttps: false }
+  },
   // ntfy 离线推送（v1.14）。默认关闭：推送会把事件摘要发往第三方服务，
   // 必须由用户显式打开并填 topic。
   ntfyEnabled: false,
@@ -57,6 +64,60 @@ const DEFAULT_CONFIG = {
   ntfyTopic: '',
   ntfyToken: ''
 };
+
+/**
+ * 「远程接入」的三种 provider。**严格互斥**：同一时刻只有一条公网出口。
+ *
+ * 为什么互斥而不是并存：`nps` 与 `cloudflared` 解决的是**同一件事**（让手机从
+ * 公网到达本机 3088/3443），只是出口不同 —— 一个是用户自己的反向代理（网关
+ * 只知道自己挂在哪个地址下），一个是网关自己向外建连（cloudflared quick
+ * tunnel，地址每次重连都会变）。两条同时开着只会让"我该填哪个地址"变成新问题。
+ */
+export const REMOTE_PROVIDERS = Object.freeze(['none', 'nps', 'cloudflared']);
+
+const DEFAULT_REMOTE_ACCESS = Object.freeze({
+  provider: 'none',
+  nps: Object.freeze({ host: '', port: 3088, useHttps: false })
+});
+
+/**
+ * 归一化远程接入配置。
+ *
+ * 两个来源：新的 `remoteAccess`，或**旧的**顶层 `npsHost/npsPort/useHttps`。
+ * 旧配置的映射刻意保持零回归 —— 填了 npsHost 就等于 `provider: 'nps'`
+ * （现有安装的 config.json 里都有这一项）。
+ */
+export function normalizeRemoteAccess(raw, legacy = {}) {
+  const rawNps = (raw && typeof raw.nps === 'object' && raw.nps) || {};
+  const host = String(
+    rawNps.host !== undefined ? rawNps.host : (legacy.npsHost || '')
+  ).trim();
+  const port = Number(rawNps.port !== undefined ? rawNps.port : legacy.npsPort)
+    || DEFAULT_REMOTE_ACCESS.nps.port;
+  const useHttps = rawNps.useHttps !== undefined
+    ? Boolean(rawNps.useHttps)
+    : Boolean(legacy.useHttps);
+
+  let provider = raw && typeof raw.provider === 'string'
+    ? raw.provider.trim().toLowerCase()
+    : '';
+  if (!REMOTE_PROVIDERS.includes(provider)) provider = host ? 'nps' : 'none';
+  // 「选了 nps 却没填地址」是无效态：回落 none，由调用方给出"缺 host"的提示。
+  // 不能让网关带着一条指向空字符串的"人肉反代"对外宣称可用。
+  if (provider === 'nps' && !host) provider = 'none';
+
+  return { provider, nps: { host, port, useHttps } };
+}
+
+/** 把远程接入模型摊平成旧的三个顶层字段（兼容旧读者）。 */
+export function legacyNpsFields(remoteAccess) {
+  const ra = remoteAccess || DEFAULT_REMOTE_ACCESS;
+  return {
+    npsHost: ra.nps.host,
+    npsPort: ra.nps.port,
+    useHttps: ra.nps.useHttps
+  };
+}
 
 export function loadConfig() {
   ensureDataDir();
@@ -74,12 +135,16 @@ export function loadConfig() {
     const token = (raw.token && String(raw.token).trim())
       || process.env.DSH_AUTH_TOKEN
       || generateToken();
+    const remoteAccess = normalizeRemoteAccess(raw.remoteAccess, {
+      npsHost: raw.npsHost,
+      npsPort: raw.npsPort,
+      useHttps: raw.useHttps
+    });
     return {
       token,
       port: Number(raw.port) || DEFAULT_CONFIG.port,
-      npsHost: (raw.npsHost && String(raw.npsHost).trim()) || DEFAULT_CONFIG.npsHost,
-      npsPort: Number(raw.npsPort) || DEFAULT_CONFIG.npsPort,
-      useHttps: Boolean(raw.useHttps),
+      remoteAccess,
+      ...legacyNpsFields(remoteAccess),
       ntfyEnabled: raw.ntfyEnabled === true,
       ntfyUrl: typeof raw.ntfyUrl === 'string' ? raw.ntfyUrl.trim() : '',
       ntfyTopic: typeof raw.ntfyTopic === 'string' ? raw.ntfyTopic.trim() : '',
@@ -100,9 +165,42 @@ export function saveConfig(patch = {}) {
   // Ensure types
   if (patch.token !== undefined) updated.token = String(patch.token).trim() || DEFAULT_CONFIG.token;
   if (patch.port !== undefined) updated.port = Number(patch.port) || DEFAULT_CONFIG.port;
-  if (patch.npsHost !== undefined) updated.npsHost = String(patch.npsHost).trim() || DEFAULT_CONFIG.npsHost;
-  if (patch.npsPort !== undefined) updated.npsPort = Number(patch.npsPort) || DEFAULT_CONFIG.npsPort;
-  if (patch.useHttps !== undefined) updated.useHttps = Boolean(patch.useHttps);
+
+  // 远程接入：新形状（remoteAccess）与旧形状（顶层 npsHost/npsPort/useHttps）
+  // 都写进**同一个**模型，避免出现"改了 npsHost 但 provider 还是 none"的分裂态。
+  const hasLegacy = patch.npsHost !== undefined
+    || patch.npsPort !== undefined
+    || patch.useHttps !== undefined;
+  const remotePatch = (patch.remoteAccess && typeof patch.remoteAccess === 'object')
+    ? patch.remoteAccess
+    : null;
+  if (remotePatch || hasLegacy) {
+    const cur = current.remoteAccess || DEFAULT_REMOTE_ACCESS;
+    const merged = {
+      provider: remotePatch && remotePatch.provider !== undefined
+        ? remotePatch.provider
+        : cur.provider,
+      nps: {
+        host: remotePatch && remotePatch.nps && remotePatch.nps.host !== undefined
+          ? remotePatch.nps.host
+          : (patch.npsHost !== undefined ? patch.npsHost : cur.nps.host),
+        port: remotePatch && remotePatch.nps && remotePatch.nps.port !== undefined
+          ? remotePatch.nps.port
+          : (patch.npsPort !== undefined ? patch.npsPort : cur.nps.port),
+        useHttps: remotePatch && remotePatch.nps && remotePatch.nps.useHttps !== undefined
+          ? remotePatch.nps.useHttps
+          : (patch.useHttps !== undefined ? patch.useHttps : cur.nps.useHttps)
+      }
+    };
+    // 旧调用方（client.js 面板没有 provider 概念）填了地址 = 表示要用 NPS。
+    if (!remotePatch && patch.npsHost !== undefined
+      && String(patch.npsHost).trim() && merged.provider === 'none') {
+      merged.provider = 'nps';
+    }
+    updated.remoteAccess = normalizeRemoteAccess(merged);
+    Object.assign(updated, legacyNpsFields(updated.remoteAccess));
+  }
+
   // 推送配置（v1.14）。空字符串是合法值 —— 用户清空地址/topic 就等于关掉这条
   // 通道，不能像 token 那样回退到默认值。
   if (patch.ntfyEnabled !== undefined) updated.ntfyEnabled = patch.ntfyEnabled === true;

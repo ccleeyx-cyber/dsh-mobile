@@ -7,6 +7,76 @@
 
 ---
 
+## [1.36.4] - 2026-10-21
+
+### 重构（远程接入：NPS 与 cloudflared 收敛成同一个能力的两种 provider）
+
+用户指出的设计问题：**这两件事是同一层的东西，却被实现成两个互不知晓的功能**。
+`cloudflared` 是「没有 NPS 时的接入方式」，和 NPS 同级，不是另一个独立功能。
+
+原来的错位：
+
+| | NPS | cloudflared |
+|---|---|---|
+| 配置在哪 | 电脑端 config（`npsHost/npsPort/useHttps`） | 无配置，进程状态只在内存 |
+| 谁启停 | 不需要（外部反代） | **手机端的按钮** |
+| 就绪判定 | 无 | `Registered tunnel connection` |
+| 与对方的关系 | 不知道 cloudflared 存在 | 不知道 NPS 存在 |
+
+所以用户既看不出这是二选一，也不知道该填哪个地址；更要命的是**隧道没开时手机
+根本连不上，那个"开启隧道"的按钮点不到**（死循环）。
+
+### 定案：严格互斥，三选一
+
+```json
+"remoteAccess": { "provider": "none | nps | cloudflared", "nps": { "host": "", "port": 3088, "useHttps": false } }
+```
+
+- **配置在电脑端**（DSH 设置页新增「远程接入方式」三选一 + NPS 字段）；
+- **cloudflared 随网关启动自动拉起、退出自动回收**，切走 provider 时立即停掉
+  （互斥的执行点）；
+- **手机端只读**：`GET /api/mobile/remote-access` → provider / 公网地址 / 是否就绪
+  / 原因。手机上的开关全部删除，改为「复制地址」「填入下方」两个动作；
+- **旧配置零回归**：只有 `npsHost` 的老安装按「填了就是 NPS」映射成
+  `provider: nps`；新装默认 `none`（此前默认值写死了 `n.cnm.asia`，等于让任何
+  人装完就指向一个他不拥有的域名）。
+
+### 改动清单
+
+- 网关 `store.mjs`：`normalizeRemoteAccess` / `legacyNpsFields`，`loadConfig`
+  做旧→新映射，`saveConfig` 同时接受新旧两种写法（顶层字段与 `remoteAccess`
+  永远同步，不再有两个真源）。
+- 网关 `index.js`：`remoteAccessPayload()`（统一视图）、`startQuickTunnel()`
+  （提取自原路由，幂等）、`reconcileRemoteAccess()`（互斥执行点）、
+  `GET/POST /api/mobile/remote-access`、TLS 就绪后自动对账；旧
+  `/tunnel/start|stop` 降级为**只对 cloudflared 生效**的排障端点（provider 不是
+  cloudflared 时 409 `provider-not-managed`）。
+- 网关 `rpc.mjs`：`config/get` 下发 `remoteAccess`，`npsUrl` 只在 provider=nps
+  时给值。
+- 电脑端设置页 `client/client.js`：三选一按钮 + 条件显示的 NPS 字段与 HTTPS 勾选；
+  保存只写 `remoteAccess`。
+- App：新增 `models/remote_access.dart`；`refreshRemoteAccess()` 取代
+  `refreshTunnel/startTunnel/stopTunnel`（后三者删除，无人再用）；远程访问页
+  从「配置 + 开关」收敛成「状态 + 复制 + 指纹确认」。
+
+### 验证
+
+- 网关 `npm test`：508 项 / **506 过** / 2 跳过（POSIX）/ 0 失败。新增
+  `remote-access.test.mjs`（6 条：新装默认 none、旧配置映射、切换保留 NPS 字段、
+  缺 host 回落、旧字段自动切 nps、显式 none 不被覆盖）与 8 条路由用例
+  （互斥 409、缺 host 400、managed/ready 语义、TLS 关闭拒绝开隧道）。
+- App `flutter analyze` 零问题；`flutter test` **834 全绿**（新增 5 条模型解析）。
+
+### 顺带修掉的两个自造缺陷
+
+- 切换 provider 时**不能 await 隧道启动**：首次要下载 60MB 二进制，await 等于让
+  「点一下切换」卡几分钟。现在只落配置并后台发起，状态由 GET 如实反映。
+- 新路由一开始被放在 `jsonBody` 解析**之前**，命中 TDZ
+  （`Cannot access 'jsonBody' before initialization`），请求永不返回 —— 测试是
+  靠"卡住 15 秒"暴露的。
+
+---
+
 ## [1.36.3] - 2026-10-21
 
 ### 变更（Runbook 搬进会话信息面板）

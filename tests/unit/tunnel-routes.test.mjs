@@ -1,10 +1,14 @@
 /**
- * v1.35 / 1.5 — 云隧道路由（网关侧薄层）
+ * v1.35 / 1.5 + 2026-10-21 重构 — 远程接入路由（网关侧薄层）
  *
- * 只钉两条最容易写错的规则：
- *   1. TLS 关闭时 POST /tunnel/start 必须 409 —— 绝不允许把明文网关暴露到公网；
- *   2. GET /tunnel 必须如实报告状态（idle + target），让 App 能区分"没开"和
- *      "开失败了"。
+ * 钉住四条最容易写错的规则：
+ *   1. 「远程接入」严格互斥：provider 只有 none / nps / cloudflared，状态接口必须
+ *      归一给出 provider + 公网地址 + 是否就绪 + 原因；
+ *   2. TLS 关闭时绝不允许把明文网关暴露到公网 —— 但前提是 provider 真的是
+ *      cloudflared（否则先被互斥规则挡掉）；
+ *   3. 切走 provider 后，旧的 /tunnel/start 必须拒绝，避免"界面说走 NPS，
+ *      cloudflared 还在后台占着一条公网隧道"；
+ *   4. provider=nps 没有 host 是无效配置，必须 400 而不是写进去。
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -34,11 +38,15 @@ async function pickFreePort() {
 const PORT = await pickFreePort();
 const BASE = `http://127.0.0.1:${PORT}`;
 
-function req(pathname, { method = 'GET' } = {}) {
+function req(pathname, { method = 'GET', body } = {}) {
   return new Promise((resolve, reject) => {
+    const payload = body === undefined ? null : JSON.stringify(body);
     const r = http.request(`${BASE}${pathname}`, {
       method,
-      headers: { Authorization: `Bearer ${TOKEN}` }
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {})
+      }
     }, (res) => {
       let data = '';
       res.on('data', (c) => { data += c; });
@@ -49,13 +57,14 @@ function req(pathname, { method = 'GET' } = {}) {
       });
     });
     r.on('error', reject);
+    if (payload) r.write(payload);
     r.end();
   });
 }
 
 let teardown = null;
 
-describe('tunnel routes', () => {
+describe('remote access routes', () => {
   before(async () => {
     const effectFns = [];
     const ctx = {
@@ -82,7 +91,7 @@ describe('tunnel routes', () => {
     try { fs.rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
-  it('reports idle status with no TLS target', async () => {
+  it('tunnel 状态接口仍然如实报告 idle（兼容旧客户端）', async () => {
     const r = await req('/api/mobile/tunnel');
     assert.equal(r.status, 200);
     assert.equal(r.parsed.ok, true);
@@ -90,9 +99,77 @@ describe('tunnel routes', () => {
     assert.equal(r.parsed.target, null);
   });
 
-  it('refuses to start without TLS instead of exposing plaintext', async () => {
+  it('默认 none：明确说"只有局域网"，不给一个假地址', async () => {
+    const r = await req('/api/mobile/remote-access');
+    assert.equal(r.status, 200);
+    assert.equal(r.parsed.provider, 'none');
+    assert.equal(r.parsed.managed, 'none');
+    assert.equal(r.parsed.publicUrl, null);
+    assert.equal(r.parsed.ready, false);
+    assert.match(r.parsed.reason, /局域网/);
+    // 局域网地址与 TLS 指纹是客户端需要的既有信息，不能因为没配远程就消失
+    assert.match(r.parsed.localUrl, /^http:\/\//);
+    assert.equal(r.parsed.tlsPort, 0);
+  });
+
+  it('provider=nps 缺 host 直接 400，不落盘', async () => {
+    const r = await req('/api/mobile/remote-access', {
+      method: 'POST',
+      body: { provider: 'nps', nps: { host: '   ' } }
+    });
+    assert.equal(r.status, 400);
+    assert.match(r.parsed.error, /nps\.host/);
+    assert.equal(loadConfig().remoteAccess.provider, 'none');
+  });
+
+  it('切到 nps：地址由配置拼出，managed=external（网关无法验证外部反代）', async () => {
+    const r = await req('/api/mobile/remote-access', {
+      method: 'POST',
+      body: { provider: 'nps', nps: { host: 'n.example.com', port: 3443, useHttps: true } }
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.parsed.provider, 'nps');
+    assert.equal(r.parsed.managed, 'external');
+    assert.equal(r.parsed.publicUrl, 'https://n.example.com:3443');
+    assert.equal(r.parsed.ready, true);
+    assert.equal(r.parsed.reason, '');
+  });
+
+  it('切走之后，旧 /tunnel/start 必须被互斥规则拒绝', async () => {
+    const r = await req('/api/mobile/tunnel/start', { method: 'POST' });
+    assert.equal(r.status, 409);
+    assert.equal(r.parsed.code, 'provider-not-managed');
+    assert.match(r.parsed.error, /严格互斥/);
+    // 状态仍在响应里，客户端能直接拿它刷新界面
+    assert.equal(r.parsed.state.provider, 'nps');
+  });
+
+  it('切到 cloudflared：managed=gateway，TLS 关着时如实说未就绪', async () => {
+    const r = await req('/api/mobile/remote-access', {
+      method: 'POST',
+      body: { provider: 'cloudflared' }
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.parsed.provider, 'cloudflared');
+    assert.equal(r.parsed.managed, 'gateway');
+    assert.equal(r.parsed.ready, false);
+    assert.ok(r.parsed.reason.length > 0, '未就绪必须给原因');
+    // 切过来之后 NPS 的地址不该再被当成当前出口
+    assert.equal(r.parsed.publicUrl, null);
+  });
+
+  it('provider=cloudflared 且 TLS 关闭：拒绝开隧道（绝不明文曝公网）', async () => {
     const r = await req('/api/mobile/tunnel/start', { method: 'POST' });
     assert.equal(r.status, 409);
     assert.match(r.parsed.error, /TLS/);
+  });
+
+  it('非法 provider 直接 400', async () => {
+    const r = await req('/api/mobile/remote-access', {
+      method: 'POST',
+      body: { provider: 'tailscale' }
+    });
+    assert.equal(r.status, 400);
+    assert.match(r.parsed.error, /none \/ nps \/ cloudflared/);
   });
 });

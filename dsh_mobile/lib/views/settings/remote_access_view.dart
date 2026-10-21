@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../../models/server_config.dart';
@@ -42,7 +43,6 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
   final _formKey = GlobalKey<FormState>();
   String _fingerprint = '';
   bool _saving = false;
-  bool _tunnelBusy = false;
   String? _error;
 
   @override
@@ -78,8 +78,8 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
     } catch (_) {
       // 指纹读不到不是错误：页面上还有别的信息可看。
     }
-    // 隧道状态：连不上网关就停在"未知"，不弹错误（这一页本身可能就是在断网时打开的）。
-    await _dsh.refreshTunnel();
+    // 通道状态：连不上网关就保留上一次快照，不弹错误（这一页可能就是在断网时打开的）。
+    await _dsh.refreshRemoteAccess();
     if (mounted) setState(() {});
   }
 
@@ -150,19 +150,12 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
     }
   }
 
-  Future<void> _toggleTunnel({required bool start}) async {
-    setState(() {
-      _tunnelBusy = true;
-      _error = null;
-    });
-    try {
-      final result = start ? await _dsh.startTunnel() : await _dsh.stopTunnel();
-      if (mounted && result != null && result['ok'] == false) {
-        setState(() => _error = (result['error'] ?? '隧道操作失败').toString());
-      }
-    } finally {
-      if (mounted) setState(() => _tunnelBusy = false);
-    }
+  Future<void> _copyPublicUrl(String url) async {
+    await Clipboard.setData(ClipboardData(text: url));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('公网地址已复制'), duration: Duration(seconds: 1)),
+    );
   }
 
   Future<void> _trustPending() async {
@@ -175,10 +168,9 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
     final dsh = context.watch<DshService>();
     final cfg = dsh.currentConfig;
     final pending = dsh.pendingCertChange;
-    final tunnel = dsh.tunnelState ?? const <String, dynamic>{};
-    final tunnelStatus = (tunnel['status'] ?? 'idle').toString();
-    final tunnelUrl = (tunnel['url'] ?? '').toString();
-    final tunnelTarget = tunnel['target']?.toString();
+    // [refactor 2026-10-21] 不再有本地隧道状态：通道由电脑端选择、由网关建立，
+    // 手机只读结果。
+    final ra = dsh.remoteAccess;
 
     return Scaffold(
       backgroundColor: context.c.surfaceMuted,
@@ -229,9 +221,9 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
           ),
           const SizedBox(height: AppSpace.xl),
 
-          // ---- 2. 云隧道 ----
+          // ---- 2. 远程通道（只读：通道类型由电脑端选择） ----
           SettingsSectionHeader(
-            title: '临时公网通道（cloudflared）',
+            title: '远程通道',
             icon: Icons.cloud_outlined,
             color: context.c.accent,
           ),
@@ -240,50 +232,52 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '免账号、一条命令即可从外网连回这台电脑。'
-                  '地址每次重启都会变，属于临时通道；长期使用建议改用 Tailscale 或自有反向代理。',
-                  style: TextStyle(fontSize: 13, height: 1.5, color: context.c.textSecondary),
+                  '通道类型在电脑端的 DSH 设置里选：NPS（自己的反向代理）/ cloudflared'
+                  '（免账号临时通道）/ 不开。这里只显示结果 —— 启停是服务端的事。',
+                  style: TextStyle(fontSize: 12.5, height: 1.5, color: context.c.textSecondary),
                 ),
                 const SizedBox(height: AppSpace.m),
-                _row(context, '状态', _tunnelStatusLabel(tunnelStatus)),
+                _row(context, '通道', ra?.providerLabel ?? '未知'),
                 const SizedBox(height: 8),
-                _row(context, '公网地址', tunnelUrl.isEmpty ? '未开通' : tunnelUrl, mono: true),
-                if (tunnelTarget != null) ...[
-                  const SizedBox(height: 8),
-                  _row(context, '指向', tunnelTarget),
-                ],
-                if ((tunnel['error'] ?? '').toString().isNotEmpty) ...[
-                  const SizedBox(height: AppSpace.s),
-                  Text(
-                    (tunnel['error']).toString(),
-                    style: TextStyle(fontSize: 12.5, color: context.c.danger, height: 1.45),
+                _row(context, '由谁提供', ra?.managedLabel ?? '未知'),
+                const SizedBox(height: 8),
+                _row(
+                  context,
+                  '公网地址',
+                  ra?.publicUrl ?? '未提供',
+                  mono: true,
+                ),
+                if (ra?.publicUrl != null) ...[
+                  const SizedBox(height: AppSpace.m),
+                  Row(
+                    children: [
+                      OutlinedButton.icon(
+                        key: const ValueKey('remote-copy-url'),
+                        onPressed: () => _copyPublicUrl(ra!.publicUrl!),
+                        icon: const Icon(Icons.copy_rounded, size: 16),
+                        label: const Text('复制地址'),
+                      ),
+                      const SizedBox(width: AppSpace.m),
+                      TextButton(
+                        key: const ValueKey('remote-fill-url'),
+                        onPressed: () => setState(() => _urlController.text = ra!.publicUrl!),
+                        child: const Text('填入下方'),
+                      ),
+                    ],
                   ),
                 ],
-                const SizedBox(height: AppSpace.m),
-                Row(
-                  children: [
-                    FilledButton.icon(
-                      key: const ValueKey('remote-tunnel-start'),
-                      onPressed: _tunnelBusy || tunnelStatus == 'ready' || tunnelStatus == 'starting'
-                          ? null
-                          : () => _toggleTunnel(start: true),
-                      icon: _tunnelBusy
-                          ? const SizedBox(
-                              width: 16, height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2))
-                          : const Icon(Icons.play_arrow_rounded, size: 18),
-                      label: Text(tunnelStatus == 'ready' ? '已开通' : '开通隧道'),
+                if (ra != null && ra.reason.isNotEmpty) ...[
+                  const SizedBox(height: AppSpace.s),
+                  Text(
+                    ra.reason,
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      height: 1.45,
+                      // 没就绪是警告、就绪但有安全提示也是警告（例如 NPS 走明文）。
+                      color: ra.ready ? context.c.warning : context.c.textSecondary,
                     ),
-                    const SizedBox(width: AppSpace.m),
-                    OutlinedButton(
-                      key: const ValueKey('remote-tunnel-stop'),
-                      onPressed: _tunnelBusy || tunnelStatus == 'idle' || tunnelStatus == 'stopped'
-                          ? null
-                          : () => _toggleTunnel(start: false),
-                      child: const Text('关闭'),
-                    ),
-                  ],
-                ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -353,15 +347,6 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
       ),
     );
   }
-
-  String _tunnelStatusLabel(String status) => switch (status) {
-        'idle' => '未启动',
-        'starting' => '正在建立…',
-        'ready' => '已开通',
-        'stopped' => '已关闭',
-        'failed' => '启动失败',
-        _ => status,
-      };
 
   /// 设置页统一卡片形态（与 push/snippets 二级页同一套装饰）。
   Widget _card(BuildContext context, Widget child) => Container(

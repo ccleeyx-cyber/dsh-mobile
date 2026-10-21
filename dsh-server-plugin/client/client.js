@@ -42,7 +42,14 @@ window.__ModuleLoader__.load({
       const [config, setConfig] = useState(null);
       const [token, setToken] = useState('');
       const [port, setPort] = useState(3088);
-      const [npsHost, setNpsHost] = useState('n.cnm.asia');
+      // [refactor 2026-10-21] 远程接入：三种 provider **严格互斥**。
+      //
+      // NPS 与 cloudflared 解决的是同一件事（让手机从公网到达本机），只是一个
+      // 用你自己的反向代理、一个由网关自己向外建连。以前它们是两个互不知晓的
+      // 功能（NPS 在配置里、cloudflared 的开关在手机上），用户既不知道是二选一，
+      // 也会出现"两条出口同时开着、不知道该填哪个地址"。现在只有这一个选择点。
+      const [provider, setProvider] = useState('none');
+      const [npsHost, setNpsHost] = useState('');
       const [npsPort, setNpsPort] = useState(3088);
       const [useHttps, setUseHttps] = useState(false);
       const [showToken, setShowToken] = useState(false);
@@ -67,9 +74,13 @@ window.__ModuleLoader__.load({
           // that literal was in every published build.
           setToken(cfg.token || '');
           setPort(cfg.port || 3088);
-          setNpsHost(cfg.npsHost || 'n.cnm.asia');
-          setNpsPort(cfg.npsPort || 3088);
-          setUseHttps(Boolean(cfg.useHttps));
+          // 远程接入：优先读新模型；旧安装只有 npsHost，按"填了就是 NPS"映射，
+          // 与服务端 store.normalizeRemoteAccess 的规则一致。
+          const ra = cfg.remoteAccess || null;
+          setProvider(ra?.provider || (cfg.npsHost ? 'nps' : 'none'));
+          setNpsHost(ra?.nps?.host || cfg.npsHost || '');
+          setNpsPort(ra?.nps?.port || cfg.npsPort || 3088);
+          setUseHttps(Boolean(ra?.nps?.useHttps ?? cfg.useHttps));
           setError('');
         } catch (e) {
           setError(e.message);
@@ -88,9 +99,16 @@ window.__ModuleLoader__.load({
           const res = await call(ENDPOINTS.updateConfig, {
             token: token.trim(),
             port: Number(port) || 3088,
-            npsHost: npsHost.trim(),
-            npsPort: Number(npsPort) || 3088,
-            useHttps
+            // [refactor 2026-10-21] 单一真源：`remoteAccess`。顶层 npsHost/npsPort/
+            // useHttps 由服务端从模型派生，这里再各写一份就会制造两个真源。
+            remoteAccess: {
+              provider,
+              nps: {
+                host: npsHost.trim(),
+                port: Number(npsPort) || 3088,
+                useHttps
+              }
+            }
           });
           setConfig((prev) => ({ ...prev, ...res.config, ...res }));
           setSaveMessage('✅ 配置已成功保存并立即生效！');
@@ -125,7 +143,11 @@ window.__ModuleLoader__.load({
       };
 
       const copyFullConfig = () => {
-        const text = `Host: ${npsHost}\nPort: ${npsPort}\nToken: ${token}`;
+        // 只有 provider=nps 时地址才是"用户自己填的公网地址"；cloudflared 的地址
+        // 由网关每次建立时生成、且会变，抄一份固定值到手机上必然过期。
+        const text = provider === 'nps'
+          ? `Host: ${npsHost}\nPort: ${npsPort}\nToken: ${token}`
+          : `Host: (由网关下发)\nPort: (由网关下发)\nToken: ${token}`;
         copyText(text, 'fullConfig');
       };
 
@@ -134,9 +156,10 @@ window.__ModuleLoader__.load({
       // localApkUrl 两个指向 /dsh-agent.apk 的变量（已是死代码）。安装包只认
       // GitHub Releases。
       const RELEASES_URL = 'https://github.com/ccleeyx-cyber/dsh-mobile/releases';
-      // 手机真正在用的公网地址 = NPS 穿透地址（config 里用户自己填的）。
-      const publicHost = npsHost;
-      const publicPort = npsPort;
+      // 手机真正在用的公网地址：nps 档 = 用户填的穿透地址；其余档由网关运行时
+      // 决定，面板里不该伪造一个固定值。
+      const publicHost = provider === 'nps' ? npsHost : '';
+      const publicPort = provider === 'nps' ? npsPort : '';
 
       // ---- 扫码配对卡片状态 [feat 2026-10-12] ----
       const [qr, setQr] = useState(null);            // {qrDataUrl, pairCode, host, port, expiresAt, ttlMs}
@@ -262,31 +285,67 @@ window.__ModuleLoader__.load({
             h('span', { style: S.helpText }, 'DSH 进程内启动的移动网关端口，默认 3088。')
           ),
 
-          // NPS 穿透地址与端口
-          h('div', { style: { display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12, marginBottom: 14 } },
-            h('div', { style: S.formGroup },
-              h('label', { style: S.label }, 'NPS 穿透地址 (Host / Domain)'),
-              h('input', {
-                type: 'text',
-                value: npsHost,
-                onChange: (e) => setNpsHost(e.target.value),
-                style: S.input,
-                placeholder: 'n.cnm.asia'
-              }),
-              h('span', { style: S.helpText }, 'NPS 穿透服务域名或公网 IP，例如 n.cnm.asia。')
+          // 远程接入：三选一（严格互斥）
+          h('div', { style: S.formGroup },
+            h('label', { style: S.label }, '远程接入方式（三选一）'),
+            h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 } },
+              ...[
+                ['none', '仅局域网'],
+                ['nps', '自有反向代理 (NPS)'],
+                ['cloudflared', '临时隧道 (cloudflared)']
+              ].map(([value, label]) => h('button', {
+                key: value,
+                type: 'button',
+                style: provider === value ? S.primaryBtn : S.btn,
+                onClick: () => setProvider(value)
+              }, label))
             ),
-            h('div', { style: S.formGroup },
-              h('label', { style: S.label }, 'NPS 外网端口 (Port)'),
-              h('input', {
-                type: 'number',
-                value: npsPort,
-                onChange: (e) => setNpsPort(e.target.value),
-                style: S.input,
-                placeholder: '3088'
-              }),
-              h('span', { style: S.helpText }, 'NPS 穿透映射的外网端口。')
-            )
+            h('span', { style: S.helpText },
+              provider === 'nps'
+                ? '出口是你自己的反向代理：填好外面的域名与端口即可，网关只负责知道自己挂在哪个地址下。'
+                : provider === 'cloudflared'
+                  ? '免账号，网关自己向外建连；地址每次重连都会变，属于临时通道（需要 TLS 端口可用）。'
+                  : '只有同一局域网内的手机能连。')
           ),
+
+          // NPS 只在选中 nps 时才需要填：它是这一档的配置，不是全局配置。
+          provider === 'nps'
+            ? h('div', { style: { display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12, marginBottom: 14 } },
+              h('div', { style: S.formGroup },
+                h('label', { style: S.label }, 'NPS 穿透地址 (Host / Domain)'),
+                h('input', {
+                  type: 'text',
+                  value: npsHost,
+                  onChange: (e) => setNpsHost(e.target.value),
+                  style: S.input,
+                  placeholder: 'n.example.com'
+                }),
+                h('span', { style: S.helpText }, 'NPS 穿透服务域名或公网 IP。')
+              ),
+              h('div', { style: S.formGroup },
+                h('label', { style: S.label }, 'NPS 外网端口 (Port)'),
+                h('input', {
+                  type: 'number',
+                  value: npsPort,
+                  onChange: (e) => setNpsPort(e.target.value),
+                  style: S.input,
+                  placeholder: '3088'
+                }),
+                h('span', { style: S.helpText }, 'NPS 穿透映射的外网端口。')
+              )
+            )
+            : null,
+
+          provider === 'nps'
+            ? h('label', { style: { ...S.label, display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 } },
+              h('input', {
+                type: 'checkbox',
+                checked: useHttps,
+                onChange: (e) => setUseHttps(e.target.checked)
+              }),
+              '穿透采用 HTTPS（强烈建议；明文会让令牌裸露在公网）'
+            )
+            : null,
 
           // 保存按钮
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 12, marginTop: 8 } },
@@ -317,11 +376,11 @@ window.__ModuleLoader__.load({
           h('div', { style: S.grid },
             h('div', { style: S.metricCard },
               h('div', { style: S.metricLabel }, '公网穿透 Host'),
-              h('div', { style: S.metricValue }, npsHost || 'n.cnm.asia'),
+              h('div', { style: S.metricValue }, publicHost || '（由网关下发）'),
             ),
             h('div', { style: S.metricCard },
               h('div', { style: S.metricLabel }, '公网穿透 Port'),
-              h('div', { style: S.metricValue }, String(npsPort || 3088)),
+              h('div', { style: S.metricValue }, publicPort ? String(publicPort) : '（由网关下发）'),
             ),
             h('div', { style: S.metricCard },
               h('div', { style: S.metricLabel }, '授权码 (Token)'),
