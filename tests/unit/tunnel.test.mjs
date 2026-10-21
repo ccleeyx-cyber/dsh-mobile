@@ -93,37 +93,47 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
   // [fix 2026-10-21] 「文件存在」不等于「版本够新」。本机原来一直复用 2026.2.0
   // （2 月构建），而同机 dsh-pocket 用 2026.9.1 —— 后者连得上边缘，前者会额外报
   // `cfd-features.argotunnel.com` DNS 超时。这条用例把升级路径钉住。
-  it('本机二进制版本过旧要重下，版本一致才复用', async () => {
+  it('本机二进制版本旧也继续用（升级不能阻塞隧道），版本一致更不该重下', async () => {
     const oldBytes = Buffer.alloc(2048, 3);
     const newBytes = Buffer.alloc(4096, 4);
     const dir = path.join(TMP_HOME, 'dl-version');
     let fetches = 0;
     const fetchBytes = async () => { fetches++; return newBytes; };
 
-    // 先放一份"旧版"
+    // 先放一份"旧版"。注意文件名必须是**本地二进制名**（`cloudflared`），
+    // 不是 release asset 名（`cloudflared-linux-amd64`）—— 早先这条用例写错了
+    // 文件名，于是 dest 根本不存在，它"通过"是因为一直在测下载路径。
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'cloudflared-linux-amd64'), oldBytes);
+    fs.writeFileSync(path.join(dir, platformAsset('linux').bin), oldBytes);
 
     const upgraded = await ensureCloudflared({
       dir,
       platform: 'linux',
       version: '2026.9.1',
       probeVersionFn: () => '2026.2.0',
-      fetchBytes
+      fetchBytes,
+      findSystemFn: () => ''
     });
-    assert.equal(fetches, 1, '版本不符必须重下');
-    assert.equal(upgraded.downloaded, true);
+    // [fix 2026-10-21] 这里原来断言的是"版本不符必须重下"。那个策略在真机上
+    // 把唯一能用的二进制删了、下载卡死 → 隧道再也起不来。现在的规则是：
+    // 旧版**继续用**（实测 2026.2.0 能正常注册），升级不阻塞隧道。
+    assert.equal(fetches, 0, '版本旧不能删掉能用的二进制');
+    assert.equal(upgraded.downloaded, false);
+    assert.equal(upgraded.from, 'cache-old');
+    assert.equal(upgraded.version, '2026.2.0');
 
-    // 再跑一次：这次探测到相同版本，就不该再下载
+    // 版本一致时也是复用
     const reused = await ensureCloudflared({
       dir,
       platform: 'linux',
       version: '2026.9.1',
       probeVersionFn: () => '2026.9.1',
-      fetchBytes
+      fetchBytes,
+      findSystemFn: () => ''
     });
-    assert.equal(fetches, 1, '版本一致不该重复下载');
+    assert.equal(fetches, 0, '版本一致不该重复下载');
     assert.equal(reused.downloaded, false);
+    assert.equal(reused.from, 'cache');
   });
 
   it('哈希不匹配拒绝安装，并把坏文件清掉', async () => {
@@ -147,16 +157,42 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
     const dir = path.join(TMP_HOME, 'dl-d');
     const html = Buffer.from('<!DOCTYPE html><html>blocked by proxy</html>' + 'x'.repeat(2000));
     await assert.rejects(
-      () => ensureCloudflared({ dir, platform: 'linux', fetchBytes: async () => html }),
+      // findSystemFn 注入空实现：否则会真的扫到本机已有的 cloudflared，
+      // 于是"下载"这一步根本不发生，这条用例就白写了。
+      () => ensureCloudflared({ dir, platform: 'linux', fetchBytes: async () => html, findSystemFn: () => '' }),
       /网页而不是可执行文件/
     );
   });
 
   it('没有下载实现时给出可操作的错误（离线环境）', async () => {
     await assert.rejects(
-      () => ensureCloudflared({ dir: path.join(TMP_HOME, 'dl-e'), platform: 'linux' }),
+      () => ensureCloudflared({
+        dir: path.join(TMP_HOME, 'dl-e'),
+        platform: 'linux',
+        findSystemFn: () => ''
+      }),
       /没有下载实现/
     );
+  });
+
+  // [fix 2026-10-21] 这次"点了没反应"的直接修法：机器上已经有可用的
+  // cloudflared（例如 dsh-pocket 下好的那份）就不该再去下载 50MB。
+  it('系统里已有 cloudflared 时直接复用，不下载', async () => {
+    const dir = path.join(TMP_HOME, 'dl-sys');
+    fs.mkdirSync(dir, { recursive: true });
+    const sysBin = path.join(TMP_HOME, 'sys-cloudflared');
+    fs.writeFileSync(sysBin, Buffer.alloc(4096, 9));
+    let fetches = 0;
+    const out = await ensureCloudflared({
+      dir,
+      platform: 'linux',
+      findSystemFn: () => sysBin,
+      probeVersionFn: () => '2026.9.1',
+      fetchBytes: async () => { fetches++; return Buffer.alloc(4096, 2); }
+    });
+    assert.equal(fetches, 0, '有现成的就不该下载');
+    assert.equal(out.path, sysBin);
+    assert.equal(out.from, 'system');
   });
 
   it('tunnelBinDir 落在 mobile-access/bin 下', () => {

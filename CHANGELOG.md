@@ -9,6 +9,48 @@
 
 ## [1.37.1] - 2026-10-21
 
+### 补丁 2（同日 · 仅网关 · 我实测复现并修掉了两个真 bug）
+
+用户说"还是不行，你自己能不能先测试一下"。测了，确实不行，原因很具体：
+
+**Bug A：自动启动挂错了地方。** `reconcileRemoteAccess()` 原本在
+`tlsServer.listen(...)` 的回调里 —— **TLS 端口没起来时隧道永远不会启动**。而隧道
+指向的是明文回环 `127.0.0.1:<listenPort>`，跟本机 TLS 毫无关系。已挪到明文网关的
+`server.listen` 回调。
+
+**Bug B：我的"版本不符就重下"把唯一能用的二进制删了。** 真机现场：
+`cloudflared.exe.part` **0 字节**（17:18 创建），52MB 下载卡死，而下载阶段没有
+任何状态 → 界面只剩"隧道未启动"。而实测 2026.2.0 **是能正常注册的** —— 版本旧
+≠ 不能用。改法三条：
+
+- 版本不一致**继续用**现有二进制（只 warn，不删、不阻塞）；
+- 自己目录没有时，**先找系统上已有的** cloudflared（`DSH_CLOUDFLARED_PATH` →
+  `~/.dsh/dsh-pocket/bin` → 常见系统目录 → PATH）。本机正好有 dsh-pocket 装的
+  2026.9.1，直接复用，根本不需要下载；
+- 下载加 180s 硬超时，并清理上次残留的 `.part`。
+
+**顺带**：
+- 新增 `preparing` 阶段（"正在准备 cloudflared"）—— `ensureCloudflared` 在 spawn
+  之前跑，以前这段只能显示"隧道未启动"，用户完全看不出在干什么；
+- `audit()` 落盘（上一补丁）在这次排查里直接起作用了：能看到 17:16 重启后**没有
+  任何 tunnel/start**，才定位到 Bug A。
+
+### 端到端实测（独立网关实例 + 临时 DSH_HOME，不碰用户实例）
+
+```
+[gw] [tunnel] 复用系统中已有的 cloudflared：~/.dsh/dsh-pocket/bin/cloudflared.exe
+t+2s  stage=requesting  正在向 Cloudflare 申请隧道域名…
+t+6s  stage=requested   已拿到域名，等待边缘注册
+t+18s stage=ready       ✅ https://during-commented-slot-trackbacks.trycloudflare.com
+=== 端到端成功 ===
+```
+
+### 验证
+
+- 网关 `npm test`：**526 项 / 524 过** / 2 跳过 / 0 失败（新增"系统里已有
+  cloudflared 时直接复用"；版本用例改为断言"旧版继续用"）。
+- App：`flutter analyze` 零问题；`flutter test` **834 全绿**（App 未改动）。
+
 ### 补丁（同日 · 仅网关，重启 dsh web 生效，不需要重装 App）
 
 用户追问「临时域名和填了 token 都不行」。做 A/B 对照实验后，三条事实同时成立：

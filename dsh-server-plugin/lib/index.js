@@ -2909,6 +2909,14 @@ export function apply(ctx, config = {}, internals = {}) {
    * 这个变量跨实例保留，并由 audit 落到磁盘（`~/.dsh/mobile-bridge/audit.log`）。
    */
   let lastTunnelFailure = null;
+  /**
+   * [fix 2026-10-21] 是否正在"准备 cloudflared"（定位/下载二进制）。
+   *
+   * 为什么需要这个标志：`ensureCloudflared` 在 spawn **之前**跑，真机上那次
+   * 52MB 下载会卡住很久。这段时间 `quickTunnel` 还是 null，状态只能报"隧道未
+   * 启动" —— 用户看到的就是"点了没反应"。现在它会被报成 preparing。
+   */
+  let tunnelPreparing = false;
 
   /** 用系统 curl 下载（另一套 TLS 栈，用来绕过 Node 的握手被断）。 */
   function curlDownload(url, file) {
@@ -3016,6 +3024,7 @@ export function apply(ctx, config = {}, internals = {}) {
   /** 隧道阶段的中文标签（客户端不该自己从 status 猜进度）。 */
   const STAGE_LABELS = {
     idle: '未启动',
+    preparing: '正在准备 cloudflared',
     requesting: '正在申请隧道域名',
     requested: '已拿到域名，等待边缘注册',
     connecting: '正在连接 Cloudflare 边缘',
@@ -3155,6 +3164,26 @@ export function apply(ctx, config = {}, internals = {}) {
         : null;
       const startedAt = quickTunnel?.startedAt ?? 0;
       const cfMode = String(ra.cloudflared?.token || '').trim() ? 'named' : 'quick';
+      // [fix 2026-10-21] 「准备二进制」阶段必须能看见。
+      //
+      // 这时 quickTunnel 还是 null（spawn 还没发生），以前只能报"隧道未启动" ——
+      // 用户点了切换却看到"未启动"，完全无从判断是在下载、还是根本没触发。
+      if (!quickTunnel && tunnelPreparing) {
+        return {
+          ...base,
+          managed: 'gateway',
+          mode: cfMode,
+          publicUrl: null,
+          ready: false,
+          status: 'preparing',
+          stage: 'preparing',
+          stageLabel: STAGE_LABELS.preparing,
+          attempts: 0,
+          elapsedMs: 0,
+          lastFailure: lastTunnelFailure,
+          reason: '正在准备 cloudflared（定位或下载二进制，首次约 50MB）…'
+        };
+      }
       return {
         ...base,
         // managed: gateway —— 进程由网关自己拉起与回收。
@@ -3209,9 +3238,14 @@ export function apply(ctx, config = {}, internals = {}) {
     // 只会在 TLS 没起来时把隧道一起挡掉 —— 两件互不相干的事被绑死。
     // 做法与 dsh-pocket 一致：隧道指向 http://127.0.0.1:<listenPort>。
     const target = `http://127.0.0.1:${listenPort}`;
+    tunnelPreparing = true;
     try {
       lastTunnelError = '';
-      const bin = await ensureCloudflared({ fetchToFile: downloadToFile });
+      // logger 传下去：ensureCloudflared 会把"复用系统中的二进制 / 版本不符但先用"
+      // 这类判断打出来，排查时是第一条线索。
+      const bin = await ensureCloudflared({ fetchToFile: downloadToFile, logger });
+      tunnelPreparing = false;
+      audit('tunnel/binary', { path: bin.path, from: bin.from, version: bin.version });
       // 命名隧道（token + 固定域名）优先：地址重启不变，比随机域名可靠得多。
       const ra = loadConfig().remoteAccess || {};
       const cf = ra.cloudflared || {};
@@ -3252,7 +3286,15 @@ export function apply(ctx, config = {}, internals = {}) {
       return { ok: true };
     } catch (err) {
       // 下载失败 / 校验失败都在这里：只降级，不影响局域网与明文端口。
+      tunnelPreparing = false;
       lastTunnelError = err?.message ?? String(err);
+      lastTunnelFailure = {
+        at: Date.now(),
+        mode: 'unknown',
+        stage: 'preparing',
+        error: lastTunnelError
+      };
+      audit('tunnel/prepare-failed', { error: lastTunnelError });
       logger.warn('[dsh-mobile-bridge] 云隧道启动失败: %s', lastTunnelError);
       return { ok: false, error: lastTunnelError };
     }
@@ -5072,16 +5114,8 @@ export function apply(ctx, config = {}, internals = {}) {
         tlsServer.listen(tlsPort, bindHost, () => {
           logger.info('dsh-mobile-bridge: TLS 网关就绪 https://%s:%d（证书指纹 %s）', bindHost, tlsPort, certFingerprint);
           audit('tls/start', { port: tlsPort, fingerprint: certFingerprint });
-          // [refactor 2026-10-21] provider=cloudflared 时随网关自动拉起隧道。
-          //
-          // 通道是**服务端能力**，不该等某台手机来点按钮 —— 而且隧道没开时手机
-          // 根本连不上，那个按钮点不到（上一版在这里是死循环）。失败只 degrade：
-          // 隧道起不来不影响局域网与明文端口。
-          setTimeout(() => {
-            reconcileRemoteAccess().catch((err) => {
-              logger.warn('[dsh-mobile-bridge] 远程接入对账失败: %s', err?.message ?? err);
-            });
-          }, 0);
+          // 隧道自动启动**不在这里**：它挂在明文网关的 listen 回调上（见文件末尾
+          // server.listen）。挂在这里的后果是 TLS 未启用时隧道永远不启动。
         });
       } catch (err) {
         logger.warn('dsh-mobile-bridge: TLS 端口启动失败（%s），HTTPS/WSS 不可用', err?.message ?? err);
@@ -5354,6 +5388,18 @@ export function apply(ctx, config = {}, internals = {}) {
     audit('gateway/start', { port: listenPort, dshPort });
     void refreshCookie().catch(() => {});
     connectUpstreamMux();
+
+    // [fix 2026-10-21] provider=cloudflared 时随网关自动拉起隧道。
+    //
+    // 这一段原来挂在 `tlsServer.listen(...)` 的回调里 —— 于是**TLS 没起来时
+    // 隧道永远不会启动**（实测 BRIDGE_TLS_PORT=0 时状态永远停在"隧道未启动"）。
+    // 隧道现在指向明文回环 127.0.0.1:<listenPort>，跟本机 TLS 毫无关系，所以
+    // 正确的挂点是"明文网关已就绪"。
+    setTimeout(() => {
+      reconcileRemoteAccess().catch((err) => {
+        logger.warn('[dsh-mobile-bridge] 远程接入对账失败: %s', err?.message ?? err);
+      });
+    }, 0);
   });
 
   const cleanupGateway = async () => {

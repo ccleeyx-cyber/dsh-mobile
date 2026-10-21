@@ -111,6 +111,50 @@ export function probeVersion(file) {
 }
 
 /**
+ * 在本机寻找**已经存在的** cloudflared（不下载）。
+ *
+ * 顺序：DSH_CLOUDFLARED_SEARCH_DIRS → 同机其它 DSH 插件的 bin 目录（dsh-pocket
+ * 会把自己的二进制放在 `~/.dsh/dsh-pocket/bin`）→ 常见系统目录 → PATH。
+ *
+ * 为什么值得这么找：52MB 下载在受限网络里会卡死（实测 `.part` 停在 0 字节），
+ * 而机器上往往已经有一份能用的 —— 有现成的就不该再下一次。
+ */
+export function findSystemCloudflared({ env = process.env, extraDirs = [] } = {}) {
+  const names = process.platform === 'win32'
+    ? ['cloudflared.exe', 'cloudflared']
+    : ['cloudflared'];
+  const home = env.USERPROFILE || env.HOME || '';
+  const dirs = [
+    ...extraDirs,
+    ...String(env.DSH_CLOUDFLARED_SEARCH_DIRS || '').split(path.delimiter).filter(Boolean),
+    path.join(home, '.dsh', 'dsh-pocket', 'bin'),
+    '/usr/local/bin', '/opt/homebrew/bin', '/usr/bin', '/snap/bin'
+  ];
+  const seen = new Set();
+  for (const dir of dirs) {
+    if (!dir || seen.has(dir)) continue;
+    seen.add(dir);
+    for (const name of names) {
+      const p = path.join(dir, name);
+      try {
+        if (fs.existsSync(p) && fs.statSync(p).isFile() && fs.statSync(p).size > 1024) return p;
+      } catch { /* ignore */ }
+    }
+  }
+  // PATH 兜底（用户用 scoop/choco/brew 装过）
+  for (const dir of String(env.PATH || env.Path || '').split(path.delimiter)) {
+    if (!dir) continue;
+    for (const name of names) {
+      const p = path.join(dir, name);
+      try {
+        if (fs.existsSync(p) && fs.statSync(p).size > 1024) return p;
+      } catch { /* ignore */ }
+    }
+  }
+  return '';
+}
+
+/**
  * 确保本机有一份可用的 cloudflared。
  *
  * @param {object} opts
@@ -131,7 +175,9 @@ export async function ensureCloudflared({
   dir = tunnelBinDir(),
   logger = console,
   /** 版本探测实现（测试注入；默认 execFileSync 跑 `--version`）。 */
-  probeVersionFn = probeVersion
+  probeVersionFn = probeVersion,
+  /** 系统二进制查找实现（测试注入：默认会真的去扫 ~/.dsh/dsh-pocket 等目录）。 */
+  findSystemFn = findSystemCloudflared
 } = {}) {
   const { bin } = platformAsset(platform);
   const dest = path.join(dir, bin);
@@ -163,27 +209,47 @@ export async function ensureCloudflared({
     if (!fs.existsSync(override)) {
       throw new Error(`DSH_CLOUDFLARED_PATH 指向的文件不存在：${override}`);
     }
-    return { path: override, downloaded: false, verifiedBy: verify(override) };
+    return { path: override, downloaded: false, verifiedBy: verify(override), from: 'override' };
   }
 
   if (fs.existsSync(dest)) {
+    // [fix 2026-10-21 · 重要] 版本不一致**不要**删掉能用的二进制。
+    //
+    // 这里原来写的是"版本不符 → 删除 + 重新下载"。真机后果：唯一能用的
+    // 2026.2.0 被删掉，52MB 下载卡成 0 字节的 `.part`，隧道再也起不来，而界面
+    // 只显示"隧道未启动"（下载阶段没有状态）。实测 2026.2.0 能正常注册 ——
+    // 版本旧 ≠ 不能用，升级必须是机会性的，不能当前置条件。
     try {
       const verifiedBy = verify(dest);
-      // [fix 2026-10-21] 校验通过不等于**版本够新**。
-      //
-      // 之前只要有文件就复用：于是本机一直跑着 2026.2.0（2 月构建），而同机上
-      // dsh-pocket 用的是 2026.9.1，后者连接正常、前者会额外报
-      // `cfd-features.argotunnel.com` DNS 超时。版本不符就重下 —— 这条判断是
-      // 这次"临时域名一直不通"的根因之一。
       const onDisk = probeVersionFn(dest);
       if (!onDisk || onDisk === version) {
-        return { path: dest, downloaded: false, verifiedBy, version: onDisk || version };
+        return { path: dest, downloaded: false, verifiedBy, version: onDisk || version, from: 'cache' };
       }
-      logger.warn?.(`[tunnel] 本机 cloudflared 是 ${onDisk}，目标版本 ${version}，重新下载`);
-      try { fs.rmSync(dest, { force: true }); } catch { /* ignore */ }
+      logger.warn?.(`[tunnel] 本机 cloudflared 是 ${onDisk}（目标 ${version}），先用它，升级不阻塞隧道`);
+      return { path: dest, downloaded: false, verifiedBy, version: onDisk, from: 'cache-old' };
     } catch {
-      // 已存在的文件坏了：删掉重下，不要把坏文件留在原地。
+      // 文件存在但跑不起来（损坏/半个文件）：删掉重下。
       try { fs.rmSync(dest, { force: true }); } catch { /* ignore */ }
+    }
+  }
+
+  // [fix 2026-10-21] 自己目录里没有时，**先找系统上已有的 cloudflared**。
+  //
+  // 这条是救命的：本机已有 dsh-pocket 下好的 2026.9.1，而 52MB 下载在这台机器
+  // 上会卡死（.part 停在 0 字节）。有现成的就用现成的，永远比"再下一份"可靠。
+  const system = findSystemFn();
+  if (system) {
+    logger.info?.(`[tunnel] 复用系统中已有的 cloudflared：${system}`);
+    try {
+      return {
+        path: system,
+        downloaded: false,
+        verifiedBy: verify(system),
+        version: probeVersionFn(system),
+        from: 'system'
+      };
+    } catch (err) {
+      logger.warn?.(`[tunnel] 系统中的 cloudflared 不可用（${err?.message || err}），转去下载`);
     }
   }
 
@@ -197,13 +263,33 @@ export async function ensureCloudflared({
   // 先写临时文件再 rename：中途失败不会留下一个"看起来存在但只能跑一半"的
   // 可执行文件，下一次启动也就不会误判为已安装。
   const tmp = `${dest}.part`;
+  // [fix 2026-10-21] 上一次失败留下的 .part 必须先清掉：真机上那次卡死留下的
+  // 就是一个 0 字节的 .part，它既让人误以为"正在下载"，也让重试行为不可预测。
+  try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+
+  // 下载必须有硬超时：真机上 52MB 的下载会静默卡住（.part 停在 0 字节），
+  // 而调用方是 fire-and-forget 的 —— 没有超时就会永远停在"没反应"。
+  //
+  // 注意超时定时器**必须清掉**：Promise.race 的败者不会自动取消，留下的
+  // setTimeout 会把进程（和测试）多挂 180 秒。
+  const withTimeout = (p, ms, label) => new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label}超时（${Math.round(ms / 1000)}s）—— 网络到 GitHub 的下载被阻断，可改用 DSH_CLOUDFLARED_PATH 指向已有二进制`)),
+      ms
+    );
+    Promise.resolve(p).then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+
   let verifiedBy;
   try {
     if (typeof fetchToFile === 'function') {
       // 60MB 的二进制走文件直写：不经过内存，也方便用 curl 兜底。
-      await fetchToFile(url, tmp);
+      await withTimeout(fetchToFile(url, tmp), 180000, 'cloudflared 下载');
     } else {
-      const bytes = await fetchBytes(url);
+      const bytes = await withTimeout(fetchBytes(url), 180000, 'cloudflared 下载');
       if (!bytes || bytes.length < 1024) {
         throw new Error(`cloudflared 下载内容过小（${bytes ? bytes.length : 0} 字节），疑似被拦截`);
       }
