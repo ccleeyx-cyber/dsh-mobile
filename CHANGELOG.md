@@ -7,6 +7,50 @@
 
 ---
 
+## [1.36.1] - 2026-10-21
+
+真机反馈的两处**消息渲染**缺陷，根因都在 `widgets/safe_markdown.dart`。同时把上一版
+遗留的网关侧「停止发包」改动随本版一起发（1.36.0 的 APK 先行发布，网关改动当时
+还没进仓库）。
+
+### 修复（消息渲染）
+
+- **段内单换行被折叠成一个空格**：`MarkdownBody` 默认 `softLineBreak: false`，
+  flutter_markdown 的实现是 `text.replaceAll(' ?\n *', ' ')`。而模型正文习惯用
+  **单换行分句、空行分段**，于是整段文字在手机上糊成一坨（网页端是 GFM breaks
+  语义，正常换行）。改为 `softLineBreak: true`，单换行按硬换行渲染，与网页端一致。
+- **```dsh-ui 围栏退化成裸 JSON**：清洗层的围栏正则只认 `\n` —— 闭合围栏的模式是
+  `^[ \t]{0,3}`{3,}[ \t]*$`，CRLF 下这一行是 "```\r"，`\r` 不在 `[ \t]` 里，匹配
+  必然失败，整段于是被当成**未闭合代码块**，本该渲染成列表/表格的地方显示成一坨
+  JSON。现在清洗入口先把 `\r\n` / `\r` 归一成 `\n`。
+
+### 移除（网关侧，需重启 dsh web 生效）
+
+- **网关不再托管、也不再分发安装包**：删除 `/dsh-agent.apk` 与
+  `/api/mobile/download/apk` 两个路由、`lib/apk-source.mjs`（含「本地没有就从最新
+  Release 自动抓回」的缓存层）、`/api/mobile/version` 里的
+  `apkUrl`/`apkSize`/`apkMtime` 字段，以及设置页 RPC 返回的 `apkUrl`/`npsApkUrl`。
+  安装包的唯一来源是 **GitHub Releases** —— App 的更新检查本来就直连
+  `releases/latest/download/latest.json`（`models/update_service.dart`），本次只是
+  把网关这条多余通路彻底去掉。
+- **网关首页的 APK 卡改为 Releases 链接**，删掉指向 `/dsh-agent.apk` 的二维码与
+  写死的版本/大小（那两行早已停在 `v1.1.0 · 22.28 MB`，是典型的陈旧信息）。
+
+移除理由：这层缓存必须与远端版本对齐，一旦忘记刷新就会长期静默发旧包（1.31.1
+事故）；而且 `ensureApk` 只判「文件存在且 >1MB」就返回，**从不比对版本** ——
+上一版发布时实测 `public/dsh-agent.apk` 仍是 10-19 的 v1.35.1，正是这个缺口的复现。
+网关既不留包也不转发包，就不存在"发的是哪一版"这个状态。
+
+### 验证
+
+- App：`flutter analyze` 零问题；`flutter test` **826 全绿**（新增
+  `test/widgets/safe_markdown_render_test.dart` 3 条：CRLF 围栏仍出组件、LF 对照、
+  段内单换行保留）。
+- 网关：`npm test` 491 项 / 489 过 / 2 跳过（POSIX）/ 0 失败。
+- 两条渲染修复都有 widget 级回归钉子；真机观感由用户侧确认。
+
+---
+
 ## [1.36.0] - 2026-10-21
 
 一次「把审查结论真正改掉」的版本：文档归因订正、深色模式可读性、几处会让状态卡死
@@ -57,23 +101,6 @@
 
 - `compileSdk` 显式 35（原跟随 `flutter.compileSdkVersion` 解析为 34，而
   `flutter_plugin_android_lifecycle` 已要求 ≥35，构建一直在打警告）。
-
-### 移除（网关侧，需重启 dsh web 生效；APK 无需重发）
-
-- **网关不再托管、也不再分发安装包**：删除 `/dsh-agent.apk` 与
-  `/api/mobile/download/apk` 两个路由、`lib/apk-source.mjs`（含「本地没有就从最新
-  Release 自动抓回」的缓存层）、`/api/mobile/version` 里的
-  `apkUrl`/`apkSize`/`apkMtime` 字段，以及设置页 RPC 返回的 `apkUrl`/`npsApkUrl`。
-  安装包的唯一来源是 **GitHub Releases** —— App 的更新检查本来就直连
-  `releases/latest/download/latest.json`（`models/update_service.dart`），本次只是
-  把网关这条多余通路彻底去掉。
-- **网关首页的 APK 卡改为 Releases 链接**，删掉指向 `/dsh-agent.apk` 的二维码与
-  写死的版本/大小（那两行早已停在 `v1.1.0 · 22.28 MB`，是典型的陈旧信息）。
-
-移除理由：这层缓存必须与远端版本对齐，一旦忘记刷新就会长期静默发旧包（1.31.1
-事故）；而且 `ensureApk` 只判「文件存在且 >1MB」就返回，**从不比对版本** ——
-本版发布时实测 `public/dsh-agent.apk` 仍是 10-19 的 v1.35.1，正是这个缺口的复现。
-网关既不留包也不转发包，就不存在"发的是哪一版"这个状态。
 
 ### 文档
 
