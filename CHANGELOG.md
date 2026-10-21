@@ -23,6 +23,27 @@
 - 注意：`client.js` 自带一份 `ENDPOINTS`（浏览器侧不能 import 服务端模块），
   加端点必须两处都改，代码里已写明。
 
+### 补丁 2（同日 · 仅网关，重启生效）：边缘重试不再「永远未就绪」
+
+真机切到 cloudflared 后一直显示未就绪。探针实测暴露出两段失败：
+
+```
+failed to request quick Tunnel: Post https://api.trycloudflare.com/tunnel:
+context deadline exceeded                      ← 默认协议下连申请都超时
+INF | https://xxx.trycloudflare.com |           ← 加 --protocol http2 后域名拿到
+INF Retrying connection ... ip=198.41.192.57    ← 但连不上边缘，2→4→8→16→32s 无限退避
+```
+
+代码原来只认 `unable to establish connection with cloudflare edge`，而实际输出是
+`Retrying connection` —— 状态于是永远停在 `starting`，界面永远「未就绪」，用户
+看不出原因。（另：`Test-NetConnection` 对 7844 显示「可达」不可信，本机 Clash
+TUN 会把 connect 伪造成成功。）
+
+- 三次重试仍不成功就判 `failed`，`lastError` 写明「到 198.41.192.0/19:7844 的
+  出站被阻断」并给出替代方案（改 NPS / 放行该网段）；
+- 判失败后杀掉进程，不留一个按 32s 退避永远重试的僵尸；
+- 两次以内仍算 `starting`（网络抖动不该立刻判死）。
+
 ### 重构（远程接入：NPS 与 cloudflared 收敛成同一个能力的两种 provider）
 
 用户指出的设计问题：**这两件事是同一层的东西，却被实现成两个互不知晓的功能**。

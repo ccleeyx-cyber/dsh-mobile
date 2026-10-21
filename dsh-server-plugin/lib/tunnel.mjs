@@ -186,6 +186,8 @@ export function createQuickTunnel({
   let lastError = '';
   let restartTimer = null;
   let registered = false;
+  /// 「Retrying connection」出现次数（见 EDGE_RETRY 的说明）。注册成功后不再计数。
+  let edgeRetries = 0;
 
   /**
    * 只拿到地址不等于隧道可用（实测教训）。
@@ -196,6 +198,14 @@ export function createQuickTunnel({
    * 「Registered tunnel connection」为准，而不是「解析到域名」。
    */
   const EDGE_FAIL = /unable to establish connection with cloudflare edge/i;
+  // [fix 2026-10-21] 边缘连不上时 cloudflared **不报错**，只是以 2→4→8→16→32s 的
+  // 退避无限重试（真机实测：域名已拿到、TCP 7844 探测还显示"可达"——因为本机
+  // Clash TUN 会把 connect 伪造成成功——但五次重试全失败）。
+  //
+  // 只认 EDGE_FAIL 的后果是状态永远停在 starting：用户看到的是"一直未就绪"，
+  // 而真正的原因是这台机器到 Cloudflare 隧道边缘的出站被阻断。
+  const EDGE_RETRY = /retrying connection/i;
+  const EDGE_RETRY_LIMIT = 3;
   const REGISTERED = /registered tunnel connection/i;
 
   const emit = (next) => {
@@ -225,6 +235,19 @@ export function createQuickTunnel({
       url = '';
       registered = false;
     }
+    if (EDGE_RETRY.test(text) && !registered) {
+      edgeRetries += 1;
+      if (edgeRetries >= EDGE_RETRY_LIMIT) {
+        // 结论化：无限重试对用户没有信息量，三次就给它一个能照着做的判断。
+        status = 'failed';
+        lastError = '连不上 Cloudflare 隧道边缘（多次重试）：到 198.41.192.0/19:7844 的出站被阻断。'
+          + '可改用自己的反向代理（NPS），或在网络/代理里放行该网段。';
+        url = '';
+        // 既然已经判失败，就不能留一个在后台按 32s 退避永远重试的进程 ——
+        // 那既费电又让"失败"和"还在试"两种状态同时存在。
+        try { child?.kill(); } catch { /* 已经退出 */ }
+      }
+    }
   };
 
   function start() {
@@ -237,6 +260,7 @@ export function createQuickTunnel({
     status = 'starting';
     lastError = '';
     registered = false;
+    edgeRetries = 0;
     try {
       // --protocol http2：QUIC 在受限网络里常被丢包；--edge-ip-version 4：
       // 避开不可用的 IPv6 边缘地址（两者都是纯经验值，失败只是更慢，不会更坏）。

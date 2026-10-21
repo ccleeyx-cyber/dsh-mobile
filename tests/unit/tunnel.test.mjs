@@ -175,6 +175,38 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
     assert.match(tunnel.lastError, /TLS handshake with edge error/);
   });
 
+  // [fix 2026-10-21] 边缘连不上时 cloudflared 不报错，只会以 2→4→8→16→32s 的
+  // 退避**无限重试**。真机症状：域名已经拿到、TCP 7844 探测还显示"可达"（本机
+  // Clash TUN 会把 connect 伪造成成功），但注册永远不成功 —— 界面于是永远
+  // "未就绪"。三次重试还不行就必须给出结论，而不是让用户猜。
+  it('边缘反复重试要判失败并给出可操作的原因（不能永远 starting）', () => {
+    const fake = new EventEmitter();
+    fake.stdout = new EventEmitter();
+    fake.stderr = new EventEmitter();
+    fake.kill = () => {};
+
+    const tunnel = createQuickTunnel({
+      binary: '/fake/cloudflared',
+      spawnFn: () => fake,
+      logger: { warn() {} }
+    });
+    tunnel.start();
+    fake.stderr.emit('data', Buffer.from('INF | https://dead-addr.trycloudflare.com |'));
+    fake.stderr.emit('data', Buffer.from('INF Retrying connection in up to 2s connIndex=0 event=0 ip=198.41.192.57\n'));
+    fake.stderr.emit('data', Buffer.from('INF Retrying connection in up to 4s connIndex=0 event=0 ip=198.41.192.67\n'));
+
+    // 两次还在重试：宽容期，保持 starting（网络抖动不该立刻判死）。
+    assert.equal(tunnel.status, 'starting');
+    assert.equal(tunnel.url, 'https://dead-addr.trycloudflare.com');
+
+    fake.stderr.emit('data', Buffer.from('INF Retrying connection in up to 8s connIndex=0 event=0 ip=198.41.192.47\n'));
+
+    assert.equal(tunnel.status, 'failed');
+    assert.equal(tunnel.url, '', '注册不成功的域名不能继续广播');
+    assert.match(tunnel.lastError, /Cloudflare 隧道边缘/);
+    assert.match(tunnel.lastError, /NPS/, '要给出替代方案，否则用户只能看到"未就绪"');
+  });
+
   it('默认启动参数带 http2 与 IPv4 边缘', () => {
     const spawned = [];
     const fake = new EventEmitter();
