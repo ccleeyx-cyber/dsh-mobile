@@ -136,7 +136,7 @@ describe('tls-listen: HTTPS/WSS 与明文并存', () => {
     assert.equal(denied, 401);
   });
 
-  it('reports the real certificate fingerprint in /health and pairing', async () => {
+  it('reports the real certificate fingerprint in /health（配对载荷刻意不再带它）', async () => {
     const health = await request(`https://127.0.0.1:${TLS}`, '/api/mobile/health');
     const certPem = fs.readFileSync(certPaths().cert, 'utf8');
     const real = 'sha256/' + crypto.createHash('sha256')
@@ -146,7 +146,10 @@ describe('tls-listen: HTTPS/WSS 与明文并存', () => {
 
     const info = await request(`https://127.0.0.1:${TLS}`, '/pair/info');
     assert.equal(info.status, 200);
-    assert.equal(info.parsed.certFingerprint, real, '/pair/info 必须与 /health 同口径');
+    // [fix 2026-10-21] 配对载荷里的 certFingerprint 已移除：App 从来没读过它
+    // （真正的 TOFU 在连接层 badCertificateCallback），而它占 76 字节 —— 二维码
+    // 密度正是"扫不出来"的直接原因。/health 仍如实上报，供诊断与展示。
+    assert.equal(info.parsed.certFingerprint, undefined, '二维码载荷不带指纹（密度）');
   });
 
   it('completes a WSS upgrade on the TLS port', async () => {

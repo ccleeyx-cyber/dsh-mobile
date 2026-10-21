@@ -644,4 +644,60 @@ void main() {
       expect(cardSize.height, lessThan(433), reason: '卡片必须被 maxHeight=420 约束，不能无限撑高');
     });
   });
+
+  // [fix 2026-10-21] 真机"提交回答点不到"：卡片原来写死 maxHeight=420，而 dock
+  // 的上限是 0.45 屏高（约 350dp），于是提交行落在 dock 可视区之外；外层 dock 还在
+  // SingleChildScrollView 里，手指在选项上拖只会滚卡片内层、外层纹丝不动 —— 表现
+  // 就是"按钮点不到"。修法是让调用方把可用高度传进来（maxHeight）。
+  group('卡片按可用空间收缩（[fix 2026-10-21] 提交按钮点不到）', () {
+    testWidgets('预算小于默认 420 时，提交按钮仍可点中（hit-test 能命中）', (tester) async {
+      const budget = 300.0;
+      tester.view.physicalSize = const Size(1000, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      final options = List.generate(
+        12,
+        (i) => {'label': '选项${i + 1}', 'description': '这是第 ${i + 1} 个选项的说明文字，比较长'},
+      );
+      final pending = PendingQuestion.fromJson({
+        'eventId': 'evt-budget',
+        'sessionId': 'session-abc',
+        'questions': [
+          {'id': 'q1', 'question': '请选择？', 'options': options, 'multiSelect': false},
+        ],
+      });
+
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: Column(
+            children: [
+              const Expanded(child: SizedBox()),
+              SizedBox(
+                width: 1000,
+                child: QuestionCard(
+                  pending: pending,
+                  canAnswer: true,
+                  maxHeight: budget,
+                  onSubmit: (_, __) => true,
+                  onDismiss: () {},
+                ),
+              ),
+            ],
+          ),
+        ),
+      ));
+      await tester.pump();
+
+      expect(tester.getSize(find.byType(QuestionCard)).height,
+          lessThanOrEqualTo(budget + 1),
+          reason: '卡片必须服从调用方给的可用高度，否则提交行会被 dock 切掉');
+      // hitTestable() 才是"点得到"：findsOneWidget 只证明它存在于 widget 树里。
+      expect(find.widgetWithText(FilledButton, '提交回答').hitTestable(), findsOneWidget,
+          reason: '提交按钮必须真的能点中（复现用户报告的"点不到"）');
+      await tester.tap(find.widgetWithText(FilledButton, '提交回答'));
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+    });
+  });
 }

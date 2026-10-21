@@ -1074,9 +1074,10 @@ class _ChatBlockerDockState extends State<ChatBlockerDock> {
     // 很小甚至溢出。这里先扣掉键盘占位，再按比例限高。
     final media = MediaQuery.of(context);
     final usableHeight = media.size.height - media.viewInsets.bottom;
+    final dockMax = usableHeight * _dockMaxHeightFraction;
     return ConstrainedBox(
       constraints: BoxConstraints(
-        maxHeight: usableHeight * _dockMaxHeightFraction,
+        maxHeight: dockMax,
       ),
       child: SingleChildScrollView(
         child: Column(
@@ -1089,7 +1090,12 @@ class _ChatBlockerDockState extends State<ChatBlockerDock> {
             // 顺序是有意的：提问在最上面，因为它阻塞着 agent 的下一步 —— 用户
             // 必须先看到并回答它，TODO 和图片都是背景信息。附件紧贴输入框，
             // 因为它是"这轮对话里出现的图"，不是一条独立消息。
-            ..._buildInteractiveBlocks(widget.dsh),
+            //
+            // [fix 2026-10-21] 把 dock 的高度上限传下去：卡片按"可用空间"收缩，
+            // 而不是自己写死 420。否则它比 dock 还高，"提交回答"那一行落在
+            // 可视区外 —— 而外层/内层两层滚动区会让拖动只滚内层，看起来就像
+            // 按钮点不到。
+            ..._buildInteractiveBlocks(widget.dsh, dockMax),
           ],
         ),
       ),
@@ -1190,7 +1196,7 @@ class _ChatBlockerDockState extends State<ChatBlockerDock> {
 
   /// 提问 / TODO / 附件三块。抽出来是因为它们共享「只属于当前会话」这条约束，
   /// 放在一起比散在 build 里更容易看出这个约束。
-  List<Widget> _buildInteractiveBlocks(DshService dsh) {
+  List<Widget> _buildInteractiveBlocks(DshService dsh, double heightBudget) {
     final blocks = <Widget>[];
     final questions = dsh.currentSessionQuestions;
 
@@ -1199,6 +1205,8 @@ class _ChatBlockerDockState extends State<ChatBlockerDock> {
         QuestionCard(
           key: ValueKey(q.eventId),
           pending: q,
+          // 按可用空间收缩：卡片高于 dock 时提交行会掉到可视区外（真机截图）。
+          maxHeight: heightBudget,
           // 只有真的连着网关才允许提交：离线时 send 会静默失败，用户会对着一个
           // 按不动的按钮以为是自己没点到。
           canAnswer: dsh.isConnected,

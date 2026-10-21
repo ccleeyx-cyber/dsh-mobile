@@ -16,6 +16,9 @@ import '../../theme/app_colors.dart';
 /// - `intent` 缺失时按普通单选题渲染。引擎文档明确说：认识不了这个 tag 的 UI
 ///   就走通用流程，**答案编码完全一样**。
 /// - 多选题（`multiSelect`）必须允许选多个，也必须允许「都不选 + 自定义」。
+/// 卡片自身的上下 margin 合计（8 + 4），限高时要扣掉它。
+const double _kVerticalMargin = 12;
+
 class QuestionCard extends StatefulWidget {
   final PendingQuestion pending;
   final bool canAnswer;
@@ -24,12 +27,21 @@ class QuestionCard extends StatefulWidget {
   final bool Function(Map<String, List<String>> selections, Map<String, String> customs) onSubmit;
   final VoidCallback onDismiss;
 
+  /// [fix 2026-10-21] 卡片允许的最大高度，由调用方按**可用空间**给。
+  ///
+  /// 原来写死 420：真机上 dock（提问/审批区）的上限是 0.45 屏高（约 350dp），
+  /// 卡片比它高，于是"提交回答"这一行落在可视区之外。而 dock 外层还有一层
+  /// SingleChildScrollView，卡片内部又有自己的滚动区 —— 手指在选项上下拖时
+  /// 滚的是内层，外层纹丝不动，用户看到的就是"提交按钮点不到"。
+  final double maxHeight;
+
   const QuestionCard({
     super.key,
     required this.pending,
     required this.canAnswer,
     required this.onSubmit,
     required this.onDismiss,
+    this.maxHeight = 420,
   });
 
   @override
@@ -117,7 +129,13 @@ class _QuestionCardState extends State<QuestionCard> {
       // 选项一多（多选题 + 每项带 description）整张卡被顶出屏幕，提交按钮
       // 根本够不着 —— 用户实测"最下面没法提交"。所以这里必须自己限高，
       // 让**题目区**滚动，提交按钮钉在卡片底部永远可见。
-      constraints: const BoxConstraints(maxHeight: 420),
+      //
+      // [fix 2026-10-21] maxHeight 的语义是「这张卡**占用的总高度**上限」，
+      // 所以要扣掉自己的上下 margin（8+4）。否则调用方按 dock 的可用高度传
+      // 300，卡片实际占到 312，提交行仍然会被切掉一点点。
+      constraints: BoxConstraints(
+        maxHeight: (widget.maxHeight - _kVerticalMargin).clamp(160.0, 2000.0),
+      ),
       decoration: BoxDecoration(
         color: context.c.questionSurface,
         borderRadius: BorderRadius.circular(12),

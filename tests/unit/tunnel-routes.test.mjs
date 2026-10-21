@@ -205,8 +205,9 @@ describe('remote access routes', () => {
     assert.equal(r.parsed.host, 'n.example.com');
     assert.equal(r.parsed.scheme, 'https', '公网是 https 时必须下发 scheme，否则 App 用 http 配对必然失败');
     assert.equal(r.parsed.port, 3443);
+    // [fix 2026-10-21] 载荷里不再有 publicHost/publicPort（与 host/port/reach 重复，
+    // 而二维码密度直接决定能不能扫出来），改用 reach 表达"这条地址是公网还是局域网"。
     assert.equal(r.parsed.reach, 'public');
-    assert.equal(r.parsed.publicHost, 'n.example.com');
   });
 
   it('provider=none：二维码绝不能再带公网域名（真机 bug：配过 NPS 就会一直带）', async () => {
@@ -222,8 +223,7 @@ describe('remote access routes', () => {
     assert.notEqual(r.parsed.host, 'n.example.com',
       '仅局域网时 npsHost 只是"留着以后切回去用"，不能当成对外地址');
     assert.equal(r.parsed.reach, 'lan');
-    assert.equal(r.parsed.publicHost, null);
-    assert.equal(r.parsed.publicPort, null);
+    assert.equal(r.parsed.lanHosts, undefined, '载荷不能带重复的 lanHosts（二维码密度）');
     assert.equal(r.parsed.scheme, 'http');
     // 局域网回退端口必须是网关自己的监听端口，而不是反代映射出来的端口
     assert.equal(typeof r.parsed.lanPort, 'number');

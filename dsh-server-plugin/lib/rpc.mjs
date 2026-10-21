@@ -258,7 +258,7 @@ async function dispatch(endpoint, payload, deps) {
         const { createRequire } = await import('node:module');
         const require_ = createRequire(import.meta.url);
         const buf = await require_('qrcode').toBuffer(JSON.stringify(payload), {
-          type: 'png', width: 360, margin: 2
+          type: 'png', width: 720, margin: 3, errorCorrectionLevel: 'L'
         });
         qrDataUrl = `data:image/png;base64,${buf.toString('base64')}`;
       } catch {

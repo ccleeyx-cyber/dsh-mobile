@@ -579,8 +579,8 @@ window.__ModuleLoader__.load({
           ),
           qr ? h('div', { style: { display: 'flex', gap: 18, marginTop: 14, alignItems: 'flex-start', flexWrap: 'wrap' } },
             qr.qrDataUrl
-              ? h('img', { src: qr.qrDataUrl, alt: '配对二维码', style: { width: 180, height: 180, borderRadius: 8, border: '1px solid var(--dsw-alias-border-l2, #e5e7eb)' } })
-              : h('div', { style: { width: 180, height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center', fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #6b7280)', border: '1px dashed var(--dsw-alias-border-l2, #d1d5db)', borderRadius: 8 } }, 'qrcode 包不可用\n请手动输入配对码'),
+              ? h('img', { src: qr.qrDataUrl, alt: '配对二维码', style: { width: 240, height: 240, borderRadius: 8, border: '1px solid var(--dsw-alias-border-l2, #e5e7eb)' } })
+              : h('div', { style: { width: 240, height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center', fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #6b7280)', border: '1px dashed var(--dsw-alias-border-l2, #d1d5db)', borderRadius: 8 } }, 'qrcode 包不可用\n请手动输入配对码'),
             h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, minWidth: 220 } },
               h('div', { style: S.metricCard },
                 h('div', { style: S.metricLabel }, '配对码（10 分钟内有效）'),

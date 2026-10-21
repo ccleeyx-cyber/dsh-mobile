@@ -3110,14 +3110,17 @@ export function apply(ctx, config = {}, internals = {}) {
       // 443 之类直接拿来连局域网一定失败）。
       lanPort: listenPort,
       reach: adv.reach, // 'public' | 'lan'
-      publicHost: adv.reach === 'public' ? host : null,
-      publicPort: adv.reach === 'public' ? port : null,
-      lanHosts,
       pairCode: code,
-      certFingerprint,
+      // [fix 2026-10-21] 去掉了 certFingerprint：App **从来没读过**它 —— 真正的
+      // TOFU 在连接层（badCertificateCallback + CertTrust），只在自签握手时触发，
+      // 与配对载荷无关。它单独占 76 字节，是二维码密度最大的一笔冗余。
       name: os.hostname(),
-      expiresAt,
       ttlMs: pairCodeTtlMs()
+      // [fix 2026-10-21] 刻意不再下发 lanHosts / publicHost / publicPort /
+      // expiresAt：它们与 hosts/host/port/reach 完全重复（App 一个都没读），
+      // 而二维码的**密度直接决定扫不扫得出来**。真机实测载荷 504 字节 →
+      // 约 121×121 模块，面板又只按 180px 显示，等于 1.5px/模块，手机解不出来。
+      // 砍掉冗余字段 + 放大渲染，密度能降一半以上。
     };
   }
 
@@ -3513,7 +3516,10 @@ export function apply(ctx, config = {}, internals = {}) {
         const { createRequire } = await import('node:module');
         const require_ = createRequire(import.meta.url);
         png = await require_('qrcode').toBuffer(JSON.stringify(payload), {
-          type: 'png', width: 360, margin: 2
+          // [fix 2026-10-21] 用 errorCorrectionLevel: 'L'（7% 冗余）而不是默认 M
+          // （15%）：这是**屏幕显示、近距离扫**的二维码，M 的冗余是浪费 —— 它让
+          // 模块边长多出约 15%，而像素密度正是"扫不出来"的直接原因。
+          type: 'png', width: 720, margin: 3, errorCorrectionLevel: 'L'
         });
       } catch (e) {
         logger.warn('dsh-mobile-bridge: qrcode 包不可用，回退 JSON:', e?.message || e);
