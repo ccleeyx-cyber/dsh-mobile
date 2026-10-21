@@ -259,7 +259,7 @@ void main() {
     await teardown(tester);
   });
 
-  testWidgets('输入框里打一个 / 自动弹出模板面板（入口不用去找那个 ⚡）', (tester) async {
+  testWidgets('输入框里打一个 / 自动弹出全量面板（命令 · 模板 · 技能）', (tester) async {
     SharedPreferences.setMockInitialValues(<String, Object>{
       'dsh_local_snippets': jsonEncode([
         {'id': 'l1', 'label': '周报', 'text': '总结这周的进展', 'tag': ''},
@@ -273,8 +273,31 @@ void main() {
     await tester.pump();
     await tester.pumpAndSettle();
 
-    expect(find.text('命令与模板'), findsOneWidget,
-        reason: '斜杠是用户本来就有的习惯，用它把面板带出来，比再加一行常驻 chips 便宜');
+    // [feat 2026-10-21] 手动打 `/` = 给我全部：命令 + 模板 + 技能（与 web 端一致）。
+    // 闪电按钮才是"默认的那几个"。
+    expect(find.text('命令 · 模板 · 技能'), findsOneWidget,
+        reason: '斜杠是用户本来就有的习惯，且要带出全部条目（含 skill）');
+    expect(find.text('周报'), findsOneWidget);
+
+    await teardown(tester);
+  });
+
+  testWidgets('点闪电按钮仍是"默认的几个"：不带技能组', (tester) async {
+    SharedPreferences.setMockInitialValues(<String, Object>{
+      'dsh_local_snippets': jsonEncode([
+        {'id': 'l1', 'label': '周报', 'text': '总结这周的进展', 'tag': ''},
+      ]),
+    });
+    await pumpChat(tester);
+    await clearField(tester);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('composer-slash-button')));
+    await tester.pump();
+    await tester.pumpAndSettle();
+
+    expect(find.text('命令与模板'), findsOneWidget);
+    expect(find.text('命令 · 模板 · 技能'), findsNothing);
     expect(find.text('周报'), findsOneWidget);
 
     await teardown(tester);

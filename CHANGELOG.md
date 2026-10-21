@@ -7,6 +7,39 @@
 
 ---
 
+## [1.36.2] - 2026-10-21
+
+手机端 `/` 菜单补上**技能目录**。真机反馈：手动打 `/` 只出来默认的几个命令，而
+web 端同样的 `/` 能列出全部 skill / 插件。
+
+### 修复（斜杠菜单 · App + 网关）
+
+- **根因**：web 的 `/` 菜单是**两路合并** —— 命令来自引擎 `commands/list`，技能
+  来自 `skills/list`（`@deepseek-ai/dsh-client-ui-skill` 的 fetchCatalog 直接调
+  `skills.list({ sessionId })`）。手机端此前只接了命令那一路，所以 skill 一个都
+  不出现。
+- **网关**新增 `GET /api/mobile/sessions/skills?sessionId=…`，转发引擎
+  `skills/list`，只挑手机菜单需要的 `name` / `description` / `source`
+  （`description` 为空时回落到 `whenToUse`）。引擎拒绝时回空表 + `degraded`，
+  **不给静态兜底**：硬编码的 skill 名字等于教用户输引擎不认的命令。
+- **App**：手动输入 `/` 的面板改为「命令 · 模板 · 技能」三段，技能单列一组
+  （与命令语义不同：一个由引擎注册、一个来自 skill 目录，混排会让人分不清）。
+  选中技能与命令一样插入 `/name ` —— 与 web 端一致。
+
+### 行为约定（用户指定）
+
+- **点闪电按钮 = 默认的那几个**（命令 + 模板），不拉技能目录；
+- **手动输入 `/` = 全部**（命令 + 模板 + 技能）。
+
+### 验证
+
+- 网关：`npm test` 495 项 / **493 过** / 2 跳过（POSIX）/ 0 失败。新增 4 条：
+  透传与 `whenToUse` 回落、`value{}` 包装容错、引擎拒绝降级、缺 sessionId 400。
+- App：`flutter analyze` 零问题；`flutter test` **827 全绿**。原「打 / 弹出模板面板」
+  用例按新行为改写为「弹出全量面板」，并新增「点闪电不带技能组」的对照用例。
+
+---
+
 ## [1.36.1] - 2026-10-21
 
 真机反馈的两处**消息渲染**缺陷，根因都在 `widgets/safe_markdown.dart`。同时把上一版

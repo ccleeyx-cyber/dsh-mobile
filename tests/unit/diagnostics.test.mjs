@@ -314,3 +314,60 @@ test('commands: engine failure degrades to an empty list with a reason, not fake
   assert.deepEqual(calls.body.commands, []);
   assert.equal(calls.body.degraded, 'engine rpc not available');
 });
+
+// [feat 2026-10-21] skill 目录：web 的 `/` 菜单 = 命令 + 技能两路合并，
+// 手机端此前只接了命令那一路，打 `/` 看不到任何 skill。
+test('skills: real engine catalog passed through, whenToUse fills an empty description', async () => {
+  const { deps, calls } = makeDeps({
+    pathname: '/api/mobile/sessions/skills',
+    parsedUrl: { query: { sessionId: 'session-1' } },
+    callDshRpc: async (method) => {
+      assert.equal(method, 'skills/list');
+      return {
+        skills: [
+          { name: 'ponytail-help', description: 'Quick-reference card', source: 'filesystem' },
+          { name: 'skill-creator', description: '', whenToUse: '当用户要新建技能时', source: 'builtin' },
+          { name: '', description: 'no name — must be dropped' }
+        ]
+      };
+    }
+  });
+  await handleFeatureRoute(deps);
+  assert.equal(calls.status, 200);
+  assert.deepEqual(calls.body.skills, [
+    { name: 'ponytail-help', description: 'Quick-reference card', source: 'filesystem' },
+    { name: 'skill-creator', description: '当用户要新建技能时', source: 'builtin' }
+  ]);
+});
+
+test('skills: tolerates the engine wrapping the catalog in value{}', async () => {
+  const { deps, calls } = makeDeps({
+    pathname: '/api/mobile/sessions/skills',
+    parsedUrl: { query: { sessionId: 'session-1' } },
+    callDshRpc: async () => ({ value: { skills: [{ name: 'a', description: 'd' }] } })
+  });
+  await handleFeatureRoute(deps);
+  assert.equal(calls.status, 200);
+  assert.deepEqual(calls.body.skills, [{ name: 'a', description: 'd', source: '' }]);
+});
+
+test('skills: engine rejection degrades to an empty list with a reason, never a fake catalog', async () => {
+  const { deps, calls } = makeDeps({
+    pathname: '/api/mobile/sessions/skills',
+    parsedUrl: { query: { sessionId: 'session-1' } },
+    callDshRpc: async () => { throw new Error('engine down'); }
+  });
+  await handleFeatureRoute(deps);
+  assert.equal(calls.status, 200);
+  assert.deepEqual(calls.body.skills, []);
+  assert.equal(calls.body.degraded, 'engine rpc not available');
+});
+
+test('skills: missing sessionId is a 400, not an empty catalog', async () => {
+  const { deps, calls } = makeDeps({
+    pathname: '/api/mobile/sessions/skills',
+    parsedUrl: { query: {} }
+  });
+  await handleFeatureRoute(deps);
+  assert.equal(calls.status, 400);
+});

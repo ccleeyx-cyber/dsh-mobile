@@ -1597,30 +1597,40 @@ class _ChatComposerState extends State<ChatComposer> {
   /// * 有模板时在同一个弹层里分两段：上半斜杠命令、下半提示词模板。
   ///   模板以前是输入区下方一整条常驻 chips 行，而它属于"想起来才会用"的功能，
   ///   不值得为它常驻一行（那正是改造前打字区被压扁的原因之一）。
-  Future<void> _openCommandOrSnippetSheet(DshService dsh) async {
+  ///
+  /// [withSkills]（[feat 2026-10-21]）决定要不要把 **skill 目录**并进来：
+  /// * 点闪电按钮 = `false` → 只给"默认的那几个"（引擎注册的斜杠命令 + 模板）；
+  /// * 手动打一个 `/` = `true` → 额外拉 `skills/list`，把 skill 全列出来，
+  ///   与 web 端的 `/` 菜单一致。
+  ///
+  /// 两个入口共用同一张面板，但内容不同 —— 这是用户明确要求的行为：闪电是
+  /// 「给我常用的」，斜杠是「给我全部」。
+  Future<void> _openCommandOrSnippetSheet(DshService dsh,
+      {bool withSkills = false}) async {
     // 弹层不可重入：`_snippetSheetOpen` 挡住"打斜杠自动弹 + 立刻再点按钮"
     // 这种叠层（叠起来的样子是遮罩变深、用户以为界面卡了）。
     if (_snippetSheetOpen) return;
     _snippetSheetOpen = true;
     try {
-      await _openCommandOrSnippetSheetImpl(dsh);
+      await _openCommandOrSnippetSheetImpl(dsh, withSkills: withSkills);
     } finally {
       _snippetSheetOpen = false;
     }
   }
 
-  /// 输入框里刚打出一个 `/`：把同一个面板带出来。
+  /// 输入框里刚打出一个 `/`：带出**全量**面板（命令 + 模板 + 技能）。
   ///
   /// 放在 postFrame 里是为了不打断这一帧的文本编辑（directly opening a modal
   /// route mid-onChanged 会让 iOS 输入法状态错乱）。
   void _maybeOpenSheetOnSlash(DshService dsh) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      unawaited(_openCommandOrSnippetSheet(dsh));
+      unawaited(_openCommandOrSnippetSheet(dsh, withSkills: true));
     });
   }
 
-  Future<void> _openCommandOrSnippetSheetImpl(DshService dsh) async {
+  Future<void> _openCommandOrSnippetSheetImpl(DshService dsh,
+      {required bool withSkills}) async {
     // [fix 2026-10-18] 每次打开都重读一次本地条目。
     //
     // 这里多花的是一次本地 IO（毫秒级），换来的是"设置里改完，回对话页立刻
@@ -1630,7 +1640,9 @@ class _ChatComposerState extends State<ChatComposer> {
     if (!mounted) return;
     // 两个来源都空时完全走原来的命令面板（行为零变化）；只要有一个有内容，
     // 就进这个合并面板。
-    if (dsh.snippets.isEmpty && _localSnippets.isEmpty) {
+    // [feat 2026-10-21] 手动打 `/` 时**不能**退化成"只有命令"的旧面板 ——
+    // 那正好丢掉用户要的技能列表。
+    if (!withSkills && dsh.snippets.isEmpty && _localSnippets.isEmpty) {
       _showCommandSheet(dsh);
       return;
     }
@@ -1651,7 +1663,9 @@ class _ChatComposerState extends State<ChatComposer> {
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 14, 16, 2),
                 child: Text(
-                  '命令与模板',
+                  // 手动打 `/` 时多了技能一组，标题跟着变，否则用户不知道下面
+                  // 那一大段是什么。
+                  withSkills ? '命令 · 模板 · 技能' : '命令与模板',
                   style: TextStyle(
                     fontSize: AppText.heading,
                     fontWeight: FontWeight.bold,
@@ -1717,6 +1731,67 @@ class _ChatComposerState extends State<ChatComposer> {
                         );
                       },
                     ),
+                    // [feat 2026-10-21] 技能目录：只有手动打 `/` 才带出来
+                    // （闪电按钮是"给我常用的"，斜杠是"给我全部"）。
+                    //
+                    // 与命令分成两组而不是混在一起：两者的语义不同 —— 命令由引擎
+                    // 注册、技能来自 skill 目录（可来自工作区文件），混排会让用户
+                    // 分不清 "/compact" 和 "/ponytail-help" 为什么长得一样。
+                    if (withSkills) ...[
+                      _sheetGroupLabel(sheetCtx, '技能'),
+                      FutureBuilder<List<SkillCatalogEntry>>(
+                        future: dsh.fetchSkills(),
+                        builder: (ctx, snap) {
+                          if (snap.connectionState != ConnectionState.done) {
+                            return const Padding(
+                              padding:
+                                  EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                              child: SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              ),
+                            );
+                          }
+                          final skills = snap.data ?? const <SkillCatalogEntry>[];
+                          if (skills.isEmpty) {
+                            // 与命令一致：不伪造条目，只说明原因。
+                            return _sheetHint(ctx, '当前工作区没有可用技能');
+                          }
+                          return Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              for (final s in skills)
+                                ListTile(
+                                  dense: true,
+                                  title: Text(
+                                    '/${s.name}',
+                                    style: TextStyle(
+                                      fontSize: AppText.title,
+                                      fontWeight: FontWeight.w600,
+                                      color: ctx.c.textPrimary,
+                                    ),
+                                  ),
+                                  subtitle: s.description.isEmpty
+                                      ? null
+                                      : Text(
+                                          s.description,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                              fontSize: AppText.subhead,
+                                              color: ctx.c.textTertiary),
+                                        ),
+                                  onTap: () {
+                                    Navigator.of(sheetCtx).pop();
+                                    _insertSlashCommand(dsh, s.name);
+                                  },
+                                ),
+                            ],
+                          );
+                        },
+                      ),
+                    ],
                     // 本地快捷指令排在最前（Phase 5.4）：自己写的那几条几乎总是
                     // 比网关下发的通用模板更常用。两者同名也不去重 —— 它们本来就是
                     // 两个来源，各自演化（见 `models/local_snippet.dart` 的文件头）。

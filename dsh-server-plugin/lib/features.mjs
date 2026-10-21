@@ -1581,7 +1581,10 @@ export const FEATURE_ROUTES = [
   ['POST', '/api/mobile/goals/resume'],
   ['POST', '/api/mobile/goals/complete'],
   // [feat 2026-10-12] slash-command discovery (engine RPC: commands/list)
-  ['GET', '/api/mobile/sessions/commands']
+  ['GET', '/api/mobile/sessions/commands'],
+  // [feat 2026-10-21] skill catalog (engine RPC: skills/list) —— web 的 `/` 菜单
+  // 是「命令 + 技能」两路合并，手机端此前只接了命令那一路。
+  ['GET', '/api/mobile/sessions/skills']
 ];
 
 /**
@@ -2139,6 +2142,47 @@ export async function handleFeatureRoute(deps) {
       // No static fallback on purpose: a stale hard-coded list would teach the
       // user slash names the engine may not accept. Empty + reason instead.
       sendJson(200, { ok: true, code: 0, commands: [], degraded: 'engine rpc not available' });
+    }
+    return true;
+  }
+
+  // [feat 2026-10-21] skill 目录（引擎 RPC：skills/list）。
+  //
+  // 为什么需要这条：web 端的 `/` 菜单是**两路合并**的结果 —— 命令来自
+  // `commands/list`，技能来自 `skills/list`（见 `@deepseek-ai/dsh-client-ui-skill`
+  // 的 fetchCatalog：`skills.list({ sessionId })`）。手机端此前只接了命令那一路，
+  // 于是打 `/` 只能看到引擎内置命令，ponytail-* / presentations 这类 skill 一个
+  // 都不出现（真机反馈）。
+  //
+  // 只挑手机菜单要用的字段：引擎的 SkillSummary 还带 invocation 策略、provider、
+  // resourceBase 等内部信息，没必要下发。
+  if (pathname === '/api/mobile/sessions/skills' && req.method === 'GET') {
+    const sessionId = String(deps.parsedUrl.query?.sessionId || '').trim();
+    if (!sessionId) { sendJson(400, { ok: false, error: 'sessionId is required' }); return true; }
+    try {
+      const raw = await callDshRpc('skills/list', { args: { sessionId } });
+      // 引擎可能回 { skills: [...] }、{ value: { skills: [...] } } 或直接数组，
+      // 三种都吃 —— 这一层不该把引擎的包装形态变成客户端的硬依赖。
+      const list = Array.isArray(raw) ? raw
+        : Array.isArray(raw?.skills) ? raw.skills
+          : Array.isArray(raw?.value?.skills) ? raw.value.skills
+            : [];
+      const skills = list.map((s) => {
+        if (!s || typeof s.name !== 'string' || !s.name) return null;
+        const description = typeof s.description === 'string' && s.description
+          ? s.description
+          : (typeof s.whenToUse === 'string' ? s.whenToUse : '');
+        return {
+          name: s.name,
+          description,
+          source: typeof s.source === 'string' ? s.source : ''
+        };
+      }).filter(Boolean);
+      sendJson(200, { ok: true, code: 0, skills });
+    } catch (err) {
+      // 与 commands 一致：不给静态兜底。硬编码的 skill 名字会教用户输引擎不认的
+      // 命令；空列表 + 原因，客户端据此显示"没有可用技能"。
+      sendJson(200, { ok: true, code: 0, skills: [], degraded: 'engine rpc not available' });
     }
     return true;
   }

@@ -766,6 +766,37 @@ class SlashCommand {
   String get insertText => '/$name ';
 }
 
+/// 一条 skill，来自 `GET /api/mobile/sessions/skills`。[feat 2026-10-21]
+///
+/// 为什么单独一个模型而不是复用 [SlashCommand]：两者在界面上的**来源与语义**
+/// 不同 —— 命令是引擎注册的斜杠命令（`commands/list`），技能是 skill 目录
+/// （`skills/list`）。web 端的 `/` 菜单把两路合并展示，手机端此前只接了命令，
+/// 于是打 `/` 看不到任何 skill（真机反馈）。
+///
+/// 插入文本与命令一致：`/name `。这条是照 web 的做法来的 —— 网页端从 `/` 菜单
+/// 选中 skill 后插入的也是 `/<name>`，引擎侧按同一个斜杠语法解析。
+class SkillCatalogEntry {
+  final String name;
+  final String description;
+
+  /// 来源（filesystem / builtin / …），仅作展示分组用，可能为空。
+  final String source;
+
+  const SkillCatalogEntry({
+    required this.name,
+    required this.description,
+    this.source = '',
+  });
+
+  factory SkillCatalogEntry.fromJson(Map<String, dynamic> json) => SkillCatalogEntry(
+        name: json['name']?.toString() ?? '',
+        description: json['description']?.toString() ?? '',
+        source: json['source']?.toString() ?? '',
+      );
+
+  String get insertText => '/$name ';
+}
+
 /// Tolerant int parsing: accepts int, double and numeric strings.
 int? _int(dynamic v) {
   if (v == null) return null;

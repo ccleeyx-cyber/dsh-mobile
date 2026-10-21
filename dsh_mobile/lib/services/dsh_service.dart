@@ -4575,6 +4575,36 @@ class DshService extends ChangeNotifier {
     return const [];
   }
 
+  /// skill 目录（`GET /api/mobile/sessions/skills`）。[feat 2026-10-21]
+  ///
+  /// 与 [fetchCommands] 是**两路**数据：引擎的 `commands/list` 只给注册过的斜杠
+  /// 命令，skill 走独立的 `skills/list`。web 端把两者合并成 `/` 菜单，手机端
+  /// 此前只取了前者。取不到就返回空表（菜单里不塞假条目）。
+  Future<List<SkillCatalogEntry>> fetchSkills() async {
+    final sessionId = _currentSession?.sessionId;
+    if (_currentConfig == null || sessionId == null) return const [];
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/skills')
+          .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) return const [];
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final raw = data['skills'];
+        return raw is List
+            ? raw
+                .whereType<Map>()
+                .map((e) => SkillCatalogEntry.fromJson(Map<String, dynamic>.from(e)))
+                .where((s) => s.name.isNotEmpty)
+                .toList(growable: false)
+            : const <SkillCatalogEntry>[];
+      }
+    } catch (e) {
+      debugPrint('[DshService] fetchSkills error: $e');
+    }
+    return const [];
+  }
+
   /// 用量 / 上下文压力 / goal。带 [_sessionLoadSeq] 守卫。
   ///
   /// [endOfTurn] 为 true 表示这是 `done` 之后为了量"本轮消耗"补的一次读：
