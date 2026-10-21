@@ -7,6 +7,54 @@
 
 ---
 
+## [1.37.1] - 2026-10-21
+
+### 修复 + 增强（cloudflared：照 `dsh-pocket` 的做法重做，四条差异三条是我错了）
+
+用户让参考 `dsh-pocket` 的实现。读完它的 `lib/tunnel.mjs`（621 行）后，我的隧道
+实现有四处与人家不同，其中三处是我的问题：
+
+| 项 | dsh-pocket | 我原来 | 结论 |
+|---|---|---|---|
+| 指哪 | `http://127.0.0.1:<port>`（**明文回环**） | `https://127.0.0.1:3443`，且 TLS 没起来就 409 | **我错**：公网那一段由 Cloudflare 终结 TLS，本机是回环，把「必须有 TLS」当前置条件是绑死两件无关的事 |
+| 超时 | 30s 硬超时，文案直接点名 Clash TUN 会掐断隧道 | 无超时，边缘被阻断就永远 `starting` | **我错**：「永远未就绪」的根源之一 |
+| 地址解析 | 正则排除 `api.` 子域（issue #32） | `https://[a-z0-9-]+\.trycloudflare\.com` —— 会把申请失败时打印的 `https://api.trycloudflare.com` 当成隧道地址 | **我错**：真机探针输出里就有这一行，手机拿到的会是 API 端点（返回 10005） |
+| 形态 | 快速隧道 + **命名隧道**（自带 token + 固定域名） | 只有快速隧道 | **缺能力**：随机域名每次重连都变，谈不上"能用" |
+
+### 改法
+
+- **目标改明文回环**：隧道指向 `http://127.0.0.1:<listenPort>`，删除「TLS 未启用
+  → 409」这条前提（`tls-disabled` 分支一起删掉）。隧道与自签证书从此无关。
+- **30s 硬超时**：没建立就判 `failed`，`lastError` 写明「若开着代理/VPN（Clash 等
+  TUN 模式）会掐断隧道连接，退出后重试；或改用自己的反向代理（NPS）」。
+- **地址解析排除 `api.`**：`parseTunnelUrl` 加负向前瞻，并补了用例（`api` 子域、
+  纯 `https://api.trycloudflare.com` 都必须返回 null）。
+- **命名隧道**：`remoteAccess.cloudflared = { token, host }`。token 非空 → 用
+  `--no-autoupdate tunnel run --protocol http2`（token 走 `TUNNEL_TOKEN` 环境变量），
+  就绪后地址取配置域名（cloudflared 不会打印它）；token 为空 → 快速隧道。
+  设置页在 cloudflared 档下多两个输入框（token / 固定域名），并注明在 Cloudflare
+  Zero Trust 里把隧道指向 `http://localhost:3088`。
+- 同时删掉 `--edge-ip-version 4`（对齐参考实现；http2 已在用 TCP 443）。
+- 服务端 `remote-access` 多返回 `mode`（`named` / `quick`），App 远程访问页显示
+  「形态：命名隧道（固定域名）/ 快速隧道（地址会变）」。
+
+### 验证
+
+- 网关 `npm test`：**523 项 / 521 过** / 2 跳过 / 0 失败。新增 4 条 tunnel 用例：
+  明文回环参数、`api.` 子域不被当地址、30s 超时点名代理、命名隧道走 `tunnel run`
+  且就绪后用配置域名；另加 1 条路由用例（配 token 切 named 模式）。
+- App：`flutter analyze` 零问题；`flutter test` **834 全绿**。
+
+### 仍未解决的问题（如实说明）
+
+这台机器**连不上 Cloudflare 隧道边缘**（探针实测 5 次重试全失败）。上面这些改动
+让失败变得**可见且可操作**（30s 内给结论 + 点名代理），但没有改变"出站被阻断"这个
+客观事实。要让 quick/named 隧道真的在这里工作，需要让
+`198.41.192.0/19`、`198.41.200.0/24` 的 **7844（TCP+UDP）** 走直连；有固定域名时
+命名隧道是更合适的形态。
+
+---
+
 ## [1.37.0] - 2026-10-21
 
 ### 修复（设置页整体逻辑：**对外宣称的地址只有单一来源了**）

@@ -42,6 +42,10 @@ class RemoteAccessState {
   /// 'public' | 'lan'：现在手机该走哪条路（由服务端判定，客户端不自己推）。
   final String reach;
 
+  /// [feat 2026-10-21] cloudflared 的两种形态：`named`（自带 token + 固定域名，
+  /// 重启不变）/ `quick`（随机域名，每次重连都会变）。其它 provider 为空。
+  final String mode;
+
   final int tlsPort;
   final String? certFingerprint;
 
@@ -59,6 +63,7 @@ class RemoteAccessState {
     this.attempts = 0,
     this.elapsedMs = 0,
     this.reach = 'lan',
+    this.mode = '',
   });
 
   factory RemoteAccessState.fromJson(Map<String, dynamic> json) {
@@ -79,6 +84,7 @@ class RemoteAccessState {
       attempts: json['attempts'] is num ? (json['attempts'] as num).toInt() : 0,
       elapsedMs: json['elapsedMs'] is num ? (json['elapsedMs'] as num).toInt() : 0,
       reach: json['reach']?.toString() ?? 'lan',
+      mode: json['mode']?.toString() ?? '',
     );
   }
 
@@ -104,5 +110,12 @@ class RemoteAccessState {
         'external' => '由你的反向代理提供',
         'gateway' => '由网关自动建立',
         _ => '未配置',
+      };
+
+  /// cloudflared 的形态标签（quick 的地址每次重连都会变，必须让用户知道）。
+  String get modeLabel => switch (mode) {
+        'named' => '命名隧道（固定域名）',
+        'quick' => '快速隧道（地址会变）',
+        _ => '',
       };
 }

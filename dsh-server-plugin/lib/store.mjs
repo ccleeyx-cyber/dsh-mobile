@@ -77,7 +77,10 @@ export const REMOTE_PROVIDERS = Object.freeze(['none', 'nps', 'cloudflared']);
 
 const DEFAULT_REMOTE_ACCESS = Object.freeze({
   provider: 'none',
-  nps: Object.freeze({ host: '', port: 3088, useHttps: false })
+  nps: Object.freeze({ host: '', port: 3088, useHttps: false }),
+  // [feat 2026-10-21] cloudflared 的命名隧道（参考 dsh-pocket）：token 非空就用
+  // `tunnel run` + 固定域名；为空则是快速隧道（随机域名、每次重连会变）。
+  cloudflared: Object.freeze({ token: '', host: '' })
 });
 
 /**
@@ -106,7 +109,23 @@ export function normalizeRemoteAccess(raw, legacy = {}) {
   // 不能让网关带着一条指向空字符串的"人肉反代"对外宣称可用。
   if (provider === 'nps' && !host) provider = 'none';
 
-  return { provider, nps: { host, port, useHttps } };
+  // [feat 2026-10-21] cloudflared 的命名隧道（参考 dsh-pocket）：
+  //   token 非空 = 命名隧道（固定域名、重启不变）；token 为空 = 快速隧道。
+  const rawCf = (raw && typeof raw.cloudflared === 'object' && raw.cloudflared) || {};
+  const cfToken = String(rawCf.token ?? '').trim();
+  const cfHost = String(rawCf.host ?? '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+
+  return {
+    provider,
+    nps: { host, port, useHttps },
+    cloudflared: { token: cfToken, host: cfHost }
+  };
+}
+
+/** 远程接入里跟 cloudflared 有关的模式判定（面板与网关都要用同一套）。 */
+export function cloudflaredMode(remoteAccess) {
+  const cf = (remoteAccess && remoteAccess.cloudflared) || {};
+  return String(cf.token || '').trim() ? 'named' : 'quick';
 }
 
 /** 把远程接入模型摊平成旧的三个顶层字段（兼容旧读者）。 */
@@ -190,6 +209,14 @@ export function saveConfig(patch = {}) {
         useHttps: remotePatch && remotePatch.nps && remotePatch.nps.useHttps !== undefined
           ? remotePatch.nps.useHttps
           : (patch.useHttps !== undefined ? patch.useHttps : cur.nps.useHttps)
+      },
+      cloudflared: {
+        token: remotePatch && remotePatch.cloudflared && remotePatch.cloudflared.token !== undefined
+          ? remotePatch.cloudflared.token
+          : (cur.cloudflared?.token ?? ''),
+        host: remotePatch && remotePatch.cloudflared && remotePatch.cloudflared.host !== undefined
+          ? remotePatch.cloudflared.host
+          : (cur.cloudflared?.host ?? '')
       }
     };
     // 旧调用方（client.js 面板没有 provider 概念）填了地址 = 表示要用 NPS。

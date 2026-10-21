@@ -55,6 +55,10 @@ window.__ModuleLoader__.load({
       const [npsHost, setNpsHost] = useState('');
       const [npsPort, setNpsPort] = useState(3088);
       const [useHttps, setUseHttps] = useState(false);
+      // [feat 2026-10-21] cloudflared 命名隧道（参考 dsh-pocket）：token 非空即
+      // 用 `tunnel run` + 固定域名，地址重启不变；为空则是快速隧道（随机域名）。
+      const [cfToken, setCfToken] = useState('');
+      const [cfHost, setCfHost] = useState('');
       const [showToken, setShowToken] = useState(false);
       const [saving, setSaving] = useState(false);
       const [saveMessage, setSaveMessage] = useState('');
@@ -88,6 +92,8 @@ window.__ModuleLoader__.load({
           setNpsHost(ra?.nps?.host || cfg.npsHost || '');
           setNpsPort(ra?.nps?.port || cfg.npsPort || 3088);
           setUseHttps(Boolean(ra?.nps?.useHttps ?? cfg.useHttps));
+          setCfToken(ra?.cloudflared?.token || '');
+          setCfHost(ra?.cloudflared?.host || '');
           setError('');
         } catch (e) {
           setError(e.message);
@@ -154,6 +160,11 @@ window.__ModuleLoader__.load({
                 host: npsHost.trim(),
                 port: Number(npsPort) || 3088,
                 useHttps
+              },
+              // 非 cloudflared 档也把 token/host 存着：切回去不用重填。
+              cloudflared: {
+                token: cfToken.trim(),
+                host: cfHost.trim()
               }
             }
           });
@@ -400,6 +411,39 @@ window.__ModuleLoader__.load({
                 onChange: (e) => setUseHttps(e.target.checked)
               }),
               '穿透采用 HTTPS（强烈建议；明文会让令牌裸露在公网）'
+            )
+            : null,
+
+          // [feat 2026-10-21] cloudflared 两种形态（参考 dsh-pocket）：
+          //   快速隧道 = 不填 token，随机域名、每次重连都会变；
+          //   命名隧道 = 填 token + 域名，地址固定。地址稳定才谈得上"能用"。
+          provider === 'cloudflared'
+            ? h('div', { style: S.formGroup },
+              h('label', { style: S.label }, 'Cloudflare Tunnel Token（可选）'),
+              h('input', {
+                type: cfToken ? 'password' : 'text',
+                value: cfToken,
+                onChange: (e) => setCfToken(e.target.value),
+                style: { ...S.input, fontFamily: 'ui-monospace,SFMono-Regular,Consolas,monospace' },
+                placeholder: 'eyJhIjoi…（留空 = 快速隧道）'
+              }),
+              h('span', { style: S.helpText },
+                '在 Cloudflare Zero Trust → Networks → Tunnels 建一条隧道并指向 http://localhost:3088，'
+                + '把它的 token 粘到这里即可获得固定域名（重启不变）。留空则用快速隧道。')
+            )
+            : null,
+          provider === 'cloudflared' && cfToken.trim()
+            ? h('div', { style: S.formGroup },
+              h('label', { style: S.label }, '固定域名 (Host)'),
+              h('input', {
+                type: 'text',
+                value: cfHost,
+                onChange: (e) => setCfHost(e.target.value),
+                style: S.input,
+                placeholder: 'dsh.example.com'
+              }),
+              h('span', { style: S.helpText },
+                '该隧道在 Cloudflare 那边绑定的域名。cloudflared 不会把它打印出来，所以这里必须填。')
             )
             : null,
 

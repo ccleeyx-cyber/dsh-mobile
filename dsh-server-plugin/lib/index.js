@@ -3146,10 +3146,14 @@ export function apply(ctx, config = {}, internals = {}) {
         ? (raw.startsWith('http') ? raw : `https://${raw}`)
         : null;
       const startedAt = quickTunnel?.startedAt ?? 0;
+      const cfMode = String(ra.cloudflared?.token || '').trim() ? 'named' : 'quick';
       return {
         ...base,
         // managed: gateway —— 进程由网关自己拉起与回收。
         managed: 'gateway',
+        // [feat 2026-10-21] named = 自带 token + 固定域名（重启不变）；
+        // quick = 随机域名、每次重连都会变。
+        mode: cfMode,
         publicUrl: adv.publicUrl || publicUrl,
         ready: status === 'ready',
         status,
@@ -3187,17 +3191,25 @@ export function apply(ctx, config = {}, internals = {}) {
     if (quickTunnel && (quickTunnel.status === 'ready' || quickTunnel.status === 'starting')) {
       return { ok: true };
     }
-    if (tlsPort <= 0 || !tlsServer) {
-      // 明确拒绝而不是"帮你改成明文暴露"：quick tunnel 会把流量放到公网，
-      // 明文 HTTP 上的 token 等于公开。
-      return { ok: false, code: 'tls-disabled', error: 'TLS 端口未启用，无法开启公网隧道（隧道必须指向 HTTPS）' };
-    }
+    // [fix 2026-10-21] 去掉"必须先有 TLS 端口"这条前提。
+    //
+    // 原来的理由（"隧道会把明文放公网"）不成立：公网那一段由 Cloudflare 终结
+    // TLS，本机那一段是**回环** 127.0.0.1，明文没有暴露面。把它当成前置条件，
+    // 只会在 TLS 没起来时把隧道一起挡掉 —— 两件互不相干的事被绑死。
+    // 做法与 dsh-pocket 一致：隧道指向 http://127.0.0.1:<listenPort>。
+    const target = `http://127.0.0.1:${listenPort}`;
     try {
       lastTunnelError = '';
       const bin = await ensureCloudflared({ fetchToFile: downloadToFile });
+      // 命名隧道（token + 固定域名）优先：地址重启不变，比随机域名可靠得多。
+      const ra = loadConfig().remoteAccess || {};
+      const cf = ra.cloudflared || {};
+      const useNamed = String(cf.token || '').trim().length > 0;
       quickTunnel = createQuickTunnel({
         binary: bin.path,
-        target: `https://127.0.0.1:${tlsPort}`,
+        target,
+        token: useNamed ? cf.token : '',
+        host: useNamed ? cf.host : '',
         onUrl: (url) => {
           audit('tunnel/url', { url });
           // 地址变化要立刻广播：手机拿着旧地址重连只会得到"连不上"，
@@ -3211,7 +3223,7 @@ export function apply(ctx, config = {}, internals = {}) {
         logger
       });
       quickTunnel.start();
-      audit('tunnel/start', { target: `https://127.0.0.1:${tlsPort}`, binary: bin.path });
+      audit('tunnel/start', { target, binary: bin.path, mode: useNamed ? 'named' : 'quick' });
       return { ok: true };
     } catch (err) {
       // 下载失败 / 校验失败都在这里：只降级，不影响局域网与明文端口。
@@ -3643,15 +3655,13 @@ export function apply(ctx, config = {}, internals = {}) {
       const started = await startQuickTunnel();
       if (started.ok) {
         sendJson(200, tunnelPayload());
-      } else if (started.code === 'tls-disabled') {
-        // 409 = 当前配置不让做这件事（而不是"做了但失败了"）。
-        sendJson(409, { ok: false, code: started.code, error: started.error });
       } else {
+        // 不再有"TLS 未启用 → 409"这一档：隧道指向的是回环明文，不需要本机 TLS。
         sendJson(500, {
           ok: false,
           status: 'failed',
           error: started.error,
-          hint: '可手动安装 cloudflared 后重试，或改用 Tailscale/自有反代'
+          hint: '可手动安装 cloudflared 后重试，或改用自有反代（NPS）'
         });
       }
       return;
@@ -3879,6 +3889,10 @@ export function apply(ctx, config = {}, internals = {}) {
         }
         const patch = { remoteAccess: { provider } };
         if (body.nps && typeof body.nps === 'object') patch.remoteAccess.nps = body.nps;
+        // [feat 2026-10-21] cloudflared 命名隧道：token 非空即走 `tunnel run`。
+        if (body.cloudflared && typeof body.cloudflared === 'object') {
+          patch.remoteAccess.cloudflared = body.cloudflared;
+        }
         if (provider === 'nps') {
           const host = String(
             (body.nps && body.nps.host) || loadConfig().remoteAccess.nps.host || ''

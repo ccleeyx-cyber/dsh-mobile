@@ -158,10 +158,28 @@ describe('remote access routes', () => {
     assert.equal(r.parsed.publicUrl, null);
   });
 
-  it('provider=cloudflared 且 TLS 关闭：拒绝开隧道（绝不明文曝公网）', async () => {
-    const r = await req('/api/mobile/tunnel/start', { method: 'POST' });
-    assert.equal(r.status, 409);
-    assert.match(r.parsed.error, /TLS/);
+  it('provider=cloudflared 且 TLS 关闭：隧道不再被 TLS 挡住（回环明文即可）', async () => {
+    // [fix 2026-10-21] 以前这里断言的是「TLS 未启用 → 409」。那条前提是错的：
+    // 公网那一段由 Cloudflare 终结 TLS，本机那一段是回环 127.0.0.1，明文没有
+    // 暴露面。把两件互不相干的事绑在一起，只会让 TLS 没起来时隧道也开不了。
+    const r = await req('/api/mobile/remote-access');
+    assert.equal(r.status, 200);
+    assert.equal(r.parsed.provider, 'cloudflared');
+    assert.equal(r.parsed.mode, 'quick', '没配 token 就是快速隧道');
+    assert.equal(r.parsed.tlsPort, 0, '本用例刻意关掉 TLS');
+    assert.doesNotMatch(r.parsed.reason, /TLS/, 'TLS 不再是隧道的前置条件');
+  });
+
+  it('cloudflared 命名隧道：配了 token 就切到 named 模式', async () => {
+    const r = await req('/api/mobile/remote-access', {
+      method: 'POST',
+      body: { provider: 'cloudflared', cloudflared: { token: 'eyJfake', host: 'dsh.example.com' } }
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.parsed.mode, 'named');
+    // 命名隧道的地址由配置域名决定，未就绪时不能提前宣称
+    assert.equal(r.parsed.ready, false);
+    assert.equal(r.parsed.publicUrl, null);
   });
 
   it('非法 provider 直接 400', async () => {

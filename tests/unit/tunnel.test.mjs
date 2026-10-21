@@ -207,7 +207,11 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
     assert.match(tunnel.lastError, /NPS/, '要给出替代方案，否则用户只能看到"未就绪"');
   });
 
-  it('默认启动参数带 http2 与 IPv4 边缘', () => {
+  // [fix 2026-10-21] 与 dsh-pocket 对齐的两条：
+  //   * 强制 http2（QUIC 走 UDP 7844，国内网络常被屏蔽 → 1033）；
+  //   * 目标用**明文 loopback** —— 公网那段由 Cloudflare 终结 TLS，本机这段是
+  //     回环，明文没有暴露面。之前"必须先有 TLS 端口"是多余前提。
+  it('默认启动参数：http2 + 明文 loopback 目标（不再依赖本机 TLS）', () => {
     const spawned = [];
     const fake = new EventEmitter();
     fake.stdout = new EventEmitter();
@@ -215,12 +219,73 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
     fake.kill = () => {};
     createQuickTunnel({
       binary: '/fake/cloudflared',
+      target: 'http://127.0.0.1:3088',
       spawnFn: (_bin, args) => { spawned.push(args); return fake; },
       logger: { warn() {} }
     }).start();
     assert.equal(spawned.length, 1);
-    assert.ok(spawned[0].includes('--protocol') && spawned[0].includes('http2'));
-    assert.ok(spawned[0].includes('--edge-ip-version') && spawned[0].includes('4'));
+    const args = spawned[0];
+    assert.ok(args.includes('--protocol') && args.includes('http2'));
+    assert.ok(args.includes('--url'), 'quick tunnel 必须带 --url');
+    assert.equal(args[args.indexOf('--url') + 1], 'http://127.0.0.1:3088');
+    assert.equal(args[0], '--no-autoupdate', '--no-autoupdate 必须在全局位置（子命令之前）');
+  });
+
+  it('cloudflared 输出里的 api.trycloudflare.com 不能被当成隧道地址', () => {
+    // 申请失败时 cloudflared 打印：
+    //   failed to request quick Tunnel: Post "https://api.trycloudflare.com/tunnel"
+    // 旧正则会把 api 子域当隧道地址发出去，手机打它会得到 10005 Method Not Allowed。
+    assert.equal(parseTunnelUrl('Post "https://api.trycloudflare.com/tunnel": timeout'), null);
+    assert.equal(parseTunnelUrl('https://api.trycloudflare.com'), null);
+    assert.equal(parseTunnelUrl('INF | https://a-b-c.trycloudflare.com |'),
+      'https://a-b-c.trycloudflare.com');
+  });
+
+  it('建立超时要判失败并点名代理/TUN（不能永远 starting）', async () => {
+    const fake = new EventEmitter();
+    fake.stdout = new EventEmitter();
+    fake.stderr = new EventEmitter();
+    fake.kill = () => {};
+    const tunnel = createQuickTunnel({
+      binary: '/fake/cloudflared',
+      spawnFn: () => fake,
+      timeoutMs: 30,
+      logger: { warn() {} }
+    });
+    tunnel.start();
+    // 什么输出都没有：进程活着但一声不响
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(tunnel.status, 'failed');
+    assert.match(tunnel.lastError, /超时/);
+    assert.match(tunnel.lastError, /Clash|代理/, '要指出最常见的元凶，否则用户无从下手');
+  });
+
+  it('命名隧道：token 走 tunnel run，就绪后用配置域名当地址', () => {
+    const spawned = [];
+    const fake = new EventEmitter();
+    fake.stdout = new EventEmitter();
+    fake.stderr = new EventEmitter();
+    fake.kill = () => {};
+    const urls = [];
+    const tunnel = createQuickTunnel({
+      binary: '/fake/cloudflared',
+      token: 'eyJfake-token',
+      host: 'dsh.example.com',
+      spawnFn: (_bin, args) => { spawned.push(args); return fake; },
+      onUrl: (u) => urls.push(u),
+      logger: { warn() {} }
+    });
+    tunnel.start();
+    const args = spawned[0];
+    assert.ok(args.includes('run'), '命名隧道用 tunnel run 子命令');
+    assert.ok(!args.includes('--url'), '命名隧道不能带 --url');
+    assert.ok(args.includes('http2'));
+
+    // 命名隧道的地址不由 cloudflared 打印，注册成功后才由配置域名补上
+    fake.stderr.emit('data', Buffer.from('INF Registered tunnel connection connIndex=0\n'));
+    assert.equal(tunnel.status, 'ready');
+    assert.equal(tunnel.url, 'https://dsh.example.com');
+    assert.deepEqual(urls, ['https://dsh.example.com']);
   });
 
   it('进程退出后地址作废并回调 onExit', () => {

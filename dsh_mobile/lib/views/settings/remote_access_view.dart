@@ -297,6 +297,11 @@ class _RemoteAccessViewState extends State<RemoteAccessView> {
                 ],
                 _row(context, '通道', ra?.providerLabel ?? '未知'),
                 const SizedBox(height: 8),
+                // [feat 2026-10-21] 快速隧道的地址每次重连都会变，必须让用户看见。
+                if (ra != null && ra.modeLabel.isNotEmpty) ...[
+                  _row(context, '形态', ra.modeLabel),
+                  const SizedBox(height: 8),
+                ],
                 _row(context, '由谁提供', ra?.managedLabel ?? '未知'),
                 const SizedBox(height: 8),
                 _row(context, '公网地址', ra?.publicUrl ?? '未提供', mono: true),

@@ -56,8 +56,31 @@ export function releaseUrl(version = CLOUDFLARED_VERSION, platform = process.pla
  */
 export function parseTunnelUrl(text) {
   if (!text) return null;
-  const m = String(text).match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
+  // [fix 2026-10-21] 必须排除 `api` 子域：cloudflared 申请隧道失败时会打印
+  //   failed to request quick Tunnel: Post "https://api.trycloudflare.com/tunnel"
+  // 而原来的正则 `https://[a-z0-9-]+\.trycloudflare\.com` 会把这句里的
+  // `https://api.trycloudflare.com` 当成隧道地址发出去 —— 手机拿到的就是 API
+  // 端点，访问会得到 {"code":10005,"message":"Method Not Allowed"}。
+  // 真机探针的输出里就有这一行（dsh-pocket 的 issue #32 是同一个坑）。
+  const m = String(text).match(/https:\/\/(?!api\.)[a-z0-9-]+\.trycloudflare\.com/i);
   return m ? m[0] : null;
+}
+
+/**
+ * 从 cloudflared 输出里挑出最有诊断价值的一段。
+ *
+ * 参数错误（`Incorrect Usage` / `flag provided but not defined`）的关键信息在
+ * 输出**开头**，尾部整段是 usage 帮助文本，对用户没用；运行期错误（403 / 协议 /
+ * 网络）的关键信息在**尾部**。所以按这个规则取，最多 500 字符。
+ *
+ * 与 dsh-pocket 的同名函数同源：它踩过的坑是"用户只看到 code=1"。
+ */
+export function firstMeaningfulErrorLine(buf) {
+  const lines = String(buf ?? '').trim().split(/\r?\n/);
+  const usageIdx = lines.findIndex((l) =>
+    /^(?:Incorrect Usage|flag provided but not defined|unknown flag|unknown command)/i.test(l.trim()));
+  if (usageIdx >= 0) return lines[usageIdx].trim().slice(0, 500);
+  return lines.slice(-4).join('\n').trim().slice(0, 500);
 }
 
 function sha256File(file) {
@@ -173,11 +196,18 @@ export async function ensureCloudflared({
  */
 export function createQuickTunnel({
   binary,
-  target = 'https://127.0.0.1:3443',
+  target = 'http://127.0.0.1:3088',
   spawnFn = nodeSpawn,
   args = null,
   onUrl = () => {},
   onExit = () => {},
+  // [feat 2026-10-21] 命名隧道（参考 dsh-pocket 的双路径做法）：
+  // 用户自带 Cloudflare Tunnel Token + 固定域名时，地址**重启不变**，比 quick
+  // tunnel 的随机域名可靠得多。给了 token 就走 `tunnel run`，否则走 `--url`。
+  token = '',
+  host = '',
+  /** 建立总超时（对齐 dsh-pocket 的 30s）。超时即判失败并给出代理提示。 */
+  timeoutMs = 30000,
   logger = console
 } = {}) {
   let child = null;
@@ -190,6 +220,10 @@ export function createQuickTunnel({
   let edgeRetries = 0;
   /// 本次启动的时刻（ms），用于界面上"已用时"。
   let startedAt = 0;
+  /// 建立超时定时器。
+  let startTimer = null;
+  /// 命名隧道模式（token 非空）。
+  const named = String(token || '').trim().length > 0;
 
   /**
    * 只拿到地址不等于隧道可用（实测教训）。
@@ -222,20 +256,25 @@ export function createQuickTunnel({
 
   const feed = (chunk) => {
     const text = String(chunk);
-    const found = parseTunnelUrl(text);
-    if (found) emit(found);
+    if (!named) {
+      const found = parseTunnelUrl(text);
+      if (found) emit(found);
+    }
     if (REGISTERED.test(text)) {
       registered = true;
       status = 'ready';
       lastError = '';
+      clearStartTimeout();
+      // 命名隧道的地址不由 cloudflared 打印（它只知道 token），必须用配置里的域名。
+      if (named && !url && host) emit(`https://${host}`);
     }
     if (EDGE_FAIL.test(text)) {
       // 边缘不可达：把错误如实留住，状态降为 failed（域名留着也没用）。
-      const line = text.split('\n').find((l) => EDGE_FAIL.test(l)) || '';
-      lastError = (line.match(/error="([^"]+)"/)?.[1] || line).trim() || '无法连接 Cloudflare 边缘';
+      lastError = firstMeaningfulErrorLine(text) || '无法连接 Cloudflare 边缘';
       status = 'failed';
       url = '';
       registered = false;
+      clearStartTimeout();
     }
     if (EDGE_RETRY.test(text) && !registered) {
       edgeRetries += 1;
@@ -245,12 +284,17 @@ export function createQuickTunnel({
         lastError = '连不上 Cloudflare 隧道边缘（多次重试）：到 198.41.192.0/19:7844 的出站被阻断。'
           + '可改用自己的反向代理（NPS），或在网络/代理里放行该网段。';
         url = '';
+        clearStartTimeout();
         // 既然已经判失败，就不能留一个在后台按 32s 退避永远重试的进程 ——
         // 那既费电又让"失败"和"还在试"两种状态同时存在。
         try { child?.kill(); } catch { /* 已经退出 */ }
       }
     }
   };
+
+  function clearStartTimeout() {
+    if (startTimer) { clearTimeout(startTimer); startTimer = null; }
+  }
 
   function start() {
     if (child) return;
@@ -265,14 +309,21 @@ export function createQuickTunnel({
     edgeRetries = 0;
     startedAt = Date.now();
     try {
-      // --protocol http2：QUIC 在受限网络里常被丢包；--edge-ip-version 4：
-      // 避开不可用的 IPv6 边缘地址（两者都是纯经验值，失败只是更慢，不会更坏）。
-      child = spawnFn(binary, args || [
-        'tunnel', '--no-autoupdate', '--protocol', 'http2', '--edge-ip-version', '4', '--url', target
-      ], {
+      // --protocol http2：QUIC 走 UDP 7844，国内网络/企业网常把它屏蔽（报
+      //   error 1033）；HTTP/2 走 TCP 443 更稳。这条与 dsh-pocket 的做法一致。
+      //
+      // [fix 2026-10-21] 目标改**明文 loopback**（http://127.0.0.1:<port>）：
+      //   公网那一段由 Cloudflare 终结 TLS，本机这一段是回环，明文没有暴露面。
+      //   之前要求"必须先有 TLS 端口"是多余前提 —— 它让隧道在这一步就 409，
+      //   而 TLS 自签证书与隧道根本无关。
+      child = spawnFn(binary, args || (named
+        ? ['--no-autoupdate', 'tunnel', 'run', '--protocol', 'http2']
+        : ['--no-autoupdate', 'tunnel', '--url', target, '--protocol', 'http2']
+      ), {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
-        detached: false
+        detached: false,
+        env: named ? { ...process.env, TUNNEL_TOKEN: String(token) } : undefined
       });
     } catch (err) {
       status = 'failed';
@@ -281,6 +332,20 @@ export function createQuickTunnel({
       logger.warn?.('[tunnel] 启动失败: %s', lastError);
       return;
     }
+
+    // 总超时（对齐 dsh-pocket 的 30s）：没能建立就判失败，并点名最常见的元凶。
+    // 没有它的话，边缘被阻断时会永远停在 starting —— 界面只能显示"未就绪"。
+    startTimer = setTimeout(() => {
+      if (status === 'ready' || status === 'failed') return;
+      status = 'failed';
+      lastError = registered
+        ? '隧道建立超时（30s）'
+        : '隧道建立超时（30s）：没能连上 Cloudflare。若开着代理/VPN（Clash 等 TUN 模式）'
+          + '会掐断隧道连接，退出后重试；或改用自己的反向代理（NPS）。';
+      url = '';
+      try { child?.kill(); } catch { /* 已经退出 */ }
+    }, timeoutMs);
+    if (typeof startTimer?.unref === 'function') startTimer.unref();
 
     const onChunk = (buf) => feed(buf);
     child.stdout?.on?.('data', onChunk);
@@ -306,6 +371,7 @@ export function createQuickTunnel({
 
   function stop() {
     if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+    clearStartTimeout();
     status = 'stopped';
     url = '';
     registered = false;
