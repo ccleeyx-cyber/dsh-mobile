@@ -13,7 +13,10 @@ window.__ModuleLoader__.load({
       generateToken: 'token/generate',
       pairQrData: 'pair/qrdata',
       devicesList: 'devices/list',
-      devicesRevoke: 'devices/revoke'
+      devicesRevoke: 'devices/revoke',
+      // [feat 2026-10-21] 远程接入实时状态。这份表与 lib/rpc.mjs 的 ENDPOINTS
+      // 是两份拷贝（浏览器侧不能 import 服务端模块），加端点必须两处都改。
+      remoteAccess: 'remote-access/status'
     };
 
     const S = {
@@ -57,6 +60,10 @@ window.__ModuleLoader__.load({
       const [saveMessage, setSaveMessage] = useState('');
       const [error, setError] = useState('');
       const [copiedKey, setCopiedKey] = useState('');
+      // [feat 2026-10-21] 远程接入的实时状态。provider 在**这一页**选，隧道却是
+      // 异步建立的（先拿域名、再连边缘才算 ready），所以必须在这里当场能看见。
+      const [raState, setRaState] = useState(null);
+      const [raBusy, setRaBusy] = useState(false);
 
       const call = useCallback(async (endpoint, payload) => {
         const res = await rpcCall(endpoint, payload);
@@ -91,6 +98,46 @@ window.__ModuleLoader__.load({
         load();
       }, [load]);
 
+      const loadRemoteAccess = useCallback(async () => {
+        try {
+          const st = await call(ENDPOINTS.remoteAccess, {});
+          setRaState(st);
+          return st;
+        } catch {
+          // 状态读不到不该打断配置编辑：面板照常可用。
+          return null;
+        }
+      }, [call]);
+
+      useEffect(() => {
+        loadRemoteAccess();
+      }, [loadRemoteAccess]);
+
+      // 未就绪时自动轮询：点完保存用户会盯着这一屏等结果，让他自己点刷新
+      // 等于把"成没成"变成猜谜。
+      useEffect(() => {
+        if (provider !== 'cloudflared') return undefined;
+        if (raState?.ready === true) return undefined;
+        const timer = setInterval(() => { loadRemoteAccess(); }, 3000);
+        return () => clearInterval(timer);
+      }, [provider, raState?.ready, loadRemoteAccess]);
+
+      const handleRefreshRa = async () => {
+        setRaBusy(true);
+        await loadRemoteAccess();
+        setRaBusy(false);
+      };
+
+      const providerLabel = (p) => (p === 'nps'
+        ? '自有反向代理 (NPS)'
+        : p === 'cloudflared'
+          ? '临时隧道 (cloudflared)'
+          : p === 'none' ? '仅局域网' : '未知');
+
+      const managedLabel = (m) => (m === 'external'
+        ? '你的反向代理'
+        : m === 'gateway' ? '网关自动建立' : '—');
+
       const handleSave = async () => {
         setSaving(true);
         setSaveMessage('');
@@ -112,6 +159,9 @@ window.__ModuleLoader__.load({
           });
           setConfig((prev) => ({ ...prev, ...res.config, ...res }));
           setSaveMessage('✅ 配置已成功保存并立即生效！');
+          // 保存后立刻拉一次状态：切到 cloudflared 时隧道正在建立，这一屏要能
+          // 马上从"未就绪"走到"已就绪"，而不是等用户自己刷新。
+          loadRemoteAccess();
           setTimeout(() => setSaveMessage(''), 3000);
         } catch (e) {
           setError('保存失败: ' + e.message);
@@ -156,9 +206,9 @@ window.__ModuleLoader__.load({
       // localApkUrl 两个指向 /dsh-agent.apk 的变量（已是死代码）。安装包只认
       // GitHub Releases。
       const RELEASES_URL = 'https://github.com/ccleeyx-cyber/dsh-mobile/releases';
-      // 手机真正在用的公网地址：nps 档 = 用户填的穿透地址；其余档由网关运行时
-      // 决定，面板里不该伪造一个固定值。
-      const publicHost = provider === 'nps' ? npsHost : '';
+      // 手机真正在用的公网地址：nps 档 = 用户填的穿透地址；cloudflared 档只有
+      // 网关知道（每次建立都不同），所以优先用实时状态里的值。
+      const publicHost = provider === 'nps' ? npsHost : (raState?.publicUrl || '');
       const publicPort = provider === 'nps' ? npsPort : '';
 
       // ---- 扫码配对卡片状态 [feat 2026-10-12] ----
@@ -357,6 +407,50 @@ window.__ModuleLoader__.load({
             }, saving ? '正在保存...' : '💾 保存配置'),
             saveMessage ? h('span', { style: { fontSize: 13, color: '#059669', fontWeight: 500 } }, saveMessage) : null
           )
+        ),
+
+        // 2.5 远程接入实时状态 [feat 2026-10-21]
+        h('div', { style: S.card },
+          h('div', { style: S.header },
+            h('div', { style: S.title }, '🌐 远程接入状态'),
+            h('button', {
+              type: 'button', style: S.btn, disabled: raBusy, onClick: handleRefreshRa
+            }, raBusy ? '刷新中...' : '🔄 刷新')
+          ),
+          h('div', { style: { ...S.subtitle, marginBottom: 12 } },
+            '切换方式或保存后看这里：cloudflared 需要先拿到域名、再连上 Cloudflare 边缘才算就绪。'
+          ),
+          h('div', { style: S.grid },
+            h('div', { style: S.metricCard },
+              h('div', { style: S.metricLabel }, '当前方式'),
+              h('div', { style: S.metricValue }, providerLabel(raState?.provider || provider)),
+            ),
+            h('div', { style: S.metricCard },
+              h('div', { style: S.metricLabel }, '公网地址'),
+              h('div', { style: S.metricValue }, raState?.publicUrl || '（尚未分配）'),
+            ),
+            h('div', { style: S.metricCard },
+              h('div', { style: S.metricLabel }, '就绪'),
+              h('div', {
+                style: { ...S.metricValue, color: raState?.ready ? '#059669' : '#b45309' }
+              }, raState ? (raState.ready ? '✅ 已就绪' : '⏳ 未就绪') : '未知'),
+            ),
+            h('div', { style: S.metricCard },
+              h('div', { style: S.metricLabel }, '出口由谁提供'),
+              h('div', { style: S.metricValue }, managedLabel(raState?.managed)),
+            ),
+          ),
+          raState && raState.reason
+            ? h('div', { style: { ...S.helpText, marginTop: 10, color: '#b45309' } }, raState.reason)
+            : null,
+          raState?.publicUrl
+            ? h('div', { style: { marginTop: 10 } },
+              h('button', {
+                type: 'button',
+                style: copiedKey === 'raUrl' ? S.btnSuccess : S.btn,
+                onClick: () => copyText(raState.publicUrl, 'raUrl')
+              }, copiedKey === 'raUrl' ? '已复制公网地址' : '📋 复制公网地址'))
+            : null
         ),
 
         // 3. 手机端连接参数速览

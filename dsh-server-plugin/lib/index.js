@@ -5223,6 +5223,9 @@ export function apply(ctx, config = {}, internals = {}) {
     dshPort,
     isListening: true,
     readAudit,
+    // [feat 2026-10-21] 设置页要能看到隧道的实时状态：provider 是在那一页选的，
+    // 而隧道是异步建立的（先拿域名、再连边缘）。与 HTTP 接口共用同一份实现。
+    getRemoteAccess: () => remoteAccessPayload(),
     // [feat 2026-10-12] pair/qrdata RPC needs the same minting machinery the
     // HTTP /pair/qr route uses — the settings page asks for a data-URL QR over
     // the RPC channel instead of hitting the unauthenticated HTTP route, so a

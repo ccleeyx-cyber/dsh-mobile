@@ -11,7 +11,13 @@ export const ENDPOINTS = {
   updateConfig: 'config/update',
   generateToken: 'token/generate',
   generatePairCode: 'pair/code',
-  pairQrData: 'pair/qrdata'
+  pairQrData: 'pair/qrdata',
+  // [feat 2026-10-21] 远程接入的实时状态。
+  //
+  // 为什么要这个 RPC：provider 是在**电脑端设置页**选的，而隧道是异步建立的
+  // （cloudflared 要先拿到域名、再连上边缘才算 ready），用户在那一页必须能当场
+  // 看到"成了没有"，而不是跑到手机或命令行去确认。
+  remoteAccess: 'remote-access/status'
 };
 
 function getLocalIp() {
@@ -264,6 +270,15 @@ async function dispatch(endpoint, payload, deps) {
         // qrcode unavailable — client falls back to manual code entry.
       }
       return { ...payload, qrDataUrl };
+    }
+
+    // [feat 2026-10-21] 远程接入实时状态（与 HTTP GET /api/mobile/remote-access
+    // 同一份实现，由 index.js 注入 —— 隧道进程状态在那边，不能在这里另算一份）。
+    case ENDPOINTS.remoteAccess: {
+      if (typeof deps.getRemoteAccess !== 'function') {
+        throw new Error('远程接入状态未注入');
+      }
+      return deps.getRemoteAccess();
     }
 
     case 'devices/list': {
