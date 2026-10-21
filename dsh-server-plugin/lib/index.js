@@ -2901,6 +2901,14 @@ export function apply(ctx, config = {}, internals = {}) {
   let quickTunnel = null;
   /** 最近一次隧道启动失败的原因（status 如实上报，避免 App 显示成 idle）。 */
   let lastTunnelError = '';
+  /**
+   * [fix 2026-10-21] 最近一次**失败现场**：模式、阶段、原因、时间。
+   *
+   * 为什么单独存：`quickTunnel.lastError` 属于那个实例，下一次 startQuickTunnel
+   * 会用新实例替换它，失败原因就跟着消失 —— 于是"刚才为什么不行"永远无法回答。
+   * 这个变量跨实例保留，并由 audit 落到磁盘（`~/.dsh/mobile-bridge/audit.log`）。
+   */
+  let lastTunnelFailure = null;
 
   /** 用系统 curl 下载（另一套 TLS 栈，用来绕过 Node 的握手被断）。 */
   function curlDownload(url, file) {
@@ -3164,8 +3172,11 @@ export function apply(ctx, config = {}, internals = {}) {
         stageLabel: STAGE_LABELS[stage] || stage,
         attempts: quickTunnel?.attempts ?? 0,
         elapsedMs: startedAt > 0 ? Math.max(0, Date.now() - startedAt) : 0,
+        // 最近一次失败现场（跨实例保留），客户端据此显示"上次为什么不行"。
+        lastFailure: lastTunnelFailure,
         reason: status === 'ready' ? ''
           : (quickTunnel?.lastError || lastTunnelError
+            || (lastTunnelFailure ? `上次失败：${lastTunnelFailure.error}` : '')
             || (stage === 'requesting' ? '正在向 Cloudflare 申请隧道域名…'
               : stage === 'requested' ? '已拿到域名，正在等 Cloudflare 边缘注册…'
                 : stage === 'connecting' ? `正在连接 Cloudflare 边缘（第 ${quickTunnel?.attempts ?? 0} 次重试）…`
@@ -3217,7 +3228,21 @@ export function apply(ctx, config = {}, internals = {}) {
           broadcastToMobileClients({ type: 'tunnel_url', url, channel: 'remote' });
         },
         onExit: (info) => {
-          audit('tunnel/exit', { code: info.code, error: info.error });
+          audit('tunnel/exit', {
+            code: info.code,
+            error: info.error,
+            stage: quickTunnel?.stage ?? null,
+            mode: useNamed ? 'named' : 'quick'
+          });
+          // 失败现场留档：payload 与 audit 都要能回答"刚才为什么不行"。
+          if (info?.error) {
+            lastTunnelFailure = {
+              at: Date.now(),
+              mode: useNamed ? 'named' : 'quick',
+              stage: quickTunnel?.stage ?? 'unknown',
+              error: info.error
+            };
+          }
           broadcastToMobileClients({ type: 'tunnel_url', url: '', channel: 'remote' });
         },
         logger

@@ -48,9 +48,11 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
   it('平台映射与下载地址固定到版本', () => {
     assert.equal(platformAsset('win32').asset, 'cloudflared-windows-amd64.exe');
     assert.equal(platformAsset('linux').asset, 'cloudflared-linux-amd64');
-    const url = releaseUrl('2026.2.0', 'linux');
-    assert.match(url, /releases\/download\/2026\.2\.0\/cloudflared-linux-amd64$/);
-    assert.equal(CLOUDFLARED_VERSION, '2026.2.0');
+    const url = releaseUrl('2026.9.1', 'linux');
+    assert.match(url, /releases\/download\/2026\.9\.1\/cloudflared-linux-amd64$/);
+    // [fix 2026-10-21] 钉住的版本必须与同机实际在用的对齐：本机原来跑 2026.2.0
+    // 而 dsh-pocket 用 2026.9.1，旧版会额外报 cfd-features DNS 超时。
+    assert.equal(CLOUDFLARED_VERSION, '2026.9.1');
   });
 
   it('下载后按 sha256 校验并存到插件私有目录', async () => {
@@ -86,6 +88,42 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
 
     assert.equal(fetches, 1);
     assert.equal(second.downloaded, false);
+  });
+
+  // [fix 2026-10-21] 「文件存在」不等于「版本够新」。本机原来一直复用 2026.2.0
+  // （2 月构建），而同机 dsh-pocket 用 2026.9.1 —— 后者连得上边缘，前者会额外报
+  // `cfd-features.argotunnel.com` DNS 超时。这条用例把升级路径钉住。
+  it('本机二进制版本过旧要重下，版本一致才复用', async () => {
+    const oldBytes = Buffer.alloc(2048, 3);
+    const newBytes = Buffer.alloc(4096, 4);
+    const dir = path.join(TMP_HOME, 'dl-version');
+    let fetches = 0;
+    const fetchBytes = async () => { fetches++; return newBytes; };
+
+    // 先放一份"旧版"
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'cloudflared-linux-amd64'), oldBytes);
+
+    const upgraded = await ensureCloudflared({
+      dir,
+      platform: 'linux',
+      version: '2026.9.1',
+      probeVersionFn: () => '2026.2.0',
+      fetchBytes
+    });
+    assert.equal(fetches, 1, '版本不符必须重下');
+    assert.equal(upgraded.downloaded, true);
+
+    // 再跑一次：这次探测到相同版本，就不该再下载
+    const reused = await ensureCloudflared({
+      dir,
+      platform: 'linux',
+      version: '2026.9.1',
+      probeVersionFn: () => '2026.9.1',
+      fetchBytes
+    });
+    assert.equal(fetches, 1, '版本一致不该重复下载');
+    assert.equal(reused.downloaded, false);
   });
 
   it('哈希不匹配拒绝安装，并把坏文件清掉', async () => {

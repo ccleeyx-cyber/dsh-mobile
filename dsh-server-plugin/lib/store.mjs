@@ -320,8 +320,33 @@ const auditBuffer = [];
  */
 const auditSink = createAuditSink({ auditBuffer, size: AUDIT_BUFFER_SIZE });
 
+/** 磁盘审计文件上限；超过就轮转到 audit.log.1（只留一份旧档）。 */
+const AUDIT_FILE_MAX = 2 * 1024 * 1024;
+
+/**
+ * [fix 2026-10-21] 审计**落盘**。
+ *
+ * 之前 `audit()` 只写内存环形缓冲，磁盘上那份 `audit.log` 是更早实现留下的死
+ * 文件（真机最后一行是 09-28）。后果：隧道为什么失败、谁在什么时候切了 provider，
+ * **重启后一个字都不剩** —— 排查只能靠猜，这正是近期反复绕圈的原因。
+ *
+ * 旧文件是 `{\"at\":..,\"action\":..}` 形状，这里写的是 core 的 entry 形状；两者
+ * 混在一个文件里无所谓 —— 读的人（我）只关心时间与 action。
+ */
+function appendAuditToDisk(entry) {
+  try {
+    const f = path.join(dataDir(), 'audit.log');
+    try {
+      if (fs.statSync(f).size > AUDIT_FILE_MAX) fs.renameSync(f, `${f}.1`);
+    } catch { /* 还不存在 */ }
+    fs.appendFileSync(f, `${JSON.stringify(entry)}\n`, 'utf8');
+  } catch { /* 审计不可用不影响业务 */ }
+}
+
 export function audit(action, payload = {}) {
-  return auditSink.record(action, payload);
+  const entry = auditSink.record(action, payload);
+  appendAuditToDisk(entry);
+  return entry;
 }
 
 export function readAudit(limit = 100) {

@@ -20,11 +20,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn as nodeSpawn } from 'node:child_process';
+import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { dshHome } from './store.mjs';
 
 /** 固定版本：不跟随 latest，避免某天上游发新版把行为改掉。 */
-export const CLOUDFLARED_VERSION = '2026.2.0';
+// [fix 2026-10-21] 2026.2.0 → 2026.9.1：与同机 dsh-pocket 实际在用的版本对齐。
+// 旧版在我们这台机器上会额外报 `cfd-features.argotunnel.com` DNS 超时。
+export const CLOUDFLARED_VERSION = '2026.9.1';
 
 export function tunnelBinDir() {
   return path.join(dshHome(), 'mobile-access', 'bin');
@@ -88,6 +90,27 @@ function sha256File(file) {
 }
 
 /**
+ * 读本机 cloudflared 的版本号；读不到返回空串（测试用假二进制、或文件损坏）。
+ *
+ * 存在的意义只有一个：判断**要不要升级**。以前只要文件存在就复用，于是本机
+ * 一直跑 2026.2.0，而同机的 dsh-pocket 用 2026.9.1 —— 后者连得上边缘，前者会
+ * 额外报 `cfd-features.argotunnel.com` DNS 超时。
+ */
+export function probeVersion(file) {
+  try {
+    const out = execFileSync(file, ['--version'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      windowsHide: true
+    });
+    const m = String(out).match(/version\s+(\d{4}\.\d+\.\d+)/i);
+    return m ? m[1] : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * 确保本机有一份可用的 cloudflared。
  *
  * @param {object} opts
@@ -105,7 +128,10 @@ export async function ensureCloudflared({
   expectedSha256,
   version = CLOUDFLARED_VERSION,
   platform = process.platform,
-  dir = tunnelBinDir()
+  dir = tunnelBinDir(),
+  logger = console,
+  /** 版本探测实现（测试注入；默认 execFileSync 跑 `--version`）。 */
+  probeVersionFn = probeVersion
 } = {}) {
   const { bin } = platformAsset(platform);
   const dest = path.join(dir, bin);
@@ -143,7 +169,18 @@ export async function ensureCloudflared({
   if (fs.existsSync(dest)) {
     try {
       const verifiedBy = verify(dest);
-      return { path: dest, downloaded: false, verifiedBy };
+      // [fix 2026-10-21] 校验通过不等于**版本够新**。
+      //
+      // 之前只要有文件就复用：于是本机一直跑着 2026.2.0（2 月构建），而同机上
+      // dsh-pocket 用的是 2026.9.1，后者连接正常、前者会额外报
+      // `cfd-features.argotunnel.com` DNS 超时。版本不符就重下 —— 这条判断是
+      // 这次"临时域名一直不通"的根因之一。
+      const onDisk = probeVersionFn(dest);
+      if (!onDisk || onDisk === version) {
+        return { path: dest, downloaded: false, verifiedBy, version: onDisk || version };
+      }
+      logger.warn?.(`[tunnel] 本机 cloudflared 是 ${onDisk}，目标版本 ${version}，重新下载`);
+      try { fs.rmSync(dest, { force: true }); } catch { /* ignore */ }
     } catch {
       // 已存在的文件坏了：删掉重下，不要把坏文件留在原地。
       try { fs.rmSync(dest, { force: true }); } catch { /* ignore */ }
@@ -359,8 +396,16 @@ export function createQuickTunnel({
     child.on?.('exit', (code, signal) => {
       child = null;
       if (status !== 'stopped') {
+        // [fix 2026-10-21] 不能覆盖已经有结论的错误。
+        //
+        // 超时判失败会先写好一句人能照着做的话（"若开着代理/VPN…"），然后才
+        // kill 进程；紧接着 exit 事件把 lastError 改成「退出 code=1」，那句诊断
+        // 就没了 —— 用户看到的又是一句没法行动的错误。
+        const alreadyDiagnosed = status === 'failed' && lastError;
         status = code === 0 ? 'stopped' : 'failed';
-        if (code !== 0) lastError = `cloudflared 退出 code=${code}${signal ? ` signal=${signal}` : ''}`;
+        if (code !== 0 && !alreadyDiagnosed) {
+          lastError = `cloudflared 退出 code=${code}${signal ? ` signal=${signal}` : ''}`;
+        }
         // 地址随进程一起失效：不清掉的话手机会拿着一个已经没人监听的域名
         // 反复重连，错误信息只会是"连不上"。
         url = '';

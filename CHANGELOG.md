@@ -9,6 +9,44 @@
 
 ## [1.37.1] - 2026-10-21
 
+### 补丁（同日 · 仅网关，重启 dsh web 生效，不需要重装 App）
+
+用户追问「临时域名和填了 token 都不行」。做 A/B 对照实验后，三条事实同时成立：
+
+```
+同一台机器、同一条命令、只换二进制：
+  我的 (cloudflared 2026.2.0)  : Registered=1 → https://semi-bras-…trycloudflare.com
+  dsh-pocket (2026.9.1)        : Registered=1 → https://reduces-differ-…trycloudflare.com
+```
+
+也就是说：**网络当时是通的、两种形态都能连、两个版本也都能注册**。真正的问题是
+三件"看不见"的事：
+
+1. **audit 从来不落盘。** `audit()` 只写内存环形缓冲，磁盘上的 `audit.log` 是更早
+   实现留下的死文件（真机最后一行为 **09-28**）。于是"隧道为什么失败、谁在什么时候
+   切了 provider"**重启后一个字都不剩** —— 这才是"为什么查不出来"。
+2. **版本钉死在 2026.2.0**（2 月构建），且 `ensureCloudflared` 命中已有文件就直接
+   复用，永不升级。同机的 dsh-pocket 用 2026.9.1；旧版在这台机器上会额外报
+   `cfd-features.argotunnel.com` DNS 超时。
+3. **失败原因会被覆盖。** 30s 超时先写好一句能照着做的话，紧接着 kill 进程触发
+   `exit` 事件，`lastError` 被改成「退出 code=1」，那句诊断就没了。
+
+### 改法
+
+- `audit()` **落盘**：JSONL 追加到 `~/.dsh/mobile-bridge/audit.log`，超过 2MB 轮转
+  成 `.1`；写盘失败不影响业务。
+- `CLOUDFLARED_VERSION` → **2026.9.1**；`ensureCloudflared` 增加版本探测
+  （`probeVersion`），**版本不符就重下**，一致才复用。
+- 隧道失败现场跨实例保留（`lastTunnelFailure`：时间 / 模式 / 阶段 / 原因），
+  暴露在 `remote-access` 的 `lastFailure` 字段并写入 audit；`exit` 事件不再覆盖
+  已有诊断。失败原因还会通过 `reason` 回落到界面（"上次失败：…"），所以设置页与
+  App 现有的那一行就能看到它，不需要新增控件。
+
+### 验证
+
+- 网关 `npm test`：**525 项 / 523 过** / 2 跳过 / 0 失败。新增 2 条：版本过旧要
+  重下、版本一致才复用；audit 必须落盘。
+
 ### 修复 + 增强（cloudflared：照 `dsh-pocket` 的做法重做，四条差异三条是我错了）
 
 用户让参考 `dsh-pocket` 的实现。读完它的 `lib/tunnel.mjs`（621 行）后，我的隧道

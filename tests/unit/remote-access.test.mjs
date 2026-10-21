@@ -85,4 +85,18 @@ describe('remote access model', () => {
     const saved = store.saveConfig({ remoteAccess: { provider: 'none' } });
     assert.equal(saved.remoteAccess.provider, 'none');
   });
+
+  // [fix 2026-10-21] audit 以前只写内存环形缓冲，磁盘那份是更早实现的死文件
+  // （真机最后一行是 09-28）。于是隧道为什么失败、谁在什么时候切了 provider，
+  // 重启后一个字都不剩 —— 排查只能靠猜。这条用例钉住"必须落盘"。
+  it('audit 必须落盘（失败现场不能只活在内存里）', () => {
+    store.audit('tunnel/exit', { error: 'edge blocked: 7844' });
+    const f = path.join(TMP_HOME, 'mobile-bridge', 'audit.log');
+    assert.ok(fs.existsSync(f), 'audit.log 必须被创建');
+    const lines = fs.readFileSync(f, 'utf8').trim().split('\n').filter(Boolean);
+    const last = JSON.parse(lines[lines.length - 1]);
+    assert.equal(last.action, 'tunnel/exit');
+    assert.match(String(last.reason ?? ''), /edge blocked/);
+    assert.equal(typeof last.time, 'number');
+  });
 });
