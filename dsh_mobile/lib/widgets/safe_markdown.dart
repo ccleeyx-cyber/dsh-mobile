@@ -40,7 +40,17 @@ List<bool> _fenceMask(String text) {
 }
 
 String _sanitizeMarkdownOnce(String raw) {
-  var text = raw.replaceAll('\u0000', '');
+  // [fix 2026-10-21] 先把换行符归一成 `\n`。
+  //
+  // 本文件与 `genui_parse.dart` 的所有围栏正则都只认 `\n`：闭合围栏的模式是
+  // `^[ \t]{0,3}`{3,}[ \t]*$`，而 CRLF 下这一行是 "```\r" —— 末尾那个 `\r`
+  // 不在 `[ \t]` 里，匹配必然失败。后果是整段围栏被当成"没有闭合"的代码块，
+  // ```dsh-ui 里的 JSON 于是原样显示出来（真机现象：本该是列表，屏幕上是一坨
+  // JSON）。模型输出或 Windows 侧存储都可能带上 `\r\n`，所以在入口一次抹平。
+  var text = raw
+      .replaceAll('\r\n', '\n')
+      .replaceAll('\r', '\n')
+      .replaceAll('\u0000', '');
 
   // 1. Auto-close dangling code fences（按行首围栏计数，不数行中的 ```）。
   {
@@ -204,6 +214,14 @@ class SafeMarkdown extends StatelessWidget {
         styleSheet: styleSheet,
         onTapLink: onTapLink,
         builders: builders,
+        // [fix 2026-10-21] 单个换行按硬换行渲染，与 dsh web 一致。
+        //
+        // flutter_markdown 默认 `softLineBreak: false`，包内实现是
+        // `text.replaceAll(RegExp(r' ?\n *'), ' ')` —— 段内每个单换行都被替换成
+        // 一个空格。而模型输出的正文习惯用**单换行**分句、空行分段，于是整段文字
+        // 在手机上糊成一坨（Web 端用 GFM 的 breaks 语义，会正常换行）。
+        // 置 true 后单换行变成 `<br>`，与网页端视觉一致。
+        softLineBreak: true,
       );
     } catch (e, stack) {
       debugPrint(
