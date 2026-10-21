@@ -29,7 +29,7 @@ import {
   loadConfig, saveConfig, verifyToken, findDeviceByToken, ensureDataDir, dshHome, audit, readAudit,
   loadDevices, saveDevices, touchDevice, revokeDevice,
   newPairCode, pairCodeTtlMs, newToken, hashToken, roleCanWrite,
-  REMOTE_PROVIDERS,
+  REMOTE_PROVIDERS, onConfigSaved,
   loadPermissions, savePermissions, permissionsFile
 } from './store.mjs';
 import { installRpc, RPC_CHANNEL, ENDPOINTS } from './rpc.mjs';
@@ -2910,6 +2910,11 @@ export function apply(ctx, config = {}, internals = {}) {
    */
   let lastTunnelFailure = null;
   /**
+   * 是否允许自动拉起隧道。测试/CI 用 `DSH_TUNNEL_AUTOSTART=0` 关掉 ——
+   * 否则单元测试会真的去 spawn cloudflared、甚至连公网。
+   */
+  const tunnelAutostart = process.env.DSH_TUNNEL_AUTOSTART !== '0';
+  /**
    * [fix 2026-10-21] 是否正在"准备 cloudflared"（定位/下载二进制）。
    *
    * 为什么需要这个标志：`ensureCloudflared` 在 spawn **之前**跑，真机上那次
@@ -3322,6 +3327,18 @@ export function apply(ctx, config = {}, internals = {}) {
     }
     return startQuickTunnel();
   }
+
+  // [fix 2026-10-21] **任何**配置保存都要对账一次。
+  //
+  // 只挂 HTTP 路由是不够的：设置页保存走的是 RPC `config/update`，那条路以前只
+  // 写配置、不触发任何动作 —— 于是"在面板上切到 cloudflared"这个最主要的入口
+  // 恰恰不会启动隧道（真机复现：配置已写、状态一直"隧道未启动"）。
+  onConfigSaved(() => {
+    if (!tunnelAutostart) return; // 测试/CI 用 DSH_TUNNEL_AUTOSTART=0 关掉，避免真起进程
+    reconcileRemoteAccess().catch((err) => {
+      logger.warn('[dsh-mobile-bridge] 配置保存后的远程接入对账失败: %s', err?.message ?? err);
+    });
+  });
 
   // [v1.35 / 1.2] 请求处理器提成具名变量：明文端口与 TLS 端口共用同一份路由与
   // 鉴权栈。此前它内联在 createServer(...) 里，想加第二个监听面就只能复制整张
@@ -5396,6 +5413,7 @@ export function apply(ctx, config = {}, internals = {}) {
     // 隧道现在指向明文回环 127.0.0.1:<listenPort>，跟本机 TLS 毫无关系，所以
     // 正确的挂点是"明文网关已就绪"。
     setTimeout(() => {
+      if (!tunnelAutostart) return;
       reconcileRemoteAccess().catch((err) => {
         logger.warn('[dsh-mobile-bridge] 远程接入对账失败: %s', err?.message ?? err);
       });

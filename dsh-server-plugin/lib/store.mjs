@@ -174,7 +174,32 @@ export function loadConfig() {
   }
 }
 
+/** 「配置已保存」钩子（同一时刻只保留一个）。 */
+let configSavedHook = null;
+
+/**
+ * 注册"配置已保存"钩子；网关用它触发远程接入对账。
+ *
+ * [fix 2026-10-21] 为什么放在 saveConfig 而不是各个调用点：面板保存走 RPC
+ * `config/update` → `saveConfig`，而 `reconcileRemoteAccess()` 只挂在 HTTP
+ * `POST /api/mobile/remote-access` 与网关启动两处。于是用户在设置页切到
+ * cloudflared 时，配置写进去了（真机 17:39:26），但**隧道从来没被触发** ——
+ * 界面一直"隧道未启动"。钩子放进 saveConfig 之后，就不存在"某条保存路径忘了
+ * 对账"这种漏网。
+ */
+export function onConfigSaved(fn) {
+  configSavedHook = typeof fn === 'function' ? fn : null;
+}
+
 export function saveConfig(patch = {}) {
+  const updated = saveConfigInternal(patch);
+  try {
+    configSavedHook?.(updated);
+  } catch { /* 对账失败不能影响保存本身 */ }
+  return updated;
+}
+
+function saveConfigInternal(patch = {}) {
   ensureDataDir();
   const current = loadConfig();
   const updated = {

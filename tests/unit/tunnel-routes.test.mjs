@@ -22,6 +22,8 @@ const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-tunnel-routes-'));
 process.env.DSH_HOME = TMP_HOME;
 // 本条用例刻意关闭 TLS：验证"没有 HTTPS 就不许开隧道"这条硬约束。
 process.env.BRIDGE_TLS_PORT = '0';
+// [fix 2026-10-21] 单测绝不真起隧道进程（provider=cloudflared 时的对账会去 spawn）。
+process.env.DSH_TUNNEL_AUTOSTART = '0';
 
 const { apply } = await import('../../dsh-server-plugin/lib/index.js');
 const { loadConfig } = await import('../../dsh-server-plugin/lib/store.mjs');

@@ -9,6 +9,45 @@
 
 ## [1.37.1] - 2026-10-21
 
+### 补丁 3（同日 · 仅网关 · 找到"面板切换后隧道从不启动"的真因）
+
+用户贴了截图：面板上已选「临时隧道（cloudflared）」、状态卡显示"隧道未启动"、
+进度条空转。查配置：`provider=cloudflared` 确实在 **17:39:26 写进去了**，网关
+也在 **17:37:54 重启过**（新代码），但接口一直 `stage=idle`。
+
+**根因：设置页保存走 RPC `config/update`，而 `reconcileRemoteAccess()` 只挂在
+HTTP `POST /api/mobile/remote-access` 与网关启动两处。** 也就是说，**最主要的
+那个入口（面板切换）恰恰不会启动隧道** —— 配置写进去了，进程从来没被拉起。
+
+### 改法
+
+- `store.mjs` 新增 `onConfigSaved(fn)` 钩子，**`saveConfig` 写完配置后统一触发**。
+  网关在 `apply()` 里注册 → 任何保存路径（面板 RPC、HTTP、未来新增的）都会对账，
+  不再有"某条路径忘了调 reconcile"这种漏网。
+- 顺带修：设置页进度条原来在 `idle` / `stopped` 也会显示（截图里那条空转的蓝条），
+  现在只在 preparing / requesting / requested / connecting 阶段出现，并补了
+  preparing 的宽度。
+- 测试环境加 `DSH_TUNNEL_AUTOSTART=0`：单测绝不真 spawn cloudflared（否则
+  provider=cloudflared 的用例会真的连公网）。
+
+### 端到端实测（模拟"面板保存"，独立实例 + 临时 DSH_HOME）
+
+```
+1) 初始 provider=none
+2) 模拟面板保存 provider=cloudflared ...
+   [tunnel] 复用系统中已有的 cloudflared：~/.dsh/dsh-pocket/bin/cloudflared.exe
+   t+2s stage=requesting
+   t+4s stage=requested  https://highest-rss-critical-make.trycloudflare.com
+   t+6s stage=ready
+=== 面板保存路径端到端成功 ===
+```
+
+### 验证
+
+- 网关 `npm test`：**527 项 / 525 过** / 2 跳过 / 0 失败（新增"任何一次 saveConfig
+  都要触发配置已保存钩子"）。
+- App：`flutter analyze` 零问题；`flutter test` **834 全绿**（未改动）。
+
 ### 补丁 2（同日 · 仅网关 · 我实测复现并修掉了两个真 bug）
 
 用户说"还是不行，你自己能不能先测试一下"。测了，确实不行，原因很具体：

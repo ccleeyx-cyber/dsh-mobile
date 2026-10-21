@@ -86,6 +86,21 @@ describe('remote access model', () => {
     assert.equal(saved.remoteAccess.provider, 'none');
   });
 
+  // [fix 2026-10-21] 这是"在面板上切到 cloudflared 但隧道从不启动"的根因：
+  // 面板保存走 RPC config/update → saveConfig，而 reconcile 只挂在 HTTP 路由上。
+  // 钩子放进 saveConfig 之后，任何保存路径都会触发对账。
+  it('任何一次 saveConfig 都要触发"配置已保存"钩子（面板保存也得启动隧道）', () => {
+    writeConfig({ token: 't', port: 3088 });
+    const seen = [];
+    store.onConfigSaved((cfg) => seen.push(cfg.remoteAccess.provider));
+    store.saveConfig({ remoteAccess: { provider: 'cloudflared' } });
+    // 注意形状：nps 的 host 必须写在 remoteAccess.nps 里（顶层的 `nps` 不是这个
+    // 模型的入参）—— 写错的话 host 为空，provider 会被规范成 none。
+    store.saveConfig({ remoteAccess: { provider: 'nps', nps: { host: 'n.example.com' } } });
+    store.onConfigSaved(null); // 清理，避免影响其它用例
+    assert.deepEqual(seen, ['cloudflared', 'nps']);
+  });
+
   // [fix 2026-10-21] audit 以前只写内存环形缓冲，磁盘那份是更早实现的死文件
   // （真机最后一行是 09-28）。于是隧道为什么失败、谁在什么时候切了 provider，
   // 重启后一个字都不剩 —— 排查只能靠猜。这条用例钉住"必须落盘"。

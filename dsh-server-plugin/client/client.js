@@ -472,7 +472,7 @@ window.__ModuleLoader__.load({
           ),
           // [fix 2026-10-21] 阶段进度：一个"未就绪"对用户没有信息量，卡在哪一步
           // 才决定该怎么办（申请阶段失败=出网断了；边缘阶段失败=7844 被阻断）。
-          raState && raState.stage && raState.stage !== 'ready' && raState.stage !== 'failed'
+          raState && raState.stage && ['preparing','requesting','requested','connecting'].includes(raState.stage)
             ? h('div', { style: { marginBottom: 12 } },
               h('div', {
                 style: {
@@ -482,7 +482,7 @@ window.__ModuleLoader__.load({
                 h('div', {
                   style: {
                     height: '100%',
-                    width: ({ requesting: '30%', requested: '65%', connecting: '85%' })[raState.stage] || '10%',
+                    width: ({ preparing: '15%', requesting: '35%', requested: '65%', connecting: '85%' })[raState.stage] || '10%',
                     background: '#2563eb',
                     transition: 'width .4s ease'
                   }
