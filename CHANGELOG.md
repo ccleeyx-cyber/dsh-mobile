@@ -7,6 +7,29 @@
 
 ---
 
+## [1.39.1] - 2026-10-23
+
+### 换图标：小鲸鱼线稿
+
+从建项目起用的都是 **Flutter 默认 logo**（一只蓝色几何箭头），一直没换过，放在桌面上
+既不像这个 App，也和 DeepSeek 那点关系都看不出来。这次换成一只蓝色线稿小鲸鱼，白底、
+单色、无渐变无阴影 —— 小尺寸下也认得出是一只鲸鱼，而不是一团色块。
+
+- 母版：`dsh_mobile/assets/branding/app-icon-1024.png`（1024×1024 满幅、四周留白，
+  **不预先烘圆角**，形状由启动器裁）。
+- 新增 `scripts/make-app-icons.ps1`：从母版生成 Android 5 档 `ic_launcher`
+  （48/72/96/144/192）。母版换图时只改这一张、重跑一次，不再手改五个 PNG。
+- 补上之前缺的**自适应图标**（Android 8+）：`mipmap-anydpi-v26/ic_launcher(_round).xml`
+  + `drawable-nodpi/ic_launcher_foreground.png` + `values/ic_launcher_background.xml`，
+  Manifest 加 `android:roundIcon` —— 圆形/圆角遮罩下不会露出白边。
+- 备选母版留在 `assets/branding/`：`app-icon-alt-solid.png`（蓝底白鲸）、
+  `app-icon-alt-navy.png`（深蓝底 + 青色水花），换图命令见脚本头注释。
+
+⚠️ 图标只在重新 build + 安装后才会变；部分启动器还会缓存旧图标，卸载重装或重启
+启动器才会刷新。
+
+---
+
 ## [1.39.0] - 2026-10-22
 
 用户报的三件事，都是"明明该能用、但用起来不对劲"的那种。

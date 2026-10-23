@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 8.0+ 自适应图标。
+
+  前景用的是满幅渐变底 + 居中「D」字形的那张图（drawable-nodpi，432×432），
+  背景色取图案最暗处，于是系统把前景裁成圆形/圆角矩形时不会露出白边或色块接缝。
+
+  为什么不拆成「纯字形 + 纯色底」两层：拆层需要把字形从渐变里抠出来，抠不干净就会
+  在边缘留一圈毛边；这里让前景自带渐变直接铺满 108dp 画布，比抠图更稳。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

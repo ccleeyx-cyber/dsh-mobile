@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标的背景层：与母版底色一致（纯白），前景裁成圆形/圆角时不露接缝。 -->
+<resources>
+    <color name="ic_launcher_background">#FFFFFF</color>
+</resources>
