@@ -132,6 +132,13 @@ test('resolveConfined: a symlink pointing outside the workspace is refused', (t)
     t.skip('symlink creation not permitted on this host');
     return;
   }
+  // [fix 2026-10-23] 实测：有的 Windows 环境下 symlinkSync **不抛错但也没建出链接**
+  // （被安全软件静默拦下）。此时断言 403 会得到一个 404（文件不存在），把一个环境
+  // 问题伪装成越权判断的缺陷。先确认链接真的存在，否则按"本机不支持"跳过。
+  if (!fs.existsSync(link)) {
+    t.skip('symlink creation silently did not create a link on this host');
+    return;
+  }
   const r = resolveConfined(ws, 'escape-link/secret.txt');
   assert.equal(r.ok, false);
   assert.equal(r.status, 403);

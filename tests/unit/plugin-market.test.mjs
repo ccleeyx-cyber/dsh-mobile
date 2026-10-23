@@ -108,3 +108,31 @@ test('插件包：包版本与运行时上报的 BRIDGE_VERSION 一致', () => {
     'package.json 的 version 与 BRIDGE_VERSION 不一致 —— 诊断页会显示错误的"当前版本"'
   );
 });
+
+/**
+ * [fix 2026-10-23] 改名之后最容易漏的一类：**包名与内部身份字符串脱钩**。
+ *
+ * 实测：把包名改成 dsh-mobile-access 时，`client/client.js` 里的 `id` / `name`
+ * 和 `lib/index.js` 里 Cordis 插件的 `name` 还写着旧名。客户端插件按 id 注册、
+ * 宿主按包名找它，两边对不上时"移动终端"面板会静默消失（或客户端加载器报错），
+ * 而 `package.json`、bundle patch 看起来都是对的 —— 从配置文件上根本查不出来。
+ *
+ * 这里把三处身份钉在一起，以后改包名漏改任何一个都会在单测里报出来。
+ */
+test('插件包：包名与客户端/服务端插件身份字符串一致', () => {
+  const clientSrc = fs.readFileSync(path.join(pluginDir, 'client', 'client.js'), 'utf8');
+
+  const idMatch = clientSrc.match(/__ModuleLoader__\.load\(\{\s*id:\s*["']([^"']+)["']/);
+  assert.ok(idMatch, 'client/client.js 里找不到 __ModuleLoader__.load({ id: ... })');
+  assert.equal(idMatch[1], pkg.name, 'client bundle 的 id 必须等于包名（客户端按它注册）');
+
+  const nameMatch = clientSrc.match(/module\.exports\s*=\s*\{\s*name:\s*["']([^"']+)["']/);
+  assert.ok(nameMatch, 'client/client.js 里找不到 module.exports.name');
+  assert.equal(nameMatch[1], pkg.name, '客户端插件的 name 必须等于包名');
+
+  const serverSrc = fs.readFileSync(path.join(pluginDir, 'lib', 'index.js'), 'utf8');
+  const serverName = serverSrc.match(/^const name = ['"]([^'"]+)['"];/m);
+  assert.ok(serverName, 'lib/index.js 里找不到 `const name = ...`（Cordis 插件名）');
+  assert.equal(serverName[1], pkg.name, 'Cordis 插件导出的 name 必须等于包名');
+});
+

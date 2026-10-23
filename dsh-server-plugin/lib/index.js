@@ -138,7 +138,7 @@ try {
   }
 }
 
-const name = 'dsh-mobile-bridge';
+const name = 'dsh-mobile-access';
 // [fix 2026-10-15] 只声明 `connection`，**去掉 `webServer`**。
 //
 // 为什么必须去掉：本插件不注入 webServer，就无法在本fiber 里访问它。Cordis 的
@@ -3707,7 +3707,7 @@ export function apply(ctx, config = {}, internals = {}) {
           ok: false,
           authenticated: false,
           error: '认证失败: 授权码无效或为空 (Unauthorized)',
-          name: 'dsh-mobile-bridge',
+          name: 'dsh-mobile-access',
           port: listenPort,
           version: BRIDGE_VERSION
         });
@@ -3718,7 +3718,7 @@ export function apply(ctx, config = {}, internals = {}) {
         code: 0,
         ok: true,
         authenticated: true,
-        name: 'dsh-mobile-bridge',
+        name: 'dsh-mobile-access',
         port: listenPort,
         // [v1.35 / 1.2] TLS 端口与证书指纹：手机在「连接与诊断」页能直接看出
         // 这台机器是否开了 HTTPS，以及当前证书是哪一张（指纹变化时对比用）。

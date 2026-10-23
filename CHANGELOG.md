@@ -32,6 +32,29 @@
 ⚠️ 改名后两台宿主机都要重新 link 一次（`dsh plugin remove 旧名` + `add link:...`），
 否则重启时 Cordis 找不到 `dsh-mobile-access` 这个模块。
 
+### 修复：改名漏掉插件内部的身份字符串（客户端面板会跟着失效）
+
+改名只改了 `package.json` 和 bundle patch，**插件内部还写着旧名**：
+
+| 位置 | 旧值 | 为什么必须一致 |
+|---|---|---|
+| `client/client.js` 的 `__ModuleLoader__.load({ id })` | `dsh-mobile-bridge` | 客户端模块按 id 注册，宿主按**包名**给出的路径加载 → 对不上时"移动终端"面板静默消失 |
+| `client/client.js` 的 `module.exports.name` | `dsh-mobile-bridge` | 同上，客户端插件的注册名 |
+| `lib/index.js` 的 `const name`（Cordis 插件名） | `dsh-mobile-bridge` | 服务端插件身份，日志与依赖解析都用它 |
+| `/health` 自报的 `name` | `dsh-mobile-bridge` | 手机端与诊断页看到的"我是谁" |
+
+- 三处身份现在与包名一致；RPC 通道 `/dsh-mobile-bridge` **刻意不改**（它是线缆上的
+  命名空间，两端一起用；改名只会在"浏览器缓存着旧客户端"的窗口里制造 404）。
+- `tests/unit/plugin-market.test.mjs` 新增断言：包名 == 客户端 id == 客户端 name ==
+  Cordis name。以后改名漏改任何一处都会在单测里炸出来。
+
+### 修复：`pack-plugin.mjs` 依赖系统 `tar`，在 GNU tar 下直接失败
+
+`tar -a -f E:\...zip` 在 GNU tar（PortableGit 自带）里会把盘符 `E:` 当成远端主机，
+报 `Cannot connect to E: resolve failed`；Windows 自带的 bsdtar 又认这个写法 ——
+同一个脚本在两个终端里行为不同。现在 ZIP 由脚本自己用 `zlib.deflateRawSync` 写出
+（无外部命令、无依赖），写完从字节里回读中央目录校验根层与条目数。
+
 ### 新增：连接页可以给网关起**别名**
 
 用户原话：「app 连接那里，需要加一个别名，像我现在需要连接多个 dsh 客户端，

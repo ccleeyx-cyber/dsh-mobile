@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: "dsh-mobile-bridge",
+  id: "dsh-mobile-access",
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
@@ -690,8 +690,10 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // [fix 2026-10-23] 名字必须与包名一致（改名 dsh-mobile-access 后漏改这里 →
+    // 客户端插件以旧名注册，宿主按新包名找插件时对不上，"移动终端"面板会静默消失）。
     module.exports = {
-      name: 'dsh-mobile-bridge',
+      name: 'dsh-mobile-access',
       inject: ['slots', 'connection'],
       apply
     };
