@@ -1,6 +1,6 @@
 - insert:
-    - id: dsh-mobile-bridge
-      name: dsh-mobile-bridge
+    - id: dsh-mobile-access
+      name: dsh-mobile-access
       # ⚠️ 刻意**不写** inject。
       #
       # 2026-10-15 曾在这里加过 `inject: [connection, webServer]`，已撤回 ——

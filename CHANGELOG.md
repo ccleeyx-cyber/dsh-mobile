@@ -11,6 +11,27 @@
 
 用户报的三件事，都是"明明该能用、但用起来不对劲"的那种。
 
+### 上架准备：插件改名 `dsh-mobile-access`
+
+要发到插件市场（deepseek.stream）时发现 npm 上的 `dsh-mobile-bridge` 已经是别人的包
+（作者 `dshapp`，0.3.6，做的是 iPhone + Noise 隧道的手机远程插件——同一个场景，
+同名会让人装错）。改名不影响功能，只影响身份：
+
+- 包名 `dsh-mobile-bridge` → **`dsh-mobile-access`**；`cordis.patch.yml` 的实例
+  `id`/`name` 一起改（Cordis 按包名解析模块）。
+- `package.json` 补齐市场要求：`dsh.name` / `dsh.category`、`license`、`author`、
+  `keywords`、`repository`、`engines.node (>=22.15)`；版本对齐 `BRIDGE_VERSION`
+  （1.15.1），并加了**版本漂移测试**。
+- 新增 `LICENSE`（MIT）、重写插件 README（功能介绍/安装/首次使用/端口/配置/安全边界）。
+- 新增 `scripts/pack-plugin.mjs`：按市场上的校验规则打 ZIP（根层必须有 package.json、
+  不许混进 node_modules），打完再自检一遍。
+- 新增 `tests/unit/plugin-market.test.mjs`：把市场会拦的那几条（entry 必须是 .js、
+  `dsh.bundle.patch` 必须存在且是 YAML 列表、README/LICENSE 必须在、版本要一致）
+  变成本地单测——别等上传后看红字。
+
+⚠️ 改名后两台宿主机都要重新 link 一次（`dsh plugin remove 旧名` + `add link:...`），
+否则重启时 Cordis 找不到 `dsh-mobile-access` 这个模块。
+
 ### 新增：连接页可以给网关起**别名**
 
 用户原话：「app 连接那里，需要加一个别名，像我现在需要连接多个 dsh 客户端，

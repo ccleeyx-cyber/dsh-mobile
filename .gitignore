@@ -75,3 +75,6 @@ apk-artifact.zip
 E2E_MEMORY_TEST.MD
 LARGE_MEMORY_TEST.MD
 PROJECT_WORKLOAD_MEMORY.MD
+
+# 插件打包产物（scripts/pack-plugin.mjs）。一次性上传件，不进仓库。
+work/plugin-package/
