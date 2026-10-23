@@ -14,6 +14,7 @@ import '../../models/trajectory.dart';
 import '../../services/dsh_service.dart';
 import '../../theme/app_colors.dart';
 import '../../widgets/top_toast.dart';
+import 'model_picker_sheet.dart';
 import 'session_info_sheet.dart';
 import 'session_status_strip.dart';
 import 'trajectory_sheet.dart';
@@ -402,9 +403,16 @@ String _getPolicyLabel(String policy) {
 }
 
 /// 快速模型选择：只影响本会话，全局默认在设置页改。
+///
+/// [feat 2026-10-22] 列表改成**按供应商分组**（见 `model_picker_sheet.dart`）。
+/// 分组依据来自网关（`settings.availableModels[].provider`），不是本地猜的：
+/// 一条 60 行的平铺列表在手机上根本选不动。
 void showChatModelSwitchSheet(BuildContext context, DshService dsh) {
-  // 同权限弹层：先抓住 toast 出口，弹层 pop 之后仍能提示。
+  // 同权限弹层：先抓住 toast 与 messenger —— 弹层 pop 之后它们仍然能用。
   final toast = TopToastHandle.capture(context);
+  final messenger = ScaffoldMessenger.of(context);
+  final danger = context.c.danger;
+
   if (dsh.settings == null || dsh.settings!.availableModels.isEmpty) {
     dsh.fetchSettings();
   }
@@ -414,228 +422,54 @@ void showChatModelSwitchSheet(BuildContext context, DshService dsh) {
   final modelList = (settings != null && settings.availableModels.isNotEmpty)
       ? settings.availableModels
       : [
-          ModelItem(id: 'cn:deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1000000, maxTokens: 16384),
-          ModelItem(id: 'cn:deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1000000, maxTokens: 32768),
-          ModelItem(id: 'cn:kimi-k3-1', name: 'Kimi K3.1', contextWindow: 1000000, maxTokens: 32768),
+          ModelItem(
+              id: 'cn:deepseek-v4.1-flash',
+              name: 'DeepSeek V4.1 Flash',
+              contextWindow: 1000000,
+              maxTokens: 16384,
+              provider: 'cn',
+              providerLabel: 'cn'),
+          ModelItem(
+              id: 'cn:deepseek-v4-pro',
+              name: 'DeepSeek V4 Pro',
+              contextWindow: 1000000,
+              maxTokens: 32768,
+              provider: 'cn',
+              providerLabel: 'cn'),
+          ModelItem(
+              id: 'cn:kimi-k3-1',
+              name: 'Kimi K3.1',
+              contextWindow: 1000000,
+              maxTokens: 32768,
+              provider: 'cn',
+              providerLabel: 'cn'),
         ];
 
-  String filter = '';
-
-  showModalBottomSheet(
+  showModelPickerSheet(
     context: context,
-    isScrollControlled: true,
-    backgroundColor: context.c.surface,
-    shape: const RoundedRectangleBorder(
-      borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-    ),
-    builder: (ctx) {
-      return SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Center(
-                child: Container(
-                  width: 40,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: context.c.border,
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: context.c.accent.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Icon(Icons.smart_toy_outlined, color: context.c.accent, size: 20),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '切换大语言模型',
-                          style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: context.c.textPrimary),
-                        ),
-                        Text(
-                          '选择要在此会话中使用的 AI 模型',
-                          style: TextStyle(fontSize: 12, color: context.c.textSecondary),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-              if (currentSession != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 8, bottom: 4),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: context.c.surfaceMuted,
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Text(
-                      '当前生效会话: ${currentSession.title}',
-                      style: TextStyle(fontSize: 12, color: context.c.textPrimary),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                ),
-              const SizedBox(height: 6),
-              Text(
-                '切换只对本次会话生效，立即生效；全局默认模型在「设置」页修改。',
-                style: TextStyle(fontSize: 11.5, color: context.c.textTertiary),
-              ),
-              const SizedBox(height: 12),
-              StatefulBuilder(
-                builder: (context, setModalState) {
-                  final filtered = modelList.where((m) {
-                    if (filter.isEmpty) return true;
-                    return m.name.toLowerCase().contains(filter) || m.id.toLowerCase().contains(filter);
-                  }).toList();
-
-                  return Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      TextField(
-                        decoration: InputDecoration(
-                          hintText: '搜索模型 (如 deepseek, glm, gpt, qwen...)',
-                          hintStyle: TextStyle(fontSize: 13, color: context.c.textTertiary),
-                          prefixIcon: Icon(Icons.search, size: 20, color: context.c.textSecondary),
-                          filled: true,
-                          fillColor: context.c.surfaceMuted,
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(8),
-                            borderSide: BorderSide.none,
-                          ),
-                        ),
-                        onChanged: (val) {
-                          setModalState(() {
-                            filter = val.trim().toLowerCase();
-                          });
-                        },
-                      ),
-                      const SizedBox(height: 10),
-                      ConstrainedBox(
-                        constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.45),
-                        child: filtered.isEmpty
-                            ? Padding(
-                                padding: const EdgeInsets.symmetric(vertical: 24),
-                                child: Center(
-                                  child: Text('未找到匹配的模型', style: TextStyle(color: context.c.textTertiary)),
-                                ),
-                              )
-                            : ListView.separated(
-                                shrinkWrap: true,
-                                separatorBuilder: (_, __) => const SizedBox(height: 6),
-                                itemCount: filtered.length,
-                                itemBuilder: (itemCtx, index) {
-                                  final m = filtered[index];
-                    final isSelected = m.id == activeModel || (m.id.replaceFirst('cn:', '') == activeModel.replaceFirst('cn:', ''));
-                    return InkWell(
-                      borderRadius: BorderRadius.circular(10),
-                      onTap: () async {
-                        Navigator.pop(ctx);
-                        HapticFeedback.selectionClick();
-                        // 只切本会话。以前这里调的是 switchModel，它除了写会话级
-                        // 还顺手把全局默认也改了 —— 一个"给这个会话换模型"的动作
-                        // 不该影响别的会话。现在全局默认只在设置页改。
-                        final ok = await dsh.selectSessionModel(m.id, sessionId: currentSession?.sessionId);
-                        // [fix 2026-10-11] Guard the OUTER sheet/chat context,
-                        // not the list item's: after Navigator.pop the item
-                        // context is unmounted, so the SnackBar here was dead
-                        // code and a failed switch showed no feedback at all.
-                        if (!itemCtx.mounted) return;
-                        if (ok) {
-                          // [feat 2026-10-17] 成功提示走**顶部**浮层，不用底部
-                          // SnackBar：底部是输入卡片/状态胶囊/审批 dock 的地盘，
-                          // 一条贴底的提示会盖住用户正在打的字（用户明确要求）。
-                          toast.show('本会话模型已切换为 ${m.name}（立即生效）');
-                        } else {
-                          // 失败仍然留在原地可见：这里不自己消失。
-                          ScaffoldMessenger.of(itemCtx).showSnackBar(
-                            SnackBar(
-                              content: Text('模型切换失败: ${dsh.lastError.isNotEmpty ? dsh.lastError : "请检查网络或授权码"}'),
-                              backgroundColor: itemCtx.c.danger,
-                              behavior: SnackBarBehavior.floating,
-                            ),
-                          );
-                        }
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                        decoration: BoxDecoration(
-                          color: isSelected ? context.c.accent.withOpacity(0.08) : context.c.surface,
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(
-                            color: isSelected ? context.c.accent : context.c.border,
-                            width: isSelected ? 1.5 : 1.0,
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            Icon(
-                              isSelected ? Icons.radio_button_checked : Icons.radio_button_off,
-                              color: isSelected ? context.c.accent : context.c.textTertiary,
-                              size: 18,
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    m.name,
-                                    style: TextStyle(
-                                      color: isSelected ? context.c.accent : context.c.textPrimary,
-                                      fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
-                                      fontSize: 14,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    '${m.id} | 上下文: ${(m.contextWindow ?? 0) ~/ 1000}k',
-                                    style: TextStyle(fontSize: 11.5, color: context.c.textSecondary),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            if (isSelected)
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                                decoration: BoxDecoration(
-                                  color: context.c.accent.withOpacity(0.12),
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                                child: Text('使用中', style: TextStyle(color: context.c.accent, fontSize: 11, fontWeight: FontWeight.w600)),
-                              ),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
-            ],
-          );
-        },
-      ),
-    ],
-          ),
-        ),
-      );
+    models: modelList,
+    selectedModelId: activeModel,
+    title: '切换大语言模型',
+    subtitle: currentSession != null ? '当前会话：${currentSession.title}' : null,
+    note: '只影响本会话，立即生效；全局默认模型在「设置」页改。',
+    onPick: (m) async {
+      HapticFeedback.selectionClick();
+      // 只切本会话。以前这里调的是 switchModel，它除了写会话级还顺手把全局
+      // 默认也改了 —— 一个"给这个会话换模型"的动作不该影响别的会话。
+      final ok = await dsh.selectSessionModel(m.id, sessionId: currentSession?.sessionId);
+      if (ok) {
+        // [feat 2026-10-17] 成功提示走**顶部**浮层：底部是输入卡片/审批 dock
+        // 的地盘，贴底的提示会盖住用户正在打的字（用户明确要求）。
+        toast.show('本会话模型已切换为 ${m.name}（立即生效）');
+      } else {
+        // 失败留在屏幕上，不自己消失。
+        messenger.clearSnackBars();
+        messenger.showSnackBar(SnackBar(
+          content: Text('模型切换失败: ${dsh.lastError.isNotEmpty ? dsh.lastError : "请检查网络或授权码"}'),
+          backgroundColor: danger,
+          behavior: SnackBarBehavior.floating,
+        ));
+      }
     },
   );
 }

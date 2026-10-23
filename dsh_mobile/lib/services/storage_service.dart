@@ -334,6 +334,38 @@ class StorageService {
     return profiles;
   }
 
+  /// 给一个新网关挑一个**不重复**的别名（[feat 2026-10-22]）。
+  ///
+  /// 为什么需要：用户可能挂着两台电脑走同一个域名（或同一台电脑的两个网关
+  /// 端口），别名一样时下拉框里两行字完全分不出来 —— 那正好是"需要加个别名"
+  /// 的原始诉求。这里只在**创建**新网关时兜底：用户自己填了名字就照用，没填就
+  /// 用 `主机:端口`，撞名就加 `(2)`、`(3)`。
+  ///
+  /// @param profiles 现有列表（调用方已经加载过，不必再读一次盘）。
+  /// @param desired 用户填的别名（可空）。
+  /// @param fallback 没填时的候选（通常是 `host:port`）。
+  /// @param excludeId 编辑已有项时排除它自己，避免"改名成自己"被判成重复。
+  static String uniqueProfileName(
+    List<ServerConfig> profiles,
+    String desired, {
+    required String fallback,
+    String? excludeId,
+  }) {
+    final base = (desired.trim().isNotEmpty ? desired.trim() : fallback.trim());
+    final seed = base.isEmpty ? '未命名网关' : base;
+    final taken = profiles
+        .where((p) => excludeId == null || p.id != excludeId)
+        .map((p) => p.name.trim().toLowerCase())
+        .where((n) => n.isNotEmpty)
+        .toSet();
+    if (!taken.contains(seed.toLowerCase())) return seed;
+    for (var n = 2; n < 1000; n += 1) {
+      final candidate = '$seed ($n)';
+      if (!taken.contains(candidate.toLowerCase())) return candidate;
+    }
+    return '$seed (${DateTime.now().millisecondsSinceEpoch})';
+  }
+
   static Future<List<ServerConfig>> deleteProfile(String id) async {
     final profiles = await loadProfiles();
     profiles.removeWhere((p) => p.id == id);

@@ -39,7 +39,11 @@ export function configurePersistence({ verifyToken: vt, findDeviceByToken: fdt }
 }
 
 
-export const BRIDGE_VERSION = '1.14.0';
+// 1.15.0：新增 /api/mobile/workspaces/{roots,browse}（新建工作区改成点选）、
+// settings 里每条模型带 provider/providerLabel、runbook 在 Windows 用内置 ls。
+// 1.15.1：密钥轮换自愈（RPC 401 时重读密钥并重试一次）+ 诊断探针改用无 id 的
+// session/modelCatalog，并区分"通道没通"与"引擎有应答"。
+export const BRIDGE_VERSION = '1.15.1';
 export const MAX_BODY_SIZE = 2 * 1024 * 1024; // 2MB defensive payload limit (F4.1)
 export const HEARTBEAT_INTERVAL_MS = 30000;
 
@@ -175,6 +179,71 @@ export function createRpcCaller({ dshPort, cookieFactory, timeoutMs = 10000 }) {
       req.write(postData);
       req.end();
     });
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * 密钥轮换自愈
+ * ------------------------------------------------------------------ */
+
+/**
+ * 这次 RPC 失败是不是"引擎不认我们的签名"（也就是密钥过期）？
+ *
+ * 两种真实形状都出现过：
+ *   * HTTP 401 直接回文本 `unauthorized` → 解析失败，消息是
+ *     `Failed to parse RPC response: unauthorized`（本机 2026-10-23 实测）；
+ *   * 引擎回 JSON 里的 `{error:{message:'unauthorized'}}`。
+ * 只认这两个词，别把别的解析失败也当成密钥问题（否则会拿无关错误反复重载）。
+ */
+export function isUnauthorizedRpcError(err) {
+  const msg = String(err?.message || err || '');
+  return /unauthorized|\b401\b/i.test(msg);
+}
+
+/**
+ * 给 unary RPC 包一层"密钥过期就重读并重试一次"。
+ *
+ * ## 为什么需要
+ *
+ * 2026-10-23 实测事故：dsh web 进程 00:26 启动，网关在 `apply()` 里把
+ * `~/.dsh/.credentials.yaml` 的 secret 读进 cookieFactory；10:19 那个文件被重写
+ * （密钥轮换），从此网关每一次 RPC 都是 401 —— 手机端表现为**会话里只剩第一句
+ * 话**（历史走不到 `session/page`，只能掉到投影缓存的 titleInput 兜底），事件流
+ * 也断着。唯一的解药是重启 dsh web，而用户不可能靠重启修每一次轮换。
+ *
+ * ## 边界
+ *
+ *   * 只重试**一次**：同一个请求不会被重放成一段循环；
+ *   * 只有密钥**确实变了**才重试（`reloadCredentials()` 返回 false 就如实抛原错）;
+ *   * 其他错误一律不碰 —— 网络抖动、方法不存在、参数错都不该触发重载。
+ *
+ * @param deps.makeClient - () => (method, payload) => Promise，每次用当前密钥新造一个客户端
+ * @param deps.reloadCredentials - () => boolean，重读密钥；返回是否真的换了
+ * @param deps.onReloaded - 可选回调（打日志 / 审计），只在真的重载后触发
+ */
+export function createRetryingRpcCaller({ makeClient, reloadCredentials, onReloaded }) {
+  if (typeof makeClient !== 'function') throw new TypeError('makeClient is required');
+  let client = makeClient();
+
+  return {
+    async call(method, payload) {
+      try {
+        return await client(method, payload);
+      } catch (err) {
+        if (typeof reloadCredentials !== 'function' || !isUnauthorizedRpcError(err)) throw err;
+        let changed = false;
+        try {
+          changed = reloadCredentials() === true;
+        } catch (reloadErr) {
+          throw err;
+        }
+        // 密钥没变 = 问题不在密钥上，原样抛：不假装重试过。
+        if (!changed) throw err;
+        try { onReloaded?.(); } catch { /* 回调不该影响这次调用 */ }
+        client = makeClient();
+        return client(method, payload);
+      }
+    }
   };
 }
 

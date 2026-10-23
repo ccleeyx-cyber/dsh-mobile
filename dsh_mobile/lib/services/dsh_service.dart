@@ -2744,6 +2744,66 @@ class DshService extends ChangeNotifier {
   // 说"已是最新"。改为直接指向 GitHub Releases（见 `AppVersion.releasesUrl`），
   // 「有没有新版」由发布页本身回答，没有可漂移的中间状态。
 
+  /// 新建工作区的目录选择器：起点清单（[feat 2026-10-22]）。
+  ///
+  /// 用户原话：「新建工作区目前是手写，这个要改成点选」。手写的真正问题是**路径
+  /// 只能靠记忆**：手机上看不见电脑的目录树，记错一层就建到错的地方。
+  ///
+  /// 起点由网关算（主目录 / 已登记工作区的上级 / 工作区本身 / 用到的盘），客户端
+  /// 不能自带参数扩面。老网关没有这个接口 → 返回 `ok:false`，弹层退回手动输入。
+  Future<WorkspaceDirListing> fetchWorkspaceRoots() async {
+    if (_currentConfig == null) {
+      return const WorkspaceDirListing(ok: false, error: '还没连上网关');
+    }
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces/roots');
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) {
+        return const WorkspaceDirListing(ok: false, error: '登录状态已失效，请重新配对');
+      }
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      final parsed = WorkspaceDirListing.fromJson(body);
+      if (res.statusCode == 200 && parsed.ok) return parsed;
+      return WorkspaceDirListing(
+        ok: false,
+        error: parsed.error.isNotEmpty ? parsed.error : '网关不支持目录选择（HTTP ${res.statusCode}）',
+      );
+    } catch (e) {
+      debugPrint('[DshService] fetchWorkspaceRoots error: $e');
+      return const WorkspaceDirListing(ok: false, error: '请求失败或超时');
+    }
+  }
+
+  /// 列出一层子目录（只读；只有目录，没有文件）。
+  Future<WorkspaceDirListing> browseWorkspaceDirs(String absPath) async {
+    if (_currentConfig == null) {
+      return const WorkspaceDirListing(ok: false, error: '还没连上网关');
+    }
+    try {
+      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces/browse')
+          .replace(queryParameters: {'path': absPath});
+      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      if (_checkResponseAuth(res)) {
+        return const WorkspaceDirListing(ok: false, error: '登录状态已失效，请重新配对');
+      }
+      final body = res.bodyBytes.isEmpty
+          ? const <String, dynamic>{}
+          : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
+      final parsed = WorkspaceDirListing.fromJson(body);
+      if (res.statusCode == 200 && parsed.ok) return parsed;
+      return WorkspaceDirListing(
+        ok: false,
+        path: absPath,
+        error: parsed.error.isNotEmpty ? parsed.error : '读不了这个目录（HTTP ${res.statusCode}）',
+      );
+    } catch (e) {
+      debugPrint('[DshService] browseWorkspaceDirs error: $e');
+      return WorkspaceDirListing(ok: false, path: absPath, error: '请求失败或超时');
+    }
+  }
+
   /// 新建工作区（[feat 2026-10-17]）。
   ///
   /// 返回 `null` 表示成功；否则是给用户看的失败说明（由调用方**内联**显示，

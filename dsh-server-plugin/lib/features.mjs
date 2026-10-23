@@ -1398,14 +1398,29 @@ export function redactDiagnosticDetail(text) {
 }
 
 /**
+ * 这个 RPC 失败是"通道/鉴权没通"，还是"引擎有应答，只是它不认这个请求"？
+ *
+ * [fix 2026-10-23] 实测踩到：密钥轮换后网关 401，`engine_rpc` 报
+ * `Failed to parse RPC response: unauthorized`（真的 down，判断正确）；修好之后
+ * 探针用了一个不存在的假会话号，引擎回答 `session "diagnostics-probe" not found`
+ * —— 这**证明通道是通的**，却被旧实现判成 FAIL。诊断页最忌讳的就是把健康的组件
+ * 标红：用户会去修一个没坏的东西。
+ *
+ * 所以：传输/鉴权类错误才算 down，其余（域错误、参数错、找不到会话）都算"通"。
+ */
+export function isTransportFailure(message) {
+  const text = String(message || '');
+  return /unauthorized|\b401\b|\b403\b|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|socket hang up|Failed to parse RPC response|timed out|timeout/i
+    .test(text);
+}
+
+/**
  * Probe the engine's live RPC surface with the cheapest real call.
  *
- * `session/page` was chosen over `workspace/list` because it is the RPC the
- * bridge already speaks with a shape we know is accepted (a past-cursor
- * rejection is itself proof the engine answered), and it does not depend on
- * any workspace being registered. Any answer — including an engine-side
- * rejection — counts as "the engine is reachable"; only transport failure
- * (ECONNREFUSED / timeout / parse error) counts as down.
+ * 用 `session/modelCatalog` 而不是早先的 `session/page`：后者必须编一个假会话号
+ * （`diagnostics-probe`），而引擎对不存在的会话会回错误 —— 于是"通道通了"和
+ * "通道断了"在结果上长得一样。modelCatalog 不需要任何 id，是真正的无副作用探针。
+ * 万一它也被拒绝（老引擎没有这个 RPC），只要错误不是传输/鉴权类，仍然算通。
  *
  * @param deps - `{ callDshRpc, timeoutMs? }`.
  * @returns `{ ok, detail, ms }`.
@@ -1416,15 +1431,16 @@ export async function probeEngineRpc({ callDshRpc, timeoutMs = 4000 } = {}) {
     return { ok: false, detail: 'rpc caller unavailable', ms: 0 };
   }
   try {
-    // `throughSeq: 0` is a valid wire field for a REQUIRED number; an engine
-    // that is alive answers (possibly with an input error, which still proves
-    // the transport + gateway are up).
-    await withTimeout(callDshRpc('session/page', {
-      args: { request: { address: { kind: 'session', sessionId: 'diagnostics-probe' }, throughSeq: 0, maxMessages: 1 } }
-    }), timeoutMs);
+    await withTimeout(callDshRpc('session/modelCatalog', { args: {} }), timeoutMs);
     return { ok: true, detail: 'ok', ms: Date.now() - started };
   } catch (err) {
-    return { ok: false, detail: redactDiagnosticDetail(err?.message || 'unreachable'), ms: Date.now() - started };
+    const message = String(err?.message || 'unreachable');
+    if (!isTransportFailure(message)) {
+      // 引擎有应答（哪怕是个错）：通道本身是好的，别把健康的组件标红。
+      const short = redactDiagnosticDetail(message).slice(0, 60);
+      return { ok: true, detail: `ok（引擎有应答：${short}）`, ms: Date.now() - started };
+    }
+    return { ok: false, detail: redactDiagnosticDetail(message), ms: Date.now() - started };
   }
 }
 

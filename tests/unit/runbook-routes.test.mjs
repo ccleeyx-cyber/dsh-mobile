@@ -109,8 +109,30 @@ describe('runbook routes', () => {
     assert.equal(r.status, 404);
   });
 
-  it('高危条目不带 confirm → 409，且不执行', async () => {
+  it('默认模板的「目录概览」（ls -lt）在 Windows 上也能跑出结果', async () => {
+    // [fix 2026-10-22] 用户报告的「目录概览执行会显示执行失败」。
+    // 这里走完整的 HTTP → 执行 → 回应链路：不带 sessionId 时 cwd 回落到
+    // DSH_HOME（临时目录，里面有 mobile-access/runbooks.yaml），目录一定存在。
     const file = path.join(TMP_HOME, 'mobile-access', 'runbooks.yaml');
+    fs.writeFileSync(file, [
+      'runbooks:',
+      '  - name: 目录概览',
+      '    description: 当前目录最近修改的 15 个条目',
+      '    command: ls -lt',
+      '    danger: low',
+      '    outputTail: 20',
+      ''
+    ].join('\n'), 'utf8');
+
+    const r = await req('/api/mobile/runbooks/run', { method: 'POST', body: { id: 'rb_1' } });
+    assert.equal(r.status, 200);
+    assert.equal(r.parsed.ok, true, `失败原因：${r.parsed.error}`);
+    assert.equal(r.parsed.exitCode, 0);
+    // 输出里至少有这个临时目录里的东西
+    assert.match(r.parsed.outputTail, /mobile-access/);
+  });
+
+  it('高危条目不带 confirm → 409，且不执行', async () => {    const file = path.join(TMP_HOME, 'mobile-access', 'runbooks.yaml');
     fs.writeFileSync(file, [
       'runbooks:',
       '  - name: 危险操作',

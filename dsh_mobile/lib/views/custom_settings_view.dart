@@ -15,6 +15,7 @@ import 'settings/push_settings_view.dart';
 import 'settings/remote_access_view.dart';
 import 'settings/settings_widgets.dart';
 import 'settings/snippets_view.dart';
+import 'widgets/model_picker_sheet.dart';
 
 /// 设置页 —— 现在是一个**入口式 hub**，不再是一张全量铺开的表单。
 ///
@@ -444,160 +445,57 @@ class CustomSettingsView extends StatelessWidget {
     );
   }
 
+  /// 全局默认模型选择 —— [feat 2026-10-22] 与对话页共用同一个**按供应商分组**的
+  /// 弹层（`model_picker_sheet.dart`），只是把"选中之后做什么"换成改全局默认。
   void _showModelSwitchSheet(BuildContext context, DshService dsh) {
     final settings = dsh.settings;
     final currentModel = settings?.currentModel ?? 'cn:deepseek-v4.1-flash';
+    final messenger = ScaffoldMessenger.of(context);
+    final success = context.c.success;
     final modelList = (settings != null && settings.availableModels.isNotEmpty)
         ? settings.availableModels
         : [
-            ModelItem(id: 'cn:deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1000000, maxTokens: 16384),
-            ModelItem(id: 'cn:deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1000000, maxTokens: 32768),
-            ModelItem(id: 'cn:kimi-k3-1', name: 'Kimi K3.1', contextWindow: 1000000, maxTokens: 32768),
+            ModelItem(
+                id: 'cn:deepseek-v4.1-flash',
+                name: 'DeepSeek V4.1 Flash',
+                contextWindow: 1000000,
+                maxTokens: 16384,
+                provider: 'cn',
+                providerLabel: 'cn'),
+            ModelItem(
+                id: 'cn:deepseek-v4-pro',
+                name: 'DeepSeek V4 Pro',
+                contextWindow: 1000000,
+                maxTokens: 32768,
+                provider: 'cn',
+                providerLabel: 'cn'),
+            ModelItem(
+                id: 'cn:kimi-k3-1',
+                name: 'Kimi K3.1',
+                contextWindow: 1000000,
+                maxTokens: 32768,
+                provider: 'cn',
+                providerLabel: 'cn'),
           ];
 
-    String filter = '';
-
-    showModalBottomSheet(
+    showModelPickerSheet(
       context: context,
-      isScrollControlled: true,
-      backgroundColor: context.c.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Center(
-                  child: Container(
-                    width: 40,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: context.c.border,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: AppSpace.xl),
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: context.c.accent.withOpacity(0.1),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Icon(Icons.smart_toy_outlined, color: context.c.accent, size: 20),
-                    ),
-                    const SizedBox(width: 10),
-                    Text(
-                      '选择大语言模型',
-                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: context.c.textPrimary),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: AppSpace.l + 2),
-                StatefulBuilder(
-                  builder: (context, setModalState) {
-                    return Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        TextField(
-                          decoration: InputDecoration(
-                            hintText: '搜索模型（如 deepseek, glm, gpt, qwen…）',
-                            hintStyle: TextStyle(fontSize: 13, color: context.c.textTertiary),
-                            prefixIcon: Icon(Icons.search, size: 20, color: context.c.textSecondary),
-                            filled: true,
-                            fillColor: context.c.surfaceMuted,
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(8),
-                              borderSide: BorderSide.none,
-                            ),
-                          ),
-                          onChanged: (val) {
-                            setModalState(() {
-                              filter = val.trim().toLowerCase();
-                            });
-                          },
-                        ),
-                        const SizedBox(height: 10),
-                        ConstrainedBox(
-                          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.5),
-                          child: Builder(
-                            builder: (context) {
-                              final filtered = modelList.where((m) {
-                                if (filter.isEmpty) return true;
-                                return m.name.toLowerCase().contains(filter) || m.id.toLowerCase().contains(filter);
-                              }).toList();
-
-                              if (filtered.isEmpty) {
-                                return Padding(
-                                  padding: const EdgeInsets.symmetric(vertical: 24),
-                                  child: Center(
-                                    child: Text('未找到匹配的模型', style: TextStyle(color: context.c.textTertiary)),
-                                  ),
-                                );
-                              }
-
-                              return ListView.separated(
-                                shrinkWrap: true,
-                                separatorBuilder: (_, __) => const SizedBox(height: 6),
-                                itemCount: filtered.length,
-                                itemBuilder: (context, index) {
-                                  final m = filtered[index];
-                                  final isSelected = m.id == currentModel ||
-                                      (m.id.replaceFirst('cn:', '') == currentModel.replaceFirst('cn:', ''));
-                                  return ListTile(
-                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                                    tileColor: isSelected ? context.c.accent.withOpacity(0.08) : null,
-                                    title: Text(
-                                      m.name,
-                                      style: TextStyle(
-                                        color: isSelected ? context.c.accent : context.c.textPrimary,
-                                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                                      ),
-                                    ),
-                                    subtitle: Text(
-                                      'ID: ${m.id} | 上下文: ${(m.contextWindow ?? 0) ~/ 1000}k',
-                                      style: TextStyle(fontSize: 12, color: context.c.textSecondary),
-                                    ),
-                                    trailing: isSelected ? Icon(Icons.check_circle, color: context.c.accent) : null,
-                                    onTap: () async {
-                                      Navigator.pop(ctx);
-                                      // 设置页改的是**全局默认**，不是某个会话。
-                                      final ok = await dsh.setDefaultModel(m.id);
-                                      if (ok && context.mounted) {
-                                        ScaffoldMessenger.of(context).clearSnackBars();
-                                        ScaffoldMessenger.of(context).showSnackBar(
-                                          SnackBar(
-                                            // 写明生效范围与时机：App 新会话立即生效；
-                                            // 引擎全局默认要到重启 dsh web 才对齐。
-                                            content: Text(
-                                                '已将全局默认模型设为 ${m.name}（App 新建会话立即生效；引擎全局对齐需重启 dsh web）'),
-                                            backgroundColor: context.c.success,
-                                            behavior: SnackBarBehavior.floating,
-                                            duration: const Duration(seconds: 2),
-                                          ),
-                                        );
-                                      }
-                                    },
-                                  );
-                                },
-                              );
-                            },
-                          ),
-                        ),
-                      ],
-                    );
-                  },
-                ),
-              ],
-            ),
+      models: modelList,
+      selectedModelId: currentModel,
+      title: '全局默认模型',
+      subtitle: 'App 新建会话时用它',
+      note: '引擎侧的全局默认要重启 dsh web 才对齐；App 新会话立即生效。',
+      onPick: (m) async {
+        // 设置页改的是**全局默认**，不是某个会话。
+        final ok = await dsh.setDefaultModel(m.id);
+        if (!ok) return;
+        messenger.clearSnackBars();
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text('全局默认已设为 ${m.name}（App 新建会话生效；引擎对齐需重启 dsh web）'),
+            backgroundColor: success,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 2),
           ),
         );
       },

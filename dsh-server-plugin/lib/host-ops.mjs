@@ -316,9 +316,87 @@ export function readTextFile(absFile, { maxBytes = DEFAULT_MAX_READ_BYTES } = {}
 }
 
 /* ------------------------------------------------------------------ *
+ * 2b. Directory picker for "new workspace"
+ * ------------------------------------------------------------------ *
+ *
+ * 与第 2 节的区别是**范围**：`listDirectory` 只服务于会话工作区内的只读浏览
+ * （`resolveConfined` 会拒绝任何绝对路径）。"新建工作区"要选的恰恰是**还没成为
+ * 工作区**的目录，所以它必须在工作区之外也能看 —— 但绝不能变成"整盘随便读"。
+ *
+ * 边界由调用方显式给的一组 **roots** 决定：只有落在这几个根里的路径才允许列出，
+ * 且只列**子目录名**（不读文件内容、不回大小以外的任何信息）。roots 本身由网关
+ * 从"主目录 + 已登记工作区 + 它们所在的盘"算出来，客户端无法扩面。
+ */
+
+/** 判断 `target` 是否落在 roots 里任意一个根之内（每个 root 都是一个包含关系）。 */
+export function isUnderAnyRoot(roots, target) {
+  if (!Array.isArray(roots) || roots.length === 0) return false;
+  for (const root of roots) {
+    if (typeof root !== 'string' || !root.trim()) continue;
+    if (isInside(root, target)) return true;
+  }
+  return false;
+}
+
+/**
+ * 只列子目录（给目录选择器用）。
+ *
+ * 刻意不返回文件：这个接口的用途是"选一个目录当工作区"，把文件也塞进来只会让
+ * 手机上多出一堆点不动的行，并且顺带把文件名泄露给设备。
+ *
+ * @param absDir - 绝对目录（调用方已用它做 roots 校验）。
+ * @param options.maxEntries - 返回行数上限。
+ * @param options.skipHidden - 跳过 `.` 开头的目录（默认 true）。
+ * @returns `{ ok, dirs, truncated, total }` 或 `{ ok:false, reason }`。
+ */
+export function listSubdirectories(absDir, { maxEntries = 300, skipHidden = true } = {}) {
+  let dirents;
+  try {
+    dirents = fs.readdirSync(absDir, { withFileTypes: true });
+  } catch (err) {
+    const code = err?.code;
+    if (code === 'ENOENT') return { ok: false, reason: 'not-found', dirs: [], truncated: false, total: 0 };
+    if (code === 'ENOTDIR') return { ok: false, reason: 'not-a-directory', dirs: [], truncated: false, total: 0 };
+    if (code === 'EACCES' || code === 'EPERM') return { ok: false, reason: 'permission-denied', dirs: [], truncated: false, total: 0 };
+    return { ok: false, reason: 'unreadable', dirs: [], truncated: false, total: 0 };
+  }
+
+  const rows = [];
+  for (const dirent of dirents) {
+    if (skipHidden && dirent.name.startsWith('.')) continue;
+    let isDir = dirent.isDirectory();
+    if (!isDir && dirent.isSymbolicLink()) {
+      // 指向目录的链接是可以当工作区用的，但真实的类型必须一次 stat 确认。
+      try { isDir = fs.statSync(path.join(absDir, dirent.name)).isDirectory(); } catch { isDir = false; }
+    }
+    if (!isDir) continue;
+    rows.push({ name: dirent.name, path: path.join(absDir, dirent.name) });
+  }
+
+  rows.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+  const cap = Math.max(1, Math.min(Number(maxEntries) || 300, 2000));
+  return {
+    ok: true,
+    dirs: rows.length > cap ? rows.slice(0, cap) : rows,
+    truncated: rows.length > cap,
+    total: rows.length
+  };
+}
+
+/** Windows 上仍存在的盘符根（`C:\`、`D:\` …），用于给选择器提供起点。 */
+export function existingDriveRoots(platform = process.platform) {
+  if (platform !== 'win32') return ['/'];
+  const out = [];
+  for (let i = 65; i <= 90; i += 1) {
+    const drive = `${String.fromCharCode(i)}:\\`;
+    try { if (fs.existsSync(drive)) out.push(drive); } catch { /* 忽略不可读盘符 */ }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
  * 3. Git repository discovery
  * ------------------------------------------------------------------ */
-
 const DEFAULT_MAX_REPO_CANDIDATES = 12;
 
 /** True when `dir` is the root of a repository (worktrees use a `.git` file). */

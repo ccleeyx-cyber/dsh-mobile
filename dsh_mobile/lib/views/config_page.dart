@@ -24,6 +24,10 @@ class _ConfigPageState extends State<ConfigPage> {
   // No pre-filled token: the gateway generates a random one on first install,
   // so a hard-coded default here would only mislead the user.
   final _tokenController = TextEditingController();
+
+  /// 别名（[feat 2026-10-22]）：多台电脑/多个网关走同一个域名时，下拉框里两行
+  /// 字完全一样就分不出来 —— 这个字段就是给它们起名的入口。
+  final _nameController = TextEditingController();
   final _npsController = TextEditingController(text: ''); // 兼容旧数据保留，UI 已移除
   bool _useHttps = false;
   bool _isTesting = false;
@@ -55,13 +59,14 @@ class _ConfigPageState extends State<ConfigPage> {
 
   @override
   void dispose() {
-    // 本页持有 5 个 TextEditingController，此前完全没有 dispose() 覆写。
+    // 本页持有 6 个 TextEditingController，此前完全没有 dispose() 覆写。
     // 每个 controller 都带 ChangeNotifier 监听者与一条原生文本输入连接，
-    // 而 ConfigPage 可从 MainShell 反复进入，所以是每次进入泄漏 5 个。
+    // 而 ConfigPage 可从 MainShell 反复进入，所以是每次进入泄漏 6 个。
     _hostController.dispose();
     _portController.dispose();
     _tokenController.dispose();
     _npsController.dispose();
+    _nameController.dispose();
     super.dispose();
   }
 
@@ -104,6 +109,7 @@ class _ConfigPageState extends State<ConfigPage> {
   }
 
   void _fillForm(ServerConfig cfg) {
+    _nameController.text = cfg.name;
     _hostController.text = cfg.host;
     _portController.text = cfg.port.toString();
     _tokenController.text = cfg.token;
@@ -112,12 +118,20 @@ class _ConfigPageState extends State<ConfigPage> {
     _pairedDeviceId = cfg.deviceId;
   }
 
+  /// 「主机:端口」—— 别名留空时给列表与表单用的兜底标识。
+  String get _addrLabel {
+    final host = _hostController.text.trim();
+    if (host.isEmpty) return '';
+    return '$host:${_portController.text.trim()}';
+  }
+
   ServerConfig _buildConfig() {
     return ServerConfig(
       // 带上当前选中的身份，这样「保存并进入聊天」是修改这个网关，
       // 而不是悄悄新建一个重复项。
       id: _activeProfileId ?? '',
-      name: _activeName,
+      // 别名来自表单，不再是"另存时弹窗问一次"——同域名多台电脑靠它区分。
+      name: _nameController.text.trim(),
       host: _hostController.text.trim(),
       port: int.tryParse(_portController.text.trim()) ?? 3088,
       token: _tokenController.text.trim(),
@@ -157,12 +171,16 @@ class _ConfigPageState extends State<ConfigPage> {
 
   Future<void> _saveAsNewProfile() async {
     if (!_formKey.currentState!.validate()) return;
-    final name = await _promptName(title: '另存为新网关', initial: _hostController.text.trim());
-    if (name == null || !mounted) return;
 
     final cfg = _buildConfig();
     cfg.id = ''; // 强制分配新身份，否则会覆盖正在编辑的那个
-    cfg.name = name;
+    // 别名在表单里已经填好了，这里不再弹一次窗问名字：同一个信息问两遍是多余
+    // 的摩擦，而且原来的弹窗默认值就是 host，同域名两台机器会得到同一个名字。
+    cfg.name = StorageService.uniqueProfileName(
+      _profiles,
+      _nameController.text,
+      fallback: _addrLabel,
+    );
     final profiles = await StorageService.upsertProfile(cfg);
     if (!mounted) return;
 
@@ -170,6 +188,7 @@ class _ConfigPageState extends State<ConfigPage> {
       _profiles = profiles;
       _activeProfileId = cfg.id;
       _activeName = cfg.name;
+      _nameController.text = cfg.name;
     });
     _toast('已保存为「${cfg.displayName}」，点「保存并进入聊天」即可连接');
   }
@@ -184,6 +203,7 @@ class _ConfigPageState extends State<ConfigPage> {
     setState(() {
       _profiles = profiles;
       _activeName = name;
+      _nameController.text = name;
     });
   }
 
@@ -239,7 +259,7 @@ class _ConfigPageState extends State<ConfigPage> {
           controller: ctrl,
           autofocus: true,
           decoration: const InputDecoration(
-            labelText: '网关名称',
+            labelText: '别名',
             hintText: '如 家里台式机 / 公司笔记本 / nps 隧道',
           ),
         ),
@@ -357,12 +377,19 @@ class _ConfigPageState extends State<ConfigPage> {
       return;
     }
 
+    // 别名：扫码时就顺手带上电脑的主机名（配对载荷里的 name，网关用
+    // os.hostname() 填的）。多台电脑走同一个域名时，这是**不用手打**就能区分
+    // 它们的最省事的信息源。用户已经填过别名就不覆盖。
+    final hostName = payload?['name']?.toString().trim() ?? '';
     setState(() {
       _hostController.text = usedHost ?? firstHost;
       _portController.text = usedPort.toString();
       _useHttps = usedHttps;
       _tokenController.text = token!;
       _pairedDeviceId = deviceId ?? '';
+      if (_nameController.text.trim().isEmpty) {
+        _nameController.text = hostName.isNotEmpty ? hostName : '${usedHost ?? firstHost}:$usedPort';
+      }
     });
     _toast('配对成功${deviceId != null ? "（设备 $deviceId）" : ""}，点「保存并进入聊天」完成连接');
   }
@@ -400,15 +427,45 @@ class _ConfigPageState extends State<ConfigPage> {
                             style: TextStyle(fontSize: 13, color: context.c.textTertiary))
                         : DropdownButton<String>(
                             isExpanded: true,
-                            isDense: true,
                             value: selected,
                             hint: const Text('选择已保存的网关', style: TextStyle(fontSize: 13)),
                             underline: const SizedBox.shrink(),
                             style: TextStyle(fontSize: 13.5, color: context.c.textPrimary),
+                            // 展开项两行（别名 + 地址），关闭态只显示别名一行 —— 顶部
+                            // 这一行还要和重命名/删除两个按钮并排，两行会把它顶高。
+                            itemHeight: 56,
+                            selectedItemBuilder: (ctx) => _profiles
+                                .map((p) => Align(
+                                      alignment: Alignment.centerLeft,
+                                      child: Text(p.displayName,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                              fontSize: 13.5, color: context.c.textPrimary)),
+                                    ))
+                                .toList(),
                             items: _profiles
                                 .map((p) => DropdownMenuItem<String>(
                                       value: p.id,
-                                      child: Text(p.displayName, overflow: TextOverflow.ellipsis),
+                                      // 两行：别名在上、地址在下。同域名两台电脑时
+                                      // 别名能区分它们；别名万一重了，地址还能兜底。
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        mainAxisAlignment: MainAxisAlignment.center,
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(p.displayName,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                  fontSize: 13.5, color: context.c.textPrimary)),
+                                          Text('${p.cleanHost}:${p.cleanPort}',
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                  fontSize: 10.5, color: context.c.textTertiary)),
+                                        ],
+                                      ),
                                     ))
                                 .toList(),
                             onChanged: _onProfileSelected,
@@ -534,6 +591,16 @@ class _ConfigPageState extends State<ConfigPage> {
     if (!_formKey.currentState!.validate()) return;
 
     final config = _buildConfig();
+    // 新建（还没有身份）时把别名补成一个不重复的值：留空就退到「主机:端口」，
+    // 撞名就加 (2) —— 下拉框里两行一模一样的字是这次需求的起因。
+    if (config.name.trim().isEmpty || config.id.isEmpty) {
+      config.name = StorageService.uniqueProfileName(
+        _profiles,
+        _nameController.text,
+        fallback: _addrLabel,
+        excludeId: config.id.isEmpty ? null : config.id,
+      );
+    }
     await StorageService.saveConfig(config);
 
     if (!mounted) return;
@@ -591,6 +658,23 @@ class _ConfigPageState extends State<ConfigPage> {
                 ),
               ),
               const SizedBox(height: 20),
+              // [feat 2026-10-22] 别名放第一位：多台电脑走同一个域名时，这是下拉框
+              // 里唯一能区分它们的字段。留空会自动退到「主机:端口」。
+              TextFormField(
+                key: const ValueKey('config-alias'),
+                controller: _nameController,
+                textInputAction: TextInputAction.next,
+                decoration: const InputDecoration(
+                  labelText: '别名（便于区分多台电脑）',
+                  hintText: '如 家里台式机 / 公司笔记本 / 机房-01',
+                  prefixIcon: Icon(Icons.badge_outlined),
+                  border: OutlineInputBorder(),
+                  helperText: '留空则用「地址:端口」代替',
+                ),
+                maxLength: 30,
+                buildCounter: (context, {required currentLength, required isFocused, maxLength}) => null,
+              ),
+              const SizedBox(height: 16),
               TextFormField(
                 controller: _hostController,
                 decoration: const InputDecoration(
@@ -800,3 +884,4 @@ class _QrScanPageState extends State<_QrScanPage> {
     );
   }
 }
+

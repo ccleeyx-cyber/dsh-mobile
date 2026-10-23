@@ -155,3 +155,107 @@ class Workspace {
     'sessions': sessions.map((s) => s.toJson()).toList(),
   };
 }
+
+/// 目录选择器的一个**起点**（`GET /api/mobile/workspaces/roots`）。
+///
+/// [kind] 是来源，客户端据此分组显示与排序：`parent`（已登记工作区的上级）、
+/// `home`（主目录）、`workspace`（已登记工作区本身）、`drive`（盘符根）。
+/// 网关只开放这几类位置 —— 客户端拿不到"任意路径"的能力。
+class WorkspaceRoot {
+  final String path;
+  final String label;
+  final String kind;
+
+  const WorkspaceRoot({required this.path, required this.label, required this.kind});
+
+  factory WorkspaceRoot.fromJson(Map<String, dynamic> json) => WorkspaceRoot(
+        path: json['path']?.toString() ?? '',
+        label: json['label']?.toString() ?? json['path']?.toString() ?? '',
+        kind: json['kind']?.toString() ?? '',
+      );
+}
+
+/// 目录选择器里的一行子目录。
+class WorkspaceDirEntry {
+  final String name;
+  final String path;
+
+  const WorkspaceDirEntry({required this.name, required this.path});
+
+  factory WorkspaceDirEntry.fromJson(Map<String, dynamic> json) {
+    final p = json['path']?.toString() ?? '';
+    return WorkspaceDirEntry(
+      name: json['name']?.toString() ?? p,
+      path: p,
+    );
+  }
+}
+
+/// 目录选择器的一层列表（`GET /api/mobile/workspaces/browse?path=`）。
+///
+/// 只有**子目录**（网关侧就不回文件）：选一个目录当工作区用不到文件名。
+class WorkspaceDirListing {
+  final bool ok;
+  final String error;
+
+  /// 服务端绝对路径。null 表示"这次只问了起点，没要列表"。
+  final String? path;
+
+  /// 上一级；已到根（或上一级不在可浏览范围内）时为 null。
+  final String? parent;
+
+  /// 当前目录名（面包屑尾段）。
+  final String name;
+
+  final List<WorkspaceRoot> roots;
+
+  /// 子目录（只有目录：网关侧就不回文件）。
+  final List<WorkspaceDirEntry> entries;
+
+  final bool truncated;
+
+  /// 这个目录**已经是**一个登记过的工作区时给出它的 id/标题，否则 null。
+  final String? registeredWorkspaceId;
+  final String? registeredTitle;
+
+  const WorkspaceDirListing({
+    required this.ok,
+    this.error = '',
+    this.path,
+    this.parent,
+    this.name = '',
+    this.roots = const [],
+    this.entries = const [],
+    this.truncated = false,
+    this.registeredWorkspaceId,
+    this.registeredTitle,
+  });
+
+  /// 老网关没有这两个接口 → 404/失败时 [ok] 为 false，调用方退回手动输入。
+  bool get hasListing => ok && path != null;
+
+  factory WorkspaceDirListing.fromJson(Map<String, dynamic> json) {
+    final rawRoots = json['roots'] as List<dynamic>? ?? [];
+    final rawEntries = json['entries'] as List<dynamic>? ?? [];
+    final registered = json['registered'];
+    return WorkspaceDirListing(
+      ok: json['ok'] == true || json['ok'] == 'true',
+      error: json['error']?.toString() ?? '',
+      path: json['path']?.toString(),
+      parent: json['parent']?.toString(),
+      name: json['name']?.toString() ?? '',
+      roots: rawRoots
+          .whereType<Map>()
+          .map((r) => WorkspaceRoot.fromJson(Map<String, dynamic>.from(r)))
+          .toList(),
+      entries: rawEntries
+          .whereType<Map>()
+          .map((e) => WorkspaceDirEntry.fromJson(Map<String, dynamic>.from(e)))
+          .toList(),
+      truncated: json['truncated'] == true,
+      registeredWorkspaceId:
+          registered is Map ? registered['workspaceId']?.toString() : null,
+      registeredTitle: registered is Map ? registered['title']?.toString() : null,
+    );
+  }
+}

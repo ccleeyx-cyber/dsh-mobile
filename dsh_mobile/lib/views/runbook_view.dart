@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../../services/dsh_service.dart';
-import '../../theme/app_colors.dart';
-import '../../theme/app_spacing.dart';
+import '../services/dsh_service.dart';
+import '../theme/app_colors.dart';
+import '../theme/app_spacing.dart';
 
 /// 「Runbook」——把电脑上写好的排障命令一键搬到手机上（v1.35 / 3.2）。
 ///
@@ -128,10 +128,30 @@ class _RunbookViewState extends State<RunbookView> {
       return;
     }
     if (result['ok'] != true) {
-      setState(() => _error = result['error']?.toString() ?? '执行失败');
+      // [fix 2026-10-22] 优先用网关给的人话。以前只回 `code`（如
+      // `command-not-found`），这里读不到 error 就一律显示「执行失败」—— 用户报告
+      // 的「目录概览执行会显示执行失败」正是这条路径。
+      final text = result['error']?.toString() ?? '';
+      setState(() => _error = text.isNotEmpty ? text : _failureText(result['code']?.toString()));
       return;
     }
     await _showResult(name, result);
+  }
+
+  /// 兜底文案：网关没给 error 时按 code 说清楚是哪一类失败。
+  String _failureText(String? code) {
+    switch (code) {
+      case 'command-not-found':
+        return '电脑上找不到这个命令（Windows 没有 ls 之类的 POSIX 命令）';
+      case 'unknown-runbook':
+        return '这条 Runbook 已经不在文件里了（刷新看看）';
+      case 'no-executor':
+        return '网关没有可用的执行器';
+      case 'run-failed':
+        return '命令没有跑起来';
+      default:
+        return '执行失败${code != null && code.isNotEmpty ? '（$code）' : ''}';
+    }
   }
 
   Future<void> _showResult(String name, Map<String, dynamic> result) async {
@@ -163,6 +183,16 @@ class _RunbookViewState extends State<RunbookView> {
                 ],
               ),
               const SizedBox(height: 10),
+              // [fix 2026-10-22] Windows 上 `ls` 由网关内置实现（没启动进程）。
+              // 如实标一句，免得用户以为电脑上真的装了 ls。
+              if (result['builtin'] != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    '（由网关内置实现结果，未启动系统命令）',
+                    style: TextStyle(fontSize: 11, color: context.c.textTertiary),
+                  ),
+                ),
               Flexible(
                 child: Container(
                   width: double.infinity,

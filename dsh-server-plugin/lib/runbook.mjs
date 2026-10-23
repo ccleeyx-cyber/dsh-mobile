@@ -19,6 +19,7 @@
 // 测试全部注入假执行器，不跑真实命令（见 tests/unit/runbook.test.mjs）。
 
 import fs from 'node:fs';
+import path from 'node:path';
 
 /**
  * 默认白名单：只读、排障、低破坏面。
@@ -28,7 +29,13 @@ export const DEFAULT_ALLOWED_BINARIES = Object.freeze([
   'git', 'ls', 'cat', 'tail', 'head', 'grep', 'wc', 'date', 'whoami', 'df', 'du', 'ps', 'pwd', 'echo'
 ]);
 
-/** 默认模板：三条低危示例，用户可改可删。 */
+/**
+ * 默认模板：三条低危示例，用户可改可删。
+ *
+ * ⚠️ 模板里故意保留 `ls -lt`（POSIX 写法）而不是为 Windows 换成别的命令：
+ * 见下面的 `runBuiltin`。模板是**跨平台共用**的一份文本，用户在两台机器之间
+ * 同步同一份 runbooks.yaml 时不该看到命令被平台改写。
+ */
 export const DEFAULT_RUNBOOK_YAML = `# DSH Mobile Runbook
 # 每条：name / command / danger(low|high) / confirmRequired / outputTail
 # command 不要用管道、重定向或 && —— 需要组合逻辑请写成脚本再在这里调用。
@@ -87,6 +94,180 @@ export function tokenizeCommand(raw) {
   if (cur) argv.push(cur);
   if (argv.length === 0) return { ok: false, error: 'command 为空' };
   return { ok: true, argv };
+}
+
+/* ------------------------------------------------------------------ *
+ * 内置替身（Windows）：白名单里的 POSIX 命令在 Windows 上压根不存在
+ * ------------------------------------------------------------------ */
+
+/**
+ * 哪些命令需要内置替身。
+ *
+ * 背景（真机实测）：默认模板第三条「目录概览」是 `ls -lt`，而网关跑在 Windows
+ * 上，`execFile('ls')` 直接 ENOENT —— runRunbook 如实回 `command-not-found`，
+ * 手机端只显示「执行失败」。用户没有任何办法从屏幕上看出"这台机器没有 ls"，
+ * 于是这条**出厂自带**的条目在 Windows 上是一条永远失败的按钮。
+ *
+ * 三种修法里选了第三种：
+ *   1. 模板按平台改写 —— 用户已有的 runbooks.yaml 不会跟着变，等于没修；
+ *   2. 让用户改用 `dir` —— 但 `dir` 是 cmd 内建，必须开 shell，违反本模块铁律；
+ *   3. **网关里用 fs 实现一份只读的 ls** —— 不开 shell、不动用户文件、已有 YAML
+ *      原样生效。这里就是第 3 种。
+ *
+ * 只做只读动作：不删、不改、不跟随符号链接去写。输出有上限。
+ */
+const BUILTIN_BINARIES = Object.freeze({
+  ls: { label: 'ls', help: 'ls [-l] [-t] [-r] [-a] [目录]' }
+});
+
+/** 内置 ls 的输出上限：手机端只需要一屏概览，不是把整盘目录搬过去。 */
+const BUILTIN_LS_MAX_ENTRIES = 300;
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+/** `YYYY-MM-DD HH:mm` —— 与 `ls -lt` 的时间列可读性相当，且不依赖 locale。 */
+function formatStamp(ms) {
+  const d = new Date(Number(ms) || 0);
+  if (Number.isNaN(d.getTime())) return '????-??-?? ??:??';
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/**
+ * 解析 `ls` 的参数。
+ *
+ * 刻意只认 `-l/-t/-r/-a`：**不认识的旗标必须报错**，而不是被静默忽略。静默
+ * 忽略会让 `ls -lhS` 看起来成功了、实际只按名字排 —— 用户以为看到了按大小排序
+ * 的结果，那是谎报。
+ */
+function parseLsArgs(argv) {
+  const rest = argv.slice(1);
+  const flags = { long: false, byTime: false, reverse: false, all: false };
+  let target = '';
+  for (const arg of rest) {
+    if (arg.startsWith('-') && arg !== '-') {
+      for (const ch of arg.slice(1)) {
+        if (ch === 'l') flags.long = true;
+        else if (ch === 't') flags.byTime = true;
+        else if (ch === 'r') flags.reverse = true;
+        else if (ch === 'a') flags.all = true;
+        else if (ch === '1') { /* 单列输出，内置本来就单列 */ }
+        else return { ok: false, error: `ls 不支持的旗标 -${ch}（内置替身支持 -l -t -r -a）` };
+      }
+      continue;
+    }
+    if (target) return { ok: false, error: 'ls 只支持一个目录参数' };
+    target = arg;
+  }
+  return { ok: true, flags, target };
+}
+
+/**
+ * Windows 上 `ls` 的内置实现（只读）。
+ *
+ * @param cwd - 相对目录参数的基准（会话工作区）。
+ * @param argv - 已经过 tokenizeCommand 的 argv，argv[0] === 'ls'。
+ * @returns 与 runQuickCommand 同形状的结果对象，另带 `builtin: 'ls'`。
+ */
+export function runBuiltinLs(cwd, argv, { maxEntries = BUILTIN_LS_MAX_ENTRIES } = {}) {
+  const startedAt = Date.now();
+  const parsed = parseLsArgs(Array.isArray(argv) ? argv : []);
+  if (!parsed.ok) return { ok: false, error: parsed.error, builtin: 'ls', durationMs: Date.now() - startedAt };
+
+  const target = parsed.target ? path.resolve(String(cwd || '.'), parsed.target) : path.resolve(String(cwd || '.'));
+  let stat;
+  try {
+    stat = fs.statSync(target);
+  } catch (err) {
+    return {
+      ok: false,
+      error: err?.code === 'ENOENT' ? `没有这个目录：${target}` : `读不了这个目录：${err?.message || err}`,
+      builtin: 'ls',
+      durationMs: Date.now() - startedAt
+    };
+  }
+  if (!stat.isDirectory()) {
+    // `ls <文件>` 就是打出这个文件名 —— 和真 ls 一致，不要报错。
+    return {
+      ok: true,
+      exitCode: 0,
+      stdout: parsed.flags.long
+        ? `${formatStamp(stat.mtimeMs)} ${String(stat.size).padStart(10)} ${path.basename(target)}\n`
+        : `${path.basename(target)}\n`,
+      stderr: '',
+      truncated: false,
+      timedOut: false,
+      builtin: 'ls',
+      durationMs: Date.now() - startedAt
+    };
+  }
+
+  let dirents;
+  try {
+    dirents = fs.readdirSync(target, { withFileTypes: true });
+  } catch (err) {
+    const code = err?.code;
+    const reason = code === 'EACCES' || code === 'EPERM' ? '没有权限读这个目录' : `读不了这个目录：${err?.message || err}`;
+    return { ok: false, error: reason, builtin: 'ls', durationMs: Date.now() - startedAt };
+  }
+
+  const rows = [];
+  for (const dirent of dirents) {
+    const name = dirent.name;
+    if (!parsed.flags.all && name.startsWith('.')) continue;
+    const full = path.join(target, name);
+    let kind = 'file';
+    let size = 0;
+    let mtimeMs = 0;
+    try {
+      const st = fs.lstatSync(full);
+      // 符号链接不跟随：概览里它是什么就写什么，跟随会让人以为链接指向的内容
+      // 就在这个目录里。
+      kind = st.isSymbolicLink() ? 'link' : (st.isDirectory() ? 'dir' : 'file');
+      size = st.size;
+      mtimeMs = st.mtimeMs;
+    } catch {
+      kind = 'unknown';
+    }
+    rows.push({ name, kind, size, mtimeMs });
+  }
+
+  rows.sort((a, b) => {
+    if (parsed.flags.byTime && a.mtimeMs !== b.mtimeMs) return b.mtimeMs - a.mtimeMs;
+    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+  });
+  if (parsed.flags.reverse) rows.reverse();
+
+  const shown = rows.slice(0, Math.max(1, Math.min(Number(maxEntries) || BUILTIN_LS_MAX_ENTRIES, 2000)));
+  const lines = shown.map((r) => {
+    const suffix = r.kind === 'dir' ? '/' : (r.kind === 'link' ? '@' : '');
+    if (!parsed.flags.long) return `${r.name}${suffix}`;
+    const kindCol = r.kind === 'dir' ? '   <DIR>' : (r.kind === 'link' ? '   <LNK>' : String(r.size).padStart(10));
+    return `${formatStamp(r.mtimeMs)} ${kindCol}  ${r.name}${suffix}`;
+  });
+  if (rows.length > shown.length) {
+    lines.push(`…（还有 ${rows.length - shown.length} 项未显示）`);
+  }
+
+  return {
+    ok: true,
+    exitCode: 0,
+    stdout: lines.length ? `${lines.join('\n')}\n` : '',
+    stderr: '',
+    truncated: rows.length > shown.length,
+    timedOut: false,
+    builtin: 'ls',
+    durationMs: Date.now() - startedAt
+  };
+}
+
+/** 这台平台上哪些白名单命令需要内置替身（目前只有 Windows 上的 ls）。 */
+export function builtinFor(argv, platform = process.platform) {
+  if (!Array.isArray(argv) || argv.length === 0) return null;
+  const binary = String(argv[0] || '').toLowerCase();
+  if (platform === 'win32' && binary === 'ls') return 'ls';
+  return null;
 }
 
 function normalizeEntry(raw, index, allowed) {
@@ -159,23 +340,35 @@ export function tailLines(text, n = 30) {
  *
  * 注意：`ok` 表示"没有环境级失败"；非零退出码仍然是 ok:true + 真实 exitCode ——
  * 手机端必须看到命令自己的输出，而不是桥接层编的"失败"。
+ *
+ * 平台自适应：Windows 上 POSIX 命令不存在（`ls` → ENOENT），此时改用内置只读
+ * 替身，`builtin: 'ls'` 会回给调用方，手机端据此说明"这是网关内置实现"。
+ * [platform] 只为测试注入，生产走 `process.platform`。
  */
 export async function runRunbook(cwd, entry, {
   run,
   timeoutMs = 20000,
-  maxBytes = 256 * 1024
+  maxBytes = 256 * 1024,
+  platform = process.platform
 } = {}) {
   if (!entry) return { ok: false, error: 'unknown-runbook' };
   if (typeof run !== 'function') return { ok: false, error: 'no-executor' };
 
   const startedAt = Date.now();
-  const result = await run(cwd, { argv: entry.argv }, { timeoutMs, maxBytes });
+  const builtin = builtinFor(entry.argv, platform);
+  const result = builtin === 'ls'
+    ? runBuiltinLs(cwd, entry.argv, { maxEntries: 300 })
+    : await run(cwd, { argv: entry.argv }, { timeoutMs, maxBytes });
   const durationMs = Date.now() - startedAt;
 
   if (!result || result.ok !== true) {
     return {
       ok: false,
+      // 失败原因要能被人读懂：`command-not-found` 单独给出人话，否则手机端只有
+      // 一句「执行失败」，用户不知道是命令不存在还是目录不对。
       error: result?.error || 'run-failed',
+      message: describeRunFailure(result, entry),
+      builtin: result?.builtin || null,
       exitCode: result?.exitCode ?? null,
       durationMs
     };
@@ -185,9 +378,23 @@ export async function runRunbook(cwd, entry, {
     exitCode: result.exitCode ?? 0,
     timedOut: result.timedOut === true,
     durationMs,
+    builtin: result.builtin || null,
     outputTail: tailLines(result.stdout || result.stderr || '', entry.outputTail || 30),
     truncated: result.truncated === true
   };
+}
+
+/** 把执行失败翻译成一句能给用户看的话（保留原始 code，不替换它）。 */
+export function describeRunFailure(result, entry) {
+  const code = String(result?.error || 'run-failed');
+  const binary = Array.isArray(entry?.argv) ? String(entry.argv[0] || '') : '';
+  if (code === 'command-not-found') {
+    return process.platform === 'win32'
+      ? `电脑上找不到命令 ${binary}（Windows 没有它；可以把 command 换成网关内置支持的写法，例如 ls）`
+      : `电脑上找不到命令 ${binary}`;
+  }
+  if (code === 'run-failed') return '命令没有跑起来（执行器没有返回结果）';
+  return code;
 }
 
 /**

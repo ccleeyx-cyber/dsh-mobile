@@ -57,7 +57,14 @@ import {
   claimsExtensionRoute,
   extractToolCallFiles
 } from './extensions.mjs';
-import { discoverGitRepos, runQuickCommand } from './host-ops.mjs';
+import {
+  discoverGitRepos,
+  runQuickCommand,
+  isInside,
+  isUnderAnyRoot,
+  listSubdirectories,
+  existingDriveRoots
+} from './host-ops.mjs';
 import { ensureCertificate, localHosts } from './tls.mjs';
 import { ensureCloudflared, createQuickTunnel } from './tunnel.mjs';
 import { lanCandidates, primaryLanAddress } from './net-address.mjs';
@@ -81,6 +88,7 @@ import {
   createPermissionStore,
   createCookieFactory,
   createRpcCaller,
+  createRetryingRpcCaller,
   createProjCacheReader,
   isCommandReadOnly,
   classifyCommand,
@@ -407,8 +415,23 @@ export function apply(ctx, config = {}, internals = {}) {
   /**
    * Signed-cookie minting and unary RPC live in core so both entry points speak
    * to the engine identically.  [unified]
+   *
+   * [fix 2026-10-23] 密钥不再"读一次用到天荒地老"：引擎会在运行期间重写
+   * `~/.dsh/.credentials.yaml`（实测 2026-10-22 00:26 启动、10:19 被重写），
+   * 之后网关所有 RPC 都是 401 —— 手机端表现为"会话里只剩第一句话 + 事件流断开"，
+   * 只有重启 dsh web 才能恢复。现在收到 unauthorized 就重读密钥并重试一次。
    */
-  const cookieFactory = createCookieFactory({ dshPort, secret: resolveInternalSecret() });
+  let internalSecret = resolveInternalSecret();
+  let cookieFactory = createCookieFactory({ dshPort, secret: internalSecret });
+  const reloadInternalSecret = () => {
+    const next = resolveInternalSecret();
+    if (!next || next === internalSecret) return false;
+    internalSecret = next;
+    cookieFactory = createCookieFactory({ dshPort, secret: next });
+    logger.warn('[dsh-mobile-bridge] 引擎密钥已轮换，已重新加载并重试（旧 cookie 作废）');
+    audit('bridge/secret-reloaded', {});
+    return true;
+  };
   const refreshCookie = async () => {
     try {
       return cookieFactory.refresh();
@@ -418,7 +441,12 @@ export function apply(ctx, config = {}, internals = {}) {
     }
   };
 
-  const callDshRpc = createRpcCaller({ dshPort, cookieFactory });
+  const rpcCaller = createRetryingRpcCaller({
+    // 每次重建都读**当前**的 cookieFactory —— 重载后这里拿到的是新密钥。
+    makeClient: () => createRpcCaller({ dshPort, cookieFactory }),
+    reloadCredentials: reloadInternalSecret
+  });
+  const callDshRpc = (method, payload) => rpcCaller.call(method, payload);
 
   /* ------------------------------------------------------------------ *
    * v1.14 能力：队列/交付物/diff/用量/ntfy 推送
@@ -1302,6 +1330,11 @@ export function apply(ctx, config = {}, internals = {}) {
           if (entry && (entry.id === 'llm-pi-ai' || entry.name === '@deepseek-ai/dsh-llm-pi-ai')) {
             const providers = entry.config?.providers || {};
             for (const [pKey, pVal] of Object.entries(providers)) {
+              // [feat 2026-10-22] 每条模型带上**归属供应商**：以前把两个供应商的
+              // 模型拍平成一个数组，手机端只能看到一个几十条的平铺列表，看不出
+              // 哪些是 wb 的、哪些是 qwen 的（用户明确要求按供应商分组）。
+              // 供应商 id 就是配置里的 key；显示名优先用配置里的 displayName。
+              const providerLabel = String(pVal?.displayName || pVal?.label || pKey);
               if (Array.isArray(pVal?.models)) {
                 for (const m of pVal.models) {
                   const mId = m.id || m.name;
@@ -1310,6 +1343,8 @@ export function apply(ctx, config = {}, internals = {}) {
                     availableModels.push({
                       id: mId,
                       name: m.name || mId,
+                      provider: pKey,
+                      providerLabel,
                       contextWindow: m.contextWindow || 256000,
                       maxTokens: m.maxTokens || 32000
                     });
@@ -1347,6 +1382,8 @@ export function apply(ctx, config = {}, internals = {}) {
                 availableModels.push({
                   id: mId,
                   name: m.name || mId,
+                  provider: 'wb',
+                  providerLabel: String(wb.displayName || wb.label || 'wb'),
                   contextWindow: m.contextWindow || 256000,
                   maxTokens: m.maxTokens || 32000
                 });
@@ -1361,16 +1398,30 @@ export function apply(ctx, config = {}, internals = {}) {
 
     if (availableModels.length === 0) {
       availableModels = [
-        { id: 'cn:auto', name: 'cn:auto', contextWindow: 256000, maxTokens: 32000 },
-        { id: 'cn:deepseek-v4.1-flash', name: 'cn:deepseek-v4.1-flash', contextWindow: 1000000, maxTokens: 393216 },
-        { id: 'cn:deepseek-v4-pro', name: 'cn:deepseek-v4-pro', contextWindow: 1000000, maxTokens: 393216 },
-        { id: 'cn:kimi-k3-1', name: 'cn:kimi-k3-1', contextWindow: 1000000, maxTokens: 1048576 }
+        { id: 'cn:auto', name: 'cn:auto', provider: 'cn', providerLabel: 'cn', contextWindow: 256000, maxTokens: 32000 },
+        { id: 'cn:deepseek-v4.1-flash', name: 'cn:deepseek-v4.1-flash', provider: 'cn', providerLabel: 'cn', contextWindow: 1000000, maxTokens: 393216 },
+        { id: 'cn:deepseek-v4-pro', name: 'cn:deepseek-v4-pro', provider: 'cn', providerLabel: 'cn', contextWindow: 1000000, maxTokens: 393216 },
+        { id: 'cn:kimi-k3-1', name: 'cn:kimi-k3-1', provider: 'cn', providerLabel: 'cn', contextWindow: 1000000, maxTokens: 1048576 }
       ];
+    }
+
+    // 供应商清单（按首次出现顺序，带条数）：手机端用它画分组标题与筛选胶囊，
+    // 不必自己去重、也不必猜 provider 的显示名。
+    const providerIndex = [];
+    const providerSeen = new Map();
+    for (const m of availableModels) {
+      const id = String(m.provider || 'default');
+      if (!providerSeen.has(id)) {
+        providerSeen.set(id, { id, label: String(m.providerLabel || id), count: 0 });
+        providerIndex.push(providerSeen.get(id));
+      }
+      providerSeen.get(id).count += 1;
     }
 
     return {
       currentModel,
       availableModels,
+      providers: providerIndex,
       permissions: {
         defaultPolicy: globalPermissions.executionPolicy,
         executionPolicy: globalPermissions.executionPolicy,
@@ -1671,6 +1722,143 @@ export function apply(ctx, config = {}, internals = {}) {
       logger.error('[Workspaces] Error reading workspace data:', err);
       return [];
     }
+  }
+
+  /* ---- 新建工作区：目录选择器（[feat 2026-10-22]） ----
+   *
+   * 用户原话：「新建工作区目前是手写，这个要改成点选」。要"点选"就必须先在
+   * 服务端列出目录，而工作区**还没注册**，所以 `/api/mobile/fs/list`（被钉死在
+   * 会话 cwd 里）帮不上忙。
+   *
+   * 这里因此单独开一组**只列子目录**的接口，范围由 roots 决定：
+   *   roots = 主目录 + 已登记工作区 + 它们的父目录 + 盘符根
+   * 客户端拿不到任何"扩面"参数：请求的路径只要不在 roots 之内就是 403。它也不会
+   * 回文件内容 —— 只有目录名，和"选一个目录"这件事严格同宽。
+   */
+  function samePath(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    const na = path.resolve(a);
+    const nb = path.resolve(b);
+    return process.platform === 'win32' ? na.toLowerCase() === nb.toLowerCase() : na === nb;
+  }
+
+  /** workspace.json 里已登记的工作区路径（读不到就当没有，绝不编）。 */
+  function workspacePathIndex() {
+    const out = [];
+    try {
+      const file = path.join(dshHomeDir, 'storages', 'workspace.json');
+      if (!fs.existsSync(file)) return out;
+      const table = JSON.parse(fs.readFileSync(file, 'utf8'))?.tables?.workspaces || {};
+      for (const [id, info] of Object.entries(table)) {
+        if (info && typeof info.path === 'string' && info.path.trim()) {
+          out.push({ workspaceId: id, path: info.path, title: String(info.title || path.basename(info.path)) });
+        }
+      }
+    } catch (err) {
+      logger.warn('[Workspaces] 读取 workspace.json 失败（选择器只用主目录与盘符）: %s', err?.message ?? err);
+    }
+    return out;
+  }
+
+  /** 目录选择器允许浏览的根，按"最可能用到的先"排序。 */
+  function workspacePickRoots() {
+    const roots = [];
+    const seen = new Set();
+    const push = (rawPath, label, kind) => {
+      const value = String(rawPath || '').trim();
+      if (!value) return;
+      let abs;
+      try { abs = path.resolve(value); } catch { return; }
+      const key = process.platform === 'win32' ? abs.toLowerCase() : abs;
+      if (seen.has(key)) return;
+      try { if (!fs.statSync(abs).isDirectory()) return; } catch { return; }
+      seen.add(key);
+      roots.push({ path: abs, label, kind });
+    };
+
+    const registered = workspacePathIndex();
+    // 1. 已登记工作区的**父目录**：最常见的动作是"在同一层再建一个"。
+    for (const ws of registered) {
+      const parent = path.dirname(ws.path);
+      if (parent && parent !== ws.path) push(parent, `上级 · ${path.basename(parent) || parent}`, 'parent');
+    }
+    // 2. 主目录：新项目/新克隆通常落在这里往下。
+    try { push(homedir(), '主目录', 'home'); } catch { /* 没有 home 就跳过 */ }
+    // 3. 已登记工作区本身（点进去是为了在它下面建子目录）。
+    for (const ws of registered) push(ws.path, `工作区 · ${ws.title}`, 'workspace');
+    // 4. 盘符根 —— **只开放"他确实在用的盘"**（有工作区的盘 + 主目录所在的盘），
+    //    不是把整机每个盘都摊开。要换一个全新盘的用户可以在那台机器上先建一个
+    //    工作区（或把项目放主目录下），这是个边界，不是遗漏。
+    for (const drive of pickableDriveRoots(registered)) push(drive, drive, 'drive');
+    return roots;
+  }
+
+  /** 目录选择器开放的盘符根：已登记工作区所在的盘 + 主目录的盘。 */
+  function pickableDriveRoots(registered) {
+    const drives = new Set();
+    const addDriveOf = (p) => {
+      try {
+        const root = path.parse(path.resolve(p)).root;
+        if (root) drives.add(root);
+      } catch { /* 忽略无法解析的路径 */ }
+    };
+    for (const ws of registered) addDriveOf(ws.path);
+    try { addDriveOf(homedir()); } catch { /* 忽略 */ }
+    // 仍要确认盘符此刻真的存在（U 盘拔掉后别把一个死路径给手机）。
+    const alive = new Set(existingDriveRoots().map((d) => process.platform === 'win32' ? d.toLowerCase() : d));
+    return [...drives].filter((d) => alive.has(process.platform === 'win32' ? d.toLowerCase() : d));
+  }
+
+  /** 把 host-ops 的 reason 翻成一句人话（这些原因是给手机看的）。 */
+  function describeBrowseReason(reason) {
+    switch (reason) {
+      case 'not-found': return '目录不存在';
+      case 'not-a-directory': return '这不是一个目录';
+      case 'permission-denied': return '没有权限读这个目录';
+      default: return '读取目录失败';
+    }
+  }
+
+  /**
+   * 目录选择器的数据。
+   *
+   * `requested` 为空时只回 roots（App 打开弹层就是这一次请求），避免"先要根、
+   * 再要一次列表"的两个来回。
+   */
+  function workspaceBrowsePayload(requested) {
+    const roots = workspacePickRoots();
+    const rootPaths = roots.map((r) => r.path);
+    const base = { roots, defaultPath: rootPaths[0] || null };
+    const wanted = String(requested || '').trim();
+    if (!wanted) return { ok: true, ...base, path: null, entries: [], truncated: false, total: 0 };
+
+    // eslint-disable-next-line no-control-regex
+    if (/[\x00-\x1f]/.test(wanted)) return { ok: false, error: '路径里有控制字符', ...base };
+    if (/^\\\\[?.]\\/.test(wanted)) return { ok: false, error: '不接受设备路径 / 长路径前缀', ...base };
+    if (!path.isAbsolute(wanted)) return { ok: false, error: '需要电脑上的绝对路径', ...base };
+
+    const abs = path.resolve(wanted);
+    // realpath 之后再判一次：`..` 与符号链接都可能把表面路径骗过去。
+    if (!isUnderAnyRoot(rootPaths, abs)) {
+      return { ok: false, error: '这个位置不在可浏览范围内（只开放主目录、已有工作区与盘符）', ...base, path: abs };
+    }
+
+    const listed = listSubdirectories(abs, { maxEntries: 300 });
+    if (!listed.ok) return { ok: false, error: describeBrowseReason(listed.reason), ...base, path: abs };
+
+    const parentAbs = path.dirname(abs);
+    const registered = workspacePathIndex().find((ws) => samePath(ws.path, abs)) || null;
+    return {
+      ok: true,
+      ...base,
+      path: abs,
+      parent: parentAbs !== abs && isUnderAnyRoot(rootPaths, parentAbs) ? parentAbs : null,
+      name: path.basename(abs) || abs,
+      entries: listed.dirs,
+      truncated: listed.truncated,
+      total: listed.total,
+      registered: registered ? { workspaceId: registered.workspaceId, title: registered.title } : null
+    };
   }
 
   async function getSessionHistory(sessionId) {
@@ -2238,6 +2426,10 @@ export function apply(ctx, config = {}, internals = {}) {
         follower.subscribed = false;
       }
       if (muxReconnectTimer) clearTimeout(muxReconnectTimer);
+      // [fix 2026-10-23] 握手被 401 拒掉时也会走到这里。重连前重读一次密钥：
+      // 引擎轮换过密钥的话，下一次握手就用新的 —— 否则事件流会一直连不上，
+      // 手机上表现为"没有会话事件/没有流式输出"。密钥没变时什么都不做。
+      try { reloadInternalSecret(); } catch { /* 重读失败不该阻断重连 */ }
       muxReconnectTimer = setTimeout(connectUpstreamMux, 3000);
       // Don't hold the event loop open just to retry an upstream link.
       muxReconnectTimer.unref?.();
@@ -4177,11 +4369,16 @@ export function apply(ctx, config = {}, internals = {}) {
         sendJson(200, {
           ok: result.ok,
           code: result.error || null,
+          // [fix 2026-10-22] 失败时给一句人话：以前只回 `code:'command-not-found'`，
+          // App 读不到 error 就显示「执行失败」，用户看不出是"这台机器没有 ls"。
+          error: result.ok ? null : (result.message || result.error || '执行失败'),
           exitCode: result.exitCode ?? null,
           timedOut: result.timedOut === true,
           durationMs: result.durationMs ?? null,
           outputTail: result.outputTail ?? '',
           truncated: result.truncated === true,
+          // Windows 上 `ls` 由网关内置实现（没开 shell），如实告诉手机端。
+          builtin: result.builtin || null,
           entry: { id: entry.id, name: entry.name, command: entry.command }
         });
         return;
@@ -4259,6 +4456,24 @@ export function apply(ctx, config = {}, internals = {}) {
       // 所以"新建"= 建目录（不存在时）+ 加一行。读改写而不是整体覆盖，避免把
       // 引擎刚写进去的 sessionIds 冲掉；同一个路径重复创建视为幂等，返回已有条目
       // —— 用户手滑点两次不该得到两个同名工作区。
+      // [feat 2026-10-22] 新建工作区改成点选：先给起点，再逐层列子目录。
+      // 两条都是只读 GET，都不回文件内容（见 workspaceBrowsePayload 的说明）。
+      if (pathname === '/api/mobile/workspaces/roots' && req.method === 'GET') {
+        const payload = workspaceBrowsePayload('');
+        sendJson(200, { ok: true, code: 0, ...payload });
+        return;
+      }
+
+      if (pathname === '/api/mobile/workspaces/browse' && req.method === 'GET') {
+        const requested = String(parsedUrl.query?.path || '');
+        const payload = workspaceBrowsePayload(requested);
+        if (payload.ok) {
+          audit('workspace/browse', { path: payload.path || null, dirs: Array.isArray(payload.entries) ? payload.entries.length : 0 });
+        }
+        sendJson(payload.ok ? 200 : 400, { code: payload.ok ? 0 : 400, ...payload });
+        return;
+      }
+
       if (pathname === '/api/mobile/workspaces/create' && req.method === 'POST') {
         // `jsonBody` 是上面统一解析好的（畸形 JSON 在那里就已经被拒了）。
         const body = jsonBody || {};

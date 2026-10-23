@@ -118,6 +118,10 @@ class _ConnectivityViewState extends State<ConnectivityView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                // [feat 2026-10-22] 别名在前：连了多台电脑时，先知道"我在哪台"，
+                // 再看地址才有意义。
+                _infoRow(context, '别名', dsh.currentConfig?.displayName ?? '未命名'),
+                const SizedBox(height: AppSpace.m),
                 _infoRow(context, '网关地址', dsh.currentConfig?.httpBaseUrl ?? '未配置'),
                 const SizedBox(height: AppSpace.m),
                 _infoRow(context, 'DSH 本地上游', settings?.dshHost ?? '127.0.0.1:3080'),

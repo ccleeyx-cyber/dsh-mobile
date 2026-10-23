@@ -117,7 +117,31 @@ test('diagnostics: probe is a real RPC and reports elapsed ms on success', async
   assert.equal(check(calls, 'engine_rpc').ok, true);
   assert.match(check(calls, 'engine_rpc').value, /^\d+ms$/);
   assert.equal(calls.rpc.length, 1);
-  assert.equal(calls.rpc[0].method, 'session/page');
+  // [fix 2026-10-23] 不再编一个假会话号去打 session/page：那个 id 必然被引擎拒绝，
+  // 于是"通"和"断"在结果上一样。modelCatalog 不需要任何 id。
+  assert.equal(calls.rpc[0].method, 'session/modelCatalog');
+});
+
+test('diagnostics: 引擎有应答（域错误）算通，不能把健康组件标红', async () => {
+  // 实测形状：修好密钥之后探针收到 `session "diagnostics-probe" not found`，
+  // 旧实现把它判成 FAIL —— 用户会去修一个没坏的东西。
+  const { deps, calls } = makeDeps({
+    callDshRpc: async () => { throw new Error('session "diagnostics-probe" not found'); }
+  });
+  await handleFeatureRoute(deps);
+  assert.equal(calls.body.ok, true, '引擎有应答说明通道是通的');
+  const rpc = check(calls, 'engine_rpc');
+  assert.equal(rpc.ok, true);
+  assert.match(rpc.detail, /引擎有应答/);
+});
+
+test('diagnostics: 未授权仍然算断（密钥轮换的真实症状）', async () => {
+  const { deps, calls } = makeDeps({
+    callDshRpc: async () => { throw new Error('Failed to parse RPC response: unauthorized'); }
+  });
+  await handleFeatureRoute(deps);
+  assert.equal(check(calls, 'engine_rpc').ok, false);
+  assert.equal(calls.body.ok, false);
 });
 
 test('diagnostics: no token, no absolute path leaks into the answer', async () => {
