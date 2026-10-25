@@ -2341,6 +2341,9 @@ class DshService extends ChangeNotifier {
       _setSending(true, sessionId: targetSessionId);
       _remoteRunningSessions.add(_syncKey(targetSessionId));
       _completedTurnEpochs.remove(_syncKey(targetSessionId));
+      for (final message in _messages) {
+        if (message.isStreaming) message.isStreaming = false;
+      }
       _startSessionPolling(targetSessionId);
 
       if (serverMessages.isNotEmpty && serverMessages.last.isAssistant) {
@@ -5752,7 +5755,9 @@ class DshService extends ChangeNotifier {
         final isReplay = json['replay'] == true;
         if (snapText.isEmpty && snapThinking.isEmpty) return;
 
-        if (_messages.isEmpty || !_messages.last.isAssistant) {
+        if (_messages.isEmpty ||
+            !_messages.last.isAssistant ||
+            !_messages.last.isStreaming) {
           _messages.add(ChatMessage(
             id: _uuid.v4(),
             role: 'assistant',
@@ -5847,7 +5852,9 @@ class DshService extends ChangeNotifier {
         // Drop lingering stream chunks if user canceled or this turn has ended.
         if (!_acceptStreamFrame(sId)) return;
 
-        if (_messages.isEmpty || !_messages.last.isAssistant) {
+        if (_messages.isEmpty ||
+            !_messages.last.isAssistant ||
+            !_messages.last.isStreaming) {
           _messages.add(ChatMessage(
             id: _uuid.v4(),
             role: 'assistant',
@@ -5884,7 +5891,9 @@ class DshService extends ChangeNotifier {
         // Drop tool start if canceled or this turn has ended.
         if (!_acceptStreamFrame(sId)) return;
 
-        if (_messages.isEmpty || !_messages.last.isAssistant) {
+        if (_messages.isEmpty ||
+            !_messages.last.isAssistant ||
+            !_messages.last.isStreaming) {
           _messages.add(ChatMessage(
             id: _uuid.v4(),
             role: 'assistant',
@@ -6138,7 +6147,9 @@ class DshService extends ChangeNotifier {
         }
         final doneText = json['text']?.toString() ?? '';
         final doneThinking = json['thinking']?.toString() ?? '';
-        if (_messages.isEmpty || !_messages.last.isAssistant) {
+        if (_messages.isEmpty ||
+            !_messages.last.isAssistant ||
+            !_messages.last.isStreaming) {
           if (doneText.isNotEmpty || doneThinking.isNotEmpty) {
             _messages.add(ChatMessage(
               id: _uuid.v4(),
@@ -6150,11 +6161,12 @@ class DshService extends ChangeNotifier {
         } else {
           final current = _messages.last;
           current.flushStreamBuffers();
-          if (doneText.isNotEmpty && doneText.startsWith(current.content)) {
+          if (doneText.isNotEmpty) {
+            // 网关的 done 是这一轮的完整快照。正文可能因断线缺了中段，
+            // 不能用 startsWith 把它当成只能追加的 delta 而丢掉整段。
             current.content = doneText;
           }
-          if (doneThinking.isNotEmpty &&
-              doneThinking.startsWith(current.thinking ?? '')) {
+          if (doneThinking.isNotEmpty) {
             current.thinking = doneThinking;
           }
           current.isStreaming = false;
