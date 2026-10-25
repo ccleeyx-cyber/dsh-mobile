@@ -2421,77 +2421,50 @@ class DshService extends ChangeNotifier {
         .whereType<int>()
         .fold<int?>(null, (min, s) => min == null || s < min ? s : min);
 
-    // 3. Preserve recent local user prompts without duplicating or inversing order
-    // [fix 2026-10-14] 服务端快照缺最新一问一答的窗口远大于 45 秒：网关投影缓存
-    // 可能滞后数小时（实测事故：日志 seq 794 vs 投影 723，隔天都没追上）。
-    // 本地用户消息的保留窗放宽到 10 分钟，且去重比较改用「剥离附件名后的
-    // 正文」——displayText 拼了 "📎 文件名" 而服务端历史没有这一段，全等比较
-    // 永远不等，纯附件消息超窗后被整体替换吞掉（= 少一条提问）。
+    // 3. 单次合并：服务端窗口替换旧窗口；尚未被快照确认的本地消息保留。
+    // 先算 olderKept，再筛选本地尾部，避免同一条既被保留又被补插。
+    final olderKept = oldestServerSeq == null
+        ? const <ChatMessage>[]
+        : _messages
+            .where((m) => m.seq != null && m.seq! < oldestServerSeq)
+            .toList();
+    final olderIds = olderKept.map((m) => m.id).toSet();
     String stripAttachmentLabel(String s) {
       final idx = s.indexOf('\n\n📎 ');
       return idx >= 0 ? s.substring(0, idx) : s;
     }
-
-    // 快照尚未覆盖的本地尾部必须整体保留：只保 user 会把对应的
-    // 乐观 assistant 丢掉，并把 user 插到另一轮 assistant 后面。
-    final localTailStart = _messages.lastIndexWhere((m) =>
-        m.seq == null && m.timestamp.isAfter(
-          DateTime.now().subtract(const Duration(minutes: 10)),
-        ));
-    final localTail = localTailStart < 0
-        ? const <ChatMessage>[]
-        : _messages.sublist(localTailStart);
-    final localTailUsers = localTail.where((m) => m.isUser).toList();
-    for (final localMsg in localTailUsers.toList()) {
-      // 已经在窗口之前、下面会原样保留的那批：不要在这里再补插一次。
-      if (localMsg.seq != null &&
-          oldestServerSeq != null &&
-          localMsg.seq! < oldestServerSeq) {
-        continue;
-      }
-      final localCore = stripAttachmentLabel(localMsg.content);
-      final matchedOnServer = serverMessages.any((server) =>
-          (localMsg.clientRequestId != null &&
-              server.clientRequestId == localMsg.clientRequestId) ||
-          (localMsg.seq != null && server.seq == localMsg.seq) ||
-          server.id == localMsg.id ||
-          // 兼容旧网关：历史不带 rpcId 时才退回正文匹配；同一轮已有
-          // requestId 的两条消息绝不能退化成正文去重。
-          (server.clientRequestId == null &&
-              localCore.isNotEmpty &&
-              (server.content == localMsg.content ||
-                  server.content == localCore)));
-      if ((localMsg.content.isNotEmpty || localMsg.hasAttachments) && !matchedOnServer) {
-        final assistIdx =
-            serverMessages.indexWhere((m) => m.isAssistant && m.isStreaming);
-        if (assistIdx != -1) {
-          serverMessages.insert(assistIdx, localMsg);
-        } else {
-          serverMessages.add(localMsg);
-        }
-      }
-    }
-
     bool matchesServer(ChatMessage local) {
       return serverMessages.any((server) =>
           (local.clientRequestId != null &&
               server.clientRequestId == local.clientRequestId) ||
           (local.seq != null && server.seq == local.seq) ||
           server.id == local.id ||
-          (server.clientRequestId == null &&
+          // 旧网关不带 rpcId 时才退回正文；双方都有 requestId 时，
+          // 相同正文的两条真实消息也绝不合并。
+          (local.clientRequestId == null &&
+              server.clientRequestId == null &&
               server.role == local.role &&
               server.content == stripAttachmentLabel(local.content)));
     }
-
-    final unconfirmedTail = localTail.where((m) => !matchesServer(m)).toList();
-    // 已经按 requestId 对齐的本地尾部不再保留；服务端版本接管它。
-    // 其余问答整段追加，不能让某条提问跑到另一轮回复的后面。
-    final anchor = localTailStart < 0 ? _messages.length : localTailStart;
-    _messages = [
-      ..._messages.sublist(0, anchor),
-      ...serverMessages,
-      ...unconfirmedTail,
-    ];
+    final recentCutoff = DateTime.now().subtract(const Duration(minutes: 10));
+    final pending = _messages.where((m) {
+      if (olderIds.contains(m.id)) return false;
+      if (m.seq != null && oldestServerSeq != null && m.seq! < oldestServerSeq) {
+        return false;
+      }
+      if (matchesServer(m)) return false;
+      return m.isStreaming || m.timestamp.isAfter(recentCutoff);
+    }).toList();
+    final firstServerTime = serverMessages.isEmpty
+        ? null
+        : serverMessages.first.timestamp;
+    final beforeServer = firstServerTime == null
+        ? const <ChatMessage>[]
+        : pending.where((m) => m.timestamp.isBefore(firstServerTime)).toList();
+    final afterServer = firstServerTime == null
+        ? pending
+        : pending.where((m) => !m.timestamp.isBefore(firstServerTime)).toList();
+    _messages = [...olderKept, ...beforeServer, ...serverMessages, ...afterServer];
     _cacheSessionHistory(targetSessionId, _historyExhausted);
     _streamRevision++;
     notifyListeners();

@@ -168,13 +168,18 @@ void main() {
       dsh.dispose();
     });
 
-    test('下一轮首个 delta 能清除上一轮结束标记', () {
+    test('下一轮 running 事件清除上一轮结束标记', () {
       final dsh = service();
       dsh.debugHandleRawMessage({
         'type': 'done',
         'sessionId': 'session-sync',
         'reason': 'completed',
         'text': '上一轮',
+      });
+      dsh.debugHandleRawMessage({
+        'type': 'session_status',
+        'sessionId': 'session-sync',
+        'isRunning': true,
       });
       dsh.debugHandleRawMessage({
         'type': 'delta',
