@@ -398,6 +398,31 @@ test('buildNtfyRequest: refuses to build without a base URL or topic', () => {
   assert.equal(buildNtfyRequest({ ntfyUrl: 'not a url', ntfyTopic: 't' }, {}), null);
 });
 
+test('buildNtfyRequest: refuses plaintext and private targets unless admin opts in', () => {
+  const message = { title: 'x', body: 'y' };
+  assert.equal(
+    buildNtfyRequest({ ntfyUrl: 'http://ntfy.sh', ntfyTopic: 't' }, message),
+    null,
+    'public HTTP would leak the token'
+  );
+  assert.equal(
+    buildNtfyRequest({ ntfyUrl: 'https://192.168.1.10', ntfyTopic: 't' }, message),
+    null,
+    'private targets are SSRF even over https'
+  );
+
+  const previous = process.env.DSH_NTFY_ALLOW_PRIVATE;
+  process.env.DSH_NTFY_ALLOW_PRIVATE = '1';
+  try {
+    const local = buildNtfyRequest({ ntfyUrl: 'http://127.0.0.1:2586', ntfyTopic: 't' }, message);
+    assert.ok(local, 'self-hosted ntfy works after explicit admin opt-in');
+    assert.equal(local.url, 'http://127.0.0.1:2586/');
+  } finally {
+    if (previous === undefined) delete process.env.DSH_NTFY_ALLOW_PRIVATE;
+    else process.env.DSH_NTFY_ALLOW_PRIVATE = previous;
+  }
+});
+
 test('buildNtfyRequest: an inline topic overrides the configured one (in the body)', () => {
   const req = buildNtfyRequest({ ntfyUrl: 'https://ntfy.sh', ntfyTopic: 'default' }, { topic: 'per-device' });
   assert.equal(req.url, 'https://ntfy.sh/');

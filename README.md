@@ -111,43 +111,18 @@ DSH 设置页与网关首页只给 Releases 链接。
 
 ---
 
-## 四、凭据存储与明文传输（v1.22 起）
+## 四、凭据与网络
 
-网关 token 与 authCode **不再明文存在 SharedPreferences**：v1.22 起改走 Android Keystore
-（`dsh_mobile/lib/services/secure_store.dart` + 原生
-`android/.../SecureStoreBridge.kt`，通道 `dsh_mobile/secure`，密钥别名 `dsh_mobile_master`、
-AES-256/GCM，密钥不可导出，密文落独立 SP 文件 `dsh_secure_store`）。
-
-升级是**先迁后删**：首次读取时把旧明文写进 Keystore，**写后读回校验通过才从
-SharedPreferences 删掉明文**；任一步失败就保留明文继续可用（宁可暂时不变好，也不能让人
-连不上），每次启动重试、幂等。没有原生侧（Dart VM / 单元测试）、API 21–22、或 Keystore
-故障时**降级而不抛异常**。
-
-实现刻意**没有**引入 `flutter_secure_storage` —— 那会再次撞上这条依赖冲突：
-
-```
-speech_to_text 6.6.2         →  js ^0.7.1
-flutter_secure_storage 9.x   →  js ^0.6.3   （8.x 及更早同样冲突）
-```
-
-它要求先放开 `speech_to_text` 的版本钉，而那又要求升级 Flutter / plugin-loader（7.x 的
-`compileSdk = flutter.compileSdkVersion` 在 3.24.5 上直接构建失败）。一条自己写的
-MethodChannel 就绕开了整条链，所以那个版本钉可以继续留着，直到真要升 Flutter 那天。
-
-剩下的两条风险必须说清：
-
-- **网络仍是明文。** 网关只有明文 HTTP / WS，配置页在使用 `http://` / `ws://` 时常驻提示
-  "Token 会以明文经网络传输……仅建议在可信局域网使用；远程请用 HTTPS / WSS"。
-  `res/xml/network_security_config.xml` 显式允许明文是**刻意**的：目标可能是任意内网 IP，
-  而 network-security-config 不支持按 CIDR 放行，一刀禁掉会让功能直接不可用。
-- **没有做自签证书指纹固定（pinning）。** 缺少指纹的分发/轮换通道，写死一个只会让
-  "换证书 / 重装网关"的用户彻底连不上；要做必须先有 TOFU 首次信任 + 指纹变更告警。
-- **未经真机验证**：本机没有 Android SDK，`SecureStoreBridge.kt` 只经过人工审查，
-  Keystore 的真实行为（密钥生成、GCM、改锁屏密码后密钥失效等）需要在真机上验一次。
-  代码侧已埋好观测点：`adb logcat -s DshSecure` 会打出每次 ping/write/read/delete
-  的结果与字节数（**只打长度，不打内容**）。验收步骤见
-  [docs/securestore-device-verification.md](docs/securestore-device-verification.md)
-  —— 那是**待办清单**，还没有执行记录。
+- **凭据**：token / authCode 走 Android Keystore（AES-256/GCM，密钥不可导出）。
+  迁移先写后校验，失败保留明文兜底；Android 5/6 或 Keystore 故障时同样降级。
+- **TLS**：网关可同时监听明文 `3088` 与自签 HTTPS/WSS `3443`。App 的 REST 与
+  WebSocket **共用同一套 TOFU 指纹校验**：首次信任，指纹变化时阻止连接并要求确认。
+- **明文**：`3088` 仍可用，但 Token 会明文过网；只建议可信局域网。远程连接请启用
+  HTTPS/WSS，或使用带公开证书的 cloudflared / 反向代理。
+- **配对码**：只能由电脑端设置页或持有管理 Token 的管理端生成。匿名来源（包括
+  经隧道回源、看起来像回环的请求）一律 `403`。
+- **真机验证**：Keystore 的厂商 ROM 差异仍建议真机验收，步骤见
+  [docs/securestore-device-verification.md](docs/securestore-device-verification.md)。
 
 ---
 

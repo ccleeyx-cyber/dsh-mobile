@@ -14,39 +14,34 @@
 
 ---
 
-## 二、 编译打包 APK 步骤
+## 二、编译与发布
 
-### 1. 环境准备
-确保电脑已安装：
-- [Flutter SDK](https://docs.flutter.cn/get-started/install) (推荐 3.19+)
-- Android Studio / Android SDK (带 Command-line Tools)
+正式包由 GitHub Actions 构建，不需要在本机安装 Android SDK：
 
-### 2. 获取依赖并构建 Release 安装包
-在 `dsh_mobile` 目录下打开终端执行：
+1. 修改 `pubspec.yaml` 的 `version`；
+2. 在 `CHANGELOG.md` 写同名版本小节；
+3. push 到 `main`，CI 构建分 ABI APK、生成 `latest.json` 并创建 Release。
+
+本机调试只需 Flutter 3.24.5：
 
 ```bash
-# 1. 下载依赖
+cd dsh_mobile
 flutter pub get
-
-# 2. 构建独立 APK 安装包 (arm64 或 通用包)
-flutter build apk --release
+flutter analyze --fatal-warnings
+flutter test
+flutter run $(node ../scripts/app-version.mjs --defines)
 ```
-
-编译完成后，APK 文件位于：
-`build/app/outputs/flutter-apk/app-release.apk`
-
-将该 `.apk` 文件通过微信/QQ/数据线传输到安卓手机上直接安装即可！
 
 ---
 
 ## 三、 使用与配置指南
 
-1. **在服务器启动 DSH 及网关**：
-   参考上级目录 `dsh-server-plugin` 中的说明，在 DSH 宿主机上运行 `node index.js`（默认监听 3088 端口）。
-2. **在路由器配置端口映射**：
-   将外网 TCP 端口 `3088` 映射到宿主机内网 IP 的 `3088` 端口。
-3. **在手机 App 中输入**：
-   - **公网 IP**：你的公网 IP 或动态域名
-   - **端口**：`3088`
-   - **Token**：与服务端环境变量 `DSH_AUTH_TOKEN` 一致的密钥
-4. 点击 **“测试连通性”**，显示通过后点击 **“保存并进入聊天”** 即可开始与 DSH Agent 对话！
+推荐在电脑端 `设置 → 移动终端` 扫码配对，App 会自动取得设备 Token。
+
+手动接入：
+
+1. 网关默认只监听 `127.0.0.1:3088`；需要手机直连时显式设置
+   `BRIDGE_HOST=0.0.0.0`（或 `host: 0.0.0.0`），并确认防火墙放行。
+2. 远程优先使用设置页里的 cloudflared / 反向代理；不要把原生 `3080` 暴露到公网。
+3. 在 App 填写**地址、端口、Token**；HTTPS 使用 `3443` 并打开开关。
+4. 点击「测试连通性」后保存进入聊天。自签证书首次连接会记录指纹，之后指纹变化会被阻止。

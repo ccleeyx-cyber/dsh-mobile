@@ -30,7 +30,8 @@ import {
   isCarriedContext,
   isFailedTurnEnd,
   readUserMessageSource,
-  resolveDeliverable
+  resolveDeliverable,
+  validateNtfyUrl
 } from './core.mjs';
 
 // Re-exported for the callers and tests that used to import them from here.
@@ -1083,6 +1084,8 @@ export function normalizeSchedule(record) {
 export function buildNtfyRequest(config, message) {
   const base = typeof config?.ntfyUrl === 'string' ? config.ntfyUrl.trim() : '';
   if (!base) return null;
+  const allowed = validateNtfyUrl(base);
+  if (!allowed.ok) return null;
   const topic = String(message?.topic || config?.ntfyTopic || '').trim();
   if (!topic) return null;
 
@@ -1092,14 +1095,7 @@ export function buildNtfyRequest(config, message) {
   // JSON 字符串当成纯文本消息展示，用户手机上看到的就是一坨转义代码，click /
   // actions 字段也全部失效（它们只有 JSON body 形态才生效）。改为根路径 +
   // body.topic，与官方 curl 示例完全一致。
-  let url;
-  try {
-    const u = new URL(base);
-    u.pathname = `${u.pathname.replace(/\/+$/, '')}/`;
-    url = u.toString();
-  } catch {
-    return null;
-  }
+  const url = allowed.url;
 
   const headers = { 'Content-Type': 'application/json' };
   const token = typeof config?.ntfyToken === 'string' ? config.ntfyToken.trim() : '';
@@ -1905,7 +1901,19 @@ export async function handleFeatureRoute(deps) {
 
   if (pathname === '/api/mobile/push/config' && req.method === 'POST') {
     const patch = {};
-    if (jsonBody.url !== undefined) patch.ntfyUrl = String(jsonBody.url || '').trim();
+    if (jsonBody.url !== undefined) {
+      const rawUrl = String(jsonBody.url || '').trim();
+      if (!rawUrl) {
+        patch.ntfyUrl = '';
+      } else {
+        const checked = validateNtfyUrl(rawUrl);
+        if (!checked.ok) {
+          sendJson(400, { ok: false, code: 400, error: `ntfy 地址不受信任：${checked.reason}` });
+          return true;
+        }
+        patch.ntfyUrl = checked.url;
+      }
+    }
     if (jsonBody.topic !== undefined) patch.ntfyTopic = String(jsonBody.topic || '').trim();
     if (jsonBody.token !== undefined) patch.ntfyToken = String(jsonBody.token || '').trim();
     if (jsonBody.enabled !== undefined) patch.ntfyEnabled = jsonBody.enabled === true;

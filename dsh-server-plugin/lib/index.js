@@ -73,7 +73,12 @@ import { createAlertEngine } from './alerts.mjs';
 import {
   BRIDGE_VERSION,
   MAX_BODY_SIZE,
+  MAX_WS_FRAME_BYTES,
+  MAX_MUX_FRAME_BYTES,
+  MAX_HTTP_INFLIGHT_PER_DEVICE,
+  MAX_STREAM_BUFFER_CHARS,
   HEARTBEAT_INTERVAL_MS,
+  pruneAuthFailures,
   checkAuthBackoff,
   noteAuthFailure,
   clearAuthFailures,
@@ -242,6 +247,21 @@ export function shouldDivertForBackpressure(bufferedAmount) {
   return typeof bufferedAmount === 'number'
     && Number.isFinite(bufferedAmount)
     && bufferedAmount > MAX_CLIENT_BUFFER_BYTES;
+}
+
+/** 保留尾部：断线重连要补的是最近一段，而不是几十轮前的开头。 */
+export function appendBoundedText(current, delta, max = MAX_STREAM_BUFFER_CHARS) {
+  const head = typeof current === 'string' ? current : '';
+  const tail = typeof delta === 'string' ? delta : '';
+  if (!tail) return head;
+  const combined = head + tail;
+  return combined.length <= max ? combined : combined.slice(combined.length - max);
+}
+
+/** 工具输入/输出单条上限：手机上不可能读完几 MB 的工具日志。 */
+export function boundToolText(value, max = 64 * 1024) {
+  const text = typeof value === 'string' ? value : String(value ?? '');
+  return text.length > max ? `${text.slice(0, max)}\n…（已截断 ${text.length - max} 字符）` : text;
 }
 
 /**
@@ -1191,6 +1211,9 @@ export function apply(ctx, config = {}, internals = {}) {
   /** Upload rate buckets: device id / ip → { windowStart, count }. */
   const uploadBuckets = new Map();
 
+  /** 每设备在途 HTTP 请求数：慢上传/脚本并发不能无限占住宿主资源。 */
+  const httpInFlight = new Map();
+
   /** 每会话最近一次"丢弃过期 lastTurn"的审计时间（节流，见 getSessionHistory）。 */
   const staleTurnAuditAt = new Map();
   // [fix 2026-10-14] 历史转换中被启发式过滤/空内容丢弃的消息的审计节流表
@@ -1265,8 +1288,72 @@ export function apply(ctx, config = {}, internals = {}) {
   const connectedClients = new Set();
   let currentEventsClientId = null;
 
+  /**
+   * 设备是否仍然有效。管理 token（deviceId=admin）不查设备表。
+   *
+   * 撤销必须同时做到两件事：立刻关掉已有连接，且任何写帧处理前再验一次。
+   * 只靠广播会留下竞态：广播到达前、或旧客户端刻意忽略时，旧 socket 仍能审批。
+   */
+  function deviceStillActive(deviceId) {
+    if (!deviceId || deviceId === 'admin') return true;
+    try {
+      const dev = loadDevices().devices.find((d) => d?.id === deviceId);
+      return Boolean(dev && dev.revoked !== true);
+    } catch {
+      return false;
+    }
+  }
+
+  /** 撤销后立即踢掉该设备的全部存量 socket，而不只是广播。 */
+  function disconnectDeviceSockets(deviceId, reason = 'device_revoked') {
+    for (const client of connectedClients) {
+      if (client._deviceId !== deviceId) continue;
+      try {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: reason, deviceId }));
+        }
+      } catch { /* close 仍要执行 */ }
+      try { client.close(4001, reason); } catch { client.terminate?.(); }
+      connectedClients.delete(client);
+      questionSubscribers.delete(client);
+    }
+  }
+
   const globalPermissions = permStore.global;
   const sessionPermissions = permStore.sessions;
+
+  const POLICY_VALUES = new Set(['ask', 'auto-read', 'danger-full-access']);
+  const SANDBOX_VALUES = new Set(['sandboxed', 'workspace-write', 'danger-full-access']);
+
+  /** 与自定义审批预设共用同一套取值约束；拒绝而不是静默夹取。 */
+  function validatePermissionPatch(body = {}) {
+    const policy = body.defaultPolicy ?? body.executionPolicy;
+    if (policy !== undefined && !POLICY_VALUES.has(String(policy))) {
+      return '执行策略必须是 ask / auto-read / danger-full-access';
+    }
+    if (body.sandboxMode !== undefined && !SANDBOX_VALUES.has(String(body.sandboxMode))) {
+      return '沙箱模式必须是 sandboxed / workspace-write / danger-full-access';
+    }
+    if (body.maxSteps !== undefined) {
+      const n = Number(body.maxSteps);
+      if (!Number.isInteger(n) || n < 1 || n > 200) {
+        return '单轮步数上限必须是 1–200 的整数';
+      }
+    }
+    if (body.protectGit !== undefined && typeof body.protectGit !== 'boolean') {
+      return 'protectGit 必须是布尔值';
+    }
+    if (body.sessionPolicies !== undefined) {
+      if (!body.sessionPolicies || typeof body.sessionPolicies !== 'object' || Array.isArray(body.sessionPolicies)) {
+        return 'sessionPolicies 必须是对象';
+      }
+      for (const [sid, p] of Object.entries(body.sessionPolicies)) {
+        if (!assertSessionId(sid).ok) return `会话 id 非法：${sid}`;
+        if (!POLICY_VALUES.has(String(p))) return `会话 ${sid} 的策略非法`;
+      }
+    }
+    return '';
+  }
 
   function getPermissionsPayload() {
     return permStore.payload();
@@ -2076,19 +2163,21 @@ export function apply(ctx, config = {}, internals = {}) {
     };
   }
 
+    // 只有这些高体积/高频帧要求“已 follow 该会话”。审批、session_status、
+    // done/error 等仍需广播给所有客户端（后台会话也要能发通知、更新列表）。
+    const FOLLOW_ONLY_FRAMES = new Set([
+      'delta', 'thinking', 'stream_snapshot', 'tool_call', 'tool_start', 'tool_result', 'todo'
+    ]);
     function broadcastToMobileClients(msg) {
     const raw = typeof msg === 'string' ? msg : JSON.stringify(msg);
-    // Session-scoped frames only go to sockets that followed that session.
-    // Every socket used to receive every session's deltas and tool frames and
-    // discarded them client-side — wasted radio for the phone, wasted writes
-    // for the gateway. Broad frames (session_status with no id, todo/permission
-    // broadcasts, question frames to subscribers) pass through untouched.
+    // 未选择任何会话的 socket 不应接收所有会话的流式内容。
     const scopeId = msg && typeof msg === 'object' ? (msg.sessionId || null) : null;
+    const followOnly = msg && typeof msg === 'object' && FOLLOW_ONLY_FRAMES.has(msg.type);
     for (const ws of connectedClients) {
       if (ws.readyState === WebSocket.OPEN) {
-        if (scopeId && ws.sessionId &&
-            !sessionIdMatchesSafe(ws.sessionId, scopeId)) {
-          continue; // this phone is following a different session
+        if (scopeId && (!ws.sessionId || !sessionIdMatchesSafe(ws.sessionId, scopeId))) {
+          if (followOnly) continue; // not following this session → no stream payload
+          if (ws.sessionId) continue; // different session: keep only broad control frames
         }
         // [P1] Backpressure. A socket that cannot keep up used to accumulate in
         // the send buffer forever, because there is no other writer on this
@@ -2365,6 +2454,7 @@ export function apply(ctx, config = {}, internals = {}) {
     const muxUrl = `ws://127.0.0.1:${dshPort}/api/remote.mux`;
 
     upstreamMuxWs = new WebSocket(muxUrl, {
+      maxPayload: MAX_MUX_FRAME_BYTES,
       headers: {
         'Host': authority,
         'Cookie': cookie,
@@ -2400,6 +2490,10 @@ export function apply(ctx, config = {}, internals = {}) {
 
     upstreamMuxWs.on('message', (data) => {
       try {
+        if (Buffer.byteLength(data) > MAX_MUX_FRAME_BYTES) {
+          logger.warn('dsh-mobile-bridge: 丢弃超限的上游 MUX 帧 %d B', Buffer.byteLength(data));
+          return;
+        }
         const msg = JSON.parse(data.toString());
         handleUpstreamMuxMessage(msg).catch((err) => {
         logger.warn('dsh-mobile-bridge: 处理上游帧失败 %s', err?.message || err);
@@ -2523,10 +2617,10 @@ export function apply(ctx, config = {}, internals = {}) {
             // 顶成"运行中"——手机上表现为永远转圈、永远不回到空闲。
             // 增量照旧转发（内容不能丢），状态由 turn 边界独占裁决。
             if (c.type === 'reasoning-delta' && c.text) {
-              follower.thinkingBuffer += c.text;
+              follower.thinkingBuffer = appendBoundedText(follower.thinkingBuffer, c.text);
               broadcastToMobileClients({ type: 'thinking', sessionId: sId, delta: c.text, text: c.text });
             } else if (c.type === 'text-delta' && c.text) {
-              follower.textBuffer += c.text;
+              follower.textBuffer = appendBoundedText(follower.textBuffer, c.text);
               broadcastToMobileClients({ type: 'delta', sessionId: sId, delta: c.text, text: c.text });
             } else if (c.type === 'tool-call-delta') {
               broadcastToMobileClients({ type: 'tool_call', sessionId: sId, tool: c.name || 'tool', delta: c.argumentsDelta || '' });
@@ -2602,19 +2696,24 @@ export function apply(ctx, config = {}, internals = {}) {
             const toolObj = {
               id: ev.data?.id || `tool_${Date.now()}`,
               name: ev.data?.name || 'tool',
-              input: coerceToolInput(ev.data?.arguments),
+              input: boundToolText(coerceToolInput(ev.data?.arguments)),
               output: '',
               isRunning: true
             };
+            if (follower.tools.length >= 200) follower.tools.shift();
             follower.tools.push(toolObj);
             broadcastToMobileClients({ type: 'tool_start', sessionId: sId, tool: toolObj.name, input: toolObj.input });
           } else if (ev.type === 'tool/result') {
             if (follower.tools.length > 0) {
               const t = follower.tools[follower.tools.length - 1];
               t.isRunning = false;
-              t.output = ev.data?.output || '执行完毕';
+              t.output = boundToolText(ev.data?.output || '执行完毕');
             }
-            broadcastToMobileClients({ type: 'tool_result', sessionId: sId, output: ev.data?.output || '执行完毕' });
+            broadcastToMobileClients({
+              type: 'tool_result',
+              sessionId: sId,
+              output: boundToolText(ev.data?.output || '执行完毕')
+            });
           }
           // todo/write and session/attachment also ride the session log. This
           // branch ends in a bare `return`, so they must be offered here too or
@@ -3738,24 +3837,23 @@ export function apply(ctx, config = {}, internals = {}) {
     // 嵌入长期 token 等于把凭据印在纸上。手机扫到码后仍要走 /__mobile/pair
     // 换取真正的设备 token，5 次错码作废、10 分钟过期逻辑全部沿用。
     //
-    // [fix 2026-10-17] 配对码铸造不再零门槛：这两条路由此前在鉴权门前可无限
-    // 自助发码，公网部署下等于"任何能连到网关的人自己发码再自己兑" —— 5 次
-    // 错码锁定保护的是猜码，管不住自助发码。新规则（二选一满足即可）：
-    //   a) 请求带有效 admin/设备 token（电脑端扫码页本来就持有）；
-    //   b) 无 token 时仅当来源是私网（RFC1918/loopback）才放行 —— 局域网
-    //      配对是主用法；公网来源一律 403，提示走设置页生成。
+    // [security-fix 2026-10-25] 配对码只能由**已认证的管理端**铸造。
+    //
+    // 旧规则允许私网/回环来源在无 token 时自助发码，理由是"局域网配对是主用法"。
+    // 这个前提被 cloudflared 打破了：隧道把公网请求转回 127.0.0.1 后再交给网关，
+    // socket 来源看起来就是回环，于是任何拿到公网地址的人都能：
+    //   GET /pair/info → 匿名拿到码 → POST /__mobile/pair → 得到 readwrite token。
+    // 5 次错码锁定保护的是猜码，完全管不住"自己发码再自己兑"。
+    //
+    // 现在不再按来源地址判可信：只有共享管理 token（电脑端/设置页持有）能发码。
+    // 已配对设备 token 也不行 —— 否则一台设备可以无限续命、扩大设备面。
     const pairMintAllowed = () => {
       const auth = authenticateRequest(req, parsedUrl);
-      if (auth.ok) return { ok: true };
-      const ip = req.socket?.remoteAddress || '';
-      const isPrivate =
-        ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' ||
-        ip.startsWith('::ffff:10.') || ip.startsWith('10.') ||
-        ip.startsWith('::ffff:192.168.') || ip.startsWith('192.168.') ||
-        /^(::ffff:)?172\.(1[6-9]|2\d|3[01])\./.test(ip);
-      return isPrivate
-        ? { ok: true }
-        : { ok: false, reason: '配对码只对本机/局域网来源开放；远程请先在电脑端 DSH 设置页生成配对码' };
+      if (auth.ok && auth.device?.id === 'admin') return { ok: true };
+      return {
+        ok: false,
+        reason: '配对码只能由电脑端 DSH 设置页或持管理令牌的管理端生成'
+      };
     };
     if ((pathname === '/pair/qr' || pathname === '/api/mobile/pair/qr') && req.method === 'GET') {
       const mint = pairMintAllowed();
@@ -3828,11 +3926,19 @@ export function apply(ctx, config = {}, internals = {}) {
 
     // 3a. 生成配对码（供 DSH 设置页 / 运维调用，短期有效）
     if ((pathname === '/__mobile/pair/code' || pathname === '/api/mobile/pair/code') && req.method === 'POST') {
-      // Already authenticated above? No — this route sits before the auth block,
-      // so require the shared token explicitly.
+      // 这条路由在统一鉴权块之前，必须显式要求**管理端**令牌。
+      // 普通已配对设备（含 readonly）也不行：否则一台设备可自行发码并兑换
+      // 新的 readwrite token，等于绕过电脑端的设备管控。
       const authOk = authenticateRequest(req, parsedUrl);
       if (!authOk.ok) {
         sendJson(401, { ok: false, error: 'Unauthorized' });
+        return;
+      }
+      if (authOk.device?.id !== 'admin') {
+        sendJson(403, {
+          ok: false,
+          error: '配对码只能由电脑端 DSH 设置页或持管理令牌的管理端生成'
+        });
         return;
       }
       const code = newPairCode();
@@ -3989,6 +4095,26 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
     }
+
+    // 并发配额：计数在响应 finish/close 时释放，所有 return 分支都覆盖得到。
+    const inflightKey = auth.device?.id || req.socket?.remoteAddress || 'anon';
+    const inflight = httpInFlight.get(inflightKey) || 0;
+    if (inflight >= MAX_HTTP_INFLIGHT_PER_DEVICE) {
+      sendJson(429, { ok: false, code: 429, error: '并发请求过多，请稍后再试' });
+      audit('http/inflight-limited', { device: inflightKey, limit: MAX_HTTP_INFLIGHT_PER_DEVICE });
+      return;
+    }
+    httpInFlight.set(inflightKey, inflight + 1);
+    let released = false;
+    const releaseInflight = () => {
+      if (released) return;
+      released = true;
+      const left = (httpInFlight.get(inflightKey) || 1) - 1;
+      if (left <= 0) httpInFlight.delete(inflightKey);
+      else httpInFlight.set(inflightKey, left);
+    };
+    res.once('finish', releaseInflight);
+    res.once('close', releaseInflight);
 
     /* ---- 兼容端点：隧道手动控制（只对 provider=cloudflared 有意义）----
      *
@@ -4443,6 +4569,8 @@ export function apply(ctx, config = {}, internals = {}) {
         }
         audit('device/revoked', { deviceId, by: auth.device?.id || 'admin', ip: req.socket?.remoteAddress });
         broadcastToMobileClients({ type: 'device_revoked', deviceId });
+        // 广播只通知，不会让旧 socket 失效；这里必须真正断开它。
+        disconnectDeviceSockets(deviceId);
         sendJson(200, { ok: true, code: 0, deviceId, message: '设备已移除' });
         return;
       }
@@ -5149,6 +5277,11 @@ export function apply(ctx, config = {}, internals = {}) {
       }
 
       if (pathname === '/api/mobile/permissions' && req.method === 'POST') {
+        const invalid = validatePermissionPatch(jsonBody);
+        if (invalid) {
+          sendJson(400, { ok: false, code: 400, error: invalid });
+          return;
+        }
         const pol = jsonBody.defaultPolicy || jsonBody.executionPolicy;
         if (pol) globalPermissions.executionPolicy = pol;
         if (jsonBody.sandboxMode) globalPermissions.sandboxMode = jsonBody.sandboxMode;
@@ -5166,8 +5299,18 @@ export function apply(ctx, config = {}, internals = {}) {
       }
 
       if (pathname === '/api/mobile/sessions/permission' && req.method === 'POST') {
-        setSessionPermission(jsonBody.sessionId, jsonBody.policy);
-        sendJson(200, { ok: true, code: 0, sessionId: jsonBody.sessionId, policy: jsonBody.policy });
+        const sid = String(jsonBody.sessionId || '').trim();
+        const policy = String(jsonBody.policy || '').trim();
+        if (!sid || !POLICY_VALUES.has(policy)) {
+          sendJson(400, { ok: false, code: 400, error: 'sessionId 必填，policy 必须是 ask / auto-read / danger-full-access' });
+          return;
+        }
+        if (!assertSessionId(sid).ok) {
+          sendJson(400, { ok: false, code: 400, error: '会话 id 非法' });
+          return;
+        }
+        setSessionPermission(sid, policy);
+        sendJson(200, { ok: true, code: 0, sessionId: sid, policy });
         return;
       }
 
@@ -5202,9 +5345,19 @@ export function apply(ctx, config = {}, internals = {}) {
           sendJson(check.status, { ok: false, error: check.error });
           return;
         }
-        let content = '';
         const exists = fs.existsSync(check.targetFile);
-        if (exists) content = fs.readFileSync(check.targetFile, 'utf8');
+        if (exists) {
+          const st = fs.statSync(check.targetFile);
+          if (!st.isFile()) {
+            sendJson(400, { ok: false, error: '目标不是文件' });
+            return;
+          }
+          if (st.size > 1024 * 1024) {
+            sendJson(413, { ok: false, error: 'Memory 文件超过 1MB，请先在电脑端拆分' });
+            return;
+          }
+        }
+        const content = exists ? fs.readFileSync(check.targetFile, 'utf8') : '';
         sendJson(200, { ok: true, code: 0, fileName, content, exists, filePath: check.targetFile });
         return;
       }
@@ -5215,6 +5368,10 @@ export function apply(ctx, config = {}, internals = {}) {
         const content = jsonBody.content;
         if (!wsPath || !fileName) {
           sendJson(400, { ok: false, error: 'Missing parameters (workspacePath and fileName required)' });
+          return;
+        }
+        if (typeof content !== 'string' || Buffer.byteLength(content, 'utf8') > 1024 * 1024) {
+          sendJson(413, { ok: false, error: 'Memory 内容必须是字符串且不超过 1MB' });
           return;
         }
         const check = sanitizeWorkspaceFilePath(wsPath, fileName);
@@ -5364,7 +5521,11 @@ export function apply(ctx, config = {}, internals = {}) {
 
   const server = createServer(requestHandler);
 
-  const wss = new WebSocket.Server({ noServer: true });
+  const wss = new WebSocket.Server({
+    noServer: true,
+    // ws 层直接拒绝超大帧（1009），避免 JSON.parse 前先把内存占满。
+    maxPayload: MAX_WS_FRAME_BYTES
+  });
 
   // [v1.35 / 1.2] upgrade 处理器同样具名，明文与 TLS 两个服务共用。
   const handleUpgrade = (req, socket, head) => {
@@ -5458,6 +5619,13 @@ export function apply(ctx, config = {}, internals = {}) {
       }
     }
     pruneStaleFollowers();
+    // 公网扫描器不断换 IP，退避表与上传桶必须定期回收；否则它们本身就是
+    // 一个可被远程撑大的内存结构。
+    pruneAuthFailures();
+    const now = Date.now();
+    for (const [key, bucket] of uploadBuckets) {
+      if (!bucket || now - bucket.windowStart > 10 * 60 * 1000) uploadBuckets.delete(key);
+    }
   }, HEARTBEAT_INTERVAL_MS);
   heartbeatInterval.unref?.();
 
@@ -5486,6 +5654,7 @@ export function apply(ctx, config = {}, internals = {}) {
     ws._remoteIp = req.socket?.remoteAddress;
     ws._role = req._mobileAuth?.device?.role || 'readwrite';
     ws._deviceId = req._mobileAuth?.device?.id || 'admin';
+    ws._writeInFlight = 0;
     connectedClients.add(ws);
     audit('ws/connect', { ip: ws._remoteIp, role: ws._role });
 
@@ -5504,10 +5673,32 @@ export function apply(ctx, config = {}, internals = {}) {
     ws.on('message', async (raw) => {
       ws.isAlive = true;
       try {
+        // ws 的 maxPayload 已经会断开超大帧；这里再兜一层，防止 Buffer 路径
+        // 或将来换实现时把无界文本送进 JSON.parse。
+        if (raw?.length > MAX_WS_FRAME_BYTES) {
+          ws.close(1009, 'frame-too-large');
+          return;
+        }
         const rawStr = String(raw).trim();
         // 1. Raw string ping support (case-insensitive) -> string pong
         if (rawStr.toLowerCase() === 'ping') {
           ws.send('pong');
+          return;
+        }
+
+        // 撤销的兜底：即使主动断开没赶上，旧连接也不能继续发帧。
+        if (!deviceStillActive(ws._deviceId)) {
+          try {
+            ws.send(JSON.stringify({
+              type: 'device_revoked',
+              code: 401,
+              deviceId: ws._deviceId,
+              error: '电脑端已移除此设备'
+            }));
+            ws.close(4001, 'device_revoked');
+          } catch { /* socket may already be gone */ }
+          connectedClients.delete(ws);
+          questionSubscribers.delete(ws);
           return;
         }
 
@@ -5572,13 +5763,22 @@ export function apply(ctx, config = {}, internals = {}) {
             ws.send(JSON.stringify({ type: 'error', error: '只读设备无法回答提问 (read-only device)', code: 403 }));
             return;
           }
-          const res = await handleQuestionAnswer(msg.eventId || msg.id, msg.answer ?? msg.payload);
-          ws.send(JSON.stringify({
-            type: 'question_ack',
-            eventId: res.eventId || (msg.eventId || msg.id),
-            ok: res.ok === true,
-            error: res.error
-          }));
+          if (ws._writeInFlight >= 4) {
+            ws.send(JSON.stringify({ type: 'error', error: '写操作过于频繁，请稍后再试', code: 429 }));
+            return;
+          }
+          ws._writeInFlight++;
+          try {
+            const res = await handleQuestionAnswer(msg.eventId || msg.id, msg.answer ?? msg.payload);
+            ws.send(JSON.stringify({
+              type: 'question_ack',
+              eventId: res.eventId || (msg.eventId || msg.id),
+              ok: res.ok === true,
+              error: res.error
+            }));
+          } finally {
+            ws._writeInFlight--;
+          }
         } else if (msg.type === 'subscribe_questions' || msg.type === 'question_subscribe') {
           // Opt in to interactive prompts. Deliberately explicit: a phone that
           // is only browsing the session list must not receive questions, or a
@@ -5614,8 +5814,17 @@ export function apply(ctx, config = {}, internals = {}) {
           }
           const eventId = msg.eventId || msg.approvalId || msg.id;
           if (eventId && msg.outcome) {
-            const res = await handleApprovalRespond(eventId, msg.outcome, msg.reason);
-            ws.send(JSON.stringify({ type: 'approval_ack', eventId, outcome: res.outcome, ok: res.ok }));
+            if (ws._writeInFlight >= 4) {
+              ws.send(JSON.stringify({ type: 'error', error: '写操作过于频繁，请稍后再试', code: 429 }));
+              return;
+            }
+            ws._writeInFlight++;
+            try {
+              const res = await handleApprovalRespond(eventId, msg.outcome, msg.reason);
+              ws.send(JSON.stringify({ type: 'approval_ack', eventId, outcome: res.outcome, ok: res.ok }));
+            } finally {
+              ws._writeInFlight--;
+            }
           }
         }
       } catch (err) {

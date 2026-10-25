@@ -170,6 +170,27 @@ describe('device revocation', () => {
     assert.equal(after.data.deviceId, deviceId);
   });
 
+  it('revoking closes the revoked device live WebSocket', async () => {
+    const { token, deviceId } = await pairDevice('在线待撤销机');
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/mobile-ws`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    await new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });
+
+    const closed = new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('revoked socket stayed open')), 5000);
+      ws.once('close', (code, reason) => {
+        clearTimeout(t);
+        resolve({ code, reason: reason.toString() });
+      });
+    });
+
+    const rev = await adminReq('/api/mobile/devices/revoke', { method: 'POST', body: { deviceId } });
+    assert.equal(rev.status, 200);
+    const result = await closed;
+    assert.equal(result.code, 4001, 'app treats 4001 as auth failure');
+  });
+
   it('revoking broadcasts device_revoked to other online clients', async () => {
     const wsUrl = `ws://127.0.0.1:${PORT}/mobile-ws`;
     const ws = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } });
@@ -195,6 +216,15 @@ describe('device revocation', () => {
     const frame = await framePromise;
     assert.equal(frame.deviceId, deviceId);
     ws.close();
+  });
+
+  it('a paired device cannot mint another pairing code', async () => {
+    const { token } = await pairDevice('普通设备');
+    const r = await req('/__mobile/pair/code', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    assert.equal(r.status, 403, 'only the admin token may mint pairing codes');
   });
 
   it('revoke of an unknown device 404s', async () => {

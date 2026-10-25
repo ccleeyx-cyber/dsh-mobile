@@ -4,6 +4,7 @@ import 'dart:io' show HttpClient, X509Certificate;
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/status.dart' as ws_status;
@@ -77,12 +78,17 @@ class DshService extends ChangeNotifier {
 
   /// 共享 HTTP 客户端（连接池 + keep-alive）。
   ///
-  /// 此前每个请求都走顶层 http.get/post：dart 默认 Client 每请求新建 TCP
-  /// 连接，且 _authHeaders 里手动加的 'Connection: close' 让它连复用的机会
-  /// 都没有 —— 弱网下每请求多一个完整 TCP 握手 + 慢启动。这里集中持有，
-  /// dispose 时关闭。sendChatMessage 里那条代理掉线重试逻辑保留，覆盖极少数
-  /// 反代掐 keep-alive 连接的场景。
-  final http.Client _httpClient = http.Client();
+  /// 每次 connect 按当前网关重建：HTTPS 时必须与 WSS 使用同一套 TOFU 证书
+  /// 判定，否则会出现“WS 连上了、历史/发送却全部证书失败”。客户端同时绑定
+  /// 连接代次，旧网关迟到的响应不会写进新网关的状态。
+  http.Client _httpClient = http.Client();
+
+  /// 连接代次：每次 connect/reconnect 自增。所有 socket 回调与 HTTP 客户端
+  /// 都捕获当时的代次，切换网关后的旧回调直接丢弃。
+  int _connectionGeneration = 0;
+
+  bool _isGenerationCurrent(int generation) =>
+      !_isDisposed && generation == _connectionGeneration;
 
   // Reconnection & Resilience State (F3.1, F3.2)
   Timer? _reconnectTimer;
@@ -171,13 +177,17 @@ class DshService extends ChangeNotifier {
   // ---- 会话历史无限上翻（v1.15）[feat 2026-10-12] ----
   /// 是否还有更早历史可拉。
   bool _hasMoreHistory = false;
+
   /// 正在拉取更早历史（顶部转圈的信号源）。
   bool _isLoadingOlder = false;
+
   /// 下一页游标：当前最旧一条带 seq 消息的 seq。null = 还没有可翻页的锚点。
   int? _oldestHistorySeq;
+
   /// 已到会话开头（拉过一页且 hasMore=false）。
   bool _historyExhausted = false;
-  bool get hasMoreHistory => _hasMoreHistory && !_historyExhausted && _oldestHistorySeq != null;
+  bool get hasMoreHistory =>
+      _hasMoreHistory && !_historyExhausted && _oldestHistorySeq != null;
   bool get isLoadingOlder => _isLoadingOlder;
   bool get historyExhausted => _historyExhausted;
 
@@ -201,7 +211,8 @@ class DshService extends ChangeNotifier {
   Timer? _streamFlushTimer;
 
   /// 累积增量并（可能）延迟通知。由流式帧处理器调用。
-  void _ingestStreamDelta(ChatMessage target, {String? content, String? thinking}) {
+  void _ingestStreamDelta(ChatMessage target,
+      {String? content, String? thinking}) {
     target.appendStreamDelta(content: content, thinking: thinking);
     _scheduleStreamFlush();
   }
@@ -214,7 +225,8 @@ class DshService extends ChangeNotifier {
       return;
     }
     // 窗口内：只挂一个待执行的 flush，重复帧不叠加定时器。
-    _streamFlushTimer ??= Timer(_streamNotifyInterval - now.difference(last), () {
+    _streamFlushTimer ??=
+        Timer(_streamNotifyInterval - now.difference(last), () {
       _streamFlushTimer = null;
       _lastStreamNotifyAt = null;
       _flushStreamBuffers();
@@ -272,7 +284,9 @@ class DshService extends ChangeNotifier {
       for (final s in ws.sessions) {
         if (s.matchesSessionId(sessionId)) {
           final t = s.title.trim();
-          return t.isEmpty ? '会话 ${sessionId.substring(0, sessionId.length.clamp(0, 8))}' : t;
+          return t.isEmpty
+              ? '会话 ${sessionId.substring(0, sessionId.length.clamp(0, 8))}'
+              : t;
         }
       }
     }
@@ -305,9 +319,7 @@ class DshService extends ChangeNotifier {
     try {
       final pct = _sessionStats?.contextFraction;
       final approvals = _pendingApprovals.length;
-      final status = !isConnected
-          ? '未连接'
-          : (isSessionRunning ? '执行中' : '空闲');
+      final status = !isConnected ? '未连接' : (isSessionRunning ? '执行中' : '空闲');
       unawaited(WidgetBridge.push({
         'title': _currentSession?.title ?? '',
         'status': status,
@@ -376,7 +388,8 @@ class DshService extends ChangeNotifier {
   /// 返回是否成功。**失败必须被如实告知用户**：Android 12+ 对后台启动前台服务
   /// 有限制，用户手动划掉通知也会让它失效。这个场景下"App 看起来能收通知但
   /// 其实收不到"是最糟的结果 —— 所以状态要暴露到 UI 上，而不是静默失败。
-  Future<bool> enableBackgroundNotifications() => notifications.enableBackground();
+  Future<bool> enableBackgroundNotifications() =>
+      notifications.enableBackground();
 
   /// 后台通知是否真的开着（UI 用来显示"后台通知已关闭"这类提示）。
   bool get backgroundNotificationsOn => notifications.backgroundEnabled;
@@ -408,8 +421,15 @@ class DshService extends ChangeNotifier {
   // Getters
   ConnectionStatus get status => _status;
   String get lastError => _lastError;
-  void clearError() { _lastError = ''; notifyListeners(); }
-  String get currentModel => _currentSessionModel ?? _settings?.currentModel ?? 'cn:deepseek-v4.1-flash';
+  void clearError() {
+    _lastError = '';
+    notifyListeners();
+  }
+
+  String get currentModel =>
+      _currentSessionModel ??
+      _settings?.currentModel ??
+      'cn:deepseek-v4.1-flash';
   bool get isConnected => _status == ConnectionStatus.connected;
   ServerConfig? get currentConfig => _currentConfig;
 
@@ -445,7 +465,8 @@ class DshService extends ChangeNotifier {
   List<TodoItem> get currentTodos {
     final s = _currentSession;
     if (s == null) return const [];
-    return _todos[s.sessionId.replaceFirst(RegExp(r'^session-'), '')] ?? const [];
+    return _todos[s.sessionId.replaceFirst(RegExp(r'^session-'), '')] ??
+        const [];
   }
 
   /// 当前会话的图片附件元信息（仅元数据，不含字节）。
@@ -483,6 +504,7 @@ class DshService extends ChangeNotifier {
   DshSettings? get settings => _settings;
   PermissionConfig get permissions => _permissions;
   List<AuditLogItem> get auditLogs => _auditLogs;
+
   /// 当前会话最近一次回合的失败说明；无失败时为 null。
   TurnEndInfo? get lastTurnFailure => _lastTurnFailure;
 
@@ -492,7 +514,8 @@ class DshService extends ChangeNotifier {
     final sid = _currentSession?.sessionId;
     if (sid != null) {
       _dismissedFailureSessions.add(_failureKey(sid));
-      unawaited(StorageService.saveDismissedTurnFailures(_dismissedFailureSessions.toList()));
+      unawaited(StorageService.saveDismissedTurnFailures(
+          _dismissedFailureSessions.toList()));
     }
     if (_lastTurnFailure == null) return;
     _lastTurnFailure = null;
@@ -599,15 +622,19 @@ class DshService extends ChangeNotifier {
     _isLoadingOlder = true;
     notifyListeners();
     try {
-      final uri = Uri.parse('${cfg.httpBaseUrl}/api/mobile/sessions/history/page')
-          .replace(queryParameters: {
+      final uri =
+          Uri.parse('${cfg.httpBaseUrl}/api/mobile/sessions/history/page')
+              .replace(queryParameters: {
         'sessionId': sessionId,
         'beforeSeq': '$anchor',
         'max': '60',
       });
-      final res = await _httpClient.get(uri, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final res = await _httpClient
+          .get(uri, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return;
-      if (_currentSession == null || !_currentSession!.matchesSessionId(sessionId)) return;
+      if (_currentSession == null ||
+          !_currentSession!.matchesSessionId(sessionId)) return;
       if (res.statusCode != 200) return;
 
       final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -625,9 +652,12 @@ class DshService extends ChangeNotifier {
       for (final m in rawPage) {
         if (m is! Map) continue;
         final raw = Map<String, dynamic>.from(m);
-        final seq = raw['seq'] is int ? raw['seq'] as int : (raw['seq'] is num ? (raw['seq'] as num).toInt() : null);
+        final seq = raw['seq'] is int
+            ? raw['seq'] as int
+            : (raw['seq'] is num ? (raw['seq'] as num).toInt() : null);
         final id = raw['id'] as String?;
-        if ((seq != null && knownSeqs.contains(seq)) || (id != null && knownIds.contains(id))) {
+        if ((seq != null && knownSeqs.contains(seq)) ||
+            (id != null && knownIds.contains(id))) {
           continue;
         }
         final msg = ChatMessage.fromWire(raw, newId: _uuid.v4);
@@ -645,7 +675,8 @@ class DshService extends ChangeNotifier {
           break;
         }
       }
-      nextAnchor ??= (pageOldest != null && pageOldest < anchor) ? pageOldest : null;
+      nextAnchor ??=
+          (pageOldest != null && pageOldest < anchor) ? pageOldest : null;
 
       if (!hasMore || nextAnchor == null) {
         _historyExhausted = true;
@@ -666,7 +697,8 @@ class DshService extends ChangeNotifier {
       debugPrint('[DshService] loadOlderHistory error: $e');
       // 静默失败：一次翻页失败不该打断用户正在看的会话。
     } finally {
-      if (_currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
+      if (_currentSession != null &&
+          _currentSession!.matchesSessionId(sessionId)) {
         _isLoadingOlder = false;
         notifyListeners();
       }
@@ -698,6 +730,7 @@ class DshService extends ChangeNotifier {
   /// 全部布局。
   Future<void> ensureFullHistory({int maxPages = 40}) async {
     final seq = _sessionLoadSeq;
+    final sessionId = _currentSession?.sessionId;
     var pages = 0;
     while (hasMoreHistory && pages < maxPages) {
       final before = _messages.length;
@@ -706,6 +739,16 @@ class DshService extends ChangeNotifier {
       pages++;
       if (_messages.length <= before) break; // 没有进展
       if (pages > 0) notifyListeners();
+    }
+    // [fix 2026-10-25] 首次加载也必须写回缓存。
+    //
+    // 旧实现只在“已有缓存”分支写回，首次打开走完整补页后什么都没留下，
+    // 于是第二次打开仍然从零重拉全部历史 —— 这正是缓存本来要解决的问题。
+    // 页数上限/网络失败时也可以缓存：exhausted 标志会如实告诉下次还要不要补。
+    if (seq == _sessionLoadSeq &&
+        sessionId != null &&
+        _currentSession?.matchesSessionId(sessionId) == true) {
+      _cacheSessionHistory(sessionId, _historyExhausted);
     }
   }
 
@@ -830,7 +873,9 @@ class DshService extends ChangeNotifier {
       // 清凭据 + 停连接；UI 层据 lastAuthFailureWasDeviceRevoked 弹提示并跳配置页。
       try {
         final body = jsonDecode(utf8.decode(res.bodyBytes));
-        if (body is Map && (body['device_revoked'] == true || body['code2'] == 'device_revoked')) {
+        if (body is Map &&
+            (body['device_revoked'] == true ||
+                body['code2'] == 'device_revoked')) {
           unawaited(handleDeviceRevoked());
           return true;
         }
@@ -899,53 +944,67 @@ class DshService extends ChangeNotifier {
         '${config.httpBaseUrl}/api/mobile/settings',
       ];
 
-      // 并行竞速：旧实现串行试 5 个端点，每个 4s 超时 —— 全失败要等 20s。
-      // 这里所有端点同时发出，任何先返回的结论（成功 / 401）直接定案。
-      final futures = testEndpoints.map((endpoint) async {
-        try {
-          final res = await _httpClient
-              .get(Uri.parse(endpoint), headers: headers)
-              .timeout(const Duration(seconds: 4));
-          return res;
-        } catch (_) {
-          return null;
+      // 测试连接也必须走与正式连接相同的证书策略，否则自签 HTTPS 会在这里
+      // 被判成“不可达”，而用户保存后 WSS 却又能连上。
+      final testClient = await _buildHttpClientFor(config);
+      try {
+        // 并行探测：旧实现串行试 5 个端点，每个 4s 超时 —— 全失败要等 20s。
+        final futures = testEndpoints.map((endpoint) async {
+          try {
+            final res = await testClient
+                .get(Uri.parse(endpoint), headers: headers)
+                .timeout(const Duration(seconds: 4));
+            return res;
+          } catch (_) {
+            return null;
+          }
+        });
+        final responses = await Future.wait(futures);
+
+        if (_pendingCertChange != null) {
+          _lastError = '网关证书指纹已变化，连接被阻止；请确认新指纹后重试';
+          return false;
         }
-      });
-      final responses = await Future.wait(futures);
-      for (final res in responses) {
-        if (res == null) continue;
-        if (res.statusCode == 401 || res.statusCode == 403) {
-          // [feat 2026-10-12] testConnection 也可能撞上被撤销设备的 401：
-          // 识别 device_revoked 并清凭据，让 UI 能引导回配对页。
-          if (res.statusCode == 401) {
+        for (final res in responses) {
+          if (res == null) continue;
+          if (res.statusCode == 401 || res.statusCode == 403) {
+            // [feat 2026-10-12] testConnection 也可能撞上被撤销设备的 401：
+            // 识别 device_revoked 并清凭据，让 UI 能引导回配对页。
+            if (res.statusCode == 401) {
+              try {
+                final errBody = jsonDecode(utf8.decode(res.bodyBytes));
+                if (errBody is Map &&
+                    (errBody['device_revoked'] == true ||
+                        errBody['code2'] == 'device_revoked')) {
+                  await handleDeviceRevoked();
+                  _lastError = '电脑端已移除此设备，请重新配对';
+                  return false;
+                }
+              } catch (_) {}
+            }
+            _lastError = '认证失败 (HTTP ${res.statusCode}): 请核对访问令牌或授权码';
+            return false;
+          }
+        }
+        for (final res in responses) {
+          if (res == null) continue;
+          if (res.statusCode >= 200 && res.statusCode < 300) {
             try {
-              final errBody = jsonDecode(utf8.decode(res.bodyBytes));
-              if (errBody is Map && (errBody['device_revoked'] == true || errBody['code2'] == 'device_revoked')) {
-                await handleDeviceRevoked();
-                _lastError = '电脑端已移除此设备，请重新配对';
+              final body = jsonDecode(res.body);
+              if (body is Map &&
+                  (body['authenticated'] == false || body['code'] == 401)) {
+                _lastError = '认证失败: 授权码错误或未提供有效令牌';
                 return false;
               }
             } catch (_) {}
+            return true;
           }
-          _lastError = '认证失败 (HTTP ${res.statusCode}): 请核对访问令牌或授权码';
-          return false;
         }
+        _lastError = '网关无响应或不可达';
+        return false;
+      } finally {
+        testClient.close();
       }
-      for (final res in responses) {
-        if (res == null) continue;
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          try {
-            final body = jsonDecode(res.body);
-            if (body is Map && (body['authenticated'] == false || body['code'] == 401)) {
-              _lastError = '认证失败: 授权码错误或未提供有效令牌';
-              return false;
-            }
-          } catch (_) {}
-          return true;
-        }
-      }
-      _lastError = '网关无响应或不可达';
-      return false;
     } catch (e) {
       _lastError = e.toString();
       return false;
@@ -954,7 +1013,35 @@ class DshService extends ChangeNotifier {
 
   // Connect
   Future<void> connect(ServerConfig config) async {
+    final previous = _currentConfig;
+    final switchingGateway = previous == null ||
+        previous.id != config.id ||
+        previous.cleanHost != config.cleanHost ||
+        previous.cleanPort != config.cleanPort;
     _currentConfig = config;
+    final generation = ++_connectionGeneration;
+    // 旧网关发起的请求/轮询不能作为新网关的“在途请求”被复用。
+    _fetchWorkspacesInFlight = null;
+    _sessionPollInFlight = false;
+    if (switchingGateway) {
+      // 会话、工作区、审批都属于上一台网关；不清会把 A 的数据画到 B 上。
+      _sessionLoadSeq++;
+      _workspaces = [];
+      _currentWorkspace = null;
+      _currentSession = null;
+      _messages = [];
+      _pendingApprovals = [];
+      _pendingQuestions.clear();
+      _todos.clear();
+      _attachments.clear();
+      _historyCache.clear();
+      _settings = null;
+      _auditLogs = [];
+      _personas = [];
+      _snippets = [];
+      _resetHistoryPaging();
+      _resetSessionInsights();
+    }
     // 加载"已关闭失败横幅"的账本（一次）。放在 connect 而不是构造里：构造是同步
     // 的，而 SharedPreferences 是异步的；connect 是每条使用路径的必经入口。
     if (!_dismissedFailuresLoaded) {
@@ -984,14 +1071,19 @@ class DshService extends ChangeNotifier {
 
     try {
       await _cleanTeardownSocket();
+      if (!_isGenerationCurrent(generation)) return;
+
+      _certGatewayId = _gatewayIdOf(config);
+      _pendingCertChange = null;
+      // REST 与 WSS 必须使用同一份证书信任策略。
+      await _replaceHttpClient(config, generation);
+      if (!_isGenerationCurrent(generation)) return;
 
       // [v1.35 / 1.4] WSS 时先装载 TOFU 信任视图（握手回调是同步的，不能
       // 在里面读存储层）；HTTP 直连不需要，保持零开销。
-      _certGatewayId = _gatewayIdOf(config);
-      _pendingCertChange = null;
-      final tlsClient = config.effectiveUseHttps
-          ? await _prepareTlsClient(config)
-          : null;
+      final tlsClient =
+          config.effectiveUseHttps ? await _prepareTlsClient(config) : null;
+      if (!_isGenerationCurrent(generation)) return;
 
       final uri = Uri.parse(config.wsUrl);
       // 鉴权走 header（不再放 URL query —— 代理日志会记录完整 URL）。
@@ -999,7 +1091,7 @@ class DshService extends ChangeNotifier {
       // WebSocketChannel.connect 的签名没有 headers。旧网关不认这些
       // header 会在 upgrade 时 401，客户端走 handleAuthFailure 的既有
       // 路径提示换 token，不会静默失败。
-      _channel = IOWebSocketChannel.connect(
+      final channel = IOWebSocketChannel.connect(
         uri,
         // [fix 2026-10-17] SYN 黑洞时没有它要挂到 OS 级 TCP 超时（约 2 分钟）。
         // 与 _executeReconnect 对称。
@@ -1010,15 +1102,20 @@ class DshService extends ChangeNotifier {
           'x-dsh-token': config.effectiveToken,
         },
       );
+      _channel = channel;
 
-      _channelSubscription = _channel!.stream.listen(
+      _channelSubscription = channel.stream.listen(
         (data) {
+          if (!_isGenerationCurrent(generation) ||
+              !identical(_channel, channel)) return;
           // 兜底：正常情况下 ready 已经把状态翻好了，这里再兜一次是为了应对
           // "消息比 ready 先到"的实现细节差异。
           _onSocketReady();
           _handleRawMessage(data);
         },
         onError: (error) {
+          if (!_isGenerationCurrent(generation) ||
+              !identical(_channel, channel)) return;
           debugPrint('[DshService] WebSocket error: $error');
           // [v1.35 / 1.4] 指纹不一致会以握手失败的形式冒到这里；它的处理与
           // 普通网络错误完全不同（不重连、要用户确认），必须最先分流。
@@ -1040,8 +1137,10 @@ class DshService extends ChangeNotifier {
           _scheduleReconnect();
         },
         onDone: () {
+          if (!_isGenerationCurrent(generation) ||
+              !identical(_channel, channel)) return;
           debugPrint('[DshService] WebSocket onDone closed');
-          final code = _channel?.closeCode;
+          final code = channel.closeCode;
           if (code == 4001 || code == 4401 || code == 1008) {
             handleAuthFailure('连接已关闭: 认证失败或Token过期 (Code: $code)');
             return;
@@ -1063,7 +1162,11 @@ class DshService extends ChangeNotifier {
       // 互等就是死锁，提问一个都到不了手机。实测就是这个表现：连接建立了、
       // 没有任何报错，但服务器一条 subscribe_questions 都没收到。
       try {
-        await _channel!.ready;
+        await channel.ready;
+        if (!_isGenerationCurrent(generation) ||
+            !identical(_channel, channel)) {
+          return;
+        }
         _onSocketReady();
       } catch (e) {
         // ready 失败会走 stream 的 onError/onDone，由它们负责重连；这里只记录，
@@ -1071,17 +1174,26 @@ class DshService extends ChangeNotifier {
         debugPrint('[DshService] WS ready 失败: $e');
       }
 
-      // Fetch initial data
-      await fetchWorkspaces();
-      await fetchSettings();
-      await fetchApprovals();
-      await fetchPermissions();
-      await fetchAuditLogs();
-      await fetchPersonas();
-      await fetchSnippets();
-      await fetchPushConfig();
-      await measurePing();
+      // Fetch initial data。每次 await 后都核对代次，避免旧网关的初始化流程
+      // 在新连接建立后继续覆盖界面。
+      for (final fetch in <Future<void> Function()>[
+        () => fetchWorkspaces(),
+        () => fetchSettings(),
+        () => fetchApprovals(),
+        () => fetchPermissions(),
+        () => fetchAuditLogs(),
+        () => fetchPersonas(),
+        () => fetchSnippets(),
+        () => fetchPushConfig(),
+        () async {
+          await measurePing();
+        },
+      ]) {
+        if (!_isGenerationCurrent(generation)) return;
+        await fetch();
+      }
     } catch (e) {
+      if (!_isGenerationCurrent(generation)) return;
       _status = ConnectionStatus.error;
       _lastError = e.toString();
       _isReconnecting = false;
@@ -1116,18 +1228,24 @@ class DshService extends ChangeNotifier {
     try {
       // 归档过滤交给网关做，而不是拉全量回来在客户端筛：本机 2322 个会话里有
       // 1338 个已归档，全量传输会把一个定时轮询的响应放大到 2.4 倍。
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces')
-          .replace(queryParameters: {'archived': _archivedFilter});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces')
+              .replace(queryParameters: {'archived': _archivedFilter});
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return;
 
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final list = data['workspaces'] as List<dynamic>? ?? [];
-        _workspaces = list.map((w) => Workspace.fromJson(w as Map<String, dynamic>)).toList();
+        _workspaces = list
+            .map((w) => Workspace.fromJson(w as Map<String, dynamic>))
+            .toList();
 
         // 能力探测：只有网关如实回显了我们请求的模式，才算筛选真的生效了。
-        _archivedFilterSupported = data['archivedMode']?.toString() == _archivedFilter;
+        _archivedFilterSupported =
+            data['archivedMode']?.toString() == _archivedFilter;
 
         // 归档筛选只影响列表展示，不应该动用户正在看的会话。所以只有默认的
         // exclude 模式才做「当前工作区/会话」对账 —— 否则切一次筛选就会把正在
@@ -1141,12 +1259,15 @@ class DshService extends ChangeNotifier {
             _currentWorkspace = matched;
             // Preserve unsaved/active new session in the workspace session list
             final cur = _currentSession;
-            if (cur != null && !matched.sessions.any((s) => s.matchesSessionId(cur.sessionId))) {
+            if (cur != null &&
+                !matched.sessions
+                    .any((s) => s.matchesSessionId(cur.sessionId))) {
               matched.sessions.insert(0, cur);
             }
           } else if (_workspaces.isNotEmpty) {
             _currentWorkspace = _workspaces.first;
-            if (_currentWorkspace!.sessions.isNotEmpty && _currentSession == null) {
+            if (_currentWorkspace!.sessions.isNotEmpty &&
+                _currentSession == null) {
               await selectSession(_currentWorkspace!.sessions.first);
             }
           }
@@ -1187,8 +1308,12 @@ class DshService extends ChangeNotifier {
     String? archivedFilter,
   }) {
     _workspaces = workspaces;
-    if (archivedFilterSupported != null) _archivedFilterSupported = archivedFilterSupported;
-    if (archivedFilter != null) _archivedFilter = archivedFilter;
+    if (archivedFilterSupported != null) {
+      _archivedFilterSupported = archivedFilterSupported;
+    }
+    if (archivedFilter != null) {
+      _archivedFilter = archivedFilter;
+    }
     notifyListeners();
   }
 
@@ -1210,7 +1335,8 @@ class DshService extends ChangeNotifier {
   /// 那些路径就只能靠人眼看，等于没测。
   @visibleForTesting
   void debugSetConnection(bool connected) {
-    _status = connected ? ConnectionStatus.connected : ConnectionStatus.disconnected;
+    _status =
+        connected ? ConnectionStatus.connected : ConnectionStatus.disconnected;
     notifyListeners();
   }
 
@@ -1225,13 +1351,29 @@ class DshService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 测试用：把当前内存里的消息按真实缓存路径写一次。
+  @visibleForTesting
+  void debugWriteHistoryCache() {
+    final sessionId = _currentSession?.sessionId;
+    if (sessionId != null) _cacheSessionHistory(sessionId, _historyExhausted);
+  }
+
+  /// 测试用：查询某个会话是否有缓存快照，以及快照是否已翻到头。
+  @visibleForTesting
+  ({int messages, bool exhausted})? debugHistoryCache(String sessionId) {
+    final snapshot = _historyCache[sessionId];
+    if (snapshot == null) return null;
+    return (messages: snapshot.messages.length, exhausted: snapshot.exhausted);
+  }
+
   /// 测试用：把一份"服务端快照"直接喂给 reconcile，不联网。
   ///
   /// 存在的理由是 2026-10-17 那个缺陷：reconcile 曾经整体替换 `_messages`，于是
   /// 每 2.5 秒一次的轮询会把用户上翻加载出来的更早几轮**全部抹掉**（"明明有五轮，
   /// 只显示三轮"）。这条路径平时只由轮询驱动，没有这个缝就只能靠人眼在真机上撞。
   @visibleForTesting
-  void debugReconcileServerMessages(List<Map<String, dynamic>> raw, {bool isRunning = false}) {
+  void debugReconcileServerMessages(List<Map<String, dynamic>> raw,
+      {bool isRunning = false}) {
     final sid = _currentSession?.sessionId;
     if (sid == null) return;
     _reconcileSessionMessages(raw, isRunning, sid);
@@ -1299,7 +1441,8 @@ class DshService extends ChangeNotifier {
     for (final item in pending.questions) {
       final selected = selections[item.id] ?? const <String>[];
       final custom = customs[item.id] ?? '';
-      final answer = AskUserQuestionAnswerItem(id: item.id, selected: selected, custom: custom);
+      final answer = AskUserQuestionAnswerItem(
+          id: item.id, selected: selected, custom: custom);
       if (!answer.isAnswered) return false;
       answers.add(answer);
     }
@@ -1359,10 +1502,16 @@ class DshService extends ChangeNotifier {
     String? sessionId,
   }) async {
     final cfg = _currentConfig;
-    if (cfg == null) throw const AttachmentError('尚未配置网关地址');
+    if (cfg == null) {
+      throw const AttachmentError('尚未配置网关地址');
+    }
     final sid = sessionId ?? _currentSession?.sessionId;
-    if (sid == null || sid.isEmpty) throw const AttachmentError('请先选择一个会话再上传文件');
-    if (bytes.isEmpty) throw const AttachmentError('文件是空的');
+    if (sid == null || sid.isEmpty) {
+      throw const AttachmentError('请先选择一个会话再上传文件');
+    }
+    if (bytes.isEmpty) {
+      throw const AttachmentError('文件是空的');
+    }
 
     final uri = Uri.parse('${cfg.httpBaseUrl}/api/mobile/upload').replace(
       queryParameters: {'sessionId': sid, 'name': name},
@@ -1370,16 +1519,19 @@ class DshService extends ChangeNotifier {
 
     http.Response res;
     try {
-      res = await _httpClient.post(
-        uri,
-        headers: {
-          ..._authHeaders,
-          'Content-Type': 'application/octet-stream',
-        },
-        body: bytes,
-      ).timeout(const Duration(seconds: 120));
+      res = await _httpClient
+          .post(
+            uri,
+            headers: {
+              ..._authHeaders,
+              'Content-Type': 'application/octet-stream',
+            },
+            body: bytes,
+          )
+          .timeout(const Duration(seconds: 120));
     } catch (e) {
-      throw AttachmentError('上传失败：${e is Exception ? e.toString().split(':').first : e}');
+      throw AttachmentError(
+          '上传失败：${e is Exception ? e.toString().split(':').first : e}');
     }
 
     Map<String, dynamic> body = const {};
@@ -1393,7 +1545,8 @@ class DshService extends ChangeNotifier {
       throw AttachmentError(body['error']?.toString() ?? '文件超过大小上限');
     }
     if (res.statusCode != 200 || body['ok'] != true) {
-      throw AttachmentError(body['error']?.toString() ?? '上传失败 (HTTP ${res.statusCode})');
+      throw AttachmentError(
+          body['error']?.toString() ?? '上传失败 (HTTP ${res.statusCode})');
     }
     final receiptId = body['receiptId']?.toString() ?? '';
     if (receiptId.isEmpty) {
@@ -1530,8 +1683,11 @@ class DshService extends ChangeNotifier {
     _sendWsJson({'type': 'follow', 'sessionId': session.sessionId});
 
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/${session.sessionId}');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/${session.sessionId}');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return;
 
       // Guard: if user switched to another session while HTTP was in flight, discard!
@@ -1632,7 +1788,8 @@ class DshService extends ChangeNotifier {
     // 消息都携带上一会话的模型，设置页的默认模型被静默绕过（用户实测报告）。
     _currentSessionModel = null;
     armReconnectRetry();
-    final currentSeq = ++_sessionLoadSeq; // Invalidate any in-flight session loads
+    final currentSeq =
+        ++_sessionLoadSeq; // Invalidate any in-flight session loads
     _sessionPollTimer?.cancel();
     _sessionPollTimer = null;
     _setSending(false);
@@ -1678,18 +1835,22 @@ class DshService extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/create');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({
-          'workspaceId': _currentWorkspace!.workspaceId,
-          // [fix 2026-10-17] 网关 create 后按此字段注入默认模型（兜底路径，
-          // 主路径是下面 selectSessionModel 的显式注入）。
-          if (_settings?.currentModel != null && _settings!.currentModel.isNotEmpty)
-            'model': _settings!.currentModel,
-        }),
-      ).timeout(const Duration(seconds: 8));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/create');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'workspaceId': _currentWorkspace!.workspaceId,
+              // [fix 2026-10-17] 网关 create 后按此字段注入默认模型（兜底路径，
+              // 主路径是下面 selectSessionModel 的显式注入）。
+              if (_settings?.currentModel != null &&
+                  _settings!.currentModel.isNotEmpty)
+                'model': _settings!.currentModel,
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return;
 
       // Guard: if user switched to another session while request was in-flight, discard
@@ -1697,7 +1858,8 @@ class DshService extends ChangeNotifier {
 
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        final realSessionId = data['sessionId']?.toString() ?? data['session']?['sessionId']?.toString();
+        final realSessionId = data['sessionId']?.toString() ??
+            data['session']?['sessionId']?.toString();
         if (realSessionId != null && realSessionId.isNotEmpty) {
           // [fix 2026-10-17] 新会话的模型 = 设置页的默认模型（_currentSessionModel
           // 已在入口重置为 null，这里必然回落到 settings）。
@@ -1709,7 +1871,8 @@ class DshService extends ChangeNotifier {
             lastPromptAt: DateTime.now().millisecondsSinceEpoch,
           );
           if (_currentWorkspace != null) {
-            final idx = _currentWorkspace!.sessions.indexWhere((s) => s.sessionId == tempSessionId);
+            final idx = _currentWorkspace!.sessions
+                .indexWhere((s) => s.sessionId == tempSessionId);
             if (idx != -1) {
               _currentWorkspace!.sessions[idx] = realSession;
             } else {
@@ -1740,7 +1903,8 @@ class DshService extends ChangeNotifier {
   ///
   /// 允许"只有附件、没有文字"：引擎的准入规则是"非空白文字**或**至少一个附件"，
   /// 所以这里不能沿用纯文本的必填判断 —— 否则用户传了一张截图却发不出去。
-  Future<void> sendChatMessage(String text, {List<PendingAttachment> attachments = const []}) async {
+  Future<void> sendChatMessage(String text,
+      {List<PendingAttachment> attachments = const []}) async {
     if (text.trim().isEmpty && attachments.isEmpty) return;
 
     final sessionId = _currentSession?.sessionId ?? 'default';
@@ -1790,7 +1954,8 @@ class DshService extends ChangeNotifier {
       id: _uuid.v4(),
       role: 'assistant',
       content: '',
-      thinking: '', // initialize so ThinkingCard immediately displays active reasoning state
+      thinking:
+          '', // initialize so ThinkingCard immediately displays active reasoning state
       isStreaming: true,
       timestamp: DateTime.now(),
     );
@@ -1808,23 +1973,27 @@ class DshService extends ChangeNotifier {
 
     try {
       // Send via HTTP RPC with retry to tolerate reverse proxy Keep-Alive drops
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/prompt');
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/prompt');
       http.Response? res;
       for (int attempt = 0; attempt < 2; attempt++) {
         try {
-          res = await _httpClient.post(
-            url,
-            headers: _authHeaders,
-            body: jsonEncode({
-              'sessionId': sessionId,
-              'text': text,
-              'model': currentModel,
-              // 附件（v1.10.0）。图片是内联 base64 的 image part，文件是上传后换到的
-              // receiptId。网关负责把它们并进引擎要求的 content 数组。
-              if (attachments.isNotEmpty)
-                'attachments': attachments.map((a) => a.toWirePart()).toList(),
-            }),
-          ).timeout(const Duration(seconds: 20));
+          res = await _httpClient
+              .post(
+                url,
+                headers: _authHeaders,
+                body: jsonEncode({
+                  'sessionId': sessionId,
+                  'text': text,
+                  'model': currentModel,
+                  // 附件（v1.10.0）。图片是内联 base64 的 image part，文件是上传后换到的
+                  // receiptId。网关负责把它们并进引擎要求的 content 数组。
+                  if (attachments.isNotEmpty)
+                    'attachments':
+                        attachments.map((a) => a.toWirePart()).toList(),
+                }),
+              )
+              .timeout(const Duration(seconds: 20));
           break;
         } on http.ClientException catch (e) {
           if (attempt == 1) rethrow;
@@ -1834,7 +2003,8 @@ class DshService extends ChangeNotifier {
       }
 
       if (_isCanceling || turnId <= _cancelledTurnSeq) {
-        debugPrint('[DshService] sendPrompt finished but turn was canceled; ignoring response.');
+        debugPrint(
+            '[DshService] sendPrompt finished but turn was canceled; ignoring response.');
         return;
       }
 
@@ -1887,7 +2057,8 @@ class DshService extends ChangeNotifier {
   /// 若真失败，快照无变化，无副作用。幂等、一次性。
   void _scheduleFailedSendResync(String sessionId) {
     Future.delayed(const Duration(seconds: 5), () {
-      if (_currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
+      if (_currentSession != null &&
+          _currentSession!.matchesSessionId(sessionId)) {
         _resyncActiveSession(sessionId);
       }
     });
@@ -1905,10 +2076,14 @@ class DshService extends ChangeNotifier {
 
     _sessionPollTimer = Timer.periodic(interval, (timer) async {
       ticks++;
-      if (_isDisposed || ticks > maxTicks || _currentSession == null || !_currentSession!.matchesSessionId(sessionId)) {
+      if (_isDisposed ||
+          ticks > maxTicks ||
+          _currentSession == null ||
+          !_currentSession!.matchesSessionId(sessionId)) {
         timer.cancel();
         _sessionPollTimer = null;
-        if (_currentSession != null && _currentSession!.matchesSessionId(sessionId)) {
+        if (_currentSession != null &&
+            _currentSession!.matchesSessionId(sessionId)) {
           _setSending(false);
           if (_messages.isNotEmpty && _messages.last.isStreaming) {
             _messages.last.isStreaming = false;
@@ -1929,8 +2104,11 @@ class DshService extends ChangeNotifier {
       if (_sessionPollInFlight) return;
       _sessionPollInFlight = true;
       try {
-        final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$sessionId');
-        final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 5));
+        final url = Uri.parse(
+            '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$sessionId');
+        final res = await _httpClient
+            .get(url, headers: _authHeaders)
+            .timeout(const Duration(seconds: 5));
         if (_checkResponseAuth(res)) {
           timer.cancel();
           _sessionPollTimer = null;
@@ -1938,7 +2116,10 @@ class DshService extends ChangeNotifier {
         }
 
         // If user changed session or canceled while HTTP was in flight, abort!
-        if (_isCanceling || _sessionPollTimer == null || _currentSession == null || !_currentSession!.matchesSessionId(sessionId)) {
+        if (_isCanceling ||
+            _sessionPollTimer == null ||
+            _currentSession == null ||
+            !_currentSession!.matchesSessionId(sessionId)) {
           timer.cancel();
           _sessionPollTimer = null;
           return;
@@ -1972,8 +2153,11 @@ class DshService extends ChangeNotifier {
 
     final targetSessionId = _currentSession!.sessionId;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$targetSessionId');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 5));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$targetSessionId');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 5));
       if (_checkResponseAuth(res)) return;
 
       if (res.statusCode == 200) {
@@ -1982,7 +2166,8 @@ class DshService extends ChangeNotifier {
         if (sessionData == null) return;
 
         // Guard against mid-flight session navigation
-        if (_currentSession == null || !_currentSession!.matchesSessionId(targetSessionId)) return;
+        if (_currentSession == null ||
+            !_currentSession!.matchesSessionId(targetSessionId)) return;
 
         final rawMessages = sessionData['messages'] as List<dynamic>? ?? [];
         final isServerRunning = sessionData['isRunning'] == true;
@@ -1991,7 +2176,8 @@ class DshService extends ChangeNotifier {
           _currentSessionModel = serverModel;
         }
 
-        _reconcileSessionMessages(rawMessages, isServerRunning, targetSessionId);
+        _reconcileSessionMessages(
+            rawMessages, isServerRunning, targetSessionId);
       }
     } catch (e) {
       debugPrint('[DshService] _resyncActiveSession error: $e');
@@ -1999,8 +2185,10 @@ class DshService extends ChangeNotifier {
   }
 
   // Non-destructive 4-Way Stream Chunk & Session Reconciliation (F3.3)
-  void _reconcileSessionMessages(List<dynamic> rawMessages, bool isServerRunning, String targetSessionId) {
-    if (_currentSession == null || !_currentSession!.matchesSessionId(targetSessionId)) return;
+  void _reconcileSessionMessages(
+      List<dynamic> rawMessages, bool isServerRunning, String targetSessionId) {
+    if (_currentSession == null ||
+        !_currentSession!.matchesSessionId(targetSessionId)) return;
 
     final serverMessages = rawMessages.map((m) {
       // [fix 2026-10-17] 统一走 ChatMessage.fromWire：此前这里手写解析漏了
@@ -2020,8 +2208,7 @@ class DshService extends ChangeNotifier {
     // 被强制 isRunning=false，轮询每 2.5s 都把 UI 拽回"空闲"。
     if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) {
       final remoteNewTurn = serverMessages.any((m) =>
-          m.role == 'user' &&
-          !_messages.any((local) => local.id == m.id));
+          m.role == 'user' && !_messages.any((local) => local.id == m.id));
       if (!remoteNewTurn) {
         isServerRunning = false;
       } else if (_cancelledTurnSeq >= _activeTurnSeq) {
@@ -2036,16 +2223,22 @@ class DshService extends ChangeNotifier {
         final serverAssistant = serverMessages.last;
         serverAssistant.isStreaming = true;
 
-        final localAssistant = _messages.isNotEmpty && _messages.last.isAssistant ? _messages.last : null;
+        final localAssistant =
+            _messages.isNotEmpty && _messages.last.isAssistant
+                ? _messages.last
+                : null;
         if (localAssistant != null) {
           // 先 flush：本地还在流式时，最后 100ms 的增量压在 buffer 里，
           // 下面两处"本地比服务端长就保留本地"的比较会漏算这段，把本应
           // 保留的领先量判成落后，进而用滞后的服务端文本盖掉较新的本地内容。
           localAssistant.flushStreamBuffers();
           // 1. Reconcile thinking: never discard in-flight local thoughts
-          if ((localAssistant.thinking != null && localAssistant.thinking!.isNotEmpty) &&
-              (serverAssistant.thinking == null || serverAssistant.thinking!.isEmpty ||
-               localAssistant.thinking!.length > serverAssistant.thinking!.length)) {
+          if ((localAssistant.thinking != null &&
+                  localAssistant.thinking!.isNotEmpty) &&
+              (serverAssistant.thinking == null ||
+                  serverAssistant.thinking!.isEmpty ||
+                  localAssistant.thinking!.length >
+                      serverAssistant.thinking!.length)) {
             serverAssistant.thinking = localAssistant.thinking;
           }
 
@@ -2057,7 +2250,9 @@ class DshService extends ChangeNotifier {
         }
       } else {
         // Server has not emitted assistant turn yet; retain local optimistic assistant placeholder
-        if (_messages.isNotEmpty && _messages.last.isAssistant && _messages.last.isStreaming) {
+        if (_messages.isNotEmpty &&
+            _messages.last.isAssistant &&
+            _messages.last.isStreaming) {
           serverMessages.add(_messages.last);
         }
       }
@@ -2076,9 +2271,15 @@ class DshService extends ChangeNotifier {
         }
 
         // Preserve local thinking if server committed record omitted reasoning
-        final localAssistant = _messages.isNotEmpty && _messages.last.isAssistant ? _messages.last : null;
-        if (localAssistant != null && (localAssistant.thinking != null && localAssistant.thinking!.isNotEmpty) &&
-            (serverAssistant.thinking == null || serverAssistant.thinking!.isEmpty)) {
+        final localAssistant =
+            _messages.isNotEmpty && _messages.last.isAssistant
+                ? _messages.last
+                : null;
+        if (localAssistant != null &&
+            (localAssistant.thinking != null &&
+                localAssistant.thinking!.isNotEmpty) &&
+            (serverAssistant.thinking == null ||
+                serverAssistant.thinking!.isEmpty)) {
           serverAssistant.thinking = localAssistant.thinking;
         }
       }
@@ -2102,24 +2303,30 @@ class DshService extends ChangeNotifier {
     // 本地用户消息的保留窗放宽到 10 分钟，且去重比较改用「剥离附件名后的
     // 正文」——displayText 拼了 "📎 文件名" 而服务端历史没有这一段，全等比较
     // 永远不等，纯附件消息超窗后被整体替换吞掉（= 少一条提问）。
-    final serverUserTexts = serverMessages.where((m) => m.isUser).map((m) => m.content).toSet();
+    final serverUserTexts =
+        serverMessages.where((m) => m.isUser).map((m) => m.content).toSet();
     String stripAttachmentLabel(String s) {
       final idx = s.indexOf('\n\n📎 ');
       return idx >= 0 ? s.substring(0, idx) : s;
     }
+
     for (final localMsg in _messages.where((m) => m.isUser)) {
       // 已经在窗口之前、下面会原样保留的那批：不要在这里再补插一次。
-      if (localMsg.seq != null && oldestServerSeq != null && localMsg.seq! < oldestServerSeq) {
+      if (localMsg.seq != null &&
+          oldestServerSeq != null &&
+          localMsg.seq! < oldestServerSeq) {
         continue;
       }
       final localCore = stripAttachmentLabel(localMsg.content);
-      final matchedOnServer = localCore.isNotEmpty && serverUserTexts.any((s) {
-        if (s == localMsg.content) return true;
-        return s == localCore;
-      });
+      final matchedOnServer = localCore.isNotEmpty &&
+          serverUserTexts.any((s) {
+            if (s == localMsg.content) return true;
+            return s == localCore;
+          });
       if (localMsg.content.isNotEmpty && !matchedOnServer) {
         if (DateTime.now().difference(localMsg.timestamp).inMinutes < 10) {
-          final assistIdx = serverMessages.indexWhere((m) => m.isAssistant && m.isStreaming);
+          final assistIdx =
+              serverMessages.indexWhere((m) => m.isAssistant && m.isStreaming);
           if (assistIdx != -1) {
             serverMessages.insert(assistIdx, localMsg);
           } else {
@@ -2134,7 +2341,9 @@ class DshService extends ChangeNotifier {
     // 没有 seq，不受这里影响，仍由上面的"保留最近本地提问"负责。
     final olderKept = oldestServerSeq == null
         ? const <ChatMessage>[]
-        : _messages.where((m) => m.seq != null && m.seq! < oldestServerSeq).toList();
+        : _messages
+            .where((m) => m.seq != null && m.seq! < oldestServerSeq)
+            .toList();
 
     _messages = [...olderKept, ...serverMessages];
     _streamRevision++;
@@ -2176,7 +2385,8 @@ class DshService extends ChangeNotifier {
           msg.content = (msg.thinking != null && msg.thinking!.isNotEmpty)
               ? '*(任务已被手动停止)*'
               : '*(已取消)*';
-        } else if (!msg.content.endsWith('*(任务已被手动停止)*') && !msg.content.endsWith('*(已取消)*')) {
+        } else if (!msg.content.endsWith('*(任务已被手动停止)*') &&
+            !msg.content.endsWith('*(已取消)*')) {
           msg.content += '\n*(任务已被手动停止)*';
         }
       }
@@ -2193,14 +2403,17 @@ class DshService extends ChangeNotifier {
     }
 
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/cancel');
-      await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({
-          'sessionId': _currentSession!.sessionId,
-        }),
-      ).timeout(const Duration(seconds: 5));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/cancel');
+      await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'sessionId': _currentSession!.sessionId,
+            }),
+          )
+          .timeout(const Duration(seconds: 5));
     } catch (e) {
       debugPrint('[DshService] cancelTurn error: $e');
     } finally {
@@ -2211,13 +2424,15 @@ class DshService extends ChangeNotifier {
     }
   }
 
-
   // Settings
   Future<void> fetchSettings() async {
     if (_currentConfig == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -2248,19 +2463,24 @@ class DshService extends ChangeNotifier {
   Future<bool> selectSessionModel(String modelId, {String? sessionId}) async {
     if (_currentConfig == null) return false;
     final targetSessionId = sessionId ?? _currentSession?.sessionId;
-    if (targetSessionId == null || targetSessionId.isEmpty || targetSessionId == 'default') {
+    if (targetSessionId == null ||
+        targetSessionId.isEmpty ||
+        targetSessionId == 'default') {
       _lastError = '没有可用于切换模型的会话';
       notifyListeners();
       return false;
     }
 
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/model');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'sessionId': targetSessionId, 'model': modelId}),
-      ).timeout(const Duration(seconds: 8));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/model');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({'sessionId': targetSessionId, 'model': modelId}),
+          )
+          .timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode != 200) {
         _lastError = _errorFromBody(res) ?? '切换模型失败 (HTTP ${res.statusCode})';
@@ -2297,12 +2517,15 @@ class DshService extends ChangeNotifier {
   Future<bool> setDefaultModel(String modelId) async {
     if (_currentConfig == null) return false;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings/model');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'model': modelId}),
-      ).timeout(const Duration(seconds: 8));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/settings/model');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({'model': modelId}),
+          )
+          .timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode != 200) {
         _lastError = _errorFromBody(res) ?? '设置默认模型失败 (HTTP ${res.statusCode})';
@@ -2328,7 +2551,9 @@ class DshService extends ChangeNotifier {
     try {
       final data = jsonDecode(utf8.decode(res.bodyBytes));
       final err = data is Map ? data['error'] : null;
-      if (err != null && err.toString().trim().isNotEmpty) return err.toString();
+      if (err != null && err.toString().trim().isNotEmpty) {
+        return err.toString();
+      }
     } catch (_) {
       // 非 JSON 的响应体（代理错误页等）——按"没有可用原因"处理
     }
@@ -2339,15 +2564,19 @@ class DshService extends ChangeNotifier {
   Future<bool> deleteSession(String sessionId, [String? workspaceId]) async {
     if (_currentConfig == null) return false;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/delete');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({
-          'sessionId': sessionId,
-          'workspaceId': workspaceId ?? _currentWorkspace?.workspaceId ?? '',
-        }),
-      ).timeout(const Duration(seconds: 8));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/delete');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'sessionId': sessionId,
+              'workspaceId':
+                  workspaceId ?? _currentWorkspace?.workspaceId ?? '',
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return false;
 
       if (res.statusCode == 200) {
@@ -2356,7 +2585,8 @@ class DshService extends ChangeNotifier {
         }
 
         if (_currentSession?.matchesSessionId(sessionId) == true) {
-          if (_currentWorkspace != null && _currentWorkspace!.sessions.isNotEmpty) {
+          if (_currentWorkspace != null &&
+              _currentWorkspace!.sessions.isNotEmpty) {
             await selectSession(_currentWorkspace!.sessions.first);
           } else {
             await createNewSession();
@@ -2387,13 +2617,18 @@ class DshService extends ChangeNotifier {
   Future<void> fetchApprovals() async {
     if (_currentConfig == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approvals');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approvals');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final list = data['approvals'] as List<dynamic>? ?? [];
-        _pendingApprovals = list.map((a) => ApprovalRequest.fromJson(a as Map<String, dynamic>)).toList();
+        _pendingApprovals = list
+            .map((a) => ApprovalRequest.fromJson(a as Map<String, dynamic>))
+            .toList();
         notifyListeners();
       }
     } catch (e) {
@@ -2409,7 +2644,8 @@ class DshService extends ChangeNotifier {
    * ------------------------------------------------------------------ */
 
   /// 通知动作回调（由构造时挂到 NotificationService 上）。
-  Future<void> _handleNotificationAction(String actionId, String payload) async {
+  Future<void> _handleNotificationAction(
+      String actionId, String payload) async {
     final target = NotificationApprovalActions.decodePayload(payload);
     if (target == null) return;
     final approvalId = target.approvalId;
@@ -2428,7 +2664,9 @@ class DshService extends ChangeNotifier {
     final ok = result['ok'] == true;
     final already = result['alreadyApplied'] == true;
     final message = ok
-        ? (already ? '这本就是你要的结果，无需重复操作' : (decision == 'approve' ? '已批准 · 会话继续' : '已拒绝 · 会话不会执行'))
+        ? (already
+            ? '这本就是你要的结果，无需重复操作'
+            : (decision == 'approve' ? '已批准 · 会话继续' : '已拒绝 · 会话不会执行'))
         : approvalNoticeForResult(result);
     await notifications.show(
       title: ok ? '审批已处理' : '审批未生效',
@@ -2478,7 +2716,8 @@ class DshService extends ChangeNotifier {
       return {'ok': false, 'code': 'offline', 'error': '尚未连接网关'};
     }
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approvals/decide');
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/approvals/decide');
       final res = await _httpClient
           .post(
             url,
@@ -2502,10 +2741,12 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  Future<void> respondApproval(ApprovalRequest req, String outcome, {String? reason}) async {
+  Future<void> respondApproval(ApprovalRequest req, String outcome,
+      {String? reason}) async {
     if (_currentConfig == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approval');
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approval');
       final Map<String, dynamic> body = {
         'eventId': req.eventId,
         'approvalId': req.id.isNotEmpty ? req.id : req.eventId,
@@ -2523,16 +2764,19 @@ class DshService extends ChangeNotifier {
             'eventId': req.eventId,
             'approvalId': req.id.isNotEmpty ? req.id : req.eventId,
             'outcome': outcome,
-            if (reason != null && reason.trim().isNotEmpty) 'reason': reason.trim(),
+            if (reason != null && reason.trim().isNotEmpty)
+              'reason': reason.trim(),
           }));
         } catch (_) {}
       }
 
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode(body),
-      ).timeout(const Duration(seconds: 8));
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode(body),
+          )
+          .timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return;
 
       // 网关对"审批不存在(404)/回传引擎失败(502)"也回 HTTP 200（历史遗留，
@@ -2547,7 +2791,8 @@ class DshService extends ChangeNotifier {
           errMsg = data['error']?.toString() ?? '';
         } catch (_) {}
         if (ok) {
-          _pendingApprovals.removeWhere((a) => a.eventId == req.eventId || a.id == req.id);
+          _pendingApprovals
+              .removeWhere((a) => a.eventId == req.eventId || a.id == req.id);
           _lastError = '';
         } else {
           // 失败保留卡片（网关同样保留了队列条目），用户还有重试入口。
@@ -2564,8 +2809,11 @@ class DshService extends ChangeNotifier {
   Future<void> fetchPermissions() async {
     if (_currentConfig == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/permissions');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/permissions');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -2586,12 +2834,15 @@ class DshService extends ChangeNotifier {
     _permissions = newConfig;
     notifyListeners();
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/permissions');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode(newConfig.toJson()),
-      ).timeout(const Duration(seconds: 6));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/permissions');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode(newConfig.toJson()),
+          )
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -2628,13 +2879,19 @@ class DshService extends ChangeNotifier {
   Future<void> fetchAuditLogs() async {
     if (_currentConfig == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/audit-logs');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/audit-logs');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        final list = (data['auditLogs'] ?? data['logs']) as List<dynamic>? ?? [];
-        _auditLogs = list.map((a) => AuditLogItem.fromJson(a as Map<String, dynamic>)).toList();
+        final list =
+            (data['auditLogs'] ?? data['logs']) as List<dynamic>? ?? [];
+        _auditLogs = list
+            .map((a) => AuditLogItem.fromJson(a as Map<String, dynamic>))
+            .toList();
         notifyListeners();
       }
     } catch (e) {
@@ -2646,13 +2903,18 @@ class DshService extends ChangeNotifier {
   Future<void> fetchPersonas() async {
     if (_currentConfig == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/personas');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/personas');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final list = data['personas'] as List<dynamic>? ?? [];
-        _personas = list.map((p) => AgentPersona.fromJson(p as Map<String, dynamic>)).toList();
+        _personas = list
+            .map((p) => AgentPersona.fromJson(p as Map<String, dynamic>))
+            .toList();
         notifyListeners();
       }
     } catch (e) {
@@ -2663,12 +2925,16 @@ class DshService extends ChangeNotifier {
   Future<bool> savePersonas(List<AgentPersona> list) async {
     if (_currentConfig == null) return false;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/personas');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'personas': list.map((p) => p.toJson()).toList()}),
-      ).timeout(const Duration(seconds: 6));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/personas');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body:
+                jsonEncode({'personas': list.map((p) => p.toJson()).toList()}),
+          )
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
         _personas = list;
@@ -2692,8 +2958,11 @@ class DshService extends ChangeNotifier {
   Future<void> fetchSnippets() async {
     if (_currentConfig == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/snippets');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/snippets');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -2712,12 +2981,16 @@ class DshService extends ChangeNotifier {
   Future<bool> saveSnippets(List<Snippet> list) async {
     if (_currentConfig == null) return false;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/snippets');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'snippets': list.map((s) => s.toJson()).toList()}),
-      ).timeout(const Duration(seconds: 6));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/snippets');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body:
+                jsonEncode({'snippets': list.map((s) => s.toJson()).toList()}),
+          )
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -2756,8 +3029,11 @@ class DshService extends ChangeNotifier {
       return const WorkspaceDirListing(ok: false, error: '还没连上网关');
     }
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces/roots');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/workspaces/roots');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) {
         return const WorkspaceDirListing(ok: false, error: '登录状态已失效，请重新配对');
       }
@@ -2768,7 +3044,9 @@ class DshService extends ChangeNotifier {
       if (res.statusCode == 200 && parsed.ok) return parsed;
       return WorkspaceDirListing(
         ok: false,
-        error: parsed.error.isNotEmpty ? parsed.error : '网关不支持目录选择（HTTP ${res.statusCode}）',
+        error: parsed.error.isNotEmpty
+            ? parsed.error
+            : '网关不支持目录选择（HTTP ${res.statusCode}）',
       );
     } catch (e) {
       debugPrint('[DshService] fetchWorkspaceRoots error: $e');
@@ -2782,9 +3060,12 @@ class DshService extends ChangeNotifier {
       return const WorkspaceDirListing(ok: false, error: '还没连上网关');
     }
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces/browse')
+      final url = Uri.parse(
+              '${_currentConfig!.httpBaseUrl}/api/mobile/workspaces/browse')
           .replace(queryParameters: {'path': absPath});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) {
         return const WorkspaceDirListing(ok: false, error: '登录状态已失效，请重新配对');
       }
@@ -2796,7 +3077,9 @@ class DshService extends ChangeNotifier {
       return WorkspaceDirListing(
         ok: false,
         path: absPath,
-        error: parsed.error.isNotEmpty ? parsed.error : '读不了这个目录（HTTP ${res.statusCode}）',
+        error: parsed.error.isNotEmpty
+            ? parsed.error
+            : '读不了这个目录（HTTP ${res.statusCode}）',
       );
     } catch (e) {
       debugPrint('[DshService] browseWorkspaceDirs error: $e');
@@ -2817,14 +3100,16 @@ class DshService extends ChangeNotifier {
     final trimmed = path.trim();
     if (trimmed.isEmpty) return '路径不能为空';
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspaces/create');
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/workspaces/create');
       final res = await _httpClient
           .post(
             url,
             headers: _authHeaders,
             body: jsonEncode({
               'path': trimmed,
-              if (title != null && title.trim().isNotEmpty) 'title': title.trim(),
+              if (title != null && title.trim().isNotEmpty)
+                'title': title.trim(),
             }),
           )
           .timeout(const Duration(seconds: 10));
@@ -2851,12 +3136,15 @@ class DshService extends ChangeNotifier {
   Future<bool> setSessionArchived(String sessionId, bool archived) async {
     if (_currentConfig == null) return false;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/archive');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'sessionId': sessionId, 'archive': archived}),
-      ).timeout(const Duration(seconds: 6));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/archive');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({'sessionId': sessionId, 'archive': archived}),
+          )
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
         // 本地同步翻转，列表立即反映（网关也会广播 session_archived，但
@@ -2888,12 +3176,15 @@ class DshService extends ChangeNotifier {
   Future<bool> renameSession(String sessionId, String title) async {
     if (_currentConfig == null || title.trim().isEmpty) return false;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/rename');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'sessionId': sessionId, 'title': title.trim()}),
-      ).timeout(const Duration(seconds: 6));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/rename');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({'sessionId': sessionId, 'title': title.trim()}),
+          )
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
         for (final ws in _workspaces) {
@@ -2917,12 +3208,16 @@ class DshService extends ChangeNotifier {
   }
 
   /// 跨会话搜索（标题 + 首条 prompt）。
-  Future<List<SessionSearchHit>> searchSessions(String query, {int limit = 30}) async {
+  Future<List<SessionSearchHit>> searchSessions(String query,
+      {int limit = 30}) async {
     if (_currentConfig == null || query.trim().isEmpty) return const [];
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/search')
-          .replace(queryParameters: {'q': query.trim(), 'limit': '$limit'});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/search')
+              .replace(queryParameters: {'q': query.trim(), 'limit': '$limit'});
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return const [];
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -2965,7 +3260,9 @@ class DshService extends ChangeNotifier {
     final start = DateTime.now().millisecondsSinceEpoch;
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/ping');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 4));
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 4));
       if (res.statusCode == 200) {
         _pingMs = DateTime.now().millisecondsSinceEpoch - start;
         notifyListeners();
@@ -2981,10 +3278,14 @@ class DshService extends ChangeNotifier {
   Future<String> fetchWorkspaceMemory(String workspacePath) async {
     if (_currentConfig == null) return '';
     try {
-      final uri = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/memory').replace(
+      final uri = Uri.parse(
+              '${_currentConfig!.httpBaseUrl}/api/mobile/workspace/memory')
+          .replace(
         queryParameters: {'path': workspacePath},
       );
-      final res = await _httpClient.get(uri, headers: _authHeaders).timeout(const Duration(seconds: 6));
+      final res = await _httpClient
+          .get(uri, headers: _authHeaders)
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return '';
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -2999,12 +3300,15 @@ class DshService extends ChangeNotifier {
   Future<bool> saveWorkspaceMemory(String workspacePath, String content) async {
     if (_currentConfig == null) return false;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/memory');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'path': workspacePath, 'content': content}),
-      ).timeout(const Duration(seconds: 6));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/workspace/memory');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({'path': workspacePath, 'content': content}),
+          )
+          .timeout(const Duration(seconds: 6));
       if (_checkResponseAuth(res)) return false;
       return res.statusCode == 200;
     } catch (e) {
@@ -3152,7 +3456,8 @@ class DshService extends ChangeNotifier {
   ///
   /// 给的是"可显示的值"而不是"拉过没有"：状态条需要的正是这个，写成
   /// `deliverablesFetched` 那种布尔，调用方还得自己再决定显示什么。
-  int? get deliverableCount => _deliverablesKnown == true ? _deliverables.length : null;
+  int? get deliverableCount =>
+      _deliverablesKnown == true ? _deliverables.length : null;
 
   List<WorkspaceChange> get workspaceChanges => _workspaceChanges;
   String get workspaceChangesReason => _workspaceChangesReason;
@@ -3170,17 +3475,20 @@ class DshService extends ChangeNotifier {
   /// True when at least one row came from the session log rather than git, so
   /// its line counts are genuinely unknown (render "—", never "+0 −0").
   bool get changesIncludeToolCallRows =>
-      _workspaceChangesSource == 'tool-calls' || _workspaceChangesSource == 'git+tool-calls';
+      _workspaceChangesSource == 'tool-calls' ||
+      _workspaceChangesSource == 'git+tool-calls';
 
   /// 变更文件数：拉到了、且可列（git 仓库）时才有值，否则 null（隐藏）。
-  int? get changeCount =>
-      (_changesKnown == true && _workspaceChangesAvailable) ? _workspaceChanges.length : null;
+  int? get changeCount => (_changesKnown == true && _workspaceChangesAvailable)
+      ? _workspaceChanges.length
+      : null;
 
   /// 变更清单确实是"读不到"（而不是"还没拉过"）：非 git 仓库 / 网关报错。
   ///
   /// 与"未知"分开的原因：未知时状态条安静地不显示就够了；确实不可用时，
   /// 信息面板里要**说清为什么**，否则用户会以为工作区是干净的。
-  bool get changesUnavailable => _changesKnown == true && !_workspaceChangesAvailable;
+  bool get changesUnavailable =>
+      _changesKnown == true && !_workspaceChangesAvailable;
 
   List<ScheduleItem> get schedules => _schedules;
   List<JobItem> get jobs => _jobs;
@@ -3232,7 +3540,8 @@ class DshService extends ChangeNotifier {
     final stats = _sessionStats;
     // 只有实时读数才有资格当基线；`cache` 快照可能落后几个小时，拿它相减会
     // 算出一个凭空捏造的数字。
-    _statsBaselineTokens = (stats != null && stats.isLive) ? stats.totalTokens : null;
+    _statsBaselineTokens =
+        (stats != null && stats.isLive) ? stats.totalTokens : null;
   }
 
   /// 换会话时清掉上一个会话的全部读数。
@@ -3275,9 +3584,12 @@ class DshService extends ChangeNotifier {
     if (_currentConfig == null || sessionId == null) return;
     _queueLoading = true;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/queue')
-          .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/queue')
+              .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return;
       if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
@@ -3327,7 +3639,8 @@ class DshService extends ChangeNotifier {
   /// 在网关的 RPC 边界（`core.mjs` 的 `reject`）就被丢掉了，客户端拿不到；
   /// 禁止用错误文本做字符串匹配。等网关补上错误码透传后，这里可以升级成按码分支
   /// （行为不变，只是少一次多余的刷新）。
-  Future<QueueActionOutcome> queueAction(String itemId, String kind, {String? text}) async {
+  Future<QueueActionOutcome> queueAction(String itemId, String kind,
+      {String? text}) async {
     final injected = _debugQueueActionOutcome;
     if (injected != null) {
       // 测试注入：不打网关（见 debugSetQueueActionResult）。记下这一次调用，
@@ -3342,19 +3655,22 @@ class DshService extends ChangeNotifier {
       return QueueActionOutcome.failed;
     }
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/queue');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({
-          'sessionId': sessionId,
-          'itemId': itemId,
-          'action': {
-            'kind': kind,
-            if (text != null) 'text': text,
-          },
-        }),
-      ).timeout(const Duration(seconds: 10));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/queue');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'sessionId': sessionId,
+              'itemId': itemId,
+              'action': {
+                'kind': kind,
+                if (text != null) 'text': text,
+              },
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return QueueActionOutcome.failed;
       if (res.statusCode == 200) {
         _queueError = '';
@@ -3381,7 +3697,8 @@ class DshService extends ChangeNotifier {
   }
 
   /// 队列动作失败后的收敛判定：先对齐服务端真值，再决定这是不是真的失败。
-  Future<QueueActionOutcome> _settleFailedQueueAction(int seq, String itemId, String fallbackError) async {
+  Future<QueueActionOutcome> _settleFailedQueueAction(
+      int seq, String itemId, String fallbackError) async {
     // 切了会话就别再刷新了：fetchQueue 会去查新会话的队列，与这条动作无关。
     if (seq == _sessionLoadSeq) {
       await fetchQueue();
@@ -3410,7 +3727,8 @@ class DshService extends ChangeNotifier {
   /// 与 [sendChatMessage] 分开是刻意的：那条路径会乐观插入"用户气泡 + 助手
   /// 占位"，而排队消息属于 inbox，插入的气泡会和引擎回传的真值重复。这里只发、
   /// 然后以服务端的队列为准刷新界面。
-  Future<bool> deliverWhileRunning(String text, {List<PendingAttachment> attachments = const []}) async {
+  Future<bool> deliverWhileRunning(String text,
+      {List<PendingAttachment> attachments = const []}) async {
     final injected = _debugDeliverResult;
     if (injected != null) {
       // 测试注入：不打网关（见 debugSetDeliverResult）。成功时按需补一条队列行，
@@ -3429,20 +3747,23 @@ class DshService extends ChangeNotifier {
     if (text.trim().isEmpty && attachments.isEmpty) return false;
 
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/prompt');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({
-          'sessionId': sessionId,
-          'text': text,
-          'model': currentModel,
-          // 恒排队：运行中发出去的消息等本轮结束后自动发送。
-          'mode': 'queue',
-          if (attachments.isNotEmpty)
-            'attachments': attachments.map((a) => a.toWirePart()).toList(),
-        }),
-      ).timeout(const Duration(seconds: 20));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/prompt');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'sessionId': sessionId,
+              'text': text,
+              'model': currentModel,
+              // 恒排队：运行中发出去的消息等本轮结束后自动发送。
+              'mode': 'queue',
+              if (attachments.isNotEmpty)
+                'attachments': attachments.map((a) => a.toWirePart()).toList(),
+            }),
+          )
+          .timeout(const Duration(seconds: 20));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
         // 会话已切换：这条消息确实发出去了（返回 true 让调用方保留回执），
@@ -3470,7 +3791,8 @@ class DshService extends ChangeNotifier {
   //（历史上正是这么累积出 1270 条空会话的）。所以给 UI 测试一个纯内存的
   // 注入口，让"页面渲染了什么"可以被钉住，而不必联网。
   @visibleForTesting
-  void debugSetQueue(List<QueueItem> rows, {bool loading = false, String error = '', bool? known}) {
+  void debugSetQueue(List<QueueItem> rows,
+      {bool loading = false, String error = '', bool? known}) {
     _queueItems = rows;
     _queueLoading = loading;
     _queueError = error;
@@ -3582,9 +3904,12 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/deliverables')
-          .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/deliverables')
+              .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return;
       if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
@@ -3593,7 +3918,8 @@ class DshService extends ChangeNotifier {
         if (raw is List) {
           _deliverables = raw
               .whereType<Map>()
-              .map((e) => DeliverableItem.fromJson(Map<String, dynamic>.from(e)))
+              .map(
+                  (e) => DeliverableItem.fromJson(Map<String, dynamic>.from(e)))
               .where((d) => d.path.isNotEmpty)
               .toList(growable: false);
           _deliverablesKnown = true;
@@ -3618,7 +3944,8 @@ class DshService extends ChangeNotifier {
   /// 交付物下载地址（带鉴权头的请求由调用方发起）。
   Uri? deliverableUrl(DeliverableItem item) {
     if (_currentConfig == null || _currentSession == null) return null;
-    return Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/deliverables/download')
+    return Uri.parse(
+            '${_currentConfig!.httpBaseUrl}/api/mobile/deliverables/download')
         .replace(queryParameters: {
       'sessionId': _currentSession!.sessionId,
       'path': item.path,
@@ -3641,9 +3968,12 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/changes')
+      final url = Uri.parse(
+              '${_currentConfig!.httpBaseUrl}/api/mobile/workspace/changes')
           .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 15));
       if (_checkResponseAuth(res)) return;
       if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
@@ -3652,7 +3982,8 @@ class DshService extends ChangeNotifier {
         _workspaceChanges = raw is List
             ? raw
                 .whereType<Map>()
-                .map((e) => WorkspaceChange.fromJson(Map<String, dynamic>.from(e)))
+                .map((e) =>
+                    WorkspaceChange.fromJson(Map<String, dynamic>.from(e)))
                 .where((c) => c.path.isNotEmpty)
                 .toList(growable: false)
             : const <WorkspaceChange>[];
@@ -3665,7 +3996,8 @@ class DshService extends ChangeNotifier {
         _workspaceRepos = repos is List
             ? repos
                 .whereType<Map>()
-                .map((e) => RepoCandidate.fromJson(Map<String, dynamic>.from(e)))
+                .map(
+                    (e) => RepoCandidate.fromJson(Map<String, dynamic>.from(e)))
                 .where((r) => r.name.isNotEmpty)
                 .toList(growable: false)
             : const <RepoCandidate>[];
@@ -3691,9 +4023,12 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return const [];
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/diff')
-          .replace(queryParameters: {'sessionId': sessionId, 'path': path});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/diff')
+              .replace(queryParameters: {'sessionId': sessionId, 'path': path});
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 15));
       if (_checkResponseAuth(res)) return const [];
       if (res.statusCode != 200) return const [];
       final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -3714,9 +4049,12 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/schedules')
-          .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/schedules')
+              .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return;
       if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
@@ -3737,12 +4075,15 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null || id.isEmpty) return false;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/schedules/delete');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'sessionId': sessionId, 'id': id}),
-      ).timeout(const Duration(seconds: 10));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/schedules/delete');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({'sessionId': sessionId, 'id': id}),
+          )
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
         await fetchSchedules();
@@ -3768,7 +4109,9 @@ class DshService extends ChangeNotifier {
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/jobs')
           .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 12));
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 12));
       if (_checkResponseAuth(res)) return;
       if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
@@ -3805,19 +4148,25 @@ class DshService extends ChangeNotifier {
       return const JobStopResult(ok: false, error: '未连接');
     }
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/jobs/kill');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'sessionId': sessionId, 'jobId': jobId}),
-      ).timeout(const Duration(seconds: 20));
-      if (_checkResponseAuth(res)) return const JobStopResult(ok: false, error: '鉴权失败');
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/jobs/kill');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({'sessionId': sessionId, 'jobId': jobId}),
+          )
+          .timeout(const Duration(seconds: 20));
+      if (_checkResponseAuth(res)) {
+        return const JobStopResult(ok: false, error: '鉴权失败');
+      }
       final body = res.bodyBytes.isEmpty
           ? const <String, dynamic>{}
           : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
       if (res.statusCode == 200) {
         await fetchJobs();
-        return JobStopResult(ok: true, outcome: body['outcome']?.toString() ?? 'requested');
+        return JobStopResult(
+            ok: true, outcome: body['outcome']?.toString() ?? 'requested');
       }
       if (res.statusCode == 409) {
         // 任务已经结束：刷新一次列表即可，不必报错。
@@ -3837,7 +4186,9 @@ class DshService extends ChangeNotifier {
           error: body['error']?.toString() ?? '该任务不在本会话的可停止列表中',
         );
       }
-      return JobStopResult(ok: false, error: body['error']?.toString() ?? 'HTTP ${res.statusCode}');
+      return JobStopResult(
+          ok: false,
+          error: body['error']?.toString() ?? 'HTTP ${res.statusCode}');
     } catch (e) {
       debugPrint('[DshService] stopJob error: $e');
       return const JobStopResult(ok: false, error: '请求失败或超时');
@@ -3859,15 +4210,21 @@ class DshService extends ChangeNotifier {
       return const JobOutputChunk(ok: false, error: '未连接');
     }
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/jobs/follow').replace(
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/jobs/follow')
+              .replace(
         queryParameters: {
           'sessionId': sessionId,
           'jobId': jobId,
           if (from != null) 'from': '$from',
         },
       );
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 25));
-      if (_checkResponseAuth(res)) return const JobOutputChunk(ok: false, error: '鉴权失败');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 25));
+      if (_checkResponseAuth(res)) {
+        return const JobOutputChunk(ok: false, error: '鉴权失败');
+      }
       final body = res.bodyBytes.isEmpty
           ? const <String, dynamic>{}
           : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
@@ -3901,8 +4258,11 @@ class DshService extends ChangeNotifier {
   Future<String?> refreshRunbooks() async {
     if (_currentConfig == null) return '尚未连接网关';
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/runbooks');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/runbooks');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return '认证失败';
       final data = jsonDecode(utf8.decode(res.bodyBytes));
       final list = (data['runbooks'] as List<dynamic>? ?? const [])
@@ -3922,10 +4282,12 @@ class DshService extends ChangeNotifier {
   }
 
   /// 执行一条 Runbook。返回网关原始结果（含 outputTail / exitCode / code）。
-  Future<Map<String, dynamic>?> runRunbookCommand(String id, {bool confirm = false, String? sessionId}) async {
+  Future<Map<String, dynamic>?> runRunbookCommand(String id,
+      {bool confirm = false, String? sessionId}) async {
     if (_currentConfig == null) return null;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/runbooks/run');
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/runbooks/run');
       final res = await _httpClient
           .post(
             url,
@@ -3933,7 +4295,8 @@ class DshService extends ChangeNotifier {
             body: jsonEncode({
               'id': id,
               if (confirm) 'confirm': true,
-              if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
+              if (sessionId != null && sessionId.isNotEmpty)
+                'sessionId': sessionId,
             }),
           )
           .timeout(const Duration(seconds: 40));
@@ -3950,7 +4313,9 @@ class DshService extends ChangeNotifier {
     if (_currentConfig == null) return;
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/alerts');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return;
       final data = jsonDecode(utf8.decode(res.bodyBytes));
       _alerts = (data['alerts'] as List<dynamic>? ?? const [])
@@ -3964,10 +4329,12 @@ class DshService extends ChangeNotifier {
     }
   }
 
-  Future<int> markAlertsRead({List<String> ids = const [], bool all = false}) async {
+  Future<int> markAlertsRead(
+      {List<String> ids = const [], bool all = false}) async {
     if (_currentConfig == null) return 0;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/alerts/read');
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/alerts/read');
       final res = await _httpClient
           .post(
             url,
@@ -3978,7 +4345,8 @@ class DshService extends ChangeNotifier {
       if (_checkResponseAuth(res)) return 0;
       final data = jsonDecode(utf8.decode(res.bodyBytes));
       final changed = data['changed'] is int ? data['changed'] as int : 0;
-      _alertUnread = data['unread'] is int ? data['unread'] as int : _alertUnread;
+      _alertUnread =
+          data['unread'] is int ? data['unread'] as int : _alertUnread;
       notifyListeners();
       return changed;
     } catch (e) {
@@ -4003,7 +4371,8 @@ class DshService extends ChangeNotifier {
 
   Future<RemoteAccessState?> refreshRemoteAccess() async {
     if (_currentConfig == null) return null;
-    final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/remote-access');
+    final url =
+        Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/remote-access');
     try {
       final res = await _httpClient
           .get(url, headers: _authHeaders)
@@ -4012,7 +4381,8 @@ class DshService extends ChangeNotifier {
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         if (data is Map) {
-          _remoteAccess = RemoteAccessState.fromJson(Map<String, dynamic>.from(data));
+          _remoteAccess =
+              RemoteAccessState.fromJson(Map<String, dynamic>.from(data));
           notifyListeners();
           return _remoteAccess;
         }
@@ -4032,12 +4402,16 @@ class DshService extends ChangeNotifier {
     _diagnosticsBusy = true;
     notifyListeners();
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/diagnostics');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/diagnostics');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 15));
       if (_checkResponseAuth(res)) return null;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
-        _diagnostics = DiagnosticsReport.fromJson(Map<String, dynamic>.from(data));
+        _diagnostics =
+            DiagnosticsReport.fromJson(Map<String, dynamic>.from(data));
         return _diagnostics;
       }
     } catch (e) {
@@ -4054,9 +4428,12 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return null;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/subagents')
+      final url = Uri.parse(
+              '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/subagents')
           .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return null;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -4100,9 +4477,12 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return null;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/team')
-          .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/team')
+              .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return null;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -4128,14 +4508,22 @@ class DshService extends ChangeNotifier {
   /// 中断一个 continuable 子代理（引擎对 one-shot 一律拒绝，App 端提前拦下）。
   Future<bool> interruptSubagent(String childSessionId) async {
     final sessionId = _currentSession?.sessionId;
-    if (_currentConfig == null || sessionId == null || childSessionId.isEmpty) return false;
+    if (_currentConfig == null || sessionId == null || childSessionId.isEmpty) {
+      return false;
+    }
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/subagents/interrupt');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'parentSessionId': sessionId, 'childSessionId': childSessionId}),
-      ).timeout(const Duration(seconds: 10));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/subagents/interrupt');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'parentSessionId': sessionId,
+              'childSessionId': childSessionId
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return false;
       return res.statusCode == 200;
     } catch (e) {
@@ -4146,17 +4534,25 @@ class DshService extends ChangeNotifier {
 
   /// goal 操作：pause / resume / complete。ref 来自最近一次 session/stats。
   /// 引擎拒绝（502）时返回 false，由界面显示"引擎拒绝了这次操作"。
-  Future<bool> controlGoal(String action, {required String goalId, required int revision}) async {
+  Future<bool> controlGoal(String action,
+      {required String goalId, required int revision}) async {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return false;
     if (!const {'pause', 'resume', 'complete'}.contains(action)) return false;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/goals/$action');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'sessionId': sessionId, 'goalId': goalId, 'revision': revision}),
-      ).timeout(const Duration(seconds: 10));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/goals/$action');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'sessionId': sessionId,
+              'goalId': goalId,
+              'revision': revision
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
         // 引擎的 goal 操作改了 revision：立刻重读 stats，让面板的 ref 和相位
@@ -4196,12 +4592,16 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return null;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/repos')
-          .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/workspace/repos')
+              .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 15));
       if (_checkResponseAuth(res)) return null;
       if (res.statusCode != 200) return null;
-      return WorkspaceRepos.fromJson(Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes))));
+      return WorkspaceRepos.fromJson(
+          Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes))));
     } catch (e) {
       debugPrint('[DshService] fetchWorkspaceRepos error: $e');
       return null;
@@ -4216,8 +4616,11 @@ class DshService extends ChangeNotifier {
   Future<List<QuickCommandInfo>> fetchQuickCommands() async {
     if (_currentConfig == null) return const [];
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/quick-commands');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/quick-commands');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return const [];
       if (res.statusCode != 200) return const [];
       final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -4225,7 +4628,8 @@ class DshService extends ChangeNotifier {
       return raw is List
           ? raw
               .whereType<Map>()
-              .map((e) => QuickCommandInfo.fromJson(Map<String, dynamic>.from(e)))
+              .map((e) =>
+                  QuickCommandInfo.fromJson(Map<String, dynamic>.from(e)))
               .where((c) => c.id.isNotEmpty)
               .toList(growable: false)
           : const <QuickCommandInfo>[];
@@ -4248,13 +4652,18 @@ class DshService extends ChangeNotifier {
       return const QuickCommandResult(ok: false, error: '没有可用的会话');
     }
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/quick-commands/run');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'sessionId': sessionId, 'id': id}),
-      ).timeout(timeout);
-      if (_checkResponseAuth(res)) return const QuickCommandResult(ok: false, error: '鉴权失败');
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/quick-commands/run');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({'sessionId': sessionId, 'id': id}),
+          )
+          .timeout(timeout);
+      if (_checkResponseAuth(res)) {
+        return const QuickCommandResult(ok: false, error: '鉴权失败');
+      }
       final body = res.bodyBytes.isEmpty
           ? const <String, dynamic>{}
           : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
@@ -4262,7 +4671,11 @@ class DshService extends ChangeNotifier {
       if (res.statusCode == 200) return parsed;
       // Non-200 keeps `ok:false` and surfaces the gateway's reason, which is
       // actionable ("该会话没有可用的工作目录") where a bare status is not.
-      return QuickCommandResult(ok: false, id: id, error: parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
+      return QuickCommandResult(
+          ok: false,
+          id: id,
+          error:
+              parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
     } catch (e) {
       debugPrint('[DshService] runQuickCommand error: $e');
       return const QuickCommandResult(ok: false, error: '请求失败或超时');
@@ -4277,15 +4690,26 @@ class DshService extends ChangeNotifier {
     }
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/fs/list')
-          .replace(queryParameters: {'sessionId': sessionId, if (relPath.isNotEmpty) 'path': relPath});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
-      if (_checkResponseAuth(res)) return const FsListing(ok: false, error: '鉴权失败');
+          .replace(queryParameters: {
+        'sessionId': sessionId,
+        if (relPath.isNotEmpty) 'path': relPath
+      });
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 15));
+      if (_checkResponseAuth(res)) {
+        return const FsListing(ok: false, error: '鉴权失败');
+      }
       final body = res.bodyBytes.isEmpty
           ? const <String, dynamic>{}
           : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
       final parsed = FsListing.fromJson(body);
       if (res.statusCode == 200) return parsed;
-      return FsListing(ok: false, path: relPath, error: parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
+      return FsListing(
+          ok: false,
+          path: relPath,
+          error:
+              parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
     } catch (e) {
       debugPrint('[DshService] fsList error: $e');
       return const FsListing(ok: false, error: '请求失败或超时');
@@ -4301,14 +4725,22 @@ class DshService extends ChangeNotifier {
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/fs/read')
           .replace(queryParameters: {'sessionId': sessionId, 'path': relPath});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 15));
-      if (_checkResponseAuth(res)) return const TextFileContent(ok: false, error: '鉴权失败');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 15));
+      if (_checkResponseAuth(res)) {
+        return const TextFileContent(ok: false, error: '鉴权失败');
+      }
       final body = res.bodyBytes.isEmpty
           ? const <String, dynamic>{}
           : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
       final parsed = TextFileContent.fromJson(body);
       if (res.statusCode == 200) return parsed;
-      return TextFileContent(ok: false, path: relPath, error: parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
+      return TextFileContent(
+          ok: false,
+          path: relPath,
+          error:
+              parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
     } catch (e) {
       debugPrint('[DshService] fsRead error: $e');
       return const TextFileContent(ok: false, error: '请求失败或超时');
@@ -4326,16 +4758,25 @@ class DshService extends ChangeNotifier {
       return const TextFileContent(ok: false, error: '没有可用的会话');
     }
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/deliverables/text')
+      final url = Uri.parse(
+              '${_currentConfig!.httpBaseUrl}/api/mobile/deliverables/text')
           .replace(queryParameters: {'sessionId': sessionId, 'path': path});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 20));
-      if (_checkResponseAuth(res)) return const TextFileContent(ok: false, error: '鉴权失败');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 20));
+      if (_checkResponseAuth(res)) {
+        return const TextFileContent(ok: false, error: '鉴权失败');
+      }
       final body = res.bodyBytes.isEmpty
           ? const <String, dynamic>{}
           : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
       final parsed = TextFileContent.fromJson(body);
       if (res.statusCode == 200) return parsed;
-      return TextFileContent(ok: false, path: path, error: parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
+      return TextFileContent(
+          ok: false,
+          path: path,
+          error:
+              parsed.error.isEmpty ? 'HTTP ${res.statusCode}' : parsed.error);
     } catch (e) {
       debugPrint('[DshService] fetchDeliverableText error: $e');
       return const TextFileContent(ok: false, error: '请求失败或超时');
@@ -4349,8 +4790,11 @@ class DshService extends ChangeNotifier {
   Future<List<ApprovalPresetInfo>?> fetchApprovalPresets() async {
     if (_currentConfig == null) return null;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approval-presets');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/approval-presets');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return null;
       if (res.statusCode != 200) return null;
       final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -4358,7 +4802,8 @@ class DshService extends ChangeNotifier {
       return raw is List
           ? raw
               .whereType<Map>()
-              .map((e) => ApprovalPresetInfo.fromJson(Map<String, dynamic>.from(e)))
+              .map((e) =>
+                  ApprovalPresetInfo.fromJson(Map<String, dynamic>.from(e)))
               .where((p) => p.id.isNotEmpty)
               .toList(growable: false)
           : const <ApprovalPresetInfo>[];
@@ -4378,17 +4823,20 @@ class DshService extends ChangeNotifier {
   }) async {
     if (_currentConfig == null) return '未连接';
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approval-presets/save');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({
-          if (id != null && id.isNotEmpty) 'id': id,
-          'label': label,
-          'summary': summary,
-          'config': config.toJson(),
-        }),
-      ).timeout(const Duration(seconds: 10));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/approval-presets/save');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              if (id != null && id.isNotEmpty) 'id': id,
+              'label': label,
+              'summary': summary,
+              'config': config.toJson(),
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return '鉴权失败';
       if (res.statusCode == 200) return null;
       final body = res.bodyBytes.isEmpty
@@ -4405,12 +4853,15 @@ class DshService extends ChangeNotifier {
   Future<String?> deleteApprovalPreset(String id) async {
     if (_currentConfig == null) return '未连接';
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/approval-presets/delete');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'id': id}),
-      ).timeout(const Duration(seconds: 10));
+      final url = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/approval-presets/delete');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({'id': id}),
+          )
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return '鉴权失败';
       if (res.statusCode == 200) return null;
       final body = res.bodyBytes.isEmpty
@@ -4432,15 +4883,20 @@ class DshService extends ChangeNotifier {
   Future<PushTopicResult?> autoConfigurePushTopic({String? url}) async {
     if (_currentConfig == null) return null;
     try {
-      final target = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/auto-topic');
-      final res = await _httpClient.post(
-        target,
-        headers: _authHeaders,
-        body: jsonEncode({if (url != null && url.trim().isNotEmpty) 'url': url.trim()}),
-      ).timeout(const Duration(seconds: 15));
+      final target = Uri.parse(
+          '${_currentConfig!.httpBaseUrl}/api/mobile/push/auto-topic');
+      final res = await _httpClient
+          .post(
+            target,
+            headers: _authHeaders,
+            body: jsonEncode(
+                {if (url != null && url.trim().isNotEmpty) 'url': url.trim()}),
+          )
+          .timeout(const Duration(seconds: 15));
       if (_checkResponseAuth(res)) return null;
       if (res.statusCode != 200) return null;
-      final parsed = PushTopicResult.fromJson(Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes))));
+      final parsed = PushTopicResult.fromJson(
+          Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes))));
       // Keep the cached config in step so the settings card redraws immediately.
       _pushConfig = PushConfig(
         enabled: parsed.enabled,
@@ -4463,7 +4919,9 @@ class DshService extends ChangeNotifier {
     try {
       final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/goals')
           .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return null;
       if (res.statusCode != 200) return null;
       final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -4485,16 +4943,19 @@ class DshService extends ChangeNotifier {
     if (text.length > 2000) return '目标描述过长（上限 2000 字）';
     if (maxGoalRounds != null && maxGoalRounds <= 0) return '轮数上限必须为正整数';
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/goals/create');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({
-          'sessionId': sessionId,
-          'objective': text,
-          if (maxGoalRounds != null) 'maxGoalRounds': maxGoalRounds,
-        }),
-      ).timeout(const Duration(seconds: 15));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/goals/create');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'sessionId': sessionId,
+              'objective': text,
+              if (maxGoalRounds != null) 'maxGoalRounds': maxGoalRounds,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
       if (_checkResponseAuth(res)) return '鉴权失败';
       if (res.statusCode == 200) {
         await fetchSessionStats();
@@ -4523,22 +4984,27 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return '未连接';
     if (goalId.isEmpty || revision <= 0) return '缺少目标 ref（id/revision）';
-    if ((objective == null || objective.trim().isEmpty) && maxGoalRounds == null) {
+    if ((objective == null || objective.trim().isEmpty) &&
+        maxGoalRounds == null) {
       return '至少要改一项（目标描述或轮数上限）';
     }
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/goals/edit');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({
-          'sessionId': sessionId,
-          'goalId': goalId,
-          'revision': revision,
-          if (objective != null && objective.trim().isNotEmpty) 'objective': objective.trim(),
-          if (maxGoalRounds != null) 'maxGoalRounds': maxGoalRounds,
-        }),
-      ).timeout(const Duration(seconds: 15));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/goals/edit');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode({
+              'sessionId': sessionId,
+              'goalId': goalId,
+              'revision': revision,
+              if (objective != null && objective.trim().isNotEmpty)
+                'objective': objective.trim(),
+              if (maxGoalRounds != null) 'maxGoalRounds': maxGoalRounds,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
       if (_checkResponseAuth(res)) return '鉴权失败';
       if (res.statusCode == 200) {
         await fetchSessionStats();
@@ -4559,9 +5025,12 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return const [];
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/checkpoints')
+      final url = Uri.parse(
+              '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/checkpoints')
           .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 30));
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 30));
       if (_checkResponseAuth(res)) return const [];
       if (res.statusCode != 200) return const [];
       final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -4569,7 +5038,8 @@ class DshService extends ChangeNotifier {
       return raw is List
           ? raw
               .whereType<Map>()
-              .map((e) => SessionCheckpoint.fromJson(Map<String, dynamic>.from(e)))
+              .map((e) =>
+                  SessionCheckpoint.fromJson(Map<String, dynamic>.from(e)))
               .where((c) => c.seq != null)
               .toList(growable: false)
           : const <SessionCheckpoint>[];
@@ -4591,19 +5061,27 @@ class DshService extends ChangeNotifier {
       return const ForkOutcome(ok: false, error: '未连接');
     }
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/fork');
-      final res = await _httpClient.post(
-        url,
-        headers: _authHeaders,
-        body: jsonEncode({'sessionId': sessionId, if (atSeq != null) 'atSeq': atSeq}),
-      ).timeout(const Duration(seconds: 30));
-      if (_checkResponseAuth(res)) return const ForkOutcome(ok: false, error: '鉴权失败');
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/fork');
+      final res = await _httpClient
+          .post(
+            url,
+            headers: _authHeaders,
+            body: jsonEncode(
+                {'sessionId': sessionId, if (atSeq != null) 'atSeq': atSeq}),
+          )
+          .timeout(const Duration(seconds: 30));
+      if (_checkResponseAuth(res)) {
+        return const ForkOutcome(ok: false, error: '鉴权失败');
+      }
       final body = res.bodyBytes.isEmpty
           ? const <String, dynamic>{}
           : Map<String, dynamic>.from(jsonDecode(utf8.decode(res.bodyBytes)));
       if (res.statusCode == 200) {
         final newId = body['sessionId']?.toString() ?? '';
-        if (newId.isEmpty) return const ForkOutcome(ok: false, error: '引擎未返回新会话 id');
+        if (newId.isEmpty) {
+          return const ForkOutcome(ok: false, error: '引擎未返回新会话 id');
+        }
         return ForkOutcome(ok: true, sessionId: newId);
       }
       return ForkOutcome(
@@ -4622,9 +5100,12 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return const [];
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/commands')
+      final url = Uri.parse(
+              '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/commands')
           .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return const [];
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -4652,9 +5133,12 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return const [];
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/skills')
-          .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/sessions/skills')
+              .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return const [];
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -4662,7 +5146,8 @@ class DshService extends ChangeNotifier {
         return raw is List
             ? raw
                 .whereType<Map>()
-                .map((e) => SkillCatalogEntry.fromJson(Map<String, dynamic>.from(e)))
+                .map((e) =>
+                    SkillCatalogEntry.fromJson(Map<String, dynamic>.from(e)))
                 .where((s) => s.name.isNotEmpty)
                 .toList(growable: false)
             : const <SkillCatalogEntry>[];
@@ -4687,19 +5172,24 @@ class DshService extends ChangeNotifier {
     final sessionId = _currentSession?.sessionId;
     if (_currentConfig == null || sessionId == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/session/stats')
-          .replace(queryParameters: {'sessionId': sessionId});
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 10));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/session/stats')
+              .replace(queryParameters: {'sessionId': sessionId});
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return;
       if (seq != _sessionLoadSeq) return; // 会话已切换：丢弃这次响应
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
         final stats = data['stats'];
         if (stats is Map) {
-          final parsed = SessionStats.fromJson(Map<String, dynamic>.from(stats));
+          final parsed =
+              SessionStats.fromJson(Map<String, dynamic>.from(stats));
           _sessionStats = parsed;
           if (endOfTurn) {
-            _measuredTurnTokens = SessionStats.turnDelta(baseline: _statsBaselineTokens, now: parsed);
+            _measuredTurnTokens = SessionStats.turnDelta(
+                baseline: _statsBaselineTokens, now: parsed);
             _hasMeasuredTurn = true;
             // 基线推进到本回合终值：下一次相减只覆盖下一个回合。
             if (parsed.isLive && parsed.totalTokens != null) {
@@ -4745,7 +5235,12 @@ class DshService extends ChangeNotifier {
 
   /// 第三档：**只在信息面板打开时**拉（面板的 `onRefresh` 也用它）。
   Future<void> fetchSessionExtras() async {
-    await Future.wait([fetchJobs(), fetchSchedules(), fetchSubagents(), fetchTeam()]); // [feat 2026-10-12] 子代理随面板懒加载；[feat 2026-10-16] 团队同批
+    await Future.wait([
+      fetchJobs(),
+      fetchSchedules(),
+      fetchSubagents(),
+      fetchTeam()
+    ]); // [feat 2026-10-12] 子代理随面板懒加载；[feat 2026-10-16] 团队同批
   }
 
   /// 下载交付物并交给系统应用打开。
@@ -4763,7 +5258,9 @@ class DshService extends ChangeNotifier {
     final uri = deliverableUrl(item);
     if (uri == null) return '当前没有可用的网关配置';
     try {
-      final res = await _httpClient.get(uri, headers: _authHeaders).timeout(const Duration(seconds: 60));
+      final res = await _httpClient
+          .get(uri, headers: _authHeaders)
+          .timeout(const Duration(seconds: 60));
       if (res.statusCode != 200) return '下载失败 (HTTP ${res.statusCode})';
       final ok = await FileOpener.openBytes(item.fileName, res.bodyBytes);
       if (!ok) return '已下载，但没有应用能打开 ${item.fileName}';
@@ -4779,8 +5276,11 @@ class DshService extends ChangeNotifier {
   Future<void> fetchPushConfig() async {
     if (_currentConfig == null) return;
     try {
-      final url = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/config');
-      final res = await _httpClient.get(url, headers: _authHeaders).timeout(const Duration(seconds: 8));
+      final url =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/config');
+      final res = await _httpClient
+          .get(url, headers: _authHeaders)
+          .timeout(const Duration(seconds: 8));
       if (_checkResponseAuth(res)) return;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -4803,17 +5303,20 @@ class DshService extends ChangeNotifier {
   }) async {
     if (_currentConfig == null) return false;
     try {
-      final uri = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/config');
-      final res = await _httpClient.post(
-        uri,
-        headers: _authHeaders,
-        body: jsonEncode({
-          if (enabled != null) 'enabled': enabled,
-          if (url != null) 'url': url,
-          if (topic != null) 'topic': topic,
-          if (token != null) 'token': token,
-        }),
-      ).timeout(const Duration(seconds: 10));
+      final uri =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/config');
+      final res = await _httpClient
+          .post(
+            uri,
+            headers: _authHeaders,
+            body: jsonEncode({
+              if (enabled != null) 'enabled': enabled,
+              if (url != null) 'url': url,
+              if (topic != null) 'topic': topic,
+              if (token != null) 'token': token,
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return false;
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -4838,8 +5341,10 @@ class DshService extends ChangeNotifier {
   Future<bool> testPush() async {
     if (_currentConfig == null) return false;
     try {
-      final uri = Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/test');
-      final res = await _httpClient.post(uri, headers: _authHeaders, body: '{}')
+      final uri =
+          Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/test');
+      final res = await _httpClient
+          .post(uri, headers: _authHeaders, body: '{}')
           .timeout(const Duration(seconds: 12));
       if (_checkResponseAuth(res)) return false;
       return res.statusCode == 200;
@@ -4865,8 +5370,12 @@ class DshService extends ChangeNotifier {
       if (type == 'pong') return;
 
       // Auth error check from WS frame
-      if (json['code'] == 401 || json['type'] == 'unauthorized' || json['status'] == 401) {
-        handleAuthFailure(json['error']?.toString() ?? json['message']?.toString() ?? '认证失败: Token无效');
+      if (json['code'] == 401 ||
+          json['type'] == 'unauthorized' ||
+          json['status'] == 401) {
+        handleAuthFailure(json['error']?.toString() ??
+            json['message']?.toString() ??
+            '认证失败: Token无效');
         return;
       }
 
@@ -4885,14 +5394,17 @@ class DshService extends ChangeNotifier {
       // 1. Initial pending approvals from server
       if (type == 'system' && json['pendingApprovals'] is List) {
         final list = json['pendingApprovals'] as List<dynamic>;
-        _pendingApprovals = list.map((a) => ApprovalRequest.fromJson(a as Map<String, dynamic>)).toList();
+        _pendingApprovals = list
+            .map((a) => ApprovalRequest.fromJson(a as Map<String, dynamic>))
+            .toList();
         notifyListeners();
         return;
       }
 
       // 2. Real-time Approval Request
       if (type == 'approval_request' && json['approval'] != null) {
-        final req = ApprovalRequest.fromJson(json['approval'] as Map<String, dynamic>);
+        final req =
+            ApprovalRequest.fromJson(json['approval'] as Map<String, dynamic>);
         // Avoid duplicate
         if (!_pendingApprovals.any((a) => a.eventId == req.eventId)) {
           _pendingApprovals.add(req);
@@ -4925,14 +5437,16 @@ class DshService extends ChangeNotifier {
       // 3. Approval Settled
       if (type == 'approval_settled') {
         final eventId = json['eventId'];
-        _pendingApprovals.removeWhere((a) => a.eventId == eventId || a.id == eventId);
+        _pendingApprovals
+            .removeWhere((a) => a.eventId == eventId || a.id == eventId);
         notifyListeners();
         return;
       }
 
       // Real-time Permission Update Broadcast
       if (type == 'permission_updated' && json['permissions'] != null) {
-        _permissions = PermissionConfig.fromJson(json['permissions'] as Map<String, dynamic>);
+        _permissions = PermissionConfig.fromJson(
+            json['permissions'] as Map<String, dynamic>);
         notifyListeners();
         return;
       }
@@ -5004,7 +5518,7 @@ class DshService extends ChangeNotifier {
               _cancelledTurnSeq = _activeTurnSeq - 1;
             }
             if (!_isCanceling) {
-            _setSending(true, sessionId: sId);
+              _setSending(true, sessionId: sId);
             }
             // 回合开始的**上升沿**：记下"开始前"的累计读数，作为本轮消耗的基线。
             //
@@ -5035,7 +5549,8 @@ class DshService extends ChangeNotifier {
           ws.sessions.removeWhere((s) => s.matchesSessionId(sId));
         }
         if (_currentSession?.matchesSessionId(sId) == true) {
-          if (_currentWorkspace != null && _currentWorkspace!.sessions.isNotEmpty) {
+          if (_currentWorkspace != null &&
+              _currentWorkspace!.sessions.isNotEmpty) {
             selectSession(_currentWorkspace!.sessions.first);
           } else {
             createNewSession();
@@ -5054,8 +5569,12 @@ class DshService extends ChangeNotifier {
         // 回合级失败（turn/end.reason.kind=error）：网关会带 turnEnded=true。
         final turnEnded = json['turnEnded'] == true;
         _lastError = errStr;
-        if (sId != null && _currentSession != null && _currentSession!.matchesSessionId(sId)) {
-          if (_messages.isNotEmpty && _messages.last.isAssistant && _messages.last.isStreaming) {
+        if (sId != null &&
+            _currentSession != null &&
+            _currentSession!.matchesSessionId(sId)) {
+          if (_messages.isNotEmpty &&
+              _messages.last.isAssistant &&
+              _messages.last.isStreaming) {
             // ⚠️ 不能把已流出的正文覆盖掉 —— 模型出错前吐出的内容对用户仍然有用
             // （旧写法直接 content = '❌ …'，把半截回答整段抹掉了）。
             // 先 flush 再读：否则 buffer 里最后 100ms 的增量会漏出 partial，
@@ -5094,7 +5613,9 @@ class DshService extends ChangeNotifier {
       // 补完后不再标 streaming。
       if (type == 'stream_snapshot') {
         final sId = json['sessionId']?.toString();
-        if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
+        if (sId == null ||
+            _currentSession == null ||
+            !_currentSession!.matchesSessionId(sId)) {
           return;
         }
         final snapText = json['text']?.toString() ?? '';
@@ -5119,7 +5640,8 @@ class DshService extends ChangeNotifier {
           // 做 startsWith 前缀判断会把"本来是前缀"判成"不是前缀"，于是快照
           // 整段被丢弃 —— 那正是这段补发机制要防的丢内容。
           current.flushStreamBuffers();
-          if (snapText.length > current.content.length && snapText.startsWith(current.content)) {
+          if (snapText.length > current.content.length &&
+              snapText.startsWith(current.content)) {
             current.content = snapText;
           }
           if (snapThinking.length > (current.thinking?.length ?? 0) &&
@@ -5136,9 +5658,15 @@ class DshService extends ChangeNotifier {
       }
 
       // 5. Streaming tokens and chat chunks (thinking / delta / token)
-      if (type == 'thinking' || type == 'delta' || type == 'token' || json.containsKey('delta') || json.containsKey('thinking')) {
+      if (type == 'thinking' ||
+          type == 'delta' ||
+          type == 'token' ||
+          json.containsKey('delta') ||
+          json.containsKey('thinking')) {
         final sId = json['sessionId']?.toString();
-        if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
+        if (sId == null ||
+            _currentSession == null ||
+            !_currentSession!.matchesSessionId(sId)) {
           return;
         }
 
@@ -5174,7 +5702,9 @@ class DshService extends ChangeNotifier {
       // 6. Tool Executions
       if (type == 'tool_start' || type == 'tool_call') {
         final sId = json['sessionId']?.toString();
-        if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
+        if (sId == null ||
+            _currentSession == null ||
+            !_currentSession!.matchesSessionId(sId)) {
           return;
         }
 
@@ -5194,7 +5724,8 @@ class DshService extends ChangeNotifier {
         }
         final toolName = json['tool'] ?? json['name'] ?? 'tool';
         final toolInput = _coerceToolInput(json['input'] ?? json['args']);
-        _messages.last.tools.add(ToolExecution(name: toolName, input: toolInput, isRunning: true));
+        _messages.last.tools.add(
+            ToolExecution(name: toolName, input: toolInput, isRunning: true));
         _messages.last.isStreaming = true;
         _setSending(true, sessionId: sId);
         _streamRevision++;
@@ -5207,16 +5738,19 @@ class DshService extends ChangeNotifier {
         if (_activeTurnSeq <= _cancelledTurnSeq) return;
 
         final sId = json['sessionId']?.toString();
-        if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
+        if (sId == null ||
+            _currentSession == null ||
+            !_currentSession!.matchesSessionId(sId)) {
           return;
         }
 
-        if (_messages.isNotEmpty && _messages.last.isAssistant && _messages.last.tools.isNotEmpty) {
-
-
+        if (_messages.isNotEmpty &&
+            _messages.last.isAssistant &&
+            _messages.last.tools.isNotEmpty) {
           final lastTool = _messages.last.tools.last;
           lastTool.isRunning = false;
-          lastTool.output = _coerceToolInput(json['output'] ?? json['result'] ?? '完成');
+          lastTool.output =
+              _coerceToolInput(json['output'] ?? json['result'] ?? '完成');
           _streamRevision++;
           notifyListeners();
         }
@@ -5241,7 +5775,9 @@ class DshService extends ChangeNotifier {
               final q = PendingQuestion.fromJson(raw);
               // The gateway may have re-offered something we already answered
               // (e.g. a reconnect landed between its send and our reply).
-              if (_pendingQuestions.any((p) => p.eventId == q.eventId)) continue;
+              if (_pendingQuestions.any((p) => p.eventId == q.eventId)) {
+                continue;
+              }
               _pendingQuestions.add(q);
             } on FormatException catch (e) {
               // One malformed item must not cost us the rest of the replay.
@@ -5281,7 +5817,8 @@ class DshService extends ChangeNotifier {
       if (type == 'question_settled') {
         final eventId = json['eventId'];
         final ok = json['ok'] == true;
-        _lastQuestionError = ok ? null : (json['reason']?.toString() ?? '提问未能送达');
+        _lastQuestionError =
+            ok ? null : (json['reason']?.toString() ?? '提问未能送达');
         // removeWhere returns void, so "did anything change" needs the length
         // comparison rather than the return value.
         final before = _pendingQuestions.length;
@@ -5298,7 +5835,8 @@ class DshService extends ChangeNotifier {
       if (type == 'questions_invalidated') {
         if (_pendingQuestions.isNotEmpty) {
           _pendingQuestions.clear();
-          _lastQuestionError = '提问已失效：${json['reason']?.toString() ?? '会话状态变化'}';
+          _lastQuestionError =
+              '提问已失效：${json['reason']?.toString() ?? '会话状态变化'}';
           notifyListeners();
         }
         return;
@@ -5382,7 +5920,10 @@ class DshService extends ChangeNotifier {
       // 也不该由每次事件触发。所以事件只负责说"变了"，真正的读取走 REST。
       if (type == 'deliverables' || type == 'workspace_changes') {
         final sId = json['sessionId']?.toString() ?? '';
-        if (_currentSession == null || !_currentSession!.matchesSessionId(sId)) return;
+        if (_currentSession == null ||
+            !_currentSession!.matchesSessionId(sId)) {
+          return;
+        }
         if (type == 'deliverables') {
           // 交付物必须**立刻**拉：用户此刻正等着文件，"产出 N" 和流内卡片都要它。
           // 同时记一次事件 —— 流内卡片只认这个计数，不认"清单非空"。
@@ -5418,7 +5959,9 @@ class DshService extends ChangeNotifier {
           );
         }
 
-        if (sId == null || _currentSession == null || !_currentSession!.matchesSessionId(sId)) {
+        if (sId == null ||
+            _currentSession == null ||
+            !_currentSession!.matchesSessionId(sId)) {
           return;
         }
         if (_messages.isNotEmpty && _messages.last.isAssistant) {
@@ -5431,7 +5974,9 @@ class DshService extends ChangeNotifier {
         // done 现在带结束原因。若 error 帧丢了（弱网/刚好断线），这里仍能补上
         // 失败说明 —— 结束原因只有网关读得到，手机不能靠猜。
         final endReason = json['reason']?.toString();
-        if (endReason == 'error' || endReason == 'interrupted' || endReason == 'blocked') {
+        if (endReason == 'error' ||
+            endReason == 'interrupted' ||
+            endReason == 'blocked') {
           _applyTurnFailure(TurnEndInfo(
             kind: endReason!,
             text: json['message']?.toString() ?? '',
@@ -5443,8 +5988,10 @@ class DshService extends ChangeNotifier {
           // 否则那条旧账会让以后真正的新失败也弹不出来。
           _lastTurnFailure = null;
           final sid = _currentSession?.sessionId;
-          if (sid != null && _dismissedFailureSessions.remove(_failureKey(sid))) {
-            unawaited(StorageService.saveDismissedTurnFailures(_dismissedFailureSessions.toList()));
+          if (sid != null &&
+              _dismissedFailureSessions.remove(_failureKey(sid))) {
+            unawaited(StorageService.saveDismissedTurnFailures(
+                _dismissedFailureSessions.toList()));
           }
         }
         _sessionPollTimer?.cancel();
@@ -5470,7 +6017,6 @@ class DshService extends ChangeNotifier {
         }
         return;
       }
-
     } catch (e) {
       // [fix 2026-10-17] 日志措辞窄化：此前的 catch 包住整个消息处理（不只
       // jsonDecode），fromJson 的 TypeError、字段强转失败全被吞成"JSON parse
@@ -5506,7 +6052,8 @@ class DshService extends ChangeNotifier {
         if (lastPing != null) {
           _missedPings++;
           if (_missedPings >= _maxMissedPings) {
-            debugPrint('[DshService] 看门狗：${_missedPings * 15}s ping 无应答，判定半死连接，强制重连');
+            debugPrint(
+                '[DshService] 看门狗：${_missedPings * 15}s ping 无应答，判定半死连接，强制重连');
             _status = ConnectionStatus.disconnected;
             notifyListeners();
             _scheduleReconnect(immediate: true);
@@ -5556,23 +6103,25 @@ class DshService extends ChangeNotifier {
     return id.isNotEmpty ? id : '${config.cleanHost}:${config.cleanPort}';
   }
 
-  /// 装载同步信任视图并构造带指纹校验的 HttpClient。
+  /// 给一个 HttpClient 装上与 WSS 完全相同的证书判定。
   ///
-  /// 公开 CA 证书（quick tunnel / 正式反代）根本不会触发
-  /// `badCertificateCallback`，走系统信任链；这里只接管自签场景。
-  Future<HttpClient> _prepareTlsClient(ServerConfig config) async {
-    await CertTrust.preload(gatewayId: _certGatewayId, channel: config.channel);
-    final client = HttpClient();
-    _wsHttpClient = client;
-    client.badCertificateCallback = (X509Certificate cert, String host, int port) {
+  /// 公开 CA 证书（quick tunnel / 正式反代）不会触发 `badCertificateCallback`，
+  /// 走系统信任链；这里只接管自签场景。gatewayId 显式传入，避免“测试一个尚未
+  /// 保存的网关”时污染当前连接的信任条目。
+  void _installCertValidation(
+    HttpClient client, {
+    required String gatewayId,
+    required String channel,
+  }) {
+    client.badCertificateCallback =
+        (X509Certificate cert, String host, int port) {
       final fp = CertTrust.fingerprintOfCertificate(cert);
       final result = CertTrust.decideSync(
-        gatewayId: _certGatewayId,
+        gatewayId: gatewayId,
         fingerprint: fp,
-        channel: config.channel,
+        channel: channel,
       );
       if (result.decision == CertTrustDecision.unavailable) {
-        // 读不到证书信息（极罕见）：宁可拒绝，也不静默降级成"不校验"。
         return false;
       }
       if (result.decision == CertTrustDecision.mismatch) {
@@ -5580,15 +6129,71 @@ class DshService extends ChangeNotifier {
         return false;
       }
       if (result.decision == CertTrustDecision.firstUse) {
-        // 握手路径不能 await：落盘挪到连接建立之后（fire-and-forget）。
         unawaited(CertTrust.acceptChange(
-          gatewayId: _certGatewayId,
+          gatewayId: gatewayId,
           fingerprint: fp,
-          channel: config.channel,
+          channel: channel,
         ));
       }
       return true;
     };
+  }
+
+  Future<HttpClient> _makeTlsHttpClient(ServerConfig config) async {
+    final gatewayId = _gatewayIdOf(config);
+    await CertTrust.preload(gatewayId: gatewayId, channel: config.channel);
+    final client = HttpClient();
+    _installCertValidation(client,
+        gatewayId: gatewayId, channel: config.channel);
+    return client;
+  }
+
+  /// HTTP 客户端同样绑定连接代次：旧网关的迟到响应在读取正文后会被丢弃。
+  Future<http.Client> _buildHttpClientFor(
+    ServerConfig config, {
+    int? generation,
+  }) async {
+    final gen = generation ?? _connectionGeneration;
+    if (!config.effectiveUseHttps) {
+      return _GenerationHttpClient(
+        inner: http.Client(),
+        generation: gen,
+        isCurrent: _isGenerationCurrent,
+      );
+    }
+    final raw = await _makeTlsHttpClient(config);
+    return _GenerationHttpClient(
+      inner: IOClient(raw),
+      generation: gen,
+      isCurrent: _isGenerationCurrent,
+    );
+  }
+
+  Future<void> _replaceHttpClient(ServerConfig config, int generation) async {
+    final next = await _buildHttpClientFor(config, generation: generation);
+    if (!_isGenerationCurrent(generation)) {
+      next.close();
+      return;
+    }
+    final previous = _httpClient;
+    _httpClient = next;
+    try {
+      previous.close();
+    } catch (_) {
+      // 旧客户端关闭失败不应阻断新连接。
+    }
+  }
+
+  /// 装载同步信任视图并构造带指纹校验的 WebSocket HttpClient。
+  Future<HttpClient> _prepareTlsClient(ServerConfig config) async {
+    await CertTrust.preload(gatewayId: _certGatewayId, channel: config.channel);
+    final client = HttpClient();
+    _installCertValidation(
+      client,
+      gatewayId: _certGatewayId,
+      channel: config.channel,
+    );
+    _wsHttpClient = client;
     return client;
   }
 
@@ -5636,9 +6241,9 @@ class DshService extends ChangeNotifier {
         // 同步抛出，所以 await/timeout 都来不及生效，close 根本没开始。
         // 表现是"每次重连都只是把旧 socket 丢掉而不关闭它"，连接在两端泄漏。
         await _channel!.sink.close(ws_status.normalClosure).timeout(
-          const Duration(milliseconds: 500),
-          onTimeout: () {},
-        );
+              const Duration(milliseconds: 500),
+              onTimeout: () {},
+            );
       } catch (e) {
         debugPrint('[DshService] Socket teardown notice: $e');
       }
@@ -5660,11 +6265,15 @@ class DshService extends ChangeNotifier {
     // 失败，只会每 12 秒刷一次日志并耗电。等用户在告警页确认（trustPendingCertChange）
     // 或改成正确地址后再手动连。
     if (_pendingCertChange != null) return;
-    if (_isExplicitlyDisconnected || _isDisposed || _isTokenInvalid || _currentConfig == null) {
+    if (_isExplicitlyDisconnected ||
+        _isDisposed ||
+        _isTokenInvalid ||
+        _currentConfig == null) {
       return;
     }
     if (_reconnectExhausted) return;
-    if (_isReconnecting || (_reconnectTimer != null && _reconnectTimer!.isActive)) {
+    if (_isReconnecting ||
+        (_reconnectTimer != null && _reconnectTimer!.isActive)) {
       return;
     }
 
@@ -5689,16 +6298,20 @@ class DshService extends ChangeNotifier {
     final int delayMs;
     if (_reconnectAttempts == 0) {
       // First retry: fast turnaround (1000-1300ms) to guarantee <= 5s reconnection
-      delayMs = _baseReconnectDelayMs + (DateTime.now().millisecondsSinceEpoch % 300);
+      delayMs =
+          _baseReconnectDelayMs + (DateTime.now().millisecondsSinceEpoch % 300);
     } else {
-      final double calculated = (_baseReconnectDelayMs * math.pow(_backoffMultiplier, math.min(_reconnectAttempts, 6))).toDouble();
+      final double calculated = (_baseReconnectDelayMs *
+              math.pow(_backoffMultiplier, math.min(_reconnectAttempts, 6)))
+          .toDouble();
       final int capped = math.min(calculated.toInt(), _maxReconnectDelayMs);
       final int jitter = (DateTime.now().millisecondsSinceEpoch % _maxJitterMs);
       delayMs = capped + jitter;
     }
 
     _reconnectAttempts++;
-    debugPrint('[DshService] Scheduling reconnect attempt #$_reconnectAttempts in ${delayMs}ms');
+    debugPrint(
+        '[DshService] Scheduling reconnect attempt #$_reconnectAttempts in ${delayMs}ms');
 
     _reconnectTimer = Timer(Duration(milliseconds: delayMs), () {
       _executeReconnect();
@@ -5717,11 +6330,18 @@ class DshService extends ChangeNotifier {
   }
 
   Future<void> _executeReconnect() async {
-    if (_isExplicitlyDisconnected || _isDisposed || _isTokenInvalid || _currentConfig == null) {
+    if (_isExplicitlyDisconnected ||
+        _isDisposed ||
+        _isTokenInvalid ||
+        _currentConfig == null) {
       return;
     }
     if (_isReconnecting) return;
 
+    final config = _currentConfig!;
+    final generation = ++_connectionGeneration;
+    _fetchWorkspacesInFlight = null;
+    _sessionPollInFlight = false;
     _isReconnecting = true;
     _status = ConnectionStatus.connecting;
     // 新连接：允许重新发一次订阅。
@@ -5730,30 +6350,39 @@ class DshService extends ChangeNotifier {
 
     try {
       await _cleanTeardownSocket();
+      if (!_isGenerationCurrent(generation)) return;
+
+      _certGatewayId = _gatewayIdOf(config);
+      _pendingCertChange = null;
+      // REST 与 WSS 一起换到当前证书信任状态。
+      await _replaceHttpClient(config, generation);
+      if (!_isGenerationCurrent(generation)) return;
 
       // [v1.35 / 1.4] 重连同样要装载信任视图：换网络后网关可能按新 SAN
       // 重签了证书，这时应该给出「指纹变了」而不是一句「连接失败」。
-      _certGatewayId = _gatewayIdOf(_currentConfig!);
-      final reconnectClient = _currentConfig!.effectiveUseHttps
-          ? await _prepareTlsClient(_currentConfig!)
-          : null;
+      final reconnectClient =
+          config.effectiveUseHttps ? await _prepareTlsClient(config) : null;
+      if (!_isGenerationCurrent(generation)) return;
 
-      final uri = Uri.parse(_currentConfig!.wsUrl);
+      final uri = Uri.parse(config.wsUrl);
       // [fix 2026-10-17] connectTimeout：SYN 黑洞（网关掉线/防火墙丢包）时
       // 没有它 ready 会挂到 OS 级 TCP 超时（约 2 分钟），期间 _isReconnecting
       // 锁死一切重连调度。connect() 与本路径必须对称设值。
-      _channel = IOWebSocketChannel.connect(
+      final channel = IOWebSocketChannel.connect(
         uri,
         connectTimeout: const Duration(seconds: 10),
         customClient: reconnectClient,
         headers: {
-          'Authorization': 'Bearer ${_currentConfig!.effectiveToken}',
-          'x-dsh-token': _currentConfig!.effectiveToken,
+          'Authorization': 'Bearer ${config.effectiveToken}',
+          'x-dsh-token': config.effectiveToken,
         },
       );
+      _channel = channel;
 
-      _channelSubscription = _channel!.stream.listen(
+      _channelSubscription = channel.stream.listen(
         (data) {
+          if (!_isGenerationCurrent(generation) ||
+              !identical(_channel, channel)) return;
           if (_status != ConnectionStatus.connected) {
             _status = ConnectionStatus.connected;
             _reconnectAttempts = 0;
@@ -5769,6 +6398,8 @@ class DshService extends ChangeNotifier {
           _handleRawMessage(data);
         },
         onError: (error) {
+          if (!_isGenerationCurrent(generation) ||
+              !identical(_channel, channel)) return;
           debugPrint('[DshService] Reconnect socket error: $error');
           final certChange = _pendingCertChange;
           if (certChange != null) {
@@ -5788,8 +6419,10 @@ class DshService extends ChangeNotifier {
           _scheduleReconnect();
         },
         onDone: () {
+          if (!_isGenerationCurrent(generation) ||
+              !identical(_channel, channel)) return;
           debugPrint('[DshService] Reconnect socket onDone closed');
-          final code = _channel?.closeCode;
+          final code = channel.closeCode;
           if (code == 4001 || code == 4401 || code == 1008) {
             handleAuthFailure('连接已关闭: 认证失败或Token过期 (Code: $code)');
             return;
@@ -5808,7 +6441,11 @@ class DshService extends ChangeNotifier {
       // 不主动推帧，状态永远停在 connecting 且 _isReconnecting=true，
       // _scheduleReconnect 从此永久阻塞，没有任何自愈路径。
       try {
-        await _channel!.ready;
+        await channel.ready;
+        if (!_isGenerationCurrent(generation) ||
+            !identical(_channel, channel)) {
+          return;
+        }
         _status = ConnectionStatus.connected;
         _reconnectAttempts = 0;
         _isReconnecting = false;
@@ -5820,10 +6457,12 @@ class DshService extends ChangeNotifier {
         debugPrint('[DshService] Reconnect WS ready 失败: $e');
       }
 
+      if (!_isGenerationCurrent(generation)) return;
       _startHeartbeat();
       // ready 之后再发 ping（此前这行是死代码：status=connecting 时被守卫拦掉）。
       _sendWsJson({'type': 'ping'});
     } catch (e) {
+      if (!_isGenerationCurrent(generation)) return;
       debugPrint('[DshService] _executeReconnect failed: $e');
       _status = ConnectionStatus.error;
       _lastError = e.toString();
@@ -5834,7 +6473,8 @@ class DshService extends ChangeNotifier {
   }
 
   void _onReconnected() {
-    debugPrint('[DshService] Reconnected successfully. Re-syncing session & state...');
+    debugPrint(
+        '[DshService] Reconnected successfully. Re-syncing session & state...');
     if (_currentSession != null) {
       _sendWsJson({'type': 'follow', 'sessionId': _currentSession!.sessionId});
       _resyncActiveSession(_currentSession!.sessionId);
@@ -5849,7 +6489,8 @@ class DshService extends ChangeNotifier {
   // App Lifecycle Handling (F3.2)
   void handleAppResumed() {
     final now = DateTime.now();
-    if (_lastResumeCheck != null && now.difference(_lastResumeCheck!).inMilliseconds < 500) {
+    if (_lastResumeCheck != null &&
+        now.difference(_lastResumeCheck!).inMilliseconds < 500) {
       return; // Debounce
     }
     _lastResumeCheck = now;
@@ -5859,16 +6500,19 @@ class DshService extends ChangeNotifier {
     armReconnectRetry();
 
     if (_status != ConnectionStatus.connected || _channel == null) {
-      debugPrint('[DshService] Resumed while disconnected/error: triggering immediate reconnect');
+      debugPrint(
+          '[DshService] Resumed while disconnected/error: triggering immediate reconnect');
       _scheduleReconnect(immediate: true);
     } else {
-      debugPrint('[DshService] Resumed while connected: checking socket liveness');
+      debugPrint(
+          '[DshService] Resumed while connected: checking socket liveness');
       // 后台期间 socket 可能已被系统/NAT 静默掐断，而本地写 ping 不报错、
       // onError/onDone 也不触发（半死连接）。判据用看门狗时钟：距离最近一次
       // **真正收到服务器帧**太久（>40s，即后台期间没收到过心跳 pong），就
       // 不能信任这条连接 —— 直接重建，重连后会重新订阅提问并重放 pending。
       final last = _lastServerFrameAt;
-      final stale = last == null || DateTime.now().difference(last).inSeconds > 40;
+      final stale =
+          last == null || DateTime.now().difference(last).inSeconds > 40;
       if (stale) {
         debugPrint('[DshService] 后台期间无服务器帧，判定连接半死，立即重建');
         _status = ConnectionStatus.disconnected;
@@ -5902,6 +6546,8 @@ class DshService extends ChangeNotifier {
 
   void disconnect() {
     _isExplicitlyDisconnected = true;
+    // 断开也是一种代次终止：在途 socket 回调与 REST 响应不得再改状态。
+    _connectionGeneration++;
     _channelSubscription?.cancel();
     _channelSubscription = null;
     _reconnectTimer?.cancel();
@@ -5962,6 +6608,51 @@ class DshService extends ChangeNotifier {
   }
 }
 
+/// 把 HTTP 响应完整读完后核对连接代次。
+///
+/// http.BaseClient.get/post 在 send 返回后还会继续读 body；只在 send 入口检查
+/// 不足以阻止“A 网关的响应在切到 B 之后才读完并写进 UI”。因此这里统一缓冲
+/// 响应体（手机端 REST 响应本来就不做增量消费），再在返回前复核一次代次。
+class _GenerationHttpClient extends http.BaseClient {
+  _GenerationHttpClient({
+    required http.Client inner,
+    required this.generation,
+    required this.isCurrent,
+  }) : _inner = inner;
+
+  final http.Client _inner;
+  final int generation;
+  final bool Function(int generation) isCurrent;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    if (!isCurrent(generation)) throw const _StaleConnectionException();
+    final response = await _inner.send(request);
+    final bytes = await response.stream.toBytes();
+    if (!isCurrent(generation)) throw const _StaleConnectionException();
+    return http.StreamedResponse(
+      Stream<List<int>>.value(bytes),
+      response.statusCode,
+      contentLength: bytes.length,
+      request: response.request,
+      headers: response.headers,
+      isRedirect: response.isRedirect,
+      persistentConnection: response.persistentConnection,
+      reasonPhrase: response.reasonPhrase,
+    );
+  }
+
+  @override
+  void close() => _inner.close();
+}
+
+class _StaleConnectionException implements Exception {
+  const _StaleConnectionException();
+
+  @override
+  String toString() => 'stale-connection';
+}
+
 /// 一次打开过的会话消息快照（供 DshService 的会话消息缓存首帧回填用）。
 ///
 /// 只用于"再打开一次时先显示什么"，不是真相：网络结果回来后按对账合并覆盖
@@ -5979,4 +6670,3 @@ class _SessionHistorySnapshot {
   final bool exhausted;
   final DateTime cachedAt;
 }
-

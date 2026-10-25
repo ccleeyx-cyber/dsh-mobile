@@ -92,6 +92,43 @@ describe('runbook: 文档校验', () => {
     assert.equal(r.entries[0].confirmRequired, true);
   });
 
+  it('命令解释器默认禁止，配置了也不许伪装成 low', () => {
+    const doc = {
+      runbooks: [{
+        name: '任意命令',
+        // 数组形式绕过了 shell 元字符检查，所以必须单独管住解释器。
+        command: ['C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', '-Command', 'Get-Process'],
+        danger: 'low'
+      }]
+    };
+    const denied = parseRunbooks(doc, {
+      allowedBinaries: [...DEFAULT_ALLOWED_BINARIES, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe']
+    });
+    assert.equal(denied.ok, false);
+    assert.match(denied.error, /解释器/);
+
+    const low = parseRunbooks(doc, {
+      allowedBinaries: [...DEFAULT_ALLOWED_BINARIES, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'],
+      allowInterpreters: true
+    });
+    assert.equal(low.ok, false);
+    assert.match(low.error, /danger: high/);
+
+    const allowed = parseRunbooks({
+      runbooks: [{
+        name: '显式授权',
+        command: ['pwsh', '-NoProfile', '-Command', 'Get-Date'],
+        danger: 'high'
+      }]
+    }, {
+      allowedBinaries: [...DEFAULT_ALLOWED_BINARIES, 'pwsh'],
+      allowInterpreters: true
+    });
+    assert.equal(allowed.ok, true);
+    assert.equal(allowed.entries[0].danger, 'high');
+    assert.equal(allowed.entries[0].confirmRequired, true);
+  });
+
   it('low 可以显式要求确认', () => {
     const r = parseRunbooks({
       runbooks: [{ name: 'x', command: 'git status', danger: 'low', confirmRequired: true }]

@@ -64,6 +64,22 @@ function req(pathname, { method = 'GET', body } = {}) {
   });
 }
 
+function reqAnon(pathname) {
+  return new Promise((resolve, reject) => {
+    const r = http.request(`${BASE}${pathname}`, { method: 'GET' }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        let parsed = null;
+        try { parsed = JSON.parse(data); } catch { /* ignore */ }
+        resolve({ status: res.statusCode, parsed, raw: data });
+      });
+    });
+    r.on('error', reject);
+    r.end();
+  });
+}
+
 let teardown = null;
 
 describe('remote access routes', () => {
@@ -194,6 +210,18 @@ describe('remote access routes', () => {
   });
 
   /* ---- [fix 2026-10-21] 配对载荷必须服从 provider ---- */
+
+  it('匿名来源一律不能自助发码（cloudflared 回源也是回环）', async () => {
+    for (const p of ['/pair/info', '/pair/qr', '/api/mobile/pair/info', '/api/mobile/pair/qr']) {
+      const r = await reqAnon(p);
+      assert.equal(r.status, 403, `${p} must never mint a code without admin auth`);
+      assert.match(r.parsed.error, /管理端/);
+    }
+    // 管理端仍然可以正常生成（设置页/命令行）。
+    const ok = await req('/pair/info');
+    assert.equal(ok.status, 200);
+    assert.match(ok.parsed.pairCode, /^\d{6}$/);
+  });
 
   it('provider=nps：二维码用公网地址，scheme/端口跟着配置走', async () => {
     await req('/api/mobile/remote-access', {

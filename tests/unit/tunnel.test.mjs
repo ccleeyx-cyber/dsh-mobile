@@ -96,6 +96,7 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
   it('本机二进制版本旧也继续用（升级不能阻塞隧道），版本一致更不该重下', async () => {
     const oldBytes = Buffer.alloc(2048, 3);
     const newBytes = Buffer.alloc(4096, 4);
+    const oldHash = crypto.createHash('sha256').update(oldBytes).digest('hex');
     const dir = path.join(TMP_HOME, 'dl-version');
     let fetches = 0;
     const fetchBytes = async () => { fetches++; return newBytes; };
@@ -110,6 +111,7 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
       dir,
       platform: 'linux',
       version: '2026.9.1',
+      expectedSha256: oldHash,
       probeVersionFn: () => '2026.2.0',
       fetchBytes,
       findSystemFn: () => ''
@@ -127,6 +129,7 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
       dir,
       platform: 'linux',
       version: '2026.9.1',
+      expectedSha256: oldHash,
       probeVersionFn: () => '2026.9.1',
       fetchBytes,
       findSystemFn: () => ''
@@ -177,15 +180,37 @@ describe('tunnel: quick tunnel 解析与生命周期', () => {
 
   // [fix 2026-10-21] 这次"点了没反应"的直接修法：机器上已经有可用的
   // cloudflared（例如 dsh-pocket 下好的那份）就不该再去下载 50MB。
+  it('系统里未受信任的二进制不会被当成 cloudflared 执行', async () => {
+    const dir = path.join(TMP_HOME, 'dl-untrusted');
+    const sysBin = path.join(TMP_HOME, 'evil-cloudflared');
+    fs.writeFileSync(sysBin, Buffer.alloc(2048, 6));
+    let fetches = 0;
+    await assert.rejects(
+      ensureCloudflared({
+        dir,
+        platform: 'linux',
+        findSystemFn: () => sysBin,
+        probeVersionFn: () => '2026.9.1',
+        fetchBytes: async () => { fetches++; return Buffer.alloc(2048, 8); }
+      }),
+      /校验失败/
+    );
+    assert.equal(fetches, 1, 'untrusted system binary must fall through to a verified download');
+    assert.equal(fs.existsSync(sysBin), true, 'never delete a user/system binary');
+  });
+
   it('系统里已有 cloudflared 时直接复用，不下载', async () => {
     const dir = path.join(TMP_HOME, 'dl-sys');
     fs.mkdirSync(dir, { recursive: true });
     const sysBin = path.join(TMP_HOME, 'sys-cloudflared');
-    fs.writeFileSync(sysBin, Buffer.alloc(4096, 9));
+    const sysBytes = Buffer.alloc(4096, 9);
+    fs.writeFileSync(sysBin, sysBytes);
+    const sysHash = crypto.createHash('sha256').update(sysBytes).digest('hex');
     let fetches = 0;
     const out = await ensureCloudflared({
       dir,
       platform: 'linux',
+      expectedSha256: sysHash,
       findSystemFn: () => sysBin,
       probeVersionFn: () => '2026.9.1',
       fetchBytes: async () => { fetches++; return Buffer.alloc(4096, 2); }

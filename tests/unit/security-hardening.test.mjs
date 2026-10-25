@@ -154,11 +154,49 @@ describe('security hardening: path sanitizer fails closed', { skip: SKIP_MSG }, 
     }
   });
 
+  it('refuses a symlink/junction that escapes the workspace', (t) => {
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-link-ws-'));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-link-out-'));
+    fs.writeFileSync(path.join(outside, 'secret.txt'), 'not yours', 'utf8');
+    const link = path.join(ws, 'docs');
+    try {
+      fs.symlinkSync(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (err) {
+      fs.rmSync(ws, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+      t.skip(`host cannot create directory links: ${err.code || err.message}`);
+      return;
+    }
+    try {
+      const sanitize = core.createPathSanitizer({
+        getRegisteredWorkspaces: () => [{ path: ws }]
+      });
+      const r = sanitize(ws, path.join('docs', 'secret.txt'));
+      assert.equal(r.status, 403, 'a link must not turn into an arbitrary file read');
+      assert.match(r.error, /escapes workspace/i);
+    } finally {
+      fs.rmSync(ws, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it('still accepts a normal file inside a registered workspace', () => {
     const sanitize = core.createPathSanitizer({ getRegisteredWorkspaces: () => [{ path: WS }] });
     const r = sanitize(WS, 'MEMORY.MD');
     assert.ok(!r.error, `expected success, got ${r.error}`);
     assert.equal(r.targetFile, path.join(WS, 'MEMORY.MD'));
+  });
+});
+
+describe('security hardening: ntfy target', { skip: SKIP_MSG }, () => {
+  it('https public is allowed; plaintext and private targets are not', () => {
+    assert.equal(core.validateNtfyUrl('https://ntfy.sh', { allowPrivate: false }).ok, true);
+    assert.equal(core.validateNtfyUrl('http://ntfy.sh', { allowPrivate: false }).ok, false);
+    assert.equal(core.validateNtfyUrl('https://127.0.0.1:2586', { allowPrivate: false }).ok, false);
+    assert.equal(core.validateNtfyUrl('https://192.168.1.5', { allowPrivate: false }).ok, false);
+    assert.equal(core.validateNtfyUrl('http://127.0.0.1:2586', { allowPrivate: true }).ok, true);
+    // 用户信息不能藏在 URL 里进入请求/审计
+    assert.equal(core.validateNtfyUrl('https://u:p@ntfy.sh', { allowPrivate: false }).ok, false);
   });
 });
 

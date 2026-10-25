@@ -169,7 +169,7 @@ window.__ModuleLoader__.load({
             }
           });
           setConfig((prev) => ({ ...prev, ...res.config, ...res }));
-          setSaveMessage('✅ 配置已成功保存并立即生效！');
+          setSaveMessage('配置已保存；监听端口变更需重启 dsh web，其余设置立即生效。');
           // 保存后立刻拉一次状态：切到 cloudflared 时隧道正在建立，这一屏要能
           // 马上从"未就绪"走到"已就绪"，而不是等用户自己刷新。
           loadRemoteAccess();

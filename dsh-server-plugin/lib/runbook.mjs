@@ -30,6 +30,34 @@ export const DEFAULT_ALLOWED_BINARIES = Object.freeze([
 ]);
 
 /**
+ * 能执行任意代码的解释器。即使被 DSH_RUNBOOK_ALLOW 放行，也必须再满足：
+ *   1. 管理员显式设置 DSH_RUNBOOK_ALLOW_INTERPRETERS=1；
+ *   2. 该条目声明 danger: high（从而强制二次确认）。
+ *
+ * 原因：`["pwsh","-Command","..."]` 是合法 argv，没有 shell 元字符，
+ * 但它等价于一把远程 shell。把它与 `docker` / `systemctl` 这种单用途命令
+ * 放在同一层白名单里，风险等级被抹平了。
+ */
+export const INTERPRETER_BINARIES = Object.freeze([
+  'cmd', 'powershell', 'pwsh', 'bash', 'sh', 'zsh', 'fish', 'dash', 'ksh', 'csh', 'tcsh',
+  'perl', 'python', 'python2', 'python3', 'node', 'nodejs', 'ruby', 'php', 'deno', 'bun',
+  'wscript', 'cscript', 'mshta', 'env'
+]);
+
+export function isInterpreterBinary(binary) {
+  const raw = String(binary || '').trim();
+  // 不依赖 path.basename：YAML 里的 Windows 路径可能在 Linux CI 上被校验。
+  let base = (raw.split(/[\\/]/).pop() || raw).toLowerCase();
+  if (base.endsWith('.exe')) base = base.slice(0, -4);
+  base = base.replace(/[-_]?\d+(?:\.\d+)*$/, '');
+  return INTERPRETER_BINARIES.includes(base);
+}
+
+export function allowInterpretersFromEnv(env = process.env) {
+  return env.DSH_RUNBOOK_ALLOW_INTERPRETERS === '1';
+}
+
+/**
  * 默认模板：三条低危示例，用户可改可删。
  *
  * ⚠️ 模板里故意保留 `ls -lt`（POSIX 写法）而不是为 Windows 换成别的命令：
@@ -270,7 +298,7 @@ export function builtinFor(argv, platform = process.platform) {
   return null;
 }
 
-function normalizeEntry(raw, index, allowed) {
+function normalizeEntry(raw, index, allowed, allowInterpreters) {
   const where = `第 ${index + 1} 条`;
   if (!raw || typeof raw !== 'object') return { ok: false, error: `${where} 不是对象` };
 
@@ -286,6 +314,20 @@ function normalizeEntry(raw, index, allowed) {
   const binary = parsed.argv[0];
   if (allowed && !allowed.includes(binary)) {
     return { ok: false, error: `${name}：命令 ${binary} 不在白名单（DSH_RUNBOOK_ALLOW 可扩展）` };
+  }
+
+  // 数组形式同样受限：绕过 shell 元字符检查不等于安全。
+  // 解释器必须由管理员双重显式授权（环境变量 + danger: high）。
+  if (isInterpreterBinary(binary)) {
+    if (!allowInterpreters) {
+      return {
+        ok: false,
+        error: `${name}：${binary} 是命令解释器，默认禁止；确需启用请设置 DSH_RUNBOOK_ALLOW_INTERPRETERS=1`
+      };
+    }
+    if (String(raw.danger || '').toLowerCase() !== 'high') {
+      return { ok: false, error: `${name}：解释器条目必须声明 danger: high` };
+    }
   }
 
   const danger = String(raw.danger ?? 'low').toLowerCase() === 'high' ? 'high' : 'low';
@@ -310,14 +352,14 @@ function normalizeEntry(raw, index, allowed) {
  * 解析 Runbook 文档（`{ runbooks: [...] }` 或直接数组）。
  * @returns {{ok: true, entries: object[]} | {ok: false, error: string}}
  */
-export function parseRunbooks(doc, { allowedBinaries = null } = {}) {
+export function parseRunbooks(doc, { allowedBinaries = null, allowInterpreters = false } = {}) {
   const list = Array.isArray(doc) ? doc : (doc && Array.isArray(doc.runbooks) ? doc.runbooks : null);
   if (!list) return { ok: false, error: '缺少 runbooks 数组' };
 
   const entries = [];
   const errors = [];
   list.forEach((raw, i) => {
-    const r = normalizeEntry(raw, i, allowedBinaries);
+    const r = normalizeEntry(raw, i, allowedBinaries, allowInterpreters === true);
     if (r.ok) entries.push(r.entry);
     else errors.push(r.error);
   });
@@ -406,7 +448,11 @@ export function describeRunFailure(result, entry) {
  * 每次请求都重新读（按 mtime 记忆化由调用方做）：用户改完 YAML 应当立刻生效，
  * 而不是"改了没反应、重启才看到"。
  */
-export function loadRunbooksFile(file, { parseYaml, allowedBinaries = null } = {}) {
+export function loadRunbooksFile(file, {
+  parseYaml,
+  allowedBinaries = null,
+  allowInterpreters = allowInterpretersFromEnv()
+} = {}) {
   try {
     if (!fs.existsSync(file)) {
       fs.mkdirSync(file.replace(/[\\/][^\\/]+$/, ''), { recursive: true });
@@ -414,7 +460,7 @@ export function loadRunbooksFile(file, { parseYaml, allowedBinaries = null } = {
     }
     const text = fs.readFileSync(file, 'utf8');
     const doc = parseYaml(text);
-    return parseRunbooks(doc, { allowedBinaries });
+    return parseRunbooks(doc, { allowedBinaries, allowInterpreters });
   } catch (err) {
     return { ok: false, error: `Runbook 读取失败：${err?.message || err}` };
   }

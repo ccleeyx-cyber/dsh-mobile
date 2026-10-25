@@ -49,9 +49,15 @@ sudo systemctl restart dsh-web
 | 变量 | 作用 | 默认 |
 |---|---|---|
 | `DSH_AUTH_TOKEN` | 覆盖共享 Token（未设置则首次启动随机生成） | 自动生成 |
+| `BRIDGE_PORT` | 独立入口监听端口 | `3088` |
+| `BRIDGE_HOST` | 监听地址；手机直连需显式设为 `0.0.0.0` | `127.0.0.1` |
 | `BRIDGE_TLS_PORT` | HTTPS/WSS 端口 | `3443`（`0` = 关闭） |
 | `DSH_HOME` | DSH 数据目录 | `~/.dsh` |
 | `BRIDGE_TRUST_PROXY` | 信任反向代理传来的 `X-Forwarded-*` | 关 |
+| `DSH_RUNBOOK_ALLOW_INTERPRETERS` | 允许 Runbook 使用解释器（仍须 `danger: high`） | 关 |
+| `DSH_NTFY_ALLOW_PRIVATE` | 允许自建 ntfy 的 http/私网地址 | 关 |
+
+配置页保存**监听端口**后需要重启 `dsh web` 才生效；Token、远程通道等其余设置立即生效。
 
 `cordis.patch.yml` 里也可以直接给实例配置 `port` / `dshPort`。
 

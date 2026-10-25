@@ -17,7 +17,12 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 
-import { classifyHarnessNotice, describeDeliverableRefusal, extractDeliverables } from './core.mjs';
+import {
+  classifyHarnessNotice,
+  describeDeliverableRefusal,
+  extractDeliverables,
+  validateNtfyUrl
+} from './core.mjs';
 
 import {
   contentTypeFor,
@@ -847,8 +852,13 @@ export async function handleExtensionRoute(deps) {
   if (pathname === '/api/mobile/push/auto-topic' && method === 'POST') {
     const cfg = readConfig();
     const baseUrl = String(jsonBody.url || cfg.ntfyUrl || 'https://ntfy.sh').trim() || 'https://ntfy.sh';
+    const checked = validateNtfyUrl(baseUrl);
+    if (!checked.ok) {
+      sendJson(400, { ok: false, code: 400, error: `ntfy 地址不受信任：${checked.reason}` });
+      return true;
+    }
     const topic = generatePushTopic((n) => crypto.randomBytes(n));
-    const updated = writeConfig({ ntfyUrl: baseUrl, ntfyTopic: topic, ntfyEnabled: true });
+    const updated = writeConfig({ ntfyUrl: checked.url, ntfyTopic: topic, ntfyEnabled: true });
     audit('push/auto-topic', { url: updated.ntfyUrl || '', enabled: true });
     sendJson(200, {
       ok: true,

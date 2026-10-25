@@ -8,9 +8,10 @@
 // 设计上的三个硬约束：
 //   1. **绝不阻塞启动**：下载失败、cloudflared 不存在、网络断，都只 degrade
 //      成「隧道不可用 + 一句可操作的提示」，网关本体照常工作。
-//   2. **二进制必须校验**：默认校验 sha256（DSH_CLOUDFLARED_SHA256 或调用方
-//      传入）；没配哈希时退化为 `--version` 探测——至少能挡住"下到一个 HTML
-//      错误页就当成可执行文件跑"。
+//   2. **二进制必须校验**：下载目标必须匹配固定版本的官方 sha256；复用缓存/
+//      系统二进制也必须匹配某个已知官方版本（内置表见 KNOWN_CLOUDFLARED_SHA256）。
+//      显式 DSH_CLOUDFLARED_SHA256 可钉住其它版本；不再接受"文件不像 HTML"作为
+//      唯一校验。
 //   3. **生命周期绑宿主**：隧道进程必须随 dsh web 退出而退出，否则宿主机上
 //      会攒下一堆孤儿 cloudflared 进程，各自占着一条公网隧道。
 //
@@ -27,6 +28,36 @@ import { dshHome } from './store.mjs';
 // [fix 2026-10-21] 2026.2.0 → 2026.9.1：与同机 dsh-pocket 实际在用的版本对齐。
 // 旧版在我们这台机器上会额外报 `cfd-features.argotunnel.com` DNS 超时。
 export const CLOUDFLARED_VERSION = '2026.9.1';
+
+/**
+ * 已知官方 release 的 SHA-256（GitHub release asset digest）。
+ *
+ * 这是“默认校验”的数据源：没有显式 DSH_CLOUDFLARED_SHA256 时，下载必须匹配
+ * 固定版本的官方哈希；复用系统/缓存中的二进制时，也必须匹配某个已知版本。
+ * 仅靠 `--version` 或“文件开头不像 HTML”无法证明可执行文件没被替换。
+ */
+export const KNOWN_CLOUDFLARED_SHA256 = Object.freeze({
+  '2026.9.1': Object.freeze({
+    win32: '2837888cc0f5d58f15b6dc478376de90b4d3ba5241c7947455d1e0a0df429712',
+    linux: '03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc',
+    darwin: 'ff0d3b51d5ff70eceef89d6b32145fee985018a2174596a5dbe405e2766e2ac4'
+  }),
+  '2026.2.0': Object.freeze({
+    win32: 'b3279f2186a1c3c438ad5865e802bbbec26090c5d3fdb4ac1113f1143a94837a',
+    linux: '176746db3be7dc7bd48f3dd287c8930a4645ebb6e6700f883fddda5a4c307c16',
+    darwin: '685688a260c324eb8d9c9434ca22f0ce4f504fd6acd0706787c4833de8d6eb17'
+  })
+});
+
+export function knownCloudflaredSha256(version, platform) {
+  return KNOWN_CLOUDFLARED_SHA256?.[String(version)]?.[platform] || '';
+}
+
+function knownHashesForPlatform(platform) {
+  return new Set(Object.values(KNOWN_CLOUDFLARED_SHA256)
+    .map((byPlatform) => byPlatform?.[platform])
+    .filter(Boolean));
+}
 
 export function tunnelBinDir() {
   return path.join(dshHome(), 'mobile-access', 'bin');
@@ -181,35 +212,61 @@ export async function ensureCloudflared({
 } = {}) {
   const { bin } = platformAsset(platform);
   const dest = path.join(dir, bin);
-  const expected = String(expectedSha256 ?? process.env.DSH_CLOUDFLARED_SHA256 ?? '')
+  const explicit = String(expectedSha256 ?? process.env.DSH_CLOUDFLARED_SHA256 ?? '')
     .trim()
     .toLowerCase();
+  const expected = explicit || knownCloudflaredSha256(version, platform);
+  const known = knownHashesForPlatform(platform);
 
-  const verify = (file) => {
-    if (expected) {
-      const got = sha256File(file);
-      if (got !== expected) {
-        throw new Error(`cloudflared 校验失败：期望 ${expected.slice(0, 12)}…，实际 ${got.slice(0, 12)}…`);
-      }
-      return 'sha256';
-    }
-    // 没配哈希时的最低限度校验：文件得像一个二进制，而不是 HTML 错误页。
+  const looksLikeHtml = (file) => {
     const head = fs.readFileSync(file).subarray(0, 256);
-    if (head.includes('<!DOCTYPE') || head.includes('<html')) {
+    return head.includes('<!DOCTYPE') || head.includes('<html');
+  };
+
+  /**
+   * @param mode 'target' 下载目标：必须匹配固定版本（或显式哈希）
+   *             'known'  系统/缓存：必须匹配任意一个已知官方版本
+   *             'override' 显式路径：本地管理员指定，允许无哈希但记录警告
+   */
+  const verify = (file, mode = 'target') => {
+    if (looksLikeHtml(file)) {
       throw new Error('cloudflared 下载内容看起来是网页而不是可执行文件');
     }
-    return 'header';
+    const got = sha256File(file);
+    if (mode === 'known') {
+      // 显式哈希优先级最高：允许管理员/测试钉住一个非内置版本。
+      if (explicit) {
+        if (got !== explicit) {
+          throw new Error(`cloudflared 校验失败：期望 ${explicit.slice(0, 12)}…，实际 ${got.slice(0, 12)}…`);
+        }
+        return 'sha256';
+      }
+      if (known.has(got)) return 'sha256-known';
+      throw new Error(`cloudflared 校验失败：不是任何已知官方版本（${got.slice(0, 12)}…）`);
+    }
+    if (!expected) {
+      if (mode === 'override' && explicit === '') {
+        logger.warn?.('[tunnel] DSH_CLOUDFLARED_PATH 指向的二进制没有已知哈希，按本地管理员显式指定使用');
+        return 'override-unverified';
+      }
+      throw new Error(`cloudflared 缺少可信哈希：请设置 DSH_CLOUDFLARED_SHA256（${version}/${platform}）`);
+    }
+    if (got !== expected) {
+      throw new Error(`cloudflared 校验失败：期望 ${expected.slice(0, 12)}…，实际 ${got.slice(0, 12)}…`);
+    }
+    return 'sha256';
   };
 
   // 0) 用户已经装好了 cloudflared（scoop / choco / 手工下载）：直接用，不下载。
   //    这是「下载通道被拦」时唯一可靠的出路——实测本机 Node 的 https 在
   //    release-assets.githubusercontent.com 上握手会被断开，而 curl 能下。
+  //    显式路径是本地管理员的信任决定；仍拒绝 HTML，且无哈希时记录警告。
   const override = String(binaryPath ?? process.env.DSH_CLOUDFLARED_PATH ?? '').trim();
   if (override) {
     if (!fs.existsSync(override)) {
       throw new Error(`DSH_CLOUDFLARED_PATH 指向的文件不存在：${override}`);
     }
-    return { path: override, downloaded: false, verifiedBy: verify(override), from: 'override' };
+    return { path: override, downloaded: false, verifiedBy: verify(override, 'override'), from: 'override' };
   }
 
   if (fs.existsSync(dest)) {
@@ -220,7 +277,7 @@ export async function ensureCloudflared({
     // 只显示"隧道未启动"（下载阶段没有状态）。实测 2026.2.0 能正常注册 ——
     // 版本旧 ≠ 不能用，升级必须是机会性的，不能当前置条件。
     try {
-      const verifiedBy = verify(dest);
+      const verifiedBy = verify(dest, 'known');
       const onDisk = probeVersionFn(dest);
       if (!onDisk || onDisk === version) {
         return { path: dest, downloaded: false, verifiedBy, version: onDisk || version, from: 'cache' };
@@ -244,7 +301,7 @@ export async function ensureCloudflared({
       return {
         path: system,
         downloaded: false,
-        verifiedBy: verify(system),
+        verifiedBy: verify(system, 'known'),
         version: probeVersionFn(system),
         from: 'system'
       };
@@ -298,7 +355,7 @@ export async function ensureCloudflared({
     if (!fs.existsSync(tmp) || fs.statSync(tmp).size < 1024) {
       throw new Error('cloudflared 下载内容过小，疑似被拦截');
     }
-    verifiedBy = verify(tmp);
+    verifiedBy = verify(tmp, 'target');
   } catch (err) {
     // 校验失败必须把 .part 删掉：留着的坏文件既占空间，也让下次安装的
     // "临时文件"语义变得可疑（同名覆盖前没人清理）。

@@ -43,9 +43,21 @@ export function configurePersistence({ verifyToken: vt, findDeviceByToken: fdt }
 // settings 里每条模型带 provider/providerLabel、runbook 在 Windows 用内置 ls。
 // 1.15.1：密钥轮换自愈（RPC 401 时重读密钥并重试一次）+ 诊断探针改用无 id 的
 // session/modelCatalog，并区分"通道没通"与"引擎有应答"。
-export const BRIDGE_VERSION = '1.15.1';
+// 1.16.0：远程访问安全加固（配对鉴权、撤销即断连、Memory realpath、解释器与
+// cloudflared 校验、资源上限、ntfy 目标限制）。
+export const BRIDGE_VERSION = '1.16.0';
 export const MAX_BODY_SIZE = 2 * 1024 * 1024; // 2MB defensive payload limit (F4.1)
 export const HEARTBEAT_INTERVAL_MS = 30000;
+/** 上游 RPC 响应硬上限：异常引擎/插件不能把网关进程堆内存拉爆。 */
+export const MAX_RPC_RESPONSE_BYTES = 8 * 1024 * 1024;
+/** 手机 WS 单帧上限（4MB）：正常按键/文本远低于此，附件走独立 HTTP 上传。 */
+export const MAX_WS_FRAME_BYTES = 4 * 1024 * 1024;
+/** 上游 MUX 单帧上限：流式帧 + 大快照都在这条线以下。 */
+export const MAX_MUX_FRAME_BYTES = 8 * 1024 * 1024;
+/** 每个设备同时进行的 HTTP 请求上限，防止脚本式并发打满宿主。 */
+export const MAX_HTTP_INFLIGHT_PER_DEVICE = 12;
+/** 单会话流式缓冲上限（字符，约等于 UTF-8 字节的保守上界）。 */
+export const MAX_STREAM_BUFFER_CHARS = 4 * 1024 * 1024;
 
 /* ------------------------------------------------------------------ *
  * DSH home / config
@@ -155,8 +167,21 @@ export function createRpcCaller({ dshPort, cookieFactory, timeoutMs = 10000 }) {
         timeout: timeoutMs
       }, (res) => {
         let data = '';
-        res.on('data', (chunk) => { data += chunk; });
+        let size = 0;
+        let tooLarge = false;
+        res.on('data', (chunk) => {
+          if (tooLarge) return;
+          size += chunk.length;
+          if (size > MAX_RPC_RESPONSE_BYTES) {
+            tooLarge = true;
+            try { req.destroy(); } catch { /* already gone */ }
+            reject(new Error(`DSH RPC ${method} response exceeds ${MAX_RPC_RESPONSE_BYTES} bytes`));
+            return;
+          }
+          data += chunk;
+        });
         res.on('end', () => {
+          if (tooLarge) return;
           try {
             const parsed = JSON.parse(data);
             if (parsed.result && parsed.result.ok === true) {
@@ -271,6 +296,67 @@ export function coerceToolInput(input) {
  *
  * Returns { targetFile, relativePath } or { error, status }.
  */
+/**
+ * ntfy 目标准入：默认只允许公网 HTTPS。
+ *
+ * 这条通道会带着用户配置的 Bearer Token 发 POST，如果允许任意 URL，已认证
+ * 手机就能把它变成 SSRF 探针（访问云元数据、内网管理面）。自建 http/私网
+ * ntfy 是合法需求，但必须由宿主机管理员显式设置 DSH_NTFY_ALLOW_PRIVATE=1。
+ */
+export function validateNtfyUrl(raw, {
+  allowPrivate = process.env.DSH_NTFY_ALLOW_PRIVATE === '1'
+} = {}) {
+  const text = String(raw ?? '').trim();
+  if (!text) return { ok: false, url: '', reason: 'empty' };
+  let u;
+  try {
+    u = new URL(text);
+  } catch {
+    return { ok: false, url: '', reason: 'invalid-url' };
+  }
+  if (u.username || u.password) {
+    return { ok: false, url: '', reason: 'credentials-not-allowed' };
+  }
+  if (u.protocol !== 'https:' && !(allowPrivate && u.protocol === 'http:')) {
+    return { ok: false, url: '', reason: allowPrivate ? 'http-only-with-allow-private' : 'https-required' };
+  }
+  let host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const privateHost =
+    host === 'localhost' || host.endsWith('.local') ||
+    /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) ||
+    /^169\.254\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+    host === '::1' || /^f[cd][0-9a-f]{2}:/.test(host) || /^fe80:/.test(host);
+  if (privateHost && !allowPrivate) {
+    return { ok: false, url: '', reason: 'private-host-requires-admin-opt-in' };
+  }
+  u.pathname = `${u.pathname.replace(/\/+$/, '')}/`;
+  return { ok: true, url: u.toString(), reason: '' };
+}
+
+/**
+ * Resolve the real path of the deepest existing ancestor, then append the
+ * not-yet-existing tail. `realpathSync` throws on missing files, but the
+ * memory routes legitimately address files that do not exist yet.
+ */
+function canonicalizeLoose(target) {
+  let current = path.resolve(target);
+  const tail = [];
+  for (let depth = 0; depth < 64; depth += 1) {
+    try {
+      const real = fs.realpathSync.native
+        ? fs.realpathSync.native(current)
+        : fs.realpathSync(current);
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      tail.push(path.basename(current));
+      current = parent;
+    }
+  }
+  return path.resolve(target);
+}
+
 export function createPathSanitizer({ getRegisteredWorkspaces }) {
   return function sanitizeWorkspaceFilePath(wsPath, fileName) {
     if (!wsPath || typeof wsPath !== 'string' || !wsPath.trim()) {
@@ -309,13 +395,20 @@ export function createPathSanitizer({ getRegisteredWorkspaces }) {
       return { error: 'Forbidden: control character in fileName', status: 403 };
     }
 
-    const resolvedWs = path.resolve(trimmedWs);
+    // [security-fix 2026-10-25] 比较真实路径，而不是字符串。
+    //
+    // 只做 path.resolve 时，工作区里的 junction/symlink（Windows 上很常见）
+    // 可以指向任意目录：`docs/credentials.txt` 的字符串仍在工作区内，实际
+    // 打开的却是工作区外。目录链接不需要管理员权限（junction），所以这不是
+    // 理论风险。对目标文件同样 canonicalize；不存在的尾部拼在最近现存祖先的
+    // 真实路径之后，保证新建文件也受同一约束。
+    const resolvedWs = canonicalizeLoose(trimmedWs);
 
     const registered = (getRegisteredWorkspaces() || []).filter(Boolean);
     const registeredPaths = [];
     for (const ws of registered) {
       const p = typeof ws === 'string' ? ws : (ws?.path || ws?.cwd || ws?.rootPath);
-      if (p && typeof p === 'string' && p.trim()) registeredPaths.push(path.resolve(p.trim()));
+      if (p && typeof p === 'string' && p.trim()) registeredPaths.push(canonicalizeLoose(p.trim()));
     }
 
     // [P0] Fail CLOSED when the workspace registry is empty.
@@ -351,10 +444,14 @@ export function createPathSanitizer({ getRegisteredWorkspaces }) {
       return { error: 'Forbidden: workspacePath is not a registered workspace', status: 403 };
     }
 
-    const resolvedTarget = path.resolve(resolvedWs, trimmedFile);
+    const resolvedTarget = canonicalizeLoose(path.resolve(resolvedWs, trimmedFile));
     const relative = path.relative(resolvedWs, resolvedTarget);
     const wsWithSep = resolvedWs.endsWith(path.sep) ? resolvedWs : resolvedWs + path.sep;
-    if (relative.startsWith('..') || path.isAbsolute(relative) || !resolvedTarget.startsWith(wsWithSep)) {
+    const targetInside = relative === '' || (
+      !relative.startsWith('..') && !path.isAbsolute(relative) &&
+      (resolvedTarget === resolvedWs || resolvedTarget.startsWith(wsWithSep))
+    );
+    if (!targetInside) {
       return { error: 'Forbidden: Resolved path escapes workspace boundaries', status: 403 };
     }
     return { targetFile: resolvedTarget, relativePath: relative };
@@ -1358,6 +1455,23 @@ export function noteAuthFailure(req) {
 /** A successful auth clears the caller's backoff. */
 export function clearAuthFailures(req) {
   AUTH_FAIL_STATE.delete(authFailKey(req));
+}
+
+/**
+ * 定期清掉过期条目。此前只有"同一个 IP 再次失败"才会重置自己的记录，
+ * 公网扫描器换 IP 就能让 Map 永久增长。
+ */
+export function pruneAuthFailures(now = Date.now()) {
+  let removed = 0;
+  for (const [key, entry] of AUTH_FAIL_STATE) {
+    const last = entry.lastFailAt || 0;
+    const blocked = entry.blockedUntil || 0;
+    if (now - last > AUTH_FAIL_WINDOW_MS && blocked <= now) {
+      AUTH_FAIL_STATE.delete(key);
+      removed++;
+    }
+  }
+  return removed;
 }
 
 /** Test seam — the backoff map is module state. */
