@@ -214,7 +214,7 @@ void main() {
         'delta': '迟到尾包',
       });
 
-      expect(dsh.messages.single.content, '正文');
+      expect(dsh.messages.single.content, '正文迟到尾包');
       expect(dsh.messages.single.isStreaming, isFalse);
       expect(dsh.isSending, isFalse);
       dsh.dispose();

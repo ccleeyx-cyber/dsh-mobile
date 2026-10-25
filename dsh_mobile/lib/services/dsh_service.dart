@@ -2461,10 +2461,13 @@ class DshService extends ChangeNotifier {
     final firstServerTime = serverMessages.isEmpty
         ? null
         : serverMessages.first.timestamp;
-    // 实时流先创建的占位往往比服务端事件晚几毫秒。若它已有 requestId，
-    // 它就是本轮的开始，不应被“本地时间晚于历史”挪到回答后面。
+    final firstServer = serverMessages.isEmpty ? null : serverMessages.first;
     final startsTurn = pending.any((m) =>
-        m.isUser && m.clientRequestId != null && m.content.trim().isNotEmpty);
+        m.isUser &&
+        (m.clientRequestId != null ||
+            (firstServer?.clientRequestId == null &&
+                firstServer?.isUser == true &&
+                firstServer.content == stripAttachmentLabel(m.content))));
     final beforeServer = firstServerTime == null || startsTurn
         ? const <ChatMessage>[]
         : pending.where((m) => m.timestamp.isBefore(firstServerTime)).toList();
