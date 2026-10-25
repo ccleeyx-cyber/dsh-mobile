@@ -2465,8 +2465,9 @@ class DshService extends ChangeNotifier {
     final startsTurn = pending.any((m) =>
         m.isUser &&
         (m.clientRequestId != null ||
-            (firstServer?.clientRequestId == null &&
-                firstServer?.isUser == true &&
+            (firstServer != null &&
+                firstServer.clientRequestId == null &&
+                firstServer.isUser &&
                 firstServer.content == stripAttachmentLabel(m.content))));
     final beforeServer = firstServerTime == null || startsTurn
         ? const <ChatMessage>[]
