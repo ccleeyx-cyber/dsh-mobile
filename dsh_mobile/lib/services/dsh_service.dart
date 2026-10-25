@@ -5660,6 +5660,19 @@ class DshService extends ChangeNotifier {
         return;
       }
 
+      // 4.9 [fix 2026-10-25] 工具参数增量帧必须在正文增量判定之前截住。
+      //
+      // `tool_call` 帧的形状是 `{type:'tool_call', tool, delta}` —— 那个 `delta`
+      // 是**工具参数**的增量，不是回复正文。而下面那段正文分支的判定条件是
+      // `json.containsKey('delta')`，于是它先被命中：工具参数的碎片被当成正文
+      // 拼进气泡（流式时正文里冒出 `{"path":"…` 这类残片），而这次工具调用
+      // 就没有任何一条增量走到工具卡上。
+      //
+      // 参数本身不需要在这里合并：网关的 `tool_start` 已经带了**完整**参数
+      // （它来自会话日志里的 `tool/call` 事件），所以这些增量直接丢弃即可 ——
+      // 既不污染正文，也不会造出重复的工具条目。
+      if (type == 'tool_call') return;
+
       // 5. Streaming tokens and chat chunks (thinking / delta / token)
       if (type == 'thinking' ||
           type == 'delta' ||

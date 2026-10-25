@@ -119,6 +119,13 @@ class _ChatViewState extends State<ChatView> {
   /// key = `'<message id>@<content length>'`。见 `_buildMessageItem` 里的说明。
   final Map<String, int> _contextMarkerCache = {};
 
+  /// 逐条消息的**已构建子树**缓存（[perf 2026-10-25]，键见 [_messageSignature]）。
+  ///
+  /// 为什么按"签名"而不是按消息 id：消息是**原地可变**的（流式追加正文、追加
+  /// 工具、isStreaming 翻转），按 id 缓存会把旧内容一直钉在屏幕上。签名把会
+  /// 影响长相的输入都算进去，任何一个变了才重新构建。
+  final Map<String, Widget> _messageWidgetCache = {};
+
   /// 当前被高亮的命中消息 id。高亮只保留一条 —— 一次跳到第一条就够用户确认
   /// "查找能用了"，剩下的自己点；全部高亮反而让页面变成一片黄。
   final Set<String> _highlightedMessageIds = {};
@@ -355,6 +362,14 @@ class _ChatViewState extends State<ChatView> {
     } catch (e) {
       if (mounted) _toast('分享的图片挂载失败: $e');
     }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // 主题 / 字号变了：缓存子树里的颜色与字体是旧值，必须整棵重建。
+    // 上下文标记缓存只存整数、与主题无关，不必清。
+    if (_messageWidgetCache.isNotEmpty) _messageWidgetCache.clear();
   }
 
   @override
@@ -843,17 +858,30 @@ class _ChatViewState extends State<ChatView> {
                 // 命中的那条消息。没有 key 只能按索引估算 offset，而
                 // 消息高度是可变的，估算必然滚偏。
                 final highlighted = _highlightedMessageIds.contains(m.id);
-                Widget built = _buildMessageItem(
-                  m,
-                  dsh,
-                  isTurnStart: _isTurnStartOf(dsh.messages, msgIndex),
-                );
-                // [fix 2026-10-25] 所有消息都加 RepaintBoundary 隔离。
-                // 流式消息逐帧变化，历史消息虽然内容稳定但在 notifyListeners()
-                // 时仍会走 build()。给每条消息隔离后，Flutter 能跳过未变化的子树，
-                // 大幅减少长会话的重绘开销。历史消息的 saveLayer 开销远小于
-                // 重新布局 Markdown 和工具卡的开销。
-                built = RepaintBoundary(child: built);
+                final isTurnStart = _isTurnStartOf(dsh.messages, msgIndex);
+                // [perf 2026-10-25] 逐条消息记忆化。
+                //
+                // ChatView 是全页 `Provider.of`（listen: true），所以服务每通知
+                // 一次（流式期间 150ms 一次、发送那一刻也会通知）整个页面就重建，
+                // `buildItem` 对**屏幕上每条可见消息**重跑一遍 —— 里面是
+                // MarkdownBody 重新解析 + linkify 扫描 + 工具卡。长会话里这就是
+                // "发出去以后要卡一下才看见在跑"和"边跑边滚不跟手"的主要成本。
+                //
+                // 签名覆盖所有会影响这条气泡长相的输入：正文/思考长度、工具数量与
+                // 运行中数量、最后一条工具的输出长度、是否还在流式、是否轮首、
+                // 是否高亮，以及交付物白名单（正文里的产物要按它决定能不能链接化）。
+                // 没变就直接返回上一次那棵子树 —— Flutter 看到同一个 widget 实例
+                // 会整棵跳过，连 build 都不进。
+                final sig = _messageSignature(m, dsh, isTurnStart, highlighted);
+                var built = _messageWidgetCache[sig];
+                if (built == null) {
+                  built = RepaintBoundary(
+                    child: _buildMessageItem(m, dsh, isTurnStart: isTurnStart),
+                  );
+                  // 缓存只服务"当前可见 + 刚离开视野"的消息；会话很长时不能无限涨。
+                  if (_messageWidgetCache.length > 400) _messageWidgetCache.clear();
+                  _messageWidgetCache[sig] = built;
+                }
                 if (highlighted) {
                   // 高亮放在这里而不是 _buildMessageItem 内部：这样
                   // 记忆卡、工具卡等所有分支都被同一层覆盖，不必逐个
@@ -1464,6 +1492,35 @@ class _ChatViewState extends State<ChatView> {
         ],
       ),
     );
+  }
+
+  /// 一条消息的"长相签名"（[perf 2026-10-25]，见 [_messageWidgetCache]）。
+  ///
+  /// 覆盖所有会影响这条气泡渲染的输入。漏一项的后果不是变慢，而是**画面停在
+  /// 旧样子**（缓存命中了旧子树），所以这里宁可多算几个字段，也不要为了省一点
+  /// 拼接而漏掉会变的东西：
+  ///
+  /// * 正文 / 思考的**内容哈希**（不只是长度）：重新对账可能把同一条消息换成
+  ///   等长的另一段文字；
+  /// * 工具条数 / 运行中条数 / 最后一条工具的输入输出长度（工具卡就地长出来）；
+  /// * `isStreaming`、轮首、高亮、附件数、本轮 token；
+  /// * 交付物白名单的**身份**：正文里的产物引用靠它决定能不能链接化。
+  String _messageSignature(
+    ChatMessage m,
+    DshService dsh,
+    bool isTurnStart,
+    bool highlighted,
+  ) {
+    final tools = m.tools;
+    final lastTool = tools.isEmpty ? null : tools.last;
+    return '${m.id}|${m.content.length}:${m.content.hashCode}|'
+        '${m.thinking?.length ?? 0}:${m.thinking?.hashCode ?? 0}|'
+        '${m.isStreaming}|$isTurnStart|$highlighted|'
+        '${tools.length}:${tools.where((t) => t.isRunning).length}:'
+        '${lastTool?.output.length ?? 0}:${lastTool?.input.length ?? 0}|'
+        '${m.attachments.length}:${m.localImagePreviews.length}|'
+        '${m.turnTokens ?? -1}|'
+        '${identityHashCode(dsh.deliverables)}:${dsh.deliverables.length}';
   }
 
   /// 这条消息是不是「一轮」的开头。

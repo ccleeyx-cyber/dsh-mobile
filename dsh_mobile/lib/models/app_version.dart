@@ -28,14 +28,14 @@ class AppVersion {
 
   /// 展示用版本号（`x.y.z`），构建期由 pubspec 注入。
   static const String version =
-      String.fromEnvironment('APP_VERSION', defaultValue: '1.39.7');
+      String.fromEnvironment('APP_VERSION', defaultValue: '1.39.8');
 
   /// 构建号（pubspec `+n`），即 Android 的 versionCode 来源。
   ///
   /// 更新检查拿它做比较：**必须严格递增**，否则新 APK 装不上去（Android 拒绝
   /// 降级覆盖安装），清单里的 versionCode 也会被判成"没有新版"。
   static const String buildNumber =
-      String.fromEnvironment('APP_BUILD', defaultValue: '96');
+      String.fromEnvironment('APP_BUILD', defaultValue: '97');
 
   /// 本 APK 的 applicationId。用于校验 `latest.json` 不是给别的应用准备的。
   ///
