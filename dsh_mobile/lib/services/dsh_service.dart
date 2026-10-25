@@ -223,10 +223,10 @@ class DshService extends ChangeNotifier {
     final epoch = _sessionEpoch(sessionId);
     // 微任务调度让紧随其后的 idle 与 done 共享同一次补拉，同时调用方
     // 可以同步完成收尾；开始之前若已被取消或来了新回合就不发旧请求。
-    final future = Future<void>.microtask(() {
+    final future = Future<void>.microtask(() async {
       if (_isDisposed || _sessionEpoch(sessionId) != epoch) return;
       _completedTurnEpochs[key] = epoch;
-      return (debugFinalResync ?? _resyncActiveSession)(sessionId);
+      await (debugFinalResync ?? _resyncActiveSession)(sessionId);
     });
     _finalResyncFlights[key] = future;
     unawaited(future.catchError((Object error) {
