@@ -64,8 +64,14 @@ void main() {
           role: 'user',
           content: '继续',
           clientRequestId: 'request-old',
+          timestamp: DateTime.fromMillisecondsSinceEpoch(1700000000000),
         ),
-        ChatMessage(id: 'a-old', role: 'assistant', content: '旧回复'),
+        ChatMessage(
+          id: 'a-old',
+          role: 'assistant',
+          content: '旧回复',
+          timestamp: DateTime.fromMillisecondsSinceEpoch(1700000000100),
+        ),
       ]);
       dsh.debugReconcileServerMessages([
         wire('u20', 'user', '继续', 20, rpcId: 'request-new'),
@@ -214,7 +220,7 @@ void main() {
         'delta': '迟到尾包',
       });
 
-      expect(dsh.messages.single.content, '正文迟到尾包');
+      expect(dsh.messages.single.content, '正文');
       expect(dsh.messages.single.isStreaming, isFalse);
       expect(dsh.isSending, isFalse);
       dsh.dispose();
