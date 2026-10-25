@@ -212,6 +212,33 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
   /// 0 = 概览，1 = 轨迹（[feat 2026-10-17] 同级 tab）。
   int _tab = 0;
 
+  /// 小节级构建缓存（[perf 2026-10-25]）。
+  ///
+  /// 面板外面套着 `Consumer<DshService>`：流式回复期间服务每 150ms 通知一次，
+  /// 这个 `build()` 就跟着跑一次；刷新（`fetchSessionExtras`）回来还会再来几次。
+  /// 每次都重扫交付物分组、变更清单、队友列表 —— 而这些数据绝大多数时候没变，
+  /// 于是"点开会话信息卡一下"就变成了"每 150ms 卡一下"。
+  ///
+  /// 缓存键是**数据签名**（列表身份 + 相关标量）：签名不变就直接返回上一次构建
+  /// 的那棵子树，Flutter 因为 widget 实例相同会整棵跳过，连 build 都不进。
+  /// 数据真的换了（新的 List 实例）签名才变。
+  final Map<String, Widget> _sectionCache = {};
+
+  /// 1 秒 ticker 的序号：只有「作业」小节的签名里含它，让时长能往前走，
+  /// 其余小节不会被这个 ticker 带着重建。
+  int _tick = 0;
+
+  Widget _sectionCached(String signature, Widget Function() build) {
+    final cached = _sectionCache[signature];
+    if (cached != null) return cached;
+    // RepaintBoundary：滚动/打开动画时每条小节能各自成层，不用整页重新光栅化。
+    final built = RepaintBoundary(child: build());
+    // 签名每次 tick 都会新增一条，留一点余量后整体清空，避免长期挂机撑大。
+    if (_sectionCache.length > 12) _sectionCache.clear();
+    _sectionCache[signature] = built;
+    return built;
+  }
+
   /// 「概览 / 轨迹」切换条。
   Widget _buildTabs(BuildContext context) {
     Widget tab(String label, int index, Key key) {
@@ -319,6 +346,13 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // 主题 / 字号变了：缓存子树里的颜色与字体是旧值，必须整棵重建。
+    if (_sectionCache.isNotEmpty) _sectionCache.clear();
+  }
+
+  @override
   void didUpdateWidget(covariant SessionInfoSheet oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!identical(oldWidget.jobs, widget.jobs)) {
@@ -340,7 +374,9 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
     final needsTick = widget.jobs.any((job) => job.isLive);
     if (needsTick && _jobTicker == null) {
       _jobTicker = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (mounted) setState(() {});
+        // 只推进 tick：作业时长要动，其它小节靠 _sectionCached 留在缓存里 ——
+        // 原来这里是空的 setState，等于每秒把整个面板（含所有小节）重建一遍。
+        if (mounted) setState(() => _tick++);
       });
     } else if (!needsTick && _jobTicker != null) {
       _jobTicker!.cancel();
@@ -635,22 +671,69 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
                           // 两步（开会话信息 → 找到那一行）。一个只读的"现状描述"
                           // 面板里混进"删除会话"这种不可撤销的动作，本来也危险。
                           // 现在这个面板只描述现状，不改任何东西。
-                          KeyedSubtree(key: _usageKey, child: _buildUsage()),
                           KeyedSubtree(
-                              key: _deliverablesKey, child: _buildDeliverables()),
-                          KeyedSubtree(key: _changesKey, child: _buildChanges()),
-                          KeyedSubtree(key: _jobsKey, child: _buildJobs()),
+                            key: _usageKey,
+                            child: _sectionCached(
+                              'usage/${identityHashCode(widget.stats)}/'
+                              '${widget.turnBurnTokens}/$_goalActionInProgress',
+                              _buildUsage,
+                            ),
+                          ),
+                          KeyedSubtree(
+                            key: _deliverablesKey,
+                            child: _sectionCached(
+                              'deliverables/${identityHashCode(widget.deliverables)}/'
+                              '${widget.busyDeliverablePath}',
+                              _buildDeliverables,
+                            ),
+                          ),
+                          KeyedSubtree(
+                            key: _changesKey,
+                            child: _sectionCached(
+                              'changes/${identityHashCode(widget.changes)}/'
+                              '${widget.changesAvailable}/${widget.changesReason}/'
+                              '${widget.changesSource}/'
+                              '${identityHashCode(widget.repoCandidates)}',
+                              _buildChanges,
+                            ),
+                          ),
+                          KeyedSubtree(
+                            key: _jobsKey,
+                            child: _sectionCached(
+                              'jobs/${identityHashCode(widget.jobs)}/'
+                              '${widget.jobsUnavailable}/$_tick/${_jobStopNotice ?? ''}',
+                              _buildJobs,
+                            ),
+                          ),
                           // [feat 2026-10-16] 智能体团队。放在子代理**之前**：团队是更高
                           // 层的组织视图，用户先想知道"谁在干活"，再看具体委派。
                           if (widget.team != null || widget.teamUnavailable)
-                            KeyedSubtree(key: _teamKey, child: _buildTeam()),
+                            KeyedSubtree(
+                              key: _teamKey,
+                              child: _sectionCached(
+                                'team/${identityHashCode(widget.team)}/'
+                                '${widget.teamUnavailable}/${_expandedTeammates.length}',
+                                _buildTeam,
+                              ),
+                            ),
                           // [feat 2026-10-12] 子代理区块。引擎没有列出能力/读取失败时
                           // 返回 null —— 整块隐藏，绝不显示一张假空表。
                           if (widget.subagents != null)
                             KeyedSubtree(
-                                key: _subagentsKey, child: _buildSubagents()),
+                              key: _subagentsKey,
+                              child: _sectionCached(
+                                'subagents/${identityHashCode(widget.subagents)}/'
+                                '${widget.subagentsUnavailable}/$_interruptingId',
+                                _buildSubagents,
+                              ),
+                            ),
                           KeyedSubtree(
-                              key: _schedulesKey, child: _buildSchedules()),
+                            key: _schedulesKey,
+                            child: _sectionCached(
+                              'schedules/${identityHashCode(widget.schedules)}',
+                              _buildSchedules,
+                            ),
+                          ),
                           // [fix 2026-10-17] 「连接诊断」区块删除：它把 ping/端口/
                           // 网关版本这些一次性排查信息摆在会话面板里，而真正的排障
                           // 入口是「设置 → 网络与网关诊断」（那里能测速、重连、换

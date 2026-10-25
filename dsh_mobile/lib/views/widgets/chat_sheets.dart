@@ -710,7 +710,10 @@ Future<void> showChatSessionInfoSheet(
       builder: (_) => Consumer<DshService>(
         builder: (_, d, __) => ValueListenableBuilder<String?>(
           valueListenable: deliverableBusy,
-          builder: (_, busyPath, __) => SessionInfoSheet(
+          // [perf 2026-10-25] 整块内容单独成层：弹层滑入动画与滚动时只做位移/合成，
+          // 不用每帧把整棵面板（几百个 widget）重新光栅化。
+          builder: (_, busyPath, __) => RepaintBoundary(
+            child: SessionInfoSheet(
             stats: d.sessionStats,
             turnBurnTokens: d.lastTurnTokens,
             deliverables: d.deliverables,
@@ -784,6 +787,7 @@ Future<void> showChatSessionInfoSheet(
             ),
             // [move 2026-10-21] Runbook（会话上下文版）。
             runbookTab: runbookTab,
+            ),
           ),
         ),
       ),
