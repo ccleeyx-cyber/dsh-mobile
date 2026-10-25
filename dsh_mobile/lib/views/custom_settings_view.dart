@@ -13,7 +13,6 @@ import 'settings/about_view.dart';
 import 'settings/connectivity_view.dart';
 import 'settings/gateway_switcher_card.dart';
 import 'settings/push_settings_view.dart';
-import 'settings/remote_access_view.dart';
 import 'settings/settings_widgets.dart';
 import 'settings/snippets_view.dart';
 import 'widgets/model_picker_sheet.dart';
@@ -33,7 +32,6 @@ import 'widgets/model_picker_sheet.dart';
 ///
 /// 二级页：
 ///  * [ConnectivityView] —— 原「网关健康」+「网络与网关诊断」合并；
-///  * [RemoteAccessView] —— v1.35 新增：证书指纹、隧道开关、远程地址；
 ///  * [PushSettingsView] —— 原内联的 ntfy 表单；
 ///  * [SnippetsView] —— 原内联的快捷指令列表与编辑器；
 ///  * [AboutView] —— 版本、检查更新、发布页。
@@ -107,15 +105,16 @@ class CustomSettingsView extends StatelessWidget {
             onTap: () => _push(context, const ConnectivityView()),
           ),
           const SizedBox(height: AppSpace.m),
-          // [v1.35] 远程访问：出门在外的第二条腿（自签 TLS + quick tunnel）。
-          // 与「连接与诊断」同级，因为它们在回答同一类问题：我现在能不能连上。
-          SettingsNavCard(
-            key: const ValueKey('settings-open-remote'),
-            icon: Icons.cloud_outlined,
-            title: '远程访问',
-            subtitle: '证书指纹与临时公网通道',
-            onTap: () => _push(context, const RemoteAccessView()),
-          ),
+          // [remove 2026-10-25] 「远程访问」入口删除。
+          //
+          // 用户判断得对：这一页只读状态，而它描述的东西（公网通道建到哪一步）
+          // **只在连不上时才有意义，而连不上时这一页本身就刷新不出来**；连得上
+          // 时又不看它。所以它既救不了急，也不构成日常信息 —— 一个进不去又没
+          // 人看的页面，留着只是让设置首屏多一张卡。
+          //
+          // 通道能力本身没有删：`DshService.refreshRemoteAccess` 与
+          // `RemoteAccessState` 仍在（网关侧 /api/mobile/remote-access 继续可用），
+          // 只是手机端不再有入口。
           const SizedBox(height: AppSpace.xl),
 
           // [v1.35] 运维入口：告警。它回答的是"人不在电脑前，还能不能把机器
