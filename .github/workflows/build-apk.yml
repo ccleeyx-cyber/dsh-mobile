@@ -94,6 +94,18 @@ jobs:
         working-directory: ./dsh_mobile
         run: flutter test
 
+      # 网关测试从仓库根跑（root package.json = dsh-mobile-bridge-tests，本身零依赖），
+      # 但它们 import 的是 dsh-server-plugin/lib/index.js，那份代码运行时依赖
+      # ws / qrcode / yaml。这些依赖只声明在 dsh-server-plugin/package.json 里，
+      # 且 node_modules 被 gitignore —— 本地因为目录已存在而全绿，CI 全新 checkout
+      # 什么都没有，于是每个测试都死在 "Cannot find module 'ws'"
+      # （2026-10-25 实测：tests 461 / pass 432 / 29 个套件 hookFailed）。
+      # 这里按提交的 package-lock.json 装依赖；lock 与 package.json 万一不同步，
+      # 退回 install 而不是让整条发布流水线因一个脆弱的 lock 直接红掉。
+      - name: Install gateway dependencies
+        working-directory: ./dsh-server-plugin
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
       - name: Test gateway (hermetic only)
         run: npm test
 
