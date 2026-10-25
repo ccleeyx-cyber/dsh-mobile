@@ -11,6 +11,7 @@ import 'alerts_view.dart';
 import 'security_permissions_view.dart';
 import 'settings/about_view.dart';
 import 'settings/connectivity_view.dart';
+import 'settings/gateway_switcher_card.dart';
 import 'settings/push_settings_view.dart';
 import 'settings/remote_access_view.dart';
 import 'settings/settings_widgets.dart';
@@ -87,7 +88,14 @@ class CustomSettingsView extends StatelessWidget {
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 14, 16, 28),
         children: [
-          // 0. 连接与诊断：出问题时用户最想立刻看到的东西，放最上面。
+          // 0. 当前服务器 + 一键切换。
+          //
+          // 多网关是重度用法：家里一台、公司一台，切换频率远高于改任何设置。
+          // 放在第一层，点开面板选一台就直接连接；新增/重命名仍走管理页。
+          GatewaySwitcherCard(dsh: dsh),
+          const SizedBox(height: AppSpace.m),
+
+          // 1. 连接与诊断：出问题时用户最想立刻看到的东西，紧跟服务器卡。
           SettingsNavCard(
             key: const ValueKey('settings-open-connectivity'),
             icon: Icons.monitor_heart_outlined,
