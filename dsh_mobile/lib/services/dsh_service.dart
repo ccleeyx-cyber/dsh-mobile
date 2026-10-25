@@ -221,8 +221,13 @@ class DshService extends ChangeNotifier {
     final key = _syncKey(sessionId);
     if (_isDisposed || _finalResyncFlights.containsKey(key)) return;
     final epoch = _sessionEpoch(sessionId);
-    _completedTurnEpochs[key] = epoch;
-    final future = (debugFinalResync ?? _resyncActiveSession)(sessionId);
+    // 微任务调度让紧随其后的 idle 与 done 共享同一次补拉，同时调用方
+    // 可以同步完成收尾；开始之前若已被取消或来了新回合就不发旧请求。
+    final future = Future<void>.microtask(() {
+      if (_isDisposed || _sessionEpoch(sessionId) != epoch) return;
+      _completedTurnEpochs[key] = epoch;
+      return (debugFinalResync ?? _resyncActiveSession)(sessionId);
+    });
     _finalResyncFlights[key] = future;
     unawaited(future.catchError((Object error) {
       debugPrint('[DshService] 回合结束补拉失败: $error');
@@ -238,13 +243,25 @@ class DshService extends ChangeNotifier {
   }
 
   bool _acceptStreamFrame(String sessionId) {
-    if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) return false;
+    if (_isCanceling) return false;
     final key = _syncKey(sessionId);
     if (_remoteRunningSessions.contains(key)) {
       _completedTurnEpochs.remove(key);
       return true;
     }
-    return _completedTurnEpochs[key] != _sessionEpoch(sessionId);
+    if (_completedTurnEpochs[key] == _sessionEpoch(sessionId)) return false;
+    // 新会话还没收到 running 帧时也必须接受首个 delta。取消栅栏只拦
+    // 本会话已被取消的代次，不能把上一轮会话的取消记录带过来。
+    return _activeTurnSeq > _cancelledTurnSeq;
+  }
+
+  bool _beginRemoteStream(String sessionId) {
+    final key = _syncKey(sessionId);
+    if (_remoteRunningSessions.contains(key)) return false;
+    _advanceSessionEpoch(sessionId);
+    _completedTurnEpochs.remove(key);
+    _remoteRunningSessions.add(key);
+    return true;
   }
 
   /// 流式通知合并窗口（[fix 2026-10-25] 从 100ms 加大到 150ms）。
@@ -5618,9 +5635,8 @@ class DshService extends ChangeNotifier {
           } else {
             final wasRemoteRunning = _remoteRunningSessions.contains(_syncKey(sId));
             if (!wasRemoteRunning && !_isSending) {
-              _advanceSessionEpoch(sId);
+              _beginRemoteStream(sId);
             }
-            _remoteRunningSessions.add(_syncKey(sId));
             if (!wasRemoteRunning) {
               unawaited(_resyncActiveSession(sId));
             }
@@ -5797,7 +5813,12 @@ class DshService extends ChangeNotifier {
             (incoming.seq != null && m.seq == incoming.seq) ||
             m.id == incoming.id);
         if (duplicate) return;
-        _messages.add(incoming);
+        _beginRemoteStream(sId);
+        if (_messages.isNotEmpty && _messages.last.isAssistant) {
+          _messages.insert(_messages.length - 1, incoming);
+        } else {
+          _messages.add(incoming);
+        }
         _streamRevision++;
         notifyListeners();
         return;
@@ -6179,6 +6200,7 @@ class DshService extends ChangeNotifier {
         // 回合结束了：本轮的基线使命结束（`_turnRunningSeen` 复位，等下一个回合
         // 的上升沿重新记基线）。
         _turnRunningSeen = false;
+        _requestFinalResync(sId);
         notifyListeners();
         fetchWorkspaces();
         // 一轮结束会领取（claim）队首消息：队列真值变了，刷新它。
