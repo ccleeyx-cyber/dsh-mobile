@@ -1261,6 +1261,15 @@ export function apply(ctx, config = {}, internals = {}) {
    */
   const QUESTION_TTL_MS = 30 * 60 * 1000;
 
+  /**
+   * 没有手机订阅时，问题仍暂存这么久，等下一台手机连上来。
+   *
+   * 实测事故：问题 10:37:38 到达，手机 10:37:46 才重连（8 秒），旧逻辑在
+   * 第一秒就把问题交给 Web UI，手机订阅时 replay 为空。只延迟"无人接收"的
+   * 条目：有过订阅者的条目按 30 分钟 TTL，交给关闭/作答/投影清理。
+   */
+  const QUESTION_UNCLAIMED_TTL_MS = 5 * 60 * 1000;
+
   /* -------------------------------------------------------------- *
    * Shared core wiring (see lib/core.mjs).
    *
@@ -2310,13 +2319,54 @@ export function apply(ctx, config = {}, internals = {}) {
     return true;
   }
 
-  /** Questions still worth offering, newest last. Expired ones are pruned. */
-  function livePendingQuestions() {
+  /**
+   * Questions still worth replaying to a (re)connecting phone.
+   *
+   * The engine's `userQuestions` projection is the authority on whether a
+   * question is still answerable. Without this check, a question that the Web UI
+   * answered while the phone was offline would come back as a stale card — and
+   * the phone's answer would be rejected with `unknown-question`.
+   */
+  async function pendingQuestionsForReplay() {
     const now = Date.now();
-    const out = [];
+    const candidates = [];
     for (const q of pendingQuestions.values()) {
-      if (now - q.createdAt > QUESTION_TTL_MS) {
+      const age = now - q.createdAt;
+      if (age > QUESTION_TTL_MS ||
+          (q.offeredTo.size === 0 && age > QUESTION_UNCLAIMED_TTL_MS)) {
         pendingQuestions.delete(q.eventId);
+        continue;
+      }
+      candidates.push(q);
+    }
+
+    // One projection read per session, not per question.
+    const activeBySession = new Map();
+    const sessions = new Set(candidates.filter((q) => q.callId).map((q) => q.sessionId));
+    for (const sessionId of sessions) {
+      const values = await readProjections(sessionId);
+      const view = values?.userQuestions;
+      const active = Array.isArray(view?.active)
+        ? view.active
+        : (Array.isArray(view?.questions?.active) ? view.questions.active : null);
+      if (active) {
+        activeBySession.set(sessionId, new Set(
+          active.map((item) => String(item?.callId || '')).filter(Boolean)
+        ));
+      }
+    }
+
+    const out = [];
+    for (const q of candidates) {
+      if (q.callId && activeBySession.has(q.sessionId) &&
+          !activeBySession.get(q.sessionId).has(q.callId)) {
+        pendingQuestions.delete(q.eventId);
+        audit('question/stale-replay', {
+          eventId: q.eventId,
+          sessionId: q.sessionId,
+          callId: q.callId,
+          why: 'projection-not-active'
+        });
         continue;
       }
       out.push({ eventId: q.eventId, sessionId: q.sessionId, questions: q.questions });
@@ -2768,29 +2818,40 @@ export function apply(ctx, config = {}, internals = {}) {
               return;
             }
 
-            if (questionSubscribers.size === 0) {
-              logger.info('[dsh-mobile-bridge] user-questions 无手机订阅者，留给 Web UI');
-              audit('question/relinquished', { eventId, sessionId, why: 'no-subscriber' });
-              return;
-            }
-
+            // [fix 2026-10-25] 没有订阅者时不再当场丢弃。
+            //
+            // 手机上的 socket 在锁屏/切网/隧道重连时会短暂断开；问题恰好在这
+            // 几秒内到达，旧代码立刻写 `question/relinquished`，8 秒后重连的
+            // 手机 replay 为空。现在先暂存（Web UI 仍可正常作答），手机订阅时
+            // 回放；回放前用引擎的 userQuestions 投影过滤已由网页答过的项。
+            const createdAt = Date.now();
+            const callId = String(request.wait?.callId || request.callId || '').trim() || null;
+            const hasSubscribers = questionSubscribers.size > 0;
             pendingQuestions.set(eventId, {
               eventId,
               sessionId,
+              callId,
               questions,
-              createdAt: Date.now(),
+              createdAt,
               // Which live subscriber sockets this prompt was offered to. A
               // phone that goes away only takes down what it was shown.
               offeredTo: new Set(questionSubscribers)
             });
 
-            sendToSubscribers({
-              type: 'question_request',
-              eventId,
-              sessionId,
-              questions
-            }, questionSubscribers);
-            audit('question/requested', { eventId, sessionId, count: questions.length });
+            if (hasSubscribers) {
+              sendToSubscribers({
+                type: 'question_request',
+                eventId,
+                sessionId,
+                questions
+              }, questionSubscribers);
+              audit('question/requested', { eventId, sessionId, count: questions.length });
+            } else {
+              logger.info('[dsh-mobile-bridge] user-questions 暂无手机订阅者，暂存等待重连');
+              audit('question/deferred', { eventId, sessionId, count: questions.length });
+            }
+            // 无论当时有没有订阅者都推送离线通知：这正是"手机不在线"时最该
+            // 叫醒用户的场景。
             pushNtfy('question', {
               sessionId,
               question: questions[0]?.question || '',
@@ -5791,12 +5852,13 @@ export function apply(ctx, config = {}, internals = {}) {
           for (const q of pendingQuestions.values()) {
             q.offeredTo?.add(ws);
           }
+          const pending = await pendingQuestionsForReplay();
           ws.send(JSON.stringify({
             type: 'question_subscribed',
             ok: true,
             // Replay anything still waiting, so a phone that connects mid-question
             // is not left looking at a session that appears to have stalled.
-            pending: livePendingQuestions()
+            pending
           }));
         } else if (msg.type === 'unsubscribe_questions') {
           questionSubscribers.delete(ws);

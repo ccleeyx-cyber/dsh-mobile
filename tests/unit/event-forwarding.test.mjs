@@ -81,6 +81,12 @@ let engineWs = null;
 let pageRecords = [];
 const pageThroughSeqs = [];
 
+/**
+ * Wire `values` for `session/projections`. Tests set this to prove that a
+ * question answered by another client (the Web UI) is not replayed as stale.
+ */
+let projectionValues = {};
+
 function startFakeEngine() {
   const srv = http.createServer((req, res) => {
     let body = '';
@@ -95,6 +101,10 @@ function startFakeEngine() {
         pageThroughSeqs.push(throughSeq);
         const records = pageRecords.filter((r) => (r.event?.seq ?? 0) <= (throughSeq ?? 0));
         res.end(JSON.stringify({ result: { ok: true, value: { records } } }));
+        return;
+      }
+      if (parsed?.method === 'session/projections') {
+        res.end(JSON.stringify({ result: { ok: true, value: { values: projectionValues } } }));
         return;
       }
       // Shape the RPC caller requires: {result:{ok:true,value:...}}.
@@ -125,7 +135,10 @@ function questionFrame(questions, opts = {}) {
     event: 'user-questions/request',
     id: opts.id,
     agent: opts.agent ?? 'session-abc',
-    request: { questions }
+    request: {
+      questions,
+      ...(opts.callId ? { wait: { callId: opts.callId } } : {})
+    }
   });
 }
 
@@ -299,13 +312,87 @@ describe('背压阈值（可测的纯函数）', () => {
 });
 
 describe('user-questions：不假装作答', () => {
-  it('没有手机订阅者时既不转发也不回空答案', async () => {
+  it('没有订阅者时暂不转发也不回空答案，但会保留给随后重连的手机', async () => {
     const before = rpcCalls.length;
     pushToEngine(questionFrame(QUESTION, { id: 'evt-nosub' }));
     await sleep(400);
     assert.equal(rpcCalls.length, before,
       '无人能答时必须保持沉默，让引擎的 waterfall 落到 Web UI；' +
       '回一个 {answers:[]} 会告诉 agent「人回答了空内容」，那是假话');
+
+    // 旧逻辑在这里就 relinquish 了；8 秒后重连的手机 replay 为空。
+    const c = await connectClient();
+    const sub = await c.subscribe();
+    const replay = sub.pending.find((q) => q.eventId === 'evt-nosub');
+    assert.equal(replay?.questions?.length, QUESTION.length,
+      '重连后的 question_subscribed 必须带回刚才无人接收的问题');
+
+    // 清掉 pending，避免影响后续用例（真实手机上这里由用户作答）。
+    c.send({
+      type: 'question_answer',
+      eventId: 'evt-nosub',
+      answer: { answers: [{ id: 'q1', selected: ['继续'] }] }
+    });
+    await c.waitFor((m) => m.type === 'question_ack' && m.eventId === 'evt-nosub');
+    await c.close();
+  });
+
+  it('网页已经答过的问题不会在手机重连时作为旧卡片回放', async () => {
+    projectionValues = {
+      userQuestions: {
+        active: [],
+        settled: [{ callId: 'call-web-done', answers: [] }]
+      }
+    };
+    try {
+      pushToEngine(questionFrame(QUESTION, {
+        id: 'evt-web-answered',
+        callId: 'call-web-done'
+      }));
+      await sleep(200);
+
+      const c = await connectClient();
+      const sub = await c.subscribe();
+      assert.equal(sub.pending.some((q) => q.eventId === 'evt-web-answered'), false,
+        'engine projection says the call is settled → must not replay');
+      assert.equal(
+        c.frames.filter((m) => m.type === 'question_request' && m.eventId === 'evt-web-answered').length,
+        0
+      );
+      await c.close();
+    } finally {
+      projectionValues = {};
+    }
+  });
+
+  it('投影仍为 active 的问题会正常回放', async () => {
+    projectionValues = {
+      userQuestions: {
+        active: [{ callId: 'call-live', questions: QUESTION, state: 'open' }],
+        settled: []
+      }
+    };
+    try {
+      pushToEngine(questionFrame(QUESTION, {
+        id: 'evt-active-replay',
+        callId: 'call-live'
+      }));
+      await sleep(200);
+
+      const c = await connectClient();
+      const sub = await c.subscribe();
+      assert.equal(sub.pending.some((q) => q.eventId === 'evt-active-replay'), true);
+
+      c.send({
+        type: 'question_answer',
+        eventId: 'evt-active-replay',
+        answer: { answers: [{ id: 'q1', selected: ['继续'] }] }
+      });
+      await c.waitFor((m) => m.type === 'question_ack' && m.eventId === 'evt-active-replay');
+      await c.close();
+    } finally {
+      projectionValues = {};
+    }
   });
 
   it('缺少 id 的帧不会被转发（mint 一个 id 也答不回去）', async () => {
