@@ -221,11 +221,13 @@ class DshService extends ChangeNotifier {
     final key = _syncKey(sessionId);
     if (_isDisposed || _finalResyncFlights.containsKey(key)) return;
     final epoch = _sessionEpoch(sessionId);
+    _completedTurnEpochs[key] = epoch;
     // 微任务调度让紧随其后的 idle 与 done 共享同一次补拉，同时调用方
     // 可以同步完成收尾；开始之前若已被取消或来了新回合就不发旧请求。
     final future = Future<void>.microtask(() async {
-      if (_isDisposed || _sessionEpoch(sessionId) != epoch) return;
-      _completedTurnEpochs[key] = epoch;
+      if (_isDisposed ||
+          _sessionEpoch(sessionId) != epoch ||
+          _completedTurnEpochs[key] != epoch) return;
       await (debugFinalResync ?? _resyncActiveSession)(sessionId);
     });
     _finalResyncFlights[key] = future;
@@ -1719,6 +1721,8 @@ class DshService extends ChangeNotifier {
     // 让在途的旧块失效，不该被当成"这一轮已被取消"。
     _activeTurnSeq++;
     _advanceSessionEpoch(session.sessionId);
+    _isCanceling = false;
+    _cancelledTurnSeq = _activeTurnSeq - 1;
     _completedTurnEpochs.remove(_syncKey(session.sessionId));
     // [fix 2026-10-17 用户反馈] 先拿上一次打开过的完整消息做**立即回填**：
     // 每次打开会话都重拉整个会话（实测 10 轮 / 7 页 / 1.58 MB）是"打开很卡"
@@ -2429,7 +2433,17 @@ class DshService extends ChangeNotifier {
       return idx >= 0 ? s.substring(0, idx) : s;
     }
 
-    for (final localMsg in _messages.where((m) => m.isUser)) {
+    // 快照尚未覆盖的本地尾部必须整体保留：只保 user 会把对应的
+    // 乐观 assistant 丢掉，并把 user 插到另一轮 assistant 后面。
+    final localTailStart = _messages.lastIndexWhere((m) =>
+        m.seq == null && m.timestamp.isAfter(
+          DateTime.now().subtract(const Duration(minutes: 10)),
+        ));
+    final localTail = localTailStart < 0
+        ? const <ChatMessage>[]
+        : _messages.sublist(localTailStart);
+    final localTailUsers = localTail.where((m) => m.isUser).toList();
+    for (final localMsg in localTailUsers.toList()) {
       // 已经在窗口之前、下面会原样保留的那批：不要在这里再补插一次。
       if (localMsg.seq != null &&
           oldestServerSeq != null &&
