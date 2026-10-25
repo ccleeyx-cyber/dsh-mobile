@@ -2456,7 +2456,9 @@ class DshService extends ChangeNotifier {
         return false;
       }
       if (matchesServer(m)) return false;
-      return m.isStreaming || m.timestamp.isAfter(recentCutoff);
+      // 无 seq 的消息只存在于本地（乐观消息/实时占位），没有服务端真值可等，
+      // 不能因时间老就丢；有 seq 的历史由上面的 olderKept/身份匹配负责。
+      return m.isStreaming || m.seq == null || m.timestamp.isAfter(recentCutoff);
     }).toList();
     final firstServerTime = serverMessages.isEmpty
         ? null
