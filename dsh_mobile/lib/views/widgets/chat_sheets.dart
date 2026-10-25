@@ -679,6 +679,35 @@ Future<void> showChatTrajectorySheet(
 /// 面板里的数据是**会话域**的，随时可能被事件刷新（例如作业列表刚拉回来），
 /// 所以让它在自己的路由里订阅一次 DshService —— 否则弹层会冻结在打开那一刻的
 /// 快照上，懒加载的结果永远看不见。
+/// 会话信息面板真正关心的那些字段（[perf 2026-10-25]）。
+///
+/// 拼成一个字符串交给 `Selector` 当比较键：`DshService` 里的这些列表是「换数据
+/// 才换实例」，所以身份变化就等价于"这一项真的变了"。
+///
+/// **不要**往这里塞消息正文或 `streamRevision`：面板显示的东西跟它们无关，塞进去
+/// 只会让它在流式期间每 150ms 重建一次 —— 那正是要消掉的成本。轨迹 tab 只需要
+/// 「条数 / 是否运行中 / 本轮 token」，流式往同一条消息里追加不改变条数。
+String _infoSheetSignature(DshService d) => [
+      identityHashCode(d.sessionStats),
+      d.lastTurnTokens,
+      identityHashCode(d.deliverables),
+      identityHashCode(d.workspaceChanges),
+      d.workspaceChangesAvailable,
+      d.workspaceChangesReason,
+      d.workspaceChangesSource,
+      identityHashCode(d.workspaceRepos),
+      identityHashCode(d.jobs),
+      d.jobsDegraded,
+      identityHashCode(d.schedules),
+      identityHashCode(d.subagents),
+      d.subagentsUnavailable,
+      identityHashCode(d.team),
+      d.teamUnavailable,
+      d.messages.length,
+      d.isSending,
+      d.isSessionRunning,
+    ].join('|');
+
 Future<void> showChatSessionInfoSheet(
   BuildContext context, {
   required SessionInsightSection section,
@@ -699,6 +728,15 @@ Future<void> showChatSessionInfoSheet(
     // 下面这些动作都在**弹层关掉之后**执行，所以要提前取好 Navigator：弹层的
     // context 在 pop 之后已失效。取外层 `context` 的 Navigator 才是安全的。
     final navigator = Navigator.of(context);
+
+    // [perf 2026-10-25] 「轨迹」tab 的缓存（一次面板生命周期内有效）。
+    //
+    // `Trajectory.build` 要遍历**全部消息**、对每个工具调用跑正则与逐行解析；
+    // 面板开着时每次 widget 重建都会调一次，流式期间就是每秒六遍。缓存键取
+    // 「条数 / 流式修订 / 是否运行中 / 本轮 token」—— 任何一项变了才重算。
+    // 缓存**整个 Widget** 而不只是数据：实例不变时 Flutter 直接整棵跳过重建。
+    Widget? cachedTrajectoryTab;
+    String cachedTrajectoryKey = '';
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -707,14 +745,23 @@ Future<void> showChatSessionInfoSheet(
       // 面板里的数据是**会话域**的，随时可能被事件刷新（例如作业列表刚拉回来），
       // 所以让它在自己的路由里订阅一次 DshService —— 否则弹层会冻结在打开那一刻
       // 的快照上，懒加载的结果永远看不见。
-      builder: (_) => Consumer<DshService>(
-        builder: (_, d, __) => ValueListenableBuilder<String?>(
-          valueListenable: deliverableBusy,
-          // [perf 2026-10-25] 整块内容单独成层：弹层滑入动画与滚动时只做位移/合成，
-          // 不用每帧把整棵面板（几百个 widget）重新光栅化。
-          builder: (_, busyPath, __) => RepaintBoundary(
-            child: SessionInfoSheet(
-            stats: d.sessionStats,
+      //
+      // [perf 2026-10-25] 用 `Selector` + 数据签名，而不是 `Consumer`：面板只关心
+      // 下面这十几项，而 `DshService` 在流式回复期间每 150ms 就通知一次 —— 那些
+      // 通知改的是消息正文，面板一个字都不会变。签名不变就完全不重建（`Consumer`
+      // 时代是每次通知都把整块面板重建一遍，这才是"开着面板也卡"的来源）。
+      builder: (_) => Selector<DshService, String>(
+        selector: (_, d) => _infoSheetSignature(d),
+        builder: (ctx, __, ___) {
+          // 签名变了才走到这里，所以这里现取一份最新的服务实例是安全的。
+          final d = Provider.of<DshService>(ctx, listen: false);
+          return ValueListenableBuilder<String?>(
+            valueListenable: deliverableBusy,
+            // [perf 2026-10-25] 整块内容单独成层：弹层滑入动画与滚动时只做位移/合成，
+            // 不用每帧把整棵面板（几百个 widget）重新光栅化。
+            builder: (_, busyPath, __) => RepaintBoundary(
+              child: SessionInfoSheet(
+              stats: d.sessionStats,
             turnBurnTokens: d.lastTurnTokens,
             deliverables: d.deliverables,
             changes: d.workspaceChanges,
@@ -769,27 +816,37 @@ Future<void> showChatSessionInfoSheet(
             //
             // 复用而不是重写：空态、`—` 规则、进行中不封口、上下文块默认折叠、
             // 导出 Markdown 全在它里面，重写一份就是第二套会漂移的规则。
-            trajectoryTab: TrajectorySheet(
-              trajectory: Trajectory.build(
-                d.messages,
-                liveTurnTokens: d.lastTurnTokens,
-                running: d.isSending || d.isSessionRunning,
-              ),
-              onJumpToMessage: onJumpToMessage == null
-                  ? null
-                  : (id) {
-                      // 先关面板再滚：轨迹与消息流是同一屏的两个视角，留在面板上
-                      // 看不到滚动效果，用户会以为"点了没反应"。
-                      navigator.pop();
-                      final index = d.messages.indexWhere((m) => m.id == id);
-                      onJumpToMessage(id, index >= 0 ? index : null, d.messages.length);
-                    },
-            ),
+            trajectoryTabBuilder: () {
+              final key = '${d.messages.length}/'
+                  '${d.isSending}/${d.isSessionRunning}/${d.lastTurnTokens}';
+              if (cachedTrajectoryTab != null && cachedTrajectoryKey == key) {
+                return cachedTrajectoryTab!;
+              }
+              cachedTrajectoryKey = key;
+              cachedTrajectoryTab = TrajectorySheet(
+                trajectory: Trajectory.build(
+                  d.messages,
+                  liveTurnTokens: d.lastTurnTokens,
+                  running: d.isSending || d.isSessionRunning,
+                ),
+                onJumpToMessage: onJumpToMessage == null
+                    ? null
+                    : (id) {
+                        // 先关面板再滚：轨迹与消息流是同一屏的两个视角，留在面板上
+                        // 看不到滚动效果，用户会以为"点了没反应"。
+                        navigator.pop();
+                        final index = d.messages.indexWhere((m) => m.id == id);
+                        onJumpToMessage(id, index >= 0 ? index : null, d.messages.length);
+                      },
+              );
+              return cachedTrajectoryTab!;
+            },
             // [move 2026-10-21] Runbook（会话上下文版）。
             runbookTab: runbookTab,
+              ),
             ),
-          ),
-        ),
+          );
+        },
       ),
     );
 }

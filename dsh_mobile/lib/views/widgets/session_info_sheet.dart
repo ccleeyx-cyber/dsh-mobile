@@ -54,16 +54,23 @@ class SessionInfoSheet extends StatefulWidget {
     this.team,
     this.teamUnavailable = false,
     this.onControlGoal,
-    this.trajectoryTab,
+    this.trajectoryTabBuilder,
     this.runbookTab,
   });
 
-  /// 「轨迹」tab 的内容（由宿主构建，本组件不认识 Trajectory 数据模型）。
+  /// 「轨迹」tab 的内容**构造器**（由宿主提供，本组件不认识 Trajectory 数据模型）。
   ///
-  /// 为什么传 Widget 而不是数据：轨迹的渲染、空态、耗时/token 的 `—` 规则、
-  /// 跳到消息的回调全部已经有实现（`TrajectorySheet`），再在这里复写一遍就是
-  /// 第二套会漂移的规则。为 null 时不渲染 tab 条（宿主没这个能力）。
-  final Widget? trajectoryTab;
+  /// [perf 2026-10-25] 这里刻意收的是 `Widget Function()` 而不是 `Widget`：
+  /// 轨迹的数据是从**全部消息**推导出来的（`Trajectory.build` 会遍历每条消息、
+  /// 对每个工具调用跑正则和逐行解析），长会话里这一份是几十毫秒级的活。传 Widget
+  /// 意味着宿主每次重建都得先把它算出来 —— 面板开着时 `Consumer<DshService>` 在
+  /// 流式期间每 150ms 重建一次，等于每秒白算六七遍，哪怕用户根本停在「概览」。
+  /// 收构造器就只有真的切到「轨迹」那一个 tab 时才付这笔钱。
+  ///
+  /// 为什么是构造器而不是数据：轨迹的渲染、空态、耗时/token 的 `—` 规则、跳到
+  /// 消息的回调全部已经有实现（`TrajectorySheet`），再在这里复写一遍就是第二套
+  /// 会漂移的规则。为 null 时不渲染 tab 条（宿主没这个能力）。
+  final Widget Function()? trajectoryTabBuilder;
 
   /// 「Runbook」tab 的内容（[move 2026-10-21] 从设置页搬进来）。
   ///
@@ -283,7 +290,7 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
         child: Row(
           children: [
             tab('概览', 0, const ValueKey('session-info-tab-overview')),
-            if (widget.trajectoryTab != null)
+            if (widget.trajectoryTabBuilder != null)
               tab('轨迹', 1, const ValueKey('session-info-tab-trajectory')),
             // [move 2026-10-21] Runbook 从设置页搬到这里：它要在**当前会话的工作区**
             // 里跑命令，没有会话上下文时 git 类命令只会报 not a git repository。
@@ -600,9 +607,9 @@ class _SessionInfoSheetState extends State<SessionInfoSheet> {
             // 轨迹以前要经过 面板 → 「运行轨迹」行 → 又一层底部弹层，用户明确说
             // "入口太深"。它和这一堆状态指标本来就是同一件事的两个视角（一个是
             // 汇总、一个是逐轮明细），放在同一层做 tab 才对得上心智。
-            if (widget.trajectoryTab != null || widget.runbookTab != null) _buildTabs(context),            Flexible(
-              child: _tab == 1 && widget.trajectoryTab != null
-                  ? widget.trajectoryTab!
+            if (widget.trajectoryTabBuilder != null || widget.runbookTab != null) _buildTabs(context),            Flexible(
+              child: _tab == 1 && widget.trajectoryTabBuilder != null
+                  ? widget.trajectoryTabBuilder!()
                   : _tab == 2 && widget.runbookTab != null
                       ? widget.runbookTab!
                       : SingleChildScrollView(
