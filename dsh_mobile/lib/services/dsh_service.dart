@@ -2492,17 +2492,6 @@ class DshService extends ChangeNotifier {
       ...serverMessages,
       ...unconfirmedTail,
     ];
-
-    // [fix 2026-10-17] 窗口之前那批（用户上翻加载出来的更早几轮）原样保留在头部。
-    // 只用 seq 比较（严格小于窗口内最旧的 seq），不会与窗口内容重复；本地乐观消息
-    // 没有 seq，不受这里影响，仍由上面的"保留最近本地提问"负责。
-    final olderKept = oldestServerSeq == null
-        ? const <ChatMessage>[]
-        : _messages
-            .where((m) => m.seq != null && m.seq! < oldestServerSeq)
-            .toList();
-
-    _messages = [...olderKept, ...serverMessages];
     _cacheSessionHistory(targetSessionId, _historyExhausted);
     _streamRevision++;
     notifyListeners();
@@ -6203,6 +6192,7 @@ class DshService extends ChangeNotifier {
         _requestFinalResync(sId);
         // done 现在带结束原因。若 error 帧丢了（弱网/刚好断线），这里仍能补上
         // 失败说明 —— 结束原因只有网关读得到，手机不能靠猜。
+        // 失败说明 —— 结束原因只有网关读得到，手机不能靠猜。
         final endReason = json['reason']?.toString();
         if (endReason == 'error' ||
             endReason == 'interrupted' ||
@@ -6232,7 +6222,6 @@ class DshService extends ChangeNotifier {
         // 回合结束了：本轮的基线使命结束（`_turnRunningSeen` 复位，等下一个回合
         // 的上升沿重新记基线）。
         _turnRunningSeen = false;
-        _requestFinalResync(sId);
         notifyListeners();
         fetchWorkspaces();
         // 一轮结束会领取（claim）队首消息：队列真值变了，刷新它。
