@@ -489,6 +489,7 @@ class CustomSettingsView extends StatelessWidget {
       context: context,
       models: modelList,
       selectedModelId: currentModel,
+      selectedProviderKey: settings?.currentModelProvider ?? '',
       title: '全局默认模型',
       subtitle: 'App 新建会话时用它',
       note: '引擎侧的全局默认要重启 dsh web 才对齐；App 新会话立即生效。',

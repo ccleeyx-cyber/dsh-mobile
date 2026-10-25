@@ -113,6 +113,82 @@ void main() {
     expect(find.text('使用中'), findsOneWidget);
   });
 
+  // [fix 2026-10-26] 用户实测反馈：「不同的供应商有相同的模型，在手机端选择的时候，
+  // 两个都会选中」。本机模型目录里就有一对：wb 的 `cn:glm-5.3` 与 qwen 的 `glm-5.3`
+  // （还有 `cn:deepseek-v4-pro` / `deepseek-v4-pro`）—— 去掉 `cn:` 前缀后两者同串，
+  // 旧的宽松比较于是把两条都判成"使用中"。
+  group('不同供应商的同名模型（去前缀同串）只能有一条选中', () {
+    final collide = [
+      item('cn:glm-5.3', 'GLM-5.3 (wb)', 'wb'),
+      item('glm-5.3', 'GLM-5.3 (qwen)', 'qwen'),
+    ];
+
+    Future<void> pumpCollide(
+      WidgetTester tester, {
+      required String selected,
+      String? provider,
+    }) async {
+      tester.view.physicalSize = const Size(420, 1200);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          builder: (ctx, child) => ThemeScope(isDark: false, child: child ?? const SizedBox()),
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: Center(
+                child: ElevatedButton(
+                  onPressed: () => showModelPickerSheet(
+                    context: context,
+                    models: collide,
+                    selectedModelId: selected,
+                    selectedProviderKey: provider,
+                    title: '切换大语言模型',
+                    onPick: (_) async {},
+                  ),
+                  child: const Text('open'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+    }
+
+    Finder inRow(String id) => find.descendant(
+          of: find.byKey(ValueKey('model-picker-item-$id')),
+          matching: find.text('使用中'),
+        );
+
+    testWidgets('选中 wb 的 cn:glm-5.3 时 qwen 的 glm-5.3 不得同时亮', (tester) async {
+      await pumpCollide(tester, selected: 'cn:glm-5.3', provider: 'wb');
+
+      expect(find.text('使用中'), findsOneWidget);
+      expect(inRow('cn:glm-5.3'), findsOneWidget);
+      expect(inRow('glm-5.3'), findsNothing);
+    });
+
+    testWidgets('选中 qwen 的 glm-5.3 时 wb 的 cn:glm-5.3 不得同时亮', (tester) async {
+      await pumpCollide(tester, selected: 'glm-5.3', provider: 'qwen');
+
+      expect(find.text('使用中'), findsOneWidget);
+      expect(inRow('glm-5.3'), findsOneWidget);
+      expect(inRow('cn:glm-5.3'), findsNothing);
+    });
+
+    testWidgets('老写法（名单里没有完整 id）靠供应商收敛到唯一一条', (tester) async {
+      // 只有 qwen 有这条时，前缀不同的旧值也应且只应点亮它。
+      await pumpCollide(tester, selected: 'qwen:glm-5.3', provider: 'qwen');
+
+      expect(find.text('使用中'), findsOneWidget);
+      expect(inRow('glm-5.3'), findsOneWidget);
+      expect(inRow('cn:glm-5.3'), findsNothing);
+    });
+  });
+
   testWidgets('360dp 下不溢出', (tester) async {
     tester.view.physicalSize = const Size(360, 740);
     tester.view.devicePixelRatio = 1.0;

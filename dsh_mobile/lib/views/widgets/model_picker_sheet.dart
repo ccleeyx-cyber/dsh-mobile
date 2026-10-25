@@ -31,6 +31,7 @@ Future<void> showModelPickerSheet({
   String? subtitle,
   String? note,
   IconData icon = Icons.smart_toy_outlined,
+  String? selectedProviderKey,
 }) {
   return showModalBottomSheet<void>(
     context: context,
@@ -42,6 +43,7 @@ Future<void> showModelPickerSheet({
     builder: (ctx) => _ModelPickerSheet(
       models: models,
       selectedModelId: selectedModelId,
+      selectedProviderKey: selectedProviderKey,
       title: title,
       subtitle: subtitle,
       note: note,
@@ -56,6 +58,7 @@ class _ModelPickerSheet extends StatefulWidget {
     required this.selectedModelId,
     required this.title,
     required this.onPick,
+    this.selectedProviderKey,
     this.subtitle,
     this.note,
     this.icon = Icons.smart_toy_outlined,
@@ -63,6 +66,10 @@ class _ModelPickerSheet extends StatefulWidget {
 
   final List<ModelItem> models;
   final String selectedModelId;
+
+  /// 当前模型所属的供应商 key（调用方从模型目录里精确查到的最多一个）。
+  /// 只在 `selectedModelId` 未能精确命中时才用于消歧 —— 见 `_effectiveSelectedId`。
+  final String? selectedProviderKey;
   final String title;
   final String? subtitle;
   final String? note;
@@ -81,11 +88,41 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
 
   bool _busy = false;
 
-  bool _isSelected(ModelItem m) {
-    if (m.id == widget.selectedModelId) return true;
-    // 老网关/老会话里同一个模型可能一边带 `cn:` 一边不带 —— 视为同一个。
+  /// 当前选中的那**一条**模型 id。判定必须唯一。
+  ///
+  /// [fix 2026-10-26] 原来是无条件做"去掉供应商前缀"的宽松比较：
+  ///
+  /// ```dart
+  /// if (m.id == selectedModelId) return true;
+  /// return strip(m.id) == strip(selectedModelId) && strip(m.id).isNotEmpty;
+  /// ```
+  ///
+  /// 第一行是对的（精确命中），第二行会**跨供应商**命中 —— 不同供应商本来就有同名
+  /// 模型（本机实测：wb 的 `cn:glm-5.3` 与 qwen 的 `glm-5.3`、wb 的
+  /// `cn:deepseek-v4-pro` 与 qwen 的 `deepseek-v4-pro`），去掉 `cn:` 之后两者同串，
+  /// 于是选中一条、两家都显示"使用中"（用户实测反馈："两个都会选中"）。
+  ///
+  /// 新规则按"越精确越优先"，且**绝不返回多个**：
+  ///   1. 列表里有完整 id → 就用它（正常情况，唯一）；
+  ///   2. 没有（老会话/老网关存的是另一种写法）→ 才退回去前缀比较，且只在候选
+  ///      **唯一**时才算数；多个候选时用 [selectedProviderKey] 收敛到一家；
+  ///   3. 仍然无法唯一确定 → 一行都不点亮。宁可"看不出哪个在用"，也不能指错，
+  ///      更不能同时指两条。
+  String get _effectiveSelectedId {
+    final want = widget.selectedModelId;
+    if (want.isEmpty) return want;
+    if (widget.models.any((m) => m.id == want)) return want;
+
     String strip(String s) => s.replaceFirst(RegExp(r'^[A-Za-z0-9_-]+:'), '');
-    return strip(m.id) == strip(widget.selectedModelId) && strip(m.id).isNotEmpty;
+    final base = strip(want);
+    if (base.isEmpty) return want;
+
+    var candidates = widget.models.where((m) => strip(m.id) == base).toList();
+    final provider = (widget.selectedProviderKey ?? '').trim();
+    if (provider.isNotEmpty && candidates.length > 1) {
+      candidates = candidates.where((m) => m.providerKey == provider).toList();
+    }
+    return candidates.length == 1 ? candidates.first.id : want;
   }
 
   /// 先按搜索词过滤，再分组。胶囊与列表共用这一份 —— 胶囊上的条数必须与列表
@@ -101,6 +138,9 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
   @override
   Widget build(BuildContext context) {
     final searchGroups = _searchGroups();
+    // 选中行只解析一次，所有行共用同一个答案 —— 逐行各自比较会产生"每条都觉得自己
+    // 命中"的多选（正是这次修的 bug）。
+    final selectedId = _effectiveSelectedId;
     final groups = _providerFilter.isEmpty
         ? searchGroups
         : searchGroups.where((g) => g.key == _providerFilter).toList();
@@ -248,7 +288,7 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             _groupHeader(context, group),
-                            ...group.models.map((m) => _modelRow(context, m, group)),
+                            ...group.models.map((m) => _modelRow(context, m, selectedId)),
                             const SizedBox(height: 6),
                           ],
                         );
@@ -306,8 +346,8 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
     );
   }
 
-  Widget _modelRow(BuildContext context, ModelItem m, ModelGroup group) {
-    final selected = _isSelected(m);
+  Widget _modelRow(BuildContext context, ModelItem m, String selectedId) {
+    final selected = m.id == selectedId;
     return InkWell(
       key: ValueKey('model-picker-item-${m.id}'),
       borderRadius: BorderRadius.circular(10),

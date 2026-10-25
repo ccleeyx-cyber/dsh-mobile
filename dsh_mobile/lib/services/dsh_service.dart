@@ -499,6 +499,24 @@ class DshService extends ChangeNotifier {
       _currentSessionModel ??
       _settings?.currentModel ??
       'cn:deepseek-v4.1-flash';
+
+  /// 当前模型（会话级优先）所属的供应商 key；查不到就是空串。
+  ///
+  /// [fix 2026-10-26] 模型选择器的高亮原先**只比 id**，为了兼容"同一个模型一边带
+  /// `cn:` 一边不带"，还额外做了一次"去掉供应商前缀"的宽松比较。而不同供应商本来
+  /// 就有同名模型（本机实测：wb 的 `cn:glm-5.3` 与 qwen 的 `glm-5.3`、wb 的
+  /// `cn:deepseek-v4-pro` 与 qwen 的 `deepseek-v4-pro`），去前缀后字符串完全相同
+  /// —— 选中一条会让两家**同时**显示"使用中"（用户实测反馈）。
+  ///
+  /// 这里给出当前模型的**确切**归属（按完整 id 精确命中；id 在模型目录里唯一），
+  /// 让选择器在 id 无法精确命中时仍有唯一答案可用。
+  String get currentModelProviderKey {
+    final model = currentModel;
+    for (final m in _settings?.availableModels ?? const <ModelItem>[]) {
+      if (m.id == model) return m.providerKey;
+    }
+    return '';
+  }
   bool get isConnected => _status == ConnectionStatus.connected;
   ServerConfig? get currentConfig => _currentConfig;
 

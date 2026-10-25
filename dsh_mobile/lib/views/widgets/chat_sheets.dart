@@ -449,6 +449,7 @@ void showChatModelSwitchSheet(BuildContext context, DshService dsh) {
     context: context,
     models: modelList,
     selectedModelId: activeModel,
+    selectedProviderKey: dsh.currentModelProviderKey,
     title: '切换大语言模型',
     subtitle: currentSession != null ? '当前会话：${currentSession.title}' : null,
     note: '只影响本会话，立即生效；全局默认模型在「设置」页改。',
