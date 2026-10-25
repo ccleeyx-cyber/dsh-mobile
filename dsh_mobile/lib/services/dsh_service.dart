@@ -2468,6 +2468,8 @@ class DshService extends ChangeNotifier {
             (firstServer != null &&
                 firstServer.clientRequestId == null &&
                 firstServer.isUser &&
+                firstServer.seq != null &&
+                m.seq == null &&
                 firstServer.content == stripAttachmentLabel(m.content))));
     final beforeServer = firstServerTime == null || startsTurn
         ? const <ChatMessage>[]
@@ -5858,7 +5860,8 @@ class DshService extends ChangeNotifier {
 
         if (_messages.isEmpty ||
             !_messages.last.isAssistant ||
-            !_messages.last.isStreaming) {
+            (!_messages.last.isStreaming &&
+                _remoteRunningSessions.contains(_syncKey(sId)))) {
           _messages.add(ChatMessage(
             id: _uuid.v4(),
             role: 'assistant',
