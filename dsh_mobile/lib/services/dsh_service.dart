@@ -251,10 +251,9 @@ class DshService extends ChangeNotifier {
       _completedTurnEpochs.remove(key);
       return true;
     }
-    if (_completedTurnEpochs[key] == _sessionEpoch(sessionId)) return false;
-    // 新会话还没收到 running 帧时也必须接受首个 delta。取消栅栏只拦
-    // 本会话已被取消的代次，不能把上一轮会话的取消记录带过来。
-    return _activeTurnSeq > _cancelledTurnSeq;
+    // 只按会话的完成代次拦截迟到帧。取消已由 _isCanceling 独占裁决，
+    // 不能再拿全局 active/cancelled 序号挡住新会话或重连后的合法流。
+    return _completedTurnEpochs[key] != _sessionEpoch(sessionId);
   }
 
   bool _beginRemoteStream(String sessionId) {
@@ -2463,17 +2462,36 @@ class DshService extends ChangeNotifier {
               (server.content == localMsg.content ||
                   server.content == localCore)));
       if ((localMsg.content.isNotEmpty || localMsg.hasAttachments) && !matchedOnServer) {
-        if (DateTime.now().difference(localMsg.timestamp).inMinutes < 10) {
-          final assistIdx =
-              serverMessages.indexWhere((m) => m.isAssistant && m.isStreaming);
-          if (assistIdx != -1) {
-            serverMessages.insert(assistIdx, localMsg);
-          } else {
-            serverMessages.add(localMsg);
-          }
+        final assistIdx =
+            serverMessages.indexWhere((m) => m.isAssistant && m.isStreaming);
+        if (assistIdx != -1) {
+          serverMessages.insert(assistIdx, localMsg);
+        } else {
+          serverMessages.add(localMsg);
         }
       }
     }
+
+    bool matchesServer(ChatMessage local) {
+      return serverMessages.any((server) =>
+          (local.clientRequestId != null &&
+              server.clientRequestId == local.clientRequestId) ||
+          (local.seq != null && server.seq == local.seq) ||
+          server.id == local.id ||
+          (server.clientRequestId == null &&
+              server.role == local.role &&
+              server.content == stripAttachmentLabel(local.content)));
+    }
+
+    final unconfirmedTail = localTail.where((m) => !matchesServer(m)).toList();
+    // 已经按 requestId 对齐的本地尾部不再保留；服务端版本接管它。
+    // 其余问答整段追加，不能让某条提问跑到另一轮回复的后面。
+    final anchor = localTailStart < 0 ? _messages.length : localTailStart;
+    _messages = [
+      ..._messages.sublist(0, anchor),
+      ...serverMessages,
+      ...unconfirmedTail,
+    ];
 
     // [fix 2026-10-17] 窗口之前那批（用户上翻加载出来的更早几轮）原样保留在头部。
     // 只用 seq 比较（严格小于窗口内最旧的 seq），不会与窗口内容重复；本地乐观消息
