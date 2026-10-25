@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import '../models/chat_message.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_spacing.dart';
+import 'tool_input_view.dart';
 
 /// 工具执行是否「看起来失败」—— 全 App 只有这一处判定。
 ///
@@ -24,8 +25,11 @@ bool looksFailedToolOutput(ToolExecution tool) {
   final lower = tail.toLowerCase();
   if (lower.contains('traceback (most recent call last)')) return true;
   // 非零退出码：`exit code: 1` / `exit status 2` / `exited with code=127`
-  if (RegExp(r'(exit|exited)[ _a-z]*code[=: ]+[1-9]').hasMatch(lower)) return true;
-  if (RegExp(r'^(error|failed|fatal|exception)\b', multiLine: true).hasMatch(lower)) {
+  if (RegExp(r'(exit|exited)[ _a-z]*code[=: ]+[1-9]').hasMatch(lower)) {
+    return true;
+  }
+  if (RegExp(r'^(error|failed|fatal|exception)\b', multiLine: true)
+      .hasMatch(lower)) {
     return true;
   }
   const markers = [
@@ -66,7 +70,24 @@ class _ToolCallCardState extends State<ToolCallCard>
   /// 两级折叠是为了让「有 800 行输出」这件事本身也有一个体积上限。
   bool _outputExpanded = false;
 
+  /// 原始 JSON 默认不展开；只有用户明确要看协议原文时才显示。
+  bool _showRawInput = false;
+
+  /// 输入通常在一次运行内不变，但流式重建很频繁 —— 缓存解析结果，避免每条
+  /// 增量都把整段 JSON 重新扫一遍。
+  ToolInputView? _inputView;
+  String? _inputViewSource;
+
+  ToolInputView get _input {
+    if (_inputViewSource != widget.tool.input) {
+      _inputViewSource = widget.tool.input;
+      _inputView = ToolInputView.parse(widget.tool.input);
+    }
+    return _inputView!;
+  }
+
   final ScrollController _inputScrollController = ScrollController();
+  final ScrollController _rawScrollController = ScrollController();
   final ScrollController _outputScrollController = ScrollController();
 
   /// 运行中状态圆点的呼吸动画。
@@ -106,6 +127,7 @@ class _ToolCallCardState extends State<ToolCallCard>
     _pulse.stop();
     _pulse.dispose();
     _inputScrollController.dispose();
+    _rawScrollController.dispose();
     _outputScrollController.dispose();
     super.dispose();
   }
@@ -142,7 +164,10 @@ class _ToolCallCardState extends State<ToolCallCard>
 
   void _toggleExpanded() {
     HapticFeedback.selectionClick();
-    setState(() => _expanded = !_expanded);
+    setState(() {
+      _expanded = !_expanded;
+      if (!_expanded) _showRawInput = false;
+    });
   }
 
   String _formatSummary(ToolExecution tool) {
@@ -150,7 +175,8 @@ class _ToolCallCardState extends State<ToolCallCard>
     if (tool.output.isEmpty) return '完成 (无输出)';
     final lines = tool.output.split('\n').length;
     final chars = tool.output.length;
-    final sizeStr = chars >= 1024 ? '${(chars / 1024).toStringAsFixed(1)} KB' : '$chars B';
+    final sizeStr =
+        chars >= 1024 ? '${(chars / 1024).toStringAsFixed(1)} KB' : '$chars B';
     return '$lines 行 · $sizeStr';
   }
 
@@ -163,13 +189,19 @@ class _ToolCallCardState extends State<ToolCallCard>
         lower.contains('exec')) {
       return Icons.terminal_rounded;
     }
-    if (lower.contains('read') || lower.contains('cat') || lower.contains('file')) {
+    if (lower.contains('read') ||
+        lower.contains('cat') ||
+        lower.contains('file')) {
       return Icons.description_outlined;
     }
-    if (lower.contains('search') || lower.contains('grep') || lower.contains('find')) {
+    if (lower.contains('search') ||
+        lower.contains('grep') ||
+        lower.contains('find')) {
       return Icons.search_rounded;
     }
-    if (lower.contains('edit') || lower.contains('write') || lower.contains('patch')) {
+    if (lower.contains('edit') ||
+        lower.contains('write') ||
+        lower.contains('patch')) {
       return Icons.edit_note_rounded;
     }
     return Icons.build_rounded;
@@ -180,6 +212,8 @@ class _ToolCallCardState extends State<ToolCallCard>
     final tool = widget.tool;
     final isRunning = tool.isRunning;
     final failed = looksFailedToolOutput(tool);
+    final input = _input;
+    final preview = input.preview;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -187,7 +221,10 @@ class _ToolCallCardState extends State<ToolCallCard>
         InkWell(
           onTap: _toggleExpanded,
           child: Container(
-            height: _rowHeight,
+            constraints: const BoxConstraints(minHeight: _rowHeight),
+            padding: EdgeInsets.symmetric(
+              vertical: preview == null || preview.isEmpty ? 0 : 4,
+            ),
             decoration: BoxDecoration(
               border: Border(
                 bottom: BorderSide(
@@ -205,16 +242,7 @@ class _ToolCallCardState extends State<ToolCallCard>
                 ),
                 const SizedBox(width: AppSpace.s),
                 Expanded(
-                  child: Text(
-                    tool.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: AppText.body,
-                      fontWeight: FontWeight.w600,
-                      color: context.c.textPrimary,
-                    ),
-                  ),
+                  child: _headerTitle(context, tool.name, preview),
                 ),
                 const SizedBox(width: AppSpace.s),
                 _statusDot(isRunning: isRunning, failed: failed),
@@ -243,20 +271,72 @@ class _ToolCallCardState extends State<ToolCallCard>
               children: [
                 _metaRow(
                   context,
-                  label: '输入参数',
-                  copyText: tool.input,
-                  copyToast: '已复制输入参数',
+                  label: input.hasCommands
+                      ? (input.commandCount > 1
+                          ? '执行的命令 · ${input.commandCount} 条'
+                          : '执行的命令')
+                      : '输入参数',
+                  copyText: input.hasCommands ? input.copyText : tool.input,
+                  copyToast: input.hasCommands ? '已复制命令' : '已复制输入参数',
                   showCopy: tool.input.isNotEmpty,
                 ),
                 const SizedBox(height: AppSpace.xs),
-                _codeBox(
-                  context,
-                  controller: _inputScrollController,
-                  child: SelectableText(
-                    tool.input,
-                    style: _monoStyle(context),
+                if (input.hasCommands)
+                  _codeBox(
+                    context,
+                    controller: _inputScrollController,
+                    child: _buildCommandBody(context, input),
+                  )
+                else
+                  _codeBox(
+                    context,
+                    controller: _inputScrollController,
+                    child: SelectableText(
+                      tool.input,
+                      style: _monoStyle(context),
+                    ),
                   ),
-                ),
+                if (input.hasCommands) ...[
+                  const SizedBox(height: AppSpace.xs),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: InkWell(
+                      key: const ValueKey('tool-raw-input-toggle'),
+                      onTap: () {
+                        HapticFeedback.selectionClick();
+                        setState(() => _showRawInput = !_showRawInput);
+                      },
+                      borderRadius: BorderRadius.circular(AppSpace.s),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 4,
+                          vertical: 2,
+                        ),
+                        child: Text(
+                          _showRawInput ? '隐藏原始参数' : '查看原始参数',
+                          style: TextStyle(
+                            fontSize: AppText.caption,
+                            color: context.c.textTertiary,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (_showRawInput) ...[
+                    const SizedBox(height: AppSpace.xs),
+                    _codeBox(
+                      context,
+                      controller: _rawScrollController,
+                      child: SelectableText(
+                        input.raw,
+                        style: _monoStyle(context).copyWith(
+                          color: context.c.textSecondary,
+                          fontSize: AppText.caption,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
                 if (tool.output.isNotEmpty || isRunning) ...[
                   const SizedBox(height: AppSpace.m),
                   _metaRow(
@@ -278,7 +358,10 @@ class _ToolCallCardState extends State<ToolCallCard>
                 InkWell(
                   onTap: () {
                     HapticFeedback.selectionClick();
-                    setState(() => _expanded = false);
+                    setState(() {
+                      _expanded = false;
+                      _showRawInput = false;
+                    });
                   },
                   borderRadius: BorderRadius.circular(AppSpace.s),
                   child: SizedBox(
@@ -308,6 +391,42 @@ class _ToolCallCardState extends State<ToolCallCard>
               ],
             ),
           ),
+      ],
+    );
+  }
+
+  /// 折叠态的两行标题：工具名 + 第一条命令/说明。
+  ///
+  /// 以前只有工具名，用户必须点开才能知道到底跑了什么；而一张展开后的原始
+  /// JSON 卡片又长到占满一屏。命令摘要放在折叠态，恰恰是最省信息量的位置。
+  Widget _headerTitle(BuildContext context, String name, String? preview) {
+    final title = Text(
+      name,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(
+        fontSize: AppText.body,
+        fontWeight: FontWeight.w600,
+        color: context.c.textPrimary,
+      ),
+    );
+    if (preview == null || preview.isEmpty) return title;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        title,
+        const SizedBox(height: 1),
+        Text(
+          preview,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: AppText.caption,
+            color: context.c.textTertiary,
+            fontFamily: 'monospace',
+          ),
+        ),
       ],
     );
   }
@@ -360,7 +479,8 @@ class _ToolCallCardState extends State<ToolCallCard>
         // 一条极淡的 hairline 是**深色模式的必需品**：深色下 `codeBackground`
         // 与页面底 `background` 是同一个取值（#0D1117），没有描边时输入/输出区
         // 就是一块看不见的空白，用户分不清"哪几行是工具输出"。
-        border: Border.all(color: context.c.border.withOpacity(0.5), width: 0.5),
+        border:
+            Border.all(color: context.c.border.withOpacity(0.5), width: 0.5),
       ),
       child: Scrollbar(
         controller: controller,
@@ -429,6 +549,65 @@ class _ToolCallCardState extends State<ToolCallCard>
               ),
             ),
           ),
+      ],
+    );
+  }
+
+  /// 把结构化输入渲染成命令列表。
+  ///
+  /// 一次并行 bash 可能带多条命令；直接展示 JSON 会丢掉最重要的“执行了什
+  /// 么”这个信息。命令和说明分组显示，序号只在多于一条时出现。
+  Widget _buildCommandBody(BuildContext context, ToolInputView input) {
+    final items = input.invocations;
+    final showOrdinal = input.commandCount > 1;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (var i = 0; i < items.length; i++) ...[
+          if (i > 0)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: AppSpace.s),
+              child: Divider(
+                height: 0.5,
+                thickness: 0.5,
+                color: context.c.border.withOpacity(0.5),
+              ),
+            ),
+          if ((items[i].description?.isNotEmpty ?? false) || showOrdinal) ...[
+            Text(
+              [
+                if (showOrdinal) '#${i + 1}',
+                if (items[i].description?.isNotEmpty ?? false)
+                  items[i].description!,
+              ].join(' · '),
+              style: TextStyle(
+                fontSize: AppText.caption,
+                color: context.c.textSecondary,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            const SizedBox(height: 2),
+          ],
+          if (items[i].hasCommand)
+            SelectableText(
+              items[i].command!,
+              style: _monoStyle(context),
+            ),
+          if (items[i].details.isNotEmpty) ...[
+            if (items[i].hasCommand) const SizedBox(height: 2),
+            Text(
+              items[i]
+                  .details
+                  .entries
+                  .map((e) => '${e.key}: ${e.value}')
+                  .join(' · '),
+              style: TextStyle(
+                fontSize: AppText.caption,
+                color: context.c.textTertiary,
+              ),
+            ),
+          ],
+        ],
       ],
     );
   }
@@ -626,9 +805,8 @@ class _AggregatedToolCallsState extends State<AggregatedToolCalls> {
   String _summary(List<ToolExecution> tools) {
     final running = tools.where((t) => t.isRunning).length;
     final failed = tools.where(looksFailedToolOutput).length;
-    final outcome = running > 0
-        ? '$running 个运行中'
-        : (failed > 0 ? '$failed 个失败' : '全部成功');
+    final outcome =
+        running > 0 ? '$running 个运行中' : (failed > 0 ? '$failed 个失败' : '全部成功');
     return '执行了 ${tools.length} 个工具 · $outcome';
   }
 }

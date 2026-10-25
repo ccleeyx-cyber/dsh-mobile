@@ -28,12 +28,14 @@ import 'package:dsh_mobile/models/chat_message.dart';
 ///   颜色在 widget test 里无法可靠断言，所以用稳定的 key 断言"状态可见"。
 void main() {
   group('ThinkingCard Ergonomics & Bounded Display', () {
-    testWidgets('respects user manual collapse during active streaming', (tester) async {
+    testWidgets('respects user manual collapse during active streaming',
+        (tester) async {
       // 1. Initial streaming thinking card
       await tester.pumpWidget(
         const MaterialApp(
           home: Scaffold(
-            body: ThinkingCard(content: 'Initial thoughts...', isThinking: true),
+            body:
+                ThinkingCard(content: 'Initial thoughts...', isThinking: true),
           ),
         ),
       );
@@ -56,18 +58,24 @@ void main() {
       await tester.pumpWidget(
         const MaterialApp(
           home: Scaffold(
-            body: ThinkingCard(content: 'Initial thoughts... more streaming tokens', isThinking: true),
+            body: ThinkingCard(
+                content: 'Initial thoughts... more streaming tokens',
+                isThinking: true),
           ),
         ),
       );
       await tester.pump();
 
       // CARD MUST REMAIN COLLAPSED (Regression bug fix)
-      expect(find.text('Initial thoughts... more streaming tokens'), findsNothing);
+      expect(
+          find.text('Initial thoughts... more streaming tokens'), findsNothing);
     });
 
-    testWidgets('enforces maxHeight 280 constraint with internal scroll view', (tester) async {
-      final longContent = List.generate(100, (i) => 'Line $i: detailed cognitive step').join('\n');
+    testWidgets('enforces maxHeight 280 constraint with internal scroll view',
+        (tester) async {
+      final longContent =
+          List.generate(100, (i) => 'Line $i: detailed cognitive step')
+              .join('\n');
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
@@ -93,7 +101,8 @@ void main() {
       await tester.pumpWidget(
         const MaterialApp(
           home: Scaffold(
-            body: ThinkingCard(content: 'Analysis completed successfully', isThinking: false),
+            body: ThinkingCard(
+                content: 'Analysis completed successfully', isThinking: false),
           ),
         ),
       );
@@ -126,11 +135,11 @@ void main() {
       // 那些与本次改造无关的容器。
       final decorated = tester
           .widgetList<Container>(
-            find.descendant(
-              of: find.byType(ThinkingCard),
-              matching: find.byType(Container),
-            ),
-          )
+        find.descendant(
+          of: find.byType(ThinkingCard),
+          matching: find.byType(Container),
+        ),
+      )
           .where((c) {
         final d = c.decoration;
         return d is BoxDecoration && d.color != null;
@@ -176,7 +185,8 @@ void main() {
       final tool = ToolExecution(
         name: 'run_shell',
         input: 'git status -s',
-        output: 'M lib/widgets/thinking_card.dart\nM lib/widgets/tool_call_card.dart',
+        output:
+            'M lib/widgets/thinking_card.dart\nM lib/widgets/tool_call_card.dart',
         isRunning: false,
       );
 
@@ -190,7 +200,8 @@ void main() {
 
       // Collapsed: name + status dot only.
       expect(find.textContaining('run_shell'), findsOneWidget);
-      expect(find.byKey(const ValueKey('tool-status-dot-done')), findsOneWidget);
+      expect(
+          find.byKey(const ValueKey('tool-status-dot-done')), findsOneWidget);
       // 摘要（「2 行 · X B」）降级为展开态专属 —— 折叠态不得出现行数摘要。
       expect(find.textContaining(' 行'), findsNothing);
 
@@ -217,7 +228,40 @@ void main() {
       expect(find.textContaining('输入参数'), findsNothing);
     });
 
-    testWidgets('displays running status dot when tool is executing', (tester) async {
+    testWidgets('bash 的结构化输入：折叠显示命令摘要，展开不再铺原始 JSON', (tester) async {
+      final tool = ToolExecution(
+        name: 'bash',
+        input: '{"command":"cd /tmp && ls","description":"列出文件"}'
+            '{"command":"pwd","description":"显示目录"}',
+        output: 'ok',
+        isRunning: false,
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: ToolCallCard(tool: tool)),
+        ),
+      );
+
+      expect(find.textContaining('2 条命令'), findsOneWidget);
+      expect(find.textContaining('{"command"'), findsNothing);
+
+      await tester.tap(find.byType(InkWell).first);
+      await tester.pumpAndSettle();
+
+      expect(find.text('执行的命令 · 2 条'), findsOneWidget);
+      expect(find.textContaining('列出文件'), findsWidgets);
+      expect(find.text('cd /tmp && ls'), findsOneWidget);
+      expect(find.text('pwd'), findsOneWidget);
+      expect(find.textContaining('{"command"'), findsNothing);
+
+      await tester.tap(find.byKey(const ValueKey('tool-raw-input-toggle')));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('{"command"'), findsOneWidget);
+    });
+
+    testWidgets('displays running status dot when tool is executing',
+        (tester) async {
       final runningTool = ToolExecution(
         name: 'fetch_docs',
         input: 'https://docs.deepseek.com',
@@ -234,7 +278,8 @@ void main() {
       );
 
       // 运行态是 accent 呼吸圆点，不是 spinner —— key 比颜色更可靠。
-      expect(find.byKey(const ValueKey('tool-status-dot-running')), findsOneWidget);
+      expect(find.byKey(const ValueKey('tool-status-dot-running')),
+          findsOneWidget);
     });
 
     testWidgets('输出超过 50 行时终端式折叠：头 5 行 + 省略行 + 尾 5 行', (tester) async {
@@ -285,21 +330,24 @@ void main() {
         ),
       );
 
-      expect(find.byKey(const ValueKey('tool-status-dot-failed')), findsOneWidget);
+      expect(
+          find.byKey(const ValueKey('tool-status-dot-failed')), findsOneWidget);
     });
   });
 
   group('AggregatedToolCalls（同消息内 ≥3 个工具调用聚合折叠）', () {
     List<ToolExecution> tools(int n) => [
           for (var i = 0; i < n; i++)
-            ToolExecution(name: 'tool-$i', input: '', output: 'ok', isRunning: false),
+            ToolExecution(
+                name: 'tool-$i', input: '', output: 'ok', isRunning: false),
         ];
 
     testWidgets('4 个工具调用折叠成一行，点击展开完整列表', (tester) async {
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
-            body: SingleChildScrollView(child: AggregatedToolCalls(tools: tools(4))),
+            body: SingleChildScrollView(
+                child: AggregatedToolCalls(tools: tools(4))),
           ),
         ),
       );
@@ -320,7 +368,8 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
-            body: SingleChildScrollView(child: AggregatedToolCalls(tools: tools(2))),
+            body: SingleChildScrollView(
+                child: AggregatedToolCalls(tools: tools(2))),
           ),
         ),
       );
