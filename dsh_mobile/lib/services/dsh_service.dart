@@ -2283,7 +2283,7 @@ class DshService extends ChangeNotifier {
       // attachments/turnTokens/noticeKind 等 6 个字段，每 2.5s 轮询整体替换
       // 后历史图片消失、逐轮 token 回退。三处解析收敛到一个工厂。
       final message = ChatMessage.fromWire(
-        Map<String, dynamic>.from(m as Map),
+        Map<String, dynamic>.from(raw as Map),
         newId: _uuid.v4,
       );
       // 网关的实时占位和历史页可能落在同一份快照里。以引擎 requestId、
