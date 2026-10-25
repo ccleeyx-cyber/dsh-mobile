@@ -2462,15 +2462,16 @@ class DshService extends ChangeNotifier {
         ? null
         : serverMessages.first.timestamp;
     final firstServer = serverMessages.isEmpty ? null : serverMessages.first;
+    // 只有旧网关（双方都没有 requestId）才用“同文首条 user”判定回合起点；
+    // 新协议下带 requestId 的本地旧消息不能凭存在就开启新回合。
     final startsTurn = pending.any((m) =>
         m.isUser &&
-        (m.clientRequestId != null ||
-            (firstServer != null &&
-                firstServer.clientRequestId == null &&
-                firstServer.isUser &&
-                firstServer.seq != null &&
-                m.seq == null &&
-                firstServer.content == stripAttachmentLabel(m.content))));
+        m.clientRequestId == null &&
+        m.seq == null &&
+        firstServer != null &&
+        firstServer.isUser &&
+        firstServer.clientRequestId == null &&
+        firstServer.content == stripAttachmentLabel(m.content));
     final beforeServer = firstServerTime == null || startsTurn
         ? const <ChatMessage>[]
         : pending.where((m) => m.timestamp.isBefore(firstServerTime)).toList();
@@ -6181,6 +6182,7 @@ class DshService extends ChangeNotifier {
             t.isRunning = false;
           }
         }
+        _remoteRunningSessions.remove(_syncKey(sId));
         _requestFinalResync(sId);
         // done 现在带结束原因。若 error 帧丢了（弱网/刚好断线），这里仍能补上
         // 失败说明 —— 结束原因只有网关读得到，手机不能靠猜。
