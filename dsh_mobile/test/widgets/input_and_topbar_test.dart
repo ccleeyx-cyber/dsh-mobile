@@ -594,6 +594,13 @@ void main() {
         300,
         scrollable: find.byType(Scrollable).first,
       );
+      // [fix 2026-10-25] `scrollUntilVisible` 只保证目标**被构建**（ListView 的
+      // cacheExtent 会构建屏幕外的行），不保证它真的落在视口里。删掉「远程访问」
+      // 那张卡以后这一屏变短，about 恰好停在底部导航栏底下：点下去打在导航栏上，
+      // 页面根本没推入，后面的 `pageBack()` 就找不到返回按钮。`ensureVisible`
+      // 才是"精确滚到可见"的那个 API。
+      await tester.ensureVisible(find.byKey(const ValueKey('settings-open-about')));
+      await tester.pump();
       await tester.tap(find.byKey(const ValueKey('settings-open-about')));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
