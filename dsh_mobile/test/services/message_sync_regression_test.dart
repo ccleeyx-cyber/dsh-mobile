@@ -70,7 +70,7 @@ void main() {
           id: 'a-old',
           role: 'assistant',
           content: '旧回复',
-          timestamp: DateTime.fromMillisecondsSinceEpoch(1700000000100),
+          timestamp: DateTime.fromMillisecondsSinceEpoch(1700000000010),
         ),
       ]);
       dsh.debugReconcileServerMessages([
