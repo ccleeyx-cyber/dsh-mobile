@@ -1295,6 +1295,7 @@ export function apply(ctx, config = {}, internals = {}) {
   /** Single permission store; persists to ~/.dsh/mobile-access/permissions.json. */
   const permStore = createPermissionStore();
   const connectedClients = new Set();
+  const mobilePromptFlights = new Map();
   let currentEventsClientId = null;
 
   /**
@@ -1409,6 +1410,33 @@ export function apply(ctx, config = {}, internals = {}) {
 
   function getSessionFollower(sessionId) {
     return coreFollowers.get(sessionId);
+  }
+
+  function livePromptFrame(follower, sessionId, replay = false) {
+    const prompt = follower?.activePrompt;
+    if (!prompt?.id) return null;
+    return {
+      type: 'user_message',
+      sessionId,
+      message: {
+        id: prompt.id,
+        role: 'user',
+        content: prompt.text || '',
+        time: prompt.time || Date.now(),
+        seq: prompt.seq ?? 999998,
+        ...(prompt.rpcId ? { rpcId: prompt.rpcId } : {})
+      },
+      ...(replay ? { replay: true } : {})
+    };
+  }
+
+  function broadcastLivePrompt(follower, sessionId) {
+    const prompt = follower?.activePrompt;
+    if (!prompt?.id || prompt.broadcastAt) return;
+    const frame = livePromptFrame(follower, sessionId);
+    if (!frame) return;
+    prompt.broadcastAt = Date.now();
+    broadcastToMobileClients(frame);
   }
 
   function getSettingsData() {
@@ -1732,9 +1760,7 @@ export function apply(ctx, config = {}, internals = {}) {
             // 纠正（见 reconcileFollowerWithProjection 的注释）。
             reconcileFollowerWithProjection(follower, rows);
             const isRecentlyPrompted = activePrompts.has(sId) || activePrompts.has(cleanId) || activePrompts.has(`session-${cleanId}`);
-            const lastActivity = sessionMeta.lastPromptAt || 0;
-            const isRecentActivity = (Date.now() - lastActivity) < 45000;
-            const isOpenTurnActive = rows.turnBoundary?.val?.openTurnStartSeq != null && isRecentActivity;
+            const isOpenTurnActive = rows.turnBoundary?.val?.openTurnStartSeq != null;
             sessionMeta.isRunning = (follower && follower.isRunning) || isRecentlyPrompted || isOpenTurnActive;
           }
 
@@ -1982,9 +2008,7 @@ export function apply(ctx, config = {}, internals = {}) {
     if (cacheData && cacheData.record && cacheData.record.rows) {
       const rows = cacheData.record.rows;
       model = rows.modelSelection?.val?.lastUsed?.model || '';
-      const lastActivity = rows.sessionListMetadata?.val?.lastPromptAt || cacheData.record?.identity?.createdAt || 0;
-      const isRecentActivity = (Date.now() - lastActivity) < 45000;
-      const isOpenTurnActive = rows.turnBoundary?.val?.openTurnStartSeq != null && isRecentActivity;
+      const isOpenTurnActive = rows.turnBoundary?.val?.openTurnStartSeq != null;
       // 先跟引擎投影对账，再算 isRunning —— 否则一个丢帧的 running 会跟着
       // 会话历史一起送到手机上，表现为"打开会话永远在转圈"。
       reconcileFollowerWithProjection(follower, rows);
@@ -2122,25 +2146,32 @@ export function apply(ctx, config = {}, internals = {}) {
       isRunning = true;
 
       // Ensure active user prompt is included if not yet present in messages
-      if (follower.activePromptText && (messages.length === 0 || messages[messages.length - 1].role !== 'user' || messages[messages.length - 1].content !== follower.activePromptText)) {
+      if (follower.activePrompt && !messages.some((m) =>
+          (follower.activePrompt.rpcId && m.rpcId === follower.activePrompt.rpcId) ||
+          m.id === follower.activePrompt.id)) {
         messages.push({
-          id: `user_prompt_${cleanId}_${Date.now()}`,
+          id: follower.activePrompt.id,
           role: 'user',
-          content: follower.activePromptText,
-          time: Date.now() - 1000,
-          seq: 999998,
+          content: follower.activePrompt.text,
+          rpcId: follower.activePrompt.rpcId,
+          time: follower.activePrompt.time,
+          seq: follower.activePrompt.seq ?? 999998,
           turn: 999998
         });
       }
 
-      if (messages.length === 0 || messages[messages.length - 1].role === 'user') {
+      if (messages.length === 0 || messages[messages.length - 1].role === 'user' || messages[messages.length - 1].seq === 999999) {
+        const previousLive = messages[messages.length - 1]?.seq === 999999
+          ? messages[messages.length - 1]
+          : null;
+        if (previousLive) messages.pop();
         messages.push({
-          id: `in_flight_${cleanId}_${Date.now()}`,
+          id: previousLive?.id || `live_${cleanId}`,
           role: 'assistant',
-          content: follower.textBuffer || '',
-          thinking: follower.thinkingBuffer || null,
-          tools: follower.tools || [],
-          time: Date.now(),
+          content: follower.textBuffer || previousLive?.content || '',
+          thinking: follower.thinkingBuffer || previousLive?.thinking || null,
+          tools: follower.tools?.length ? follower.tools : (previousLive?.tools || []),
+          time: previousLive?.time || Date.now(),
           seq: 999999,
           turn: 999999,
           isStreaming: follower.isRunning
@@ -2175,7 +2206,7 @@ export function apply(ctx, config = {}, internals = {}) {
     // 只有这些高体积/高频帧要求“已 follow 该会话”。审批、session_status、
     // done/error 等仍需广播给所有客户端（后台会话也要能发通知、更新列表）。
     const FOLLOW_ONLY_FRAMES = new Set([
-      'delta', 'thinking', 'stream_snapshot', 'tool_call', 'tool_start', 'tool_result', 'todo'
+      'delta', 'thinking', 'stream_snapshot', 'user_message', 'tool_call', 'tool_start', 'tool_result', 'todo'
     ]);
     function broadcastToMobileClients(msg) {
     const raw = typeof msg === 'string' ? msg : JSON.stringify(msg);
@@ -2474,6 +2505,7 @@ export function apply(ctx, config = {}, internals = {}) {
     follower.isRunning = false;
     follower.turnOpen = false;
     follower.activePromptText = null;
+    follower.activePrompt = null;
     if (follower.sessionId) {
       const clean = follower.sessionId.replace(/^session-/, '');
       activePrompts.delete(follower.sessionId);
@@ -2692,10 +2724,36 @@ export function apply(ctx, config = {}, internals = {}) {
             follower.textBuffer = '';
             follower.tools = [];
             broadcastToMobileClients({ type: 'session_status', sessionId: sId, isRunning: true });
+          } else if (ev.type === 'user/message') {
+            // Web 发起的回合不经过 /sessions/prompt，也必须进入网关的实时
+            // 缓冲。否则手机错过 delta 后连用户问题都无法从快照恢复。
+            const source = ev.data?.source;
+            if (source?.kind === 'user') {
+              const parts = Array.isArray(ev.data?.content) ? ev.data.content : [];
+              const text = parts.filter((p) => p?.type === 'text').map((p) => p.text || '').join('');
+              follower.activePrompt = {
+                id: `live_${source.rpcId || ev.seq || Date.now()}`,
+                text,
+                rpcId: typeof source.rpcId === 'string' ? source.rpcId : null,
+                time: ev.time || Date.now(),
+                seq: ev.seq || null
+              };
+              follower.activePromptText = text;
+              if (follower.isRunning) {
+                // 事件和 assistant-stream 在 MUX 上顺序不保证，只有在这里
+                // 确认进入新回合才能补发提示词，不能靠 turn/start 猜文本。
+                broadcastLivePrompt(follower, sId);
+              } else {
+                // follow 重放只发送新事件之后产生的提示词。Web 可能只留下
+                // user/message，turn/start 尚未到达，这里启动跟随并补快照。
+                followSession(sId);
+              }
+            }
           } else if (ev.type === 'turn/end') {
             follower.isRunning = false;
             follower.turnOpen = false;
             follower.activePromptText = null;
+            follower.activePrompt = null;
             activePrompts.delete(sId);
             activePrompts.delete(cleanId);
             activePrompts.delete(`session-${cleanId}`);
@@ -2720,7 +2778,14 @@ export function apply(ctx, config = {}, internals = {}) {
                 message: end.text || '本轮执行失败'
               });
             }
-            broadcastToMobileClients({ type: 'done', sessionId: sId, reason: end.kind, message: end.text });
+            broadcastToMobileClients({
+              type: 'done',
+              sessionId: sId,
+              reason: end.kind,
+              message: end.text,
+              text: follower.textBuffer || '',
+              thinking: follower.thinkingBuffer || ''
+            });
             // [fix 2026-10-14] turn/end 时把本轮完整正文快照存进 lastTurnPayload，
             // 供断线重连的手机补拉（手机可能只收到部分 delta 或一个都没收到）。
             // 60 秒 TTL：正常路径（App 收到了完整 delta 或已拉过快照）不需要它，
@@ -5105,6 +5170,22 @@ export function apply(ctx, config = {}, internals = {}) {
 
         const now = Date.now();
         const recentCancel = coreTurns.getLastCancelTime(sessionId);
+        const requestId = typeof jsonBody.requestId === 'string' && jsonBody.requestId.trim()
+          ? jsonBody.requestId.trim()
+          : crypto.randomUUID();
+        if (requestId.length > 200) {
+          sendJson(400, { error: 'requestId is too long' });
+          return;
+        }
+        // 超时重试与双击可能让同一个 HTTP 请求并发到达。按会话 + requestId
+        // 共享唯一一次上游投递，不能让两次随机 UUID 变成两个真实回合。
+        const promptKey = `${sessionId.replace(/^session-/, '').toLowerCase()}:${requestId}`;
+        const inFlight = mobilePromptFlights.get(promptKey);
+        if (inFlight) {
+          if (await inFlight) sendJson(200, { ok: true, code: 0, deduplicated: true });
+          else sendJson(500, { ok: false, error: 'Prompt execution failed' });
+          return;
+        }
         // Turn sequence fencing: if a cancellation was recorded very recently (e.g. within 350ms)
         // for this session due to concurrent prompt/cancel race, treat this prompt as canceled immediately
         if (now - recentCancel < 350) {
@@ -5120,23 +5201,35 @@ export function apply(ctx, config = {}, internals = {}) {
         const deliveryMode = jsonBody.mode === 'steer' ? 'steer' : 'queue';
 
         activePrompts.set(sessionId, now);
-        const follower = getSessionFollower(sessionId);
+        const follower = getSessionFollower(sessionId) || coreFollowers.ensure(sessionId);
         if (follower) {
           follower.isRunning = true;
           follower.thinkingBuffer = '';
           follower.textBuffer = '';
           follower.tools = [];
           follower.activePromptText = text || '';
+          follower.activePrompt = {
+            id: `live_${requestId}`,
+            text: text || '',
+            rpcId: requestId,
+            time: now,
+            seq: 999998
+          };
           follower.lastUpdated = now;
+          broadcastLivePrompt(follower, sessionId);
         }
 
         broadcastToMobileClients({ type: 'session_status', sessionId, isRunning: true });
 
+        let promptAccepted = false;
+        let settleFlight;
+        const promptFlight = new Promise((resolve) => { settleFlight = resolve; });
+        mobilePromptFlights.set(promptKey, promptFlight);
         try {
           const promptRes = await callDshRpc('session/prompt', {
             args: {
               request: {
-                requestId: crypto.randomUUID(),
+                requestId,
                 sessionId: sessionId,
                 mode: deliveryMode,
                 // 文字 part 只在有文字时加入。引擎要求"非空白文字或至少一个附件"，
@@ -5171,10 +5264,12 @@ export function apply(ctx, config = {}, internals = {}) {
             broadcastToMobileClients({ type: 'session_status', sessionId, isRunning: false });
             broadcastToMobileClients({ type: 'done', sessionId });
             sendJson(200, { ok: true, code: 0, cancelled: true, result: promptRes });
+            promptAccepted = true;
             return;
           }
 
           sendJson(200, { ok: true, code: 0, result: promptRes });
+          promptAccepted = true;
           audit('session/prompt', { sessionId, length: text.length });
           return;
         } catch (err) {
@@ -5193,6 +5288,9 @@ export function apply(ctx, config = {}, internals = {}) {
 
           sendJson(500, { ok: false, error: err?.message || 'Prompt execution failed' });
           return;
+        } finally {
+          settleFlight(promptAccepted);
+          mobilePromptFlights.delete(promptKey);
         }
       }
 
@@ -5788,6 +5886,8 @@ export function apply(ctx, config = {}, internals = {}) {
             // 结束的话 buffer 也已清空，这轮内容在手机上为零，直到下次快照。
             // 这里把当前缓冲整体推一次；App 端按已有内容做前缀合并（多余的
             // 部分会被去重，不足的部分被补齐）。
+            const replayPrompt = livePromptFrame(follower, sId, true);
+            if (replayPrompt) ws.send(JSON.stringify(replayPrompt));
             if (follower.isRunning && follower.subscribed !== false &&
                 ((follower.textBuffer && follower.textBuffer.length) ||
                  (follower.thinkingBuffer && follower.thinkingBuffer.length))) {
@@ -6027,6 +6127,7 @@ export function apply(ctx, config = {}, internals = {}) {
     });
     await Promise.all([closeServer(server), closeServer(tlsServer)]);
     await disposeRpc();
+    mobilePromptFlights.clear();
     activePrompts.clear();
     sessionFollowers.clear();
     pendingApprovals.clear();

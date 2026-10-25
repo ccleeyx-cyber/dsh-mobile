@@ -86,7 +86,18 @@ jobs:
           node scripts/app-version.mjs
           node scripts/app-version.mjs --github-output
 
-      - name: Prepare Android Project & Dependencies
+      - name: Analyze Flutter
+        working-directory: ./dsh_mobile
+        run: flutter analyze --fatal-warnings
+
+      - name: Test Flutter
+        working-directory: ./dsh_mobile
+        run: flutter test
+
+      - name: Test gateway (hermetic only)
+        run: npm test
+
+      - name: Build APK (Release, split per ABI)
         working-directory: ./dsh_mobile
         run: |
           # android/ 现在是**已提交**的（含 build.gradle、MainActivity.kt、

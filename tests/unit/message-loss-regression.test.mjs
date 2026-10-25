@@ -89,6 +89,34 @@ describe('convertSessionRecordsToMessages: tool-only assistant turns', () => {
   });
 });
 
+describe('消息稳定身份与跨端同步', () => {
+  it('真人消息透出引擎 requestId，且重复发送的 retry 能关联同一身份', () => {
+    const records = [
+      { event: { type: 'user/message', seq: 10, time: 1000, data: {
+        source: { kind: 'user', rpcId: 'request-1' },
+        content: [{ type: 'text', text: '查一下' }]
+      } } },
+      { event: { type: 'user/message', seq: 20, time: 2000, data: {
+        source: { kind: 'user', rpcId: 'request-2' },
+        content: [{ type: 'text', text: '查一下' }]
+      } } }
+    ];
+    const { messages } = convertSessionRecordsToMessages(records);
+    assert.deepEqual(messages.map((m) => m.rpcId), ['request-1', 'request-2']);
+  });
+
+  it('远端回合也有稳定提示词身份，历史到达后不靠时间戳制造副本', () => {
+    const { messages } = convertSessionRecordsToMessages([
+      { event: { type: 'user/message', seq: 30, time: 3000, data: {
+        source: { kind: 'user', rpcId: 'request-web' },
+        content: [{ type: 'text', text: 'Web 发起' }]
+      } } }
+    ]);
+    assert.equal(messages[0].id, 'hist_30');
+    assert.equal(messages[0].rpcId, 'request-web');
+  });
+});
+
 /* ------------------------------------------------------------------ *
  * 3+4. auditDropped — silent drops become observable
  * ------------------------------------------------------------------ */

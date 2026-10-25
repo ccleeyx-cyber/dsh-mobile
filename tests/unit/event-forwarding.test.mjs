@@ -919,6 +919,64 @@ describe('回合结束时手机必须能停下来并看到原因', () => {
     assert.equal(body.data.lastTurn?.failed, false);
   });
 
+  it('Web 提问与最终正文可跨端恢复，done 自带最终快照', async () => {
+    const c = await connectClient();
+    const sid = 'session-web-sync';
+    c.send({ type: 'follow', sessionId: sid });
+    await c.waitFor((m) => m.type === 'follow_ack' && m.sessionId === sid);
+
+    pushToEngine(followFrame(sid, {
+      type: 'event', event: { type: 'turn/start', seq: 50, data: { turn: 5 } }
+    }));
+    await c.waitFor((m) => m.type === 'session_status' && m.sessionId === sid && m.isRunning === true);
+    pushToEngine(followFrame(sid, {
+      type: 'event', event: {
+        type: 'user/message', seq: 51, time: 51000,
+        data: { source: { kind: 'user', rpcId: 'web-request-1' }, content: [{ type: 'text', text: 'Web 发起的提问' }] }
+      }
+    }));
+    const user = await c.waitFor((m) => m.type === 'user_message' && m.sessionId === sid);
+    assert.equal(user.message.rpcId, 'web-request-1');
+    assert.equal(user.message.content, 'Web 发起的提问');
+
+    pushToEngine(followFrame(sid, {
+      type: 'assistant-stream', frame: { type: 'chunk', chunk: { type: 'text-delta', text: '最终回答' } }
+    }));
+    await c.waitFor((m) => m.type === 'delta' && m.sessionId === sid);
+    pushToEngine(followFrame(sid, {
+      type: 'event', event: { type: 'turn/end', seq: 52, data: { turn: 5, reason: { kind: 'completed' } } }
+    }));
+    const done = await c.waitFor((m) => m.type === 'done' && m.sessionId === sid);
+    assert.equal(done.text, '最终回答');
+
+    // 回合已结束：提示词交由历史接口提供，实时只回放最终正文。
+    c.send({ type: 'follow', sessionId: sid });
+    await c.waitFor((m) => m.type === 'follow_ack' && m.sessionId === sid);
+    const replay = await c.waitFor((m) => m.type === 'stream_snapshot' && m.replay === true);
+    assert.equal(replay.text, '最终回答');
+    await c.close();
+  });
+
+  it('同一 requestId 的并发 HTTP 重试只向引擎投递一次', async () => {
+    const c = await connectClient();
+    const sid = 'session-prompt-dedupe';
+    c.send({ type: 'follow', sessionId: sid });
+    await c.waitFor((m) => m.type === 'follow_ack' && m.sessionId === sid);
+    const before = rpcCalls.filter((r) => r.method === 'session/prompt').length;
+    const body = JSON.stringify({ sessionId: sid, requestId: 'retry-same-request', text: '只执行一次' });
+    const headers = { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
+    const [a, b] = await Promise.all([
+      fetch(`${BASE}/api/mobile/sessions/prompt`, { method: 'POST', headers, body }),
+      fetch(`${BASE}/api/mobile/sessions/prompt`, { method: 'POST', headers, body })
+    ]);
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    const calls = rpcCalls.filter((r) => r.method === 'session/prompt').slice(before);
+    assert.equal(calls.length, 1, '超时重试必须共享一次上游调用');
+    assert.equal(calls[0].payload.args.request.requestId, 'retry-same-request');
+    await c.close();
+  });
+
   it('分页里读到的 turn/end 不是引擎认定的最后一轮时，宁可不报也不报旧账', async () => {
     const sid = 'session-stale-turn2';
     writeProjCache(sid, {

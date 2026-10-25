@@ -46,7 +46,8 @@ export function configurePersistence({ verifyToken: vt, findDeviceByToken: fdt }
 // 1.16.0：远程访问安全加固（配对鉴权、撤销即断连、Memory realpath、解释器与
 // cloudflared 校验、资源上限、ntfy 目标限制）。
 // 1.16.1：手机短暂掉线期间到达的提问先暂存，重连 subscribe 时按引擎投影回放。
-export const BRIDGE_VERSION = '1.16.1';
+// 1.16.2：requestId 幂等、跨端实时提示词、最终正文快照与长回合状态修复。
+export const BRIDGE_VERSION = '1.16.2';
 export const MAX_BODY_SIZE = 2 * 1024 * 1024; // 2MB defensive payload limit (F4.1)
 export const HEARTBEAT_INTERVAL_MS = 30000;
 /** 上游 RPC 响应硬上限：异常引擎/插件不能把网关进程堆内存拉爆。 */

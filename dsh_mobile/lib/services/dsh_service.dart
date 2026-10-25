@@ -199,6 +199,54 @@ class DshService extends ChangeNotifier {
   int _sessionLoadSeq = 0;
   int _streamRevision = 0;
 
+  // done 与随后的 session_status(false) 是同一回合的两个通知，只补拉一次。
+  // generation 同时防止迟到的异步补拉串进已切换的会话或新回合。
+  final Map<String, Future<void>> _finalResyncFlights = {};
+  final Map<String, int> _sessionEpochs = {};
+  final Map<String, int> _completedTurnEpochs = {};
+  final Set<String> _remoteRunningSessions = {};
+
+  String _syncKey(String sessionId) =>
+      sessionId.replaceFirst(RegExp(r'^session-'), '').toLowerCase();
+
+  int _sessionEpoch(String sessionId) => _sessionEpochs[_syncKey(sessionId)] ?? 0;
+
+  void _advanceSessionEpoch(String sessionId) {
+    final key = _syncKey(sessionId);
+    _sessionEpochs[key] = _sessionEpoch(sessionId) + 1;
+    _remoteRunningSessions.remove(key);
+  }
+
+  void _requestFinalResync(String sessionId) {
+    final key = _syncKey(sessionId);
+    if (_isDisposed || _finalResyncFlights.containsKey(key)) return;
+    final epoch = _sessionEpoch(sessionId);
+    _completedTurnEpochs[key] = epoch;
+    final future = (debugFinalResync ?? _resyncActiveSession)(sessionId);
+    _finalResyncFlights[key] = future;
+    unawaited(future.catchError((Object error) {
+      debugPrint('[DshService] 回合结束补拉失败: $error');
+    }).whenComplete(() {
+      if (identical(_finalResyncFlights[key], future)) {
+        _finalResyncFlights.remove(key);
+      }
+      // 补拉返回前又来了新回合，不能把新回合误置为已完成。
+      if (_sessionEpoch(sessionId) != epoch) {
+        _completedTurnEpochs.remove(key);
+      }
+    }));
+  }
+
+  bool _acceptStreamFrame(String sessionId) {
+    if (_isCanceling || _activeTurnSeq <= _cancelledTurnSeq) return false;
+    final key = _syncKey(sessionId);
+    if (_remoteRunningSessions.contains(key)) {
+      _completedTurnEpochs.remove(key);
+      return true;
+    }
+    return _completedTurnEpochs[key] != _sessionEpoch(sessionId);
+  }
+
   /// 流式通知合并窗口（[fix 2026-10-25] 从 100ms 加大到 150ms）。
   ///
   /// 网关的 delta 帧可以密到每秒数百片，而 `notifyListeners()` 会让整个
@@ -1382,6 +1430,14 @@ class DshService extends ChangeNotifier {
     _reconcileSessionMessages(raw, isRunning, sid);
   }
 
+  @visibleForTesting
+  void debugHandleRawMessage(Map<String, dynamic> frame) {
+    _handleRawMessage(jsonEncode(frame));
+  }
+
+  @visibleForTesting
+  Future<void> Function(String sessionId)? debugFinalResync;
+
   /// 测试用：当前消息列表里算作"真人回合"的条数。
   ///
   /// [ensureFullHistory] 的补页口径就用它 —— 而"哪些消息算真人回合"这条口径
@@ -1645,6 +1701,8 @@ class DshService extends ChangeNotifier {
     // matchesSessionId(sId) 判断负责（见流式块处理的开头）。turn 计数在这里只是
     // 让在途的旧块失效，不该被当成"这一轮已被取消"。
     _activeTurnSeq++;
+    _advanceSessionEpoch(session.sessionId);
+    _completedTurnEpochs.remove(_syncKey(session.sessionId));
     // [fix 2026-10-17 用户反馈] 先拿上一次打开过的完整消息做**立即回填**：
     // 每次打开会话都重拉整个会话（实测 10 轮 / 7 页 / 1.58 MB）是"打开很卡"
     // 的直接来源。缓存命中时列表当帧就有内容，真正的网络请求只去补尾部增量。
@@ -1678,8 +1736,8 @@ class DshService extends ChangeNotifier {
     // 上一个会话的读数（交付物/变更/作业/用量）必须清掉：不清的话新会话的状态条
     // 会拿旧会话的上下文压力与作业数当自己的（这比"多打几个请求"严重得多）。
     _resetSessionInsights();
-    // [feat 2026-10-12] 上翻分页状态跟会话走：切走即清。
-    _resetHistoryPaging();
+    // 无缓存时才重置分页；缓存已恢复了锚点和 exhausted，不能再清空。
+    if (cached == null) _resetHistoryPaging();
     notifyListeners();
 
     // Notify server to follow this session for real-time streaming
@@ -1949,6 +2007,7 @@ class DshService extends ChangeNotifier {
       content: displayText,
       timestamp: DateTime.now(),
       localImagePreviews: localPreviews,
+      clientRequestId: _uuid.v4(),
     );
     _messages.add(userMsg);
 
@@ -1965,6 +2024,8 @@ class DshService extends ChangeNotifier {
     _messages.add(assistantMsg);
 
     final int turnId = ++_activeTurnSeq;
+    _advanceSessionEpoch(sessionId);
+    _completedTurnEpochs.remove(_syncKey(sessionId));
     _setSending(true, sessionId: sessionId);
     _streamRevision++;
     // 新的一轮开始：上一次的失败横幅（若有）让位，别再挂着旧错误。
@@ -1973,6 +2034,10 @@ class DshService extends ChangeNotifier {
 
     // Send follow event via WS
     _sendWsJson({'type': 'follow', 'sessionId': sessionId});
+
+    // 同一次发送的自动重试必须沿用同一个 requestId。引擎会按它做幂等，
+    // 网关也用它合并并发投递；每次重试换 ID 会让同一句话真正执行两遍。
+    final requestId = userMsg.clientRequestId!;
 
     try {
       // Send via HTTP RPC with retry to tolerate reverse proxy Keep-Alive drops
@@ -1987,6 +2052,7 @@ class DshService extends ChangeNotifier {
                 headers: _authHeaders,
                 body: jsonEncode({
                   'sessionId': sessionId,
+                  'requestId': requestId,
                   'text': text,
                   'model': currentModel,
                   // 附件（v1.10.0）。图片是内联 base64 的 image part，文件是上传后换到的
@@ -2150,11 +2216,25 @@ class DshService extends ChangeNotifier {
   bool _sessionPollInFlight = false;
 
   // Active Session State & Pending Stream Chunks Resync (F3.3)
-  Future<void> _resyncActiveSession(String sessionId) async {
-    if (_currentConfig == null || _currentSession == null) return;
+  final Map<String, Future<void>> _resyncFlights = {};
+  Future<void> _resyncActiveSession(String sessionId) {
+    final existing = _resyncFlights[sessionId];
+    if (existing != null) return existing;
+    final future = _performSessionResync(sessionId);
+    _resyncFlights[sessionId] = future;
+    return future.whenComplete(() {
+      if (identical(_resyncFlights[sessionId], future)) {
+        _resyncFlights.remove(sessionId);
+      }
+    });
+  }
+
+  Future<void> _performSessionResync(String sessionId) async {
+    if (_isDisposed || _currentConfig == null || _currentSession == null) return;
     if (!_currentSession!.matchesSessionId(sessionId)) return;
 
     final targetSessionId = _currentSession!.sessionId;
+    final epoch = _sessionEpoch(targetSessionId);
     try {
       final url = Uri.parse(
           '${_currentConfig!.httpBaseUrl}/api/mobile/sessions/$targetSessionId');
@@ -2170,7 +2250,8 @@ class DshService extends ChangeNotifier {
 
         // Guard against mid-flight session navigation
         if (_currentSession == null ||
-            !_currentSession!.matchesSessionId(targetSessionId)) return;
+            !_currentSession!.matchesSessionId(targetSessionId) ||
+            epoch != _sessionEpoch(targetSessionId)) return;
 
         final rawMessages = sessionData['messages'] as List<dynamic>? ?? [];
         final isServerRunning = sessionData['isRunning'] == true;
@@ -2193,15 +2274,32 @@ class DshService extends ChangeNotifier {
     if (_currentSession == null ||
         !_currentSession!.matchesSessionId(targetSessionId)) return;
 
-    final serverMessages = rawMessages.map((m) {
+    final serverMessages = <ChatMessage>[];
+    final seenMessageIds = <String>{};
+    final seenMessageSeqs = <int>{};
+    final seenRequestIds = <String>{};
+    for (final raw in rawMessages) {
       // [fix 2026-10-17] 统一走 ChatMessage.fromWire：此前这里手写解析漏了
       // attachments/turnTokens/noticeKind 等 6 个字段，每 2.5s 轮询整体替换
       // 后历史图片消失、逐轮 token 回退。三处解析收敛到一个工厂。
-      return ChatMessage.fromWire(
+      final message = ChatMessage.fromWire(
         Map<String, dynamic>.from(m as Map),
         newId: _uuid.v4,
       );
-    }).toList();
+      // 网关的实时占位和历史页可能落在同一份快照里。以引擎 requestId、
+      // 事件 seq、稳定 id 为身份去重，不用正文猜；相同正文的两次发送仍保留。
+      final duplicate = (message.clientRequestId != null &&
+              seenRequestIds.contains(message.clientRequestId)) ||
+          (message.seq != null && seenMessageSeqs.contains(message.seq)) ||
+          seenMessageIds.contains(message.id);
+      if (duplicate) continue;
+      serverMessages.add(message);
+      seenMessageIds.add(message.id);
+      if (message.seq != null) seenMessageSeqs.add(message.seq!);
+      if (message.clientRequestId != null) {
+        seenRequestIds.add(message.clientRequestId!);
+      }
+    }
 
     // Turn cancellation sequence fence
     //
@@ -2221,6 +2319,9 @@ class DshService extends ChangeNotifier {
 
     if (isServerRunning) {
       _setSending(true, sessionId: targetSessionId);
+      _remoteRunningSessions.add(_syncKey(targetSessionId));
+      _completedTurnEpochs.remove(_syncKey(targetSessionId));
+      _startSessionPolling(targetSessionId);
 
       if (serverMessages.isNotEmpty && serverMessages.last.isAssistant) {
         final serverAssistant = serverMessages.last;
@@ -2306,8 +2407,6 @@ class DshService extends ChangeNotifier {
     // 本地用户消息的保留窗放宽到 10 分钟，且去重比较改用「剥离附件名后的
     // 正文」——displayText 拼了 "📎 文件名" 而服务端历史没有这一段，全等比较
     // 永远不等，纯附件消息超窗后被整体替换吞掉（= 少一条提问）。
-    final serverUserTexts =
-        serverMessages.where((m) => m.isUser).map((m) => m.content).toSet();
     String stripAttachmentLabel(String s) {
       final idx = s.indexOf('\n\n📎 ');
       return idx >= 0 ? s.substring(0, idx) : s;
@@ -2321,12 +2420,18 @@ class DshService extends ChangeNotifier {
         continue;
       }
       final localCore = stripAttachmentLabel(localMsg.content);
-      final matchedOnServer = localCore.isNotEmpty &&
-          serverUserTexts.any((s) {
-            if (s == localMsg.content) return true;
-            return s == localCore;
-          });
-      if (localMsg.content.isNotEmpty && !matchedOnServer) {
+      final matchedOnServer = serverMessages.any((server) =>
+          (localMsg.clientRequestId != null &&
+              server.clientRequestId == localMsg.clientRequestId) ||
+          (localMsg.seq != null && server.seq == localMsg.seq) ||
+          server.id == localMsg.id ||
+          // 兼容旧网关：历史不带 rpcId 时才退回正文匹配；同一轮已有
+          // requestId 的两条消息绝不能退化成正文去重。
+          (server.clientRequestId == null &&
+              localCore.isNotEmpty &&
+              (server.content == localMsg.content ||
+                  server.content == localCore)));
+      if ((localMsg.content.isNotEmpty || localMsg.hasAttachments) && !matchedOnServer) {
         if (DateTime.now().difference(localMsg.timestamp).inMinutes < 10) {
           final assistIdx =
               serverMessages.indexWhere((m) => m.isAssistant && m.isStreaming);
@@ -2349,6 +2454,7 @@ class DshService extends ChangeNotifier {
             .toList();
 
     _messages = [...olderKept, ...serverMessages];
+    _cacheSessionHistory(targetSessionId, _historyExhausted);
     _streamRevision++;
     notifyListeners();
   }
@@ -5496,6 +5602,8 @@ class DshService extends ChangeNotifier {
         }
         if (_currentSession != null && _currentSession!.matchesSessionId(sId)) {
           if (!isRunning) {
+            _requestFinalResync(sId);
+            _remoteRunningSessions.remove(_syncKey(sId));
             _setSending(false);
             _isCanceling = false;
             _sessionPollTimer?.cancel();
@@ -5508,6 +5616,14 @@ class DshService extends ChangeNotifier {
               }
             }
           } else {
+            final wasRemoteRunning = _remoteRunningSessions.contains(_syncKey(sId));
+            if (!wasRemoteRunning && !_isSending) {
+              _advanceSessionEpoch(sId);
+            }
+            _remoteRunningSessions.add(_syncKey(sId));
+            if (!wasRemoteRunning) {
+              unawaited(_resyncActiveSession(sId));
+            }
             // [fix 2026-10-17] 远端新回合的上升沿要**解除本地取消栅栏**。
             //
             // 栅栏的语义是"丢弃本地已取消那一轮的残余帧"，不是"这个会话从此
@@ -5660,6 +5776,33 @@ class DshService extends ChangeNotifier {
         return;
       }
 
+      // Web/App 任一端的新提问。实时消息与历史消息使用同一个 rpcId，
+      // 重复 follow 回放和轮询对账都必须幂等。
+      if (type == 'user_message') {
+        final sId = json['sessionId']?.toString();
+        final raw = json['message'];
+        if (sId == null ||
+            _currentSession == null ||
+            !_currentSession!.matchesSessionId(sId) ||
+            raw is! Map) {
+          return;
+        }
+        final incoming = ChatMessage.fromWire(
+          Map<String, dynamic>.from(raw),
+          newId: _uuid.v4,
+        );
+        final duplicate = _messages.any((m) =>
+            (incoming.clientRequestId != null &&
+                m.clientRequestId == incoming.clientRequestId) ||
+            (incoming.seq != null && m.seq == incoming.seq) ||
+            m.id == incoming.id);
+        if (duplicate) return;
+        _messages.add(incoming);
+        _streamRevision++;
+        notifyListeners();
+        return;
+      }
+
       // 4.9 [fix 2026-10-25] 工具参数增量帧必须在正文增量判定之前截住。
       //
       // `tool_call` 帧的形状是 `{type:'tool_call', tool, delta}` —— 那个 `delta`
@@ -5686,9 +5829,8 @@ class DshService extends ChangeNotifier {
           return;
         }
 
-        // Drop lingering stream chunks if user canceled this turn or turn sequence mismatch
-        if (_isCanceling) return;
-        if (_activeTurnSeq <= _cancelledTurnSeq) return;
+        // Drop lingering stream chunks if user canceled or this turn has ended.
+        if (!_acceptStreamFrame(sId)) return;
 
         if (_messages.isEmpty || !_messages.last.isAssistant) {
           _messages.add(ChatMessage(
@@ -5724,9 +5866,8 @@ class DshService extends ChangeNotifier {
           return;
         }
 
-        // Drop tool start if canceled or turn sequence mismatch
-        if (_isCanceling) return;
-        if (_activeTurnSeq <= _cancelledTurnSeq) return;
+        // Drop tool start if canceled or this turn has ended.
+        if (!_acceptStreamFrame(sId)) return;
 
         if (_messages.isEmpty || !_messages.last.isAssistant) {
           _messages.add(ChatMessage(
@@ -5980,13 +6121,33 @@ class DshService extends ChangeNotifier {
             !_currentSession!.matchesSessionId(sId)) {
           return;
         }
-        if (_messages.isNotEmpty && _messages.last.isAssistant) {
+        final doneText = json['text']?.toString() ?? '';
+        final doneThinking = json['thinking']?.toString() ?? '';
+        if (_messages.isEmpty || !_messages.last.isAssistant) {
+          if (doneText.isNotEmpty || doneThinking.isNotEmpty) {
+            _messages.add(ChatMessage(
+              id: _uuid.v4(),
+              role: 'assistant',
+              content: doneText,
+              thinking: doneThinking,
+            ));
+          }
+        } else {
           final current = _messages.last;
+          current.flushStreamBuffers();
+          if (doneText.isNotEmpty && doneText.startsWith(current.content)) {
+            current.content = doneText;
+          }
+          if (doneThinking.isNotEmpty &&
+              doneThinking.startsWith(current.thinking ?? '')) {
+            current.thinking = doneThinking;
+          }
           current.isStreaming = false;
           for (var t in current.tools) {
             t.isRunning = false;
           }
         }
+        _requestFinalResync(sId);
         // done 现在带结束原因。若 error 帧丢了（弱网/刚好断线），这里仍能补上
         // 失败说明 —— 结束原因只有网关读得到，手机不能靠猜。
         final endReason = json['reason']?.toString();

@@ -556,6 +556,11 @@ export function convertSessionRecordsToMessages(records, opts = {}) {
           content: text.trim(),
           time: ev.time || Date.now(),
           seq: typeof ev.seq === 'number' ? ev.seq : null,
+          // 引擎把 session/prompt.requestId 持久化为 user/message.source.rpcId。
+          // App 的乐观消息和历史快照靠它配对；正文可能相同，不能拿来当身份。
+          ...(typeof ev.data?.source?.rpcId === 'string'
+            ? { rpcId: ev.data.source.rpcId }
+            : {}),
           // 逐轮用量先占位为 null：**只有真人消息**是载体，轮结束时由 settleTurn 按分段写值；
           // 注入消息永远是 null（新 App 靠这个字段区分"未知"与"老网关没有这个字段"）。
           tokens: null,

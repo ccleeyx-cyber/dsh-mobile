@@ -80,6 +80,10 @@ class ChatMessage {
   /// 没有时为 null（这类消息不参与翻页与去重，只留在尾部）。
   final int? seq;
 
+  /// 引擎 session/prompt 的请求身份（user/message.source.rpcId）。
+  /// 本地乐观消息与服务端历史靠它精确配对；相同正文的两次发送仍是两条消息。
+  final String? clientRequestId;
+
   /// [feat 2026-10-17] 引擎注入的通知语义（见 [HarnessNotice]）。
   ///
   /// 网关标了就用网关的（权威：它能读到事件上的 `source`），没标就按锚定文案兜底。
@@ -129,6 +133,7 @@ class ChatMessage {
       isMemory: m['isMemory'] == true || m['role'] == 'memory',
       isContext: m['isContext'] == true || m['role'] == 'context',
       seq: wireSeq(m['seq']),
+      clientRequestId: m['rpcId']?.toString(),
       tools: rawTools.map(toolExecutionFromWire).toList(),
       timestamp: wireTime(m['time']),
       // [fix 2026-10-17] 对账路径此前丢失的六个字段 —— 统一工厂的意义所在。
@@ -154,6 +159,7 @@ class ChatMessage {
     this.isMemory = false,
     this.isContext = false,
     this.seq,
+    this.clientRequestId,
     String? noticeKind,
     String? noticeVariant,
     String? noticeChildId,
