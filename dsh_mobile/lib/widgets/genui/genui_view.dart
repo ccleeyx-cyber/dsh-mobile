@@ -7,14 +7,14 @@
 /// json/code/callout/steps/avatar）、图表（chart：bars/line/donut）、交互容器
 /// （tabs/accordion/copy/link）、以及行内富文本。
 ///
-/// **降级为占位**：`echart`/`plot`/`mermaid`/`diagram`/`scene3d`/`svg`/`audio`/
-/// `video`，以及全部需要 `[genui-action]` 往返的表单类
-/// （button/input/select/checkbox/radio/switch/textarea/submit/quiz）。
+/// **原生表单**：button/input/select/checkbox/radio/switch/slider/textarea/submit/quiz。
+/// 同一份规格里的分组答案与带 id 的字段由 GenuiFormController 聚合，submit
+/// 一次回传 `[genui-action]`（见 SafeMarkdown 的 onGenuiAction）。
 ///
-/// 降级**不丢信息**：渲染成一条说明 + 可展开的原始 JSON。理由 —— 这些能力的
+/// **降级为占位**：`echart`/`plot`/`mermaid`/`diagram`/`scene3d`/`svg`/`audio`/
+/// `video`。降级**不丢信息**：渲染成一条说明 + 可展开的原始 JSON。这些能力的
 /// 渲染成本差一个数量级（ECharts ≈1MB、diagram 27 种排版、scene3d 需要 WebGL），
-/// 而表单类还依赖宿主把 action 送回模型（App 侧尚无该链路）。先把信息如实呈现，
-/// 比假装支持然后画错要好。
+/// 先把信息如实呈现，比假装支持然后画错要好。
 ///
 /// ⚠️ 与 Web 端已知的差距（本轮未做）：表格的本地排序/筛选/导出/`details` 展开、
 /// 状态持久化、`filter`/`sortField` 绑定。它们都是本地增强，不影响信息完整性。
@@ -27,39 +27,114 @@ import 'package:flutter/services.dart';
 
 import '../../theme/app_colors.dart';
 import 'genui_charts.dart';
+import 'genui_form.dart';
 import 'genui_inline.dart';
 import 'genui_parse.dart';
 
 /// 一个规格的根视图：可选标题 + 纵向组件列表。
 class GenuiSpecView extends StatelessWidget {
-  const GenuiSpecView({super.key, required this.spec, this.onLink});
+  const GenuiSpecView({
+    super.key,
+    required this.spec,
+    this.onLink,
+    this.onGenuiAction,
+  });
 
   final GenuiSpec spec;
   final void Function(String href)? onLink;
+  final GenuiActionCallback? onGenuiAction;
 
   @override
   Widget build(BuildContext context) {
-    final children = <Widget>[];
-    final title = spec.title;
-    if (title != null && title.isNotEmpty) {
-      children.add(GenuiInlineText(
-        title,
-        style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700, color: context.c.textPrimary),
-      ));
-    }
-    for (final node in spec.items) {
-      children.add(GenuiNodeView(node: node, onLink: onLink));
-    }
-    if (children.isEmpty) return const SizedBox.shrink();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        for (var i = 0; i < children.length; i++) ...[
-          if (i > 0) SizedBox(height: spec.gap > 0 ? spec.gap : 10),
-          children[i],
-        ],
-      ],
+    return _GenuiFormHost(
+      spec: spec,
+      onLink: onLink,
+      onAction: onGenuiAction,
+    );
+  }
+}
+
+/// 一份规格一个表单作用域：radio/checkbox 的分组、input 的 id 字段都汇总
+/// 到同一个 controller，submit 才能一次交齐。规格内容变了就换一代 controller，
+/// 避免下一道题继承上一题的答案。
+class _GenuiFormHost extends StatefulWidget {
+  const _GenuiFormHost({
+    required this.spec,
+    required this.onLink,
+    required this.onAction,
+  });
+
+  final GenuiSpec spec;
+  final void Function(String href)? onLink;
+  final GenuiActionCallback? onAction;
+
+  @override
+  State<_GenuiFormHost> createState() => _GenuiFormHostState();
+}
+
+class _GenuiFormHostState extends State<_GenuiFormHost> {
+  late GenuiFormController _controller;
+  late String _signature;
+
+  @override
+  void initState() {
+    super.initState();
+    _signature = _signatureOf(widget.spec);
+    _controller = GenuiFormStore.forSignature(_signature);
+  }
+
+  static String _signatureOf(GenuiSpec spec) => jsonEncode({
+        'title': spec.title,
+        'items': [for (final node in spec.items) node.data],
+      });
+
+  @override
+  void didUpdateWidget(covariant _GenuiFormHost oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final next = _signatureOf(widget.spec);
+    if (next == _signature) return;
+    _signature = next;
+    _controller = GenuiFormStore.forSignature(next);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        final children = <Widget>[];
+        final title = widget.spec.title;
+        if (title != null && title.isNotEmpty) {
+          children.add(GenuiInlineText(
+            title,
+            style: TextStyle(
+              fontSize: 13.5,
+              fontWeight: FontWeight.w700,
+              color: context.c.textPrimary,
+            ),
+          ));
+        }
+        for (final node in widget.spec.items) {
+          children.add(GenuiNodeView(node: node, onLink: widget.onLink));
+        }
+        if (children.isEmpty) return const SizedBox.shrink();
+
+        return GenuiFormScope(
+          controller: _controller,
+          onAction: widget.onAction,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (var i = 0; i < children.length; i++) ...[
+                if (i > 0)
+                  SizedBox(height: widget.spec.gap > 0 ? widget.spec.gap : 10),
+                children[i],
+              ],
+            ],
+          ),
+        );
+      },
     );
   }
 }
@@ -137,6 +212,26 @@ class GenuiNodeView extends StatelessWidget {
         return _Tabs(node: node, onLink: onLink, depth: depth);
       case 'accordion':
         return _Accordion(node: node, onLink: onLink, depth: depth);
+      case 'button':
+        return GenuiButton(node: node);
+      case 'input':
+        return GenuiTextField(node: node);
+      case 'textarea':
+        return GenuiTextField(node: node, multiline: true);
+      case 'radio':
+        return GenuiRadioField(node: node);
+      case 'checkbox':
+        return GenuiCheckboxField(node: node);
+      case 'select':
+        return GenuiSelectField(node: node);
+      case 'switch':
+        return GenuiSwitchField(node: node);
+      case 'slider':
+        return GenuiSliderField(node: node);
+      case 'submit':
+        return GenuiSubmitButton(node: node);
+      case 'quiz':
+        return GenuiQuiz(node: node);
       default:
         return _Unsupported(node: node);
     }

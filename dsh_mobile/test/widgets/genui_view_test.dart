@@ -1,7 +1,10 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:dsh_mobile/theme/app_colors.dart';
+import 'package:dsh_mobile/widgets/genui/genui_action.dart';
 import 'package:dsh_mobile/widgets/genui/genui_charts.dart';
 import 'package:dsh_mobile/widgets/genui/genui_inline.dart';
 import 'package:dsh_mobile/widgets/genui/genui_parse.dart';
@@ -14,13 +17,15 @@ import 'package:dsh_mobile/widgets/safe_markdown.dart';
 /// 这条链路此前完全不存在（GenUI 的渲染器是浏览器侧模块，手机端拿不到），所以
 /// 每个用例都在钉住"端到端真的画出来了"。
 void main() {
-  Future<void> pump(WidgetTester tester, Widget child, {Size size = const Size(420, 900)}) async {
+  Future<void> pump(WidgetTester tester, Widget child,
+      {Size size = const Size(420, 900)}) async {
     tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
     await tester.pumpWidget(
       MaterialApp(
-        builder: (ctx, c) => ThemeScope(isDark: false, child: c ?? const SizedBox()),
+        builder: (ctx, c) =>
+            ThemeScope(isDark: false, child: c ?? const SizedBox()),
         home: Scaffold(body: SingleChildScrollView(child: child)),
       ),
     );
@@ -35,7 +40,8 @@ void main() {
       await pump(
         tester,
         SafeMarkdown(
-          data: body('{"title":"概览","items":[{"type":"table","columns":["项目","值"],"rows":[["用例","453"]]}]}'),
+          data: body(
+              '{"title":"概览","items":[{"type":"table","columns":["项目","值"],"rows":[["用例","453"]]}]}'),
         ),
       );
 
@@ -67,7 +73,9 @@ void main() {
     testWidgets('围栏前后的正文都还在', (tester) async {
       await pump(
         tester,
-        const SafeMarkdown(data: '开头。\n\n```dsh-ui\n{"items":[{"type":"divider"}]}\n```\n\n结尾。'),
+        const SafeMarkdown(
+            data:
+                '开头。\n\n```dsh-ui\n{"items":[{"type":"divider"}]}\n```\n\n结尾。'),
       );
       expect(find.byType(GenuiSpecView), findsOneWidget);
       expect(find.textContaining('开头'), findsWidgets);
@@ -76,13 +84,22 @@ void main() {
   });
 
   group('组件渲染', () {
-    Future<void> pumpNode(WidgetTester tester, Map<String, dynamic> node) => pump(
+    Future<void> pumpNode(WidgetTester tester, Map<String, dynamic> node) =>
+        pump(
           tester,
-          GenuiSpecView(spec: GenuiSpec.fromJson({'items': [node]})!),
+          GenuiSpecView(
+              spec: GenuiSpec.fromJson({
+            'items': [node]
+          })!),
         );
 
     testWidgets('callout 的标题与正文都画出来（字段名是 content 不是 text）', (tester) async {
-      await pumpNode(tester, {'type': 'callout', 'tone': 'warning', 'title': '注意', 'content': '这里有个坑'});
+      await pumpNode(tester, {
+        'type': 'callout',
+        'tone': 'warning',
+        'title': '注意',
+        'content': '这里有个坑'
+      });
       expect(find.text('注意'), findsOneWidget);
       expect(find.text('这里有个坑'), findsOneWidget);
     });
@@ -114,7 +131,8 @@ void main() {
     });
 
     testWidgets('stat 的数值与涨跌都渲染', (tester) async {
-      await pumpNode(tester, {'type': 'stat', 'label': '用例', 'value': '453', 'delta': '+33'});
+      await pumpNode(tester,
+          {'type': 'stat', 'label': '用例', 'value': '453', 'delta': '+33'});
       expect(find.text('用例'), findsOneWidget);
       expect(find.text('453'), findsOneWidget);
       expect(find.text('+33'), findsOneWidget);
@@ -136,6 +154,71 @@ void main() {
       await pumpNode(tester, {'type': 'scene3d', 'meshes': [], 'title': '3D'});
       expect(find.textContaining('暂不支持'), findsOneWidget);
       expect(find.text('查看原始数据'), findsOneWidget);
+    });
+
+    testWidgets('radio + input + submit 原生渲染，并一次回传分组答案与字段', (tester) async {
+      String? actionName;
+      Map<String, dynamic>? actionData;
+      final spec = {
+        'items': [
+          {
+            'type': 'radio',
+            'label': '模式',
+            'group': 'mode',
+            'options': ['选项 A', '选项 B'],
+          },
+          {
+            'type': 'input',
+            'label': '备注',
+            'id': 'note',
+            'placeholder': '可选填写',
+          },
+          {
+            'type': 'submit',
+            'label': '提交选择',
+            'action': 'choose',
+            'groups': ['mode', 'note'],
+          },
+        ],
+      };
+
+      await pump(
+        tester,
+        SafeMarkdown(
+          data: body(jsonEncode(spec)),
+          onGenuiAction: (action, data) {
+            actionName = action;
+            actionData = data;
+          },
+        ),
+      );
+
+      expect(find.text('模式'), findsOneWidget);
+      expect(find.text('选项 A'), findsOneWidget);
+      expect(find.byType(TextField), findsOneWidget);
+      expect(find.textContaining('暂不支持'), findsNothing);
+
+      ButtonStyleButton submit() => tester.widget<ButtonStyleButton>(
+            find.byKey(const ValueKey('genui-submit')),
+          );
+      expect(submit().onPressed, isNull, reason: '分组未填完不能提交');
+
+      await tester.tap(find.text('选项 B'));
+      await tester.enterText(find.byType(TextField), '测试备注');
+      await tester.pump();
+
+      expect(submit().onPressed, isNotNull);
+      await tester.tap(find.byKey(const ValueKey('genui-submit')));
+      await tester.pump();
+
+      expect(actionName, 'choose');
+      expect(actionData?['answers'], {
+        'mode': ['选项 B']
+      });
+      expect(actionData?['fields'], {'note': '测试备注'});
+      expect(actionData?['total'], 2);
+      expect(actionData?['answered'], 2);
+      expect(find.text('已提交'), findsOneWidget);
     });
 
     testWidgets('steps 的序号与当前步都画出来', (tester) async {
@@ -168,6 +251,24 @@ void main() {
     });
   });
 
+  group('动作回传协议', () {
+    test('动作名与组件数据都进入 [genui-action] 文本，历史可识别并折叠', () {
+      final text = buildGenuiActionPrompt('choose', {
+        'answers': {
+          'mode': ['选项 B']
+        },
+        'fields': {'note': '测试'},
+      });
+
+      expect(text.startsWith('[genui-action] choose。'), isTrue);
+      expect(text, contains('组件数据:'));
+      expect(text, contains('"mode":["选项 B"]'));
+      expect(isGenuiActionMessage(text), isTrue);
+      expect(isGenuiActionMessage('  [genui-action] x'), isTrue);
+      expect(isGenuiActionMessage('普通消息'), isFalse);
+    });
+  });
+
   group('行内富文本（纯函数）', () {
     const base = TextStyle(fontSize: 13);
 
@@ -181,21 +282,26 @@ void main() {
       expect(spanWithText('粗').style?.fontWeight, FontWeight.w700);
       expect(spanWithText('亮').style?.backgroundColor, isNotNull);
       // 未被标记包裹的文字原样保留（标记之间的空白会单独成段，所以按包含判断）
-      expect(spans.whereType<TextSpan>().map((s) => s.text).join(), contains('末尾'));
+      expect(spans.whereType<TextSpan>().map((s) => s.text).join(),
+          contains('末尾'));
     });
 
     test('链接只在给了回调时可点，且只认 http/https/mailto', () {
       bool anyClickable(List<InlineSpan> spans) =>
           spans.whereType<TextSpan>().any((s) => s.recognizer != null);
 
-      expect(anyClickable(parseGenuiInline('[官网](https://example.com)', base: base, onLink: (_) {})), isTrue);
+      expect(
+          anyClickable(parseGenuiInline('[官网](https://example.com)',
+              base: base, onLink: (_) {})),
+          isTrue);
       expect(
         anyClickable(parseGenuiInline('[官网](https://example.com)', base: base)),
         isFalse,
         reason: '没有回调时不能假装可点',
       );
       expect(
-        anyClickable(parseGenuiInline('[x](javascript:void)', base: base, onLink: (_) {})),
+        anyClickable(parseGenuiInline('[x](javascript:void)',
+            base: base, onLink: (_) {})),
         isFalse,
         reason: '非 http/https/mailto 协议不接受',
       );
