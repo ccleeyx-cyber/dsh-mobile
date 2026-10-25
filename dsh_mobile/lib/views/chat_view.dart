@@ -15,6 +15,7 @@ import '../widgets/memory_card.dart';
 import '../widgets/inline_file_links.dart';
 import '../widgets/harness_notice_card.dart';
 import '../widgets/safe_markdown.dart';
+import '../widgets/genui/genui_action.dart';
 import '../widgets/top_toast.dart';
 import 'widgets/attachment_tile.dart';
 import 'widgets/turn_navigation_rail.dart';
@@ -496,6 +497,35 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
+  /// GenUI 组件动作回传。
+  ///
+  /// 与 Web 端保持同一条约定：正文必须以 `[genui-action]` 开头，动作名后面
+  /// 跟组件数据，模型据此重渲染。手机端只负责把这一条消息发出去；渲染结果
+  /// 仍走正常的助手消息流。
+  void _sendGenuiAction(
+    DshService dsh,
+    String action,
+    Map<String, dynamic> data,
+  ) {
+    if (action.trim().isEmpty) return;
+    if (!dsh.isConnected) {
+      _toast('网络已断开，请先重试连接');
+      return;
+    }
+    final text = buildGenuiActionPrompt(action, data);
+
+    HapticFeedback.lightImpact();
+    if (dsh.isSessionRunning) {
+      unawaited(dsh.deliverWhileRunning(text).then((ok) {
+        if (!mounted || ok) return;
+        _toast('操作未送达，请稍后重试');
+      }));
+    } else {
+      unawaited(dsh.sendChatMessage(text));
+    }
+    _scroll.scrollToBottom();
+  }
+
   void _sendMessage(DshService dsh) {
     final text = _inputController.text.trim();
     // 允许"只有附件、没有文字"（引擎的准入规则是"文字或附件"）。
@@ -818,15 +848,12 @@ class _ChatViewState extends State<ChatView> {
                   dsh,
                   isTurnStart: _isTurnStartOf(dsh.messages, msgIndex),
                 );
-                // [fix 2026-10-16] 只给正在流式的那条加
-                // RepaintBoundary。它是唯一逐 chunk 重绘的气泡，
-                // 里面是 MarkdownBody 重新解析 + 链接化扫描；
-                // 不给它单独一层，每帧的光栅化会连带波及列表里
-                // 已经稳定的历史气泡。历史消息包了反而是浪费
-                // （它们不重绘，多一层 saveLayer）。
-                if (m.isStreaming) {
-                  built = RepaintBoundary(child: built);
-                }
+                // [fix 2026-10-25] 所有消息都加 RepaintBoundary 隔离。
+                // 流式消息逐帧变化，历史消息虽然内容稳定但在 notifyListeners()
+                // 时仍会走 build()。给每条消息隔离后，Flutter 能跳过未变化的子树，
+                // 大幅减少长会话的重绘开销。历史消息的 saveLayer 开销远小于
+                // 重新布局 Markdown 和工具卡的开销。
+                built = RepaintBoundary(child: built);
                 if (highlighted) {
                   // 高亮放在这里而不是 _buildMessageItem 内部：这样
                   // 记忆卡、工具卡等所有分支都被同一层覆盖，不必逐个
@@ -1135,20 +1162,33 @@ class _ChatViewState extends State<ChatView> {
       'Contents of ',
     ];
 
-    // [fix 2026-10-16] marker 扫描按 (id, content.length) 记忆化。
+    // [fix 2026-10-25] marker 扫描缓存优化。
     //
-    // 这 9 个 indexOf 是对**整条正文**做的，而 build 每个 flush 边界跑一次。
-    // 流式消息一条回复能到几千字符，等于每个 100ms 窗口白扫 9 × 几千字符。
-    // marker 的位置在内容变长后只会前移或不变（它是正文里的固定字面量），
-    // 所以缓存是安全的：key 里带 content.length，内容一长就重算。
+    // 问题：原来按 `id@length` 作 key，流式期间每次内容变长都要重算，
+    // 且 64 条限制在长会话时频繁清空导致命中率低。
     //
-    // 用 message id 而不是 index 作 key：翻页 / 删除会让索引错位。
-    final markerCacheKey = '${msg.id}@${msg.content.length}';
-    final cached = _contextMarkerCache[markerCacheKey];
+    // 优化：稳定消息（!isStreaming）按 id 作 key 永久缓存；流式消息
+    // 每次重算但不污染缓存。流式结束后下一次 build 会按稳定 id 写入缓存。
+    // 这样缓存只增不清，命中率接近 100%。
     int earliestMarkerIndex;
-    if (cached != null) {
-      earliestMarkerIndex = cached;
+    if (!msg.isStreaming) {
+      final cached = _contextMarkerCache[msg.id];
+      if (cached != null) {
+        earliestMarkerIndex = cached;
+      } else {
+        earliestMarkerIndex = -1;
+        for (final marker in contextMarkers) {
+          final idx = msg.content.indexOf(marker);
+          if (idx != -1) {
+            if (earliestMarkerIndex == -1 || idx < earliestMarkerIndex) {
+              earliestMarkerIndex = idx;
+            }
+          }
+        }
+        _contextMarkerCache[msg.id] = earliestMarkerIndex;
+      }
     } else {
+      // 流式期间每次重算，不写缓存避免污染。
       earliestMarkerIndex = -1;
       for (final marker in contextMarkers) {
         final idx = msg.content.indexOf(marker);
@@ -1158,12 +1198,14 @@ class _ChatViewState extends State<ChatView> {
           }
         }
       }
-      // 只保留最近若干条，避免长时间挂机的会话把缓存撑大。
-      if (_contextMarkerCache.length > 64) _contextMarkerCache.clear();
-      _contextMarkerCache[markerCacheKey] = earliestMarkerIndex;
     }
 
     String displayContent = msg.content;
+    // 动作回传是发给模型的协议消息，不是用户手写的内容；历史里显示原文会
+    // 变成一大段指令。折叠成一句状态，模型侧收到的原文不受影响。
+    if (msg.role == 'user' && isGenuiActionMessage(displayContent)) {
+      displayContent = '已提交选择';
+    }
     String? embeddedContext;
     if (earliestMarkerIndex == 0) {
       return Padding(
@@ -1368,6 +1410,8 @@ class _ChatViewState extends State<ChatView> {
                       selectable: true,
                       onTapLink: (text, href, title) =>
                           _openMessageLink(dsh, href),
+                      onGenuiAction: (action, data) =>
+                          _sendGenuiAction(dsh, action, data),
                       fallbackTextStyle: TextStyle(
                         fontSize: AppText.title,
                         color: context.c.textPrimary,

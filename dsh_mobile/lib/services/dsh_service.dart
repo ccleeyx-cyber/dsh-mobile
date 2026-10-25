@@ -199,14 +199,17 @@ class DshService extends ChangeNotifier {
   int _sessionLoadSeq = 0;
   int _streamRevision = 0;
 
-  /// 流式通知合并窗口。
+  /// 流式通知合并窗口（[fix 2026-10-25] 从 100ms 加大到 150ms）。
   ///
   /// 网关的 delta 帧可以密到每秒数百片，而 `notifyListeners()` 会让整个
   /// `ChatView`（含 AppBar / 横幅 / 输入框 / 搜索面板）重建一次。人眼在
   /// ~60fps 之上看不出区别，所以按窗口节流：窗口内的增量先进 buffer，
   /// 到边界才 flush + 通知一次。收尾的 flush 是立即的（不等满窗口），
   /// 否则最后一小段内容会迟一个窗口才显示。
-  static const Duration _streamNotifyInterval = Duration(milliseconds: 100);
+  ///
+  /// 100ms → 150ms：在长会话时 100ms 仍会触发 6-7 次/秒的全量重建，
+  /// 而人眼对文字流的感知阈值在 100-200ms 之间，150ms 既流畅又减少 33% 重建。
+  static const Duration _streamNotifyInterval = Duration(milliseconds: 150);
   DateTime? _lastStreamNotifyAt;
   Timer? _streamFlushTimer;
 

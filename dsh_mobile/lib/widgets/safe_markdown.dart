@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 
 import '../theme/app_colors.dart';
+import 'genui/genui_form.dart';
 import 'genui/genui_parse.dart';
 import 'genui/genui_view.dart';
 
@@ -93,10 +94,12 @@ String _sanitizeMarkdownOnce(String raw) {
   return lines.join('\n');
 }
 
-/// 按文本 memo 的 sanitize（[fix 2026-10-17]）：流式期间每帧全量重跑
-/// 两条正则是长回复卡顿的来源之一。LRU=8 足够覆盖可见消息。
+/// 按文本 memo 的 sanitize（[fix 2026-10-25] 扩大缓存容量）。
+///
+/// 原来 8 条上限在长会话滚动时频繁清空。改为 128 条：按平均 2KB/消息，
+/// 缓存约 256KB，对手机内存无压力，且能覆盖大部分可见 + 临近消息。
 final Map<String, String> _sanitizeCache = <String, String>{};
-const int _sanitizeCacheLimit = 8;
+const int _sanitizeCacheLimit = 128;
 
 String sanitizeMarkdown(String? raw) {
   if (raw == null || raw.isEmpty) return '';
@@ -104,7 +107,12 @@ String sanitizeMarkdown(String? raw) {
   if (cached != null) return cached;
   final result = _sanitizeMarkdownOnce(raw);
   if (_sanitizeCache.length >= _sanitizeCacheLimit) {
-    _sanitizeCache.remove(_sanitizeCache.keys.first);
+    // LRU 淘汰：删除最早的 1/4，避免每次满了都删一条导致频繁操作。
+    final toRemove = (_sanitizeCacheLimit * 0.25).toInt();
+    final keys = _sanitizeCache.keys.toList();
+    for (var i = 0; i < toRemove && i < keys.length; i++) {
+      _sanitizeCache.remove(keys[i]);
+    }
   }
   _sanitizeCache[raw] = result;
   return result;
@@ -128,6 +136,9 @@ String sanitizeMarkdown(String? raw) {
 ///
 /// 组件内部的文字不做 `selectable`（`Text.rich` 不支持）；围栏之外的正文仍按
 /// 传入的 `selectable` 渲染，长按复制正文的行为不受影响。
+///
+/// 交互组件的 `[genui-action]` 由 [onGenuiAction] 回传；不传时表单一律禁用，
+/// 只读预览场景不会假装能提交。
 class SafeMarkdown extends StatelessWidget {
   final String data;
   final MarkdownStyleSheet? styleSheet;
@@ -153,6 +164,12 @@ class SafeMarkdown extends StatelessWidget {
   /// 时行为与改动前**逐字一致**。
   final Map<String, MarkdownElementBuilder> builders;
 
+  /// GenUI 交互组件的 `[genui-action]` 回传。
+  ///
+  /// 只有聊天页需要（把动作作为一条用户消息送回模型）；交付物预览、记忆卡
+  /// 等只读场景不传，表单会保持禁用而不是假装可操作。
+  final GenuiActionCallback? onGenuiAction;
+
   const SafeMarkdown({
     super.key,
     required this.data,
@@ -161,6 +178,7 @@ class SafeMarkdown extends StatelessWidget {
     this.fallbackTextStyle,
     this.onTapLink,
     this.builders = const <String, MarkdownElementBuilder>{},
+    this.onGenuiAction,
   });
 
   @override
@@ -179,7 +197,11 @@ class SafeMarkdown extends StatelessWidget {
           if (text.trim().isEmpty) continue;
           children.add(_markdown(context, text));
         case GenuiSpecSegment(:final spec):
-          children.add(GenuiSpecView(spec: spec, onLink: _openLink));
+          children.add(GenuiSpecView(
+            spec: spec,
+            onLink: _openLink,
+            onGenuiAction: onGenuiAction,
+          ));
       }
     }
     if (children.isEmpty) return const SizedBox.shrink();
