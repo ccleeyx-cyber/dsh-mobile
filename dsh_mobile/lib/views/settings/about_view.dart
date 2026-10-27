@@ -67,20 +67,30 @@ class _AboutViewState extends State<AboutView> {
                       child: const Icon(Icons.layers_rounded, color: Colors.white, size: 22),
                     ),
                     const SizedBox(width: AppSpace.l),
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('DSH Mobile Pro',
-                            style: TextStyle(
-                                color: context.c.textPrimary, fontWeight: FontWeight.bold, fontSize: 14)),
-                        const SizedBox(height: AppSpace.xs),
-                        // 真源是 pubspec.yaml，构建期经 --dart-define 注入
-                        // （见 lib/models/app_version.dart 顶部链路说明）。
-                        Text(
-                          '版本: v${AppVersion.version} (Build ${AppVersion.buildNumber})',
-                          style: TextStyle(color: context.c.textSecondary, fontSize: 12),
-                        ),
-                      ],
+                    // [fix 2026-10-27] 必须 Expanded。
+                    //
+                    // 这一段是卡片里 icon 右侧的自适应文字块，而它原来没有弹性：
+                    // 版本号 `v1.39.11 (Build 100)` 一变成三位构建号，整行就比
+                    // 可用宽度宽了 12px —— RenderFlex overflow，窄屏真机上同样会
+                    // 被切掉一截。文字块本该吃掉剩余宽度并在放不下时省略。
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('DSH Mobile Pro',
+                              style: TextStyle(
+                                  color: context.c.textPrimary, fontWeight: FontWeight.bold, fontSize: 14)),
+                          const SizedBox(height: AppSpace.xs),
+                          // 真源是 pubspec.yaml，构建期经 --dart-define 注入
+                          // （见 lib/models/app_version.dart 顶部链路说明）。
+                          Text(
+                            '版本: v${AppVersion.version} (Build ${AppVersion.buildNumber})',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(color: context.c.textSecondary, fontSize: 12),
+                          ),
+                        ],
+                      ),
                     ),
                   ],
                 ),
