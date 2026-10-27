@@ -2493,6 +2493,28 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
       final idx = s.indexOf('\n\n📎 ');
       return idx >= 0 ? s.substring(0, idx) : s;
     }
+
+    // [fix 2026-10-27] 先剔掉网关**兜底伪造**的那条用户消息。
+    //
+    // 引擎读不到历史时（网关鉴权失效、引擎重启中），网关会拿本地投影缓存里的
+    // `titleInput` 造一条用户消息顶上（见网关 `index.js` 的「兜底解析」分支）：
+    // 它有 id 和时间，但**既没有 rpcId 也没有 seq**。对账是靠身份配对的，于是
+    // 它永远配不上手机上那条乐观消息 —— 同一条提问就并排出现两次。
+    //
+    // 这里删影子、留本机那条：本地那份带着附件字节与预览，信息更多。判据收得很
+    // 紧（服务端无身份 + 角色相同 + 正文相同），真历史永远带 seq，不会被误删。
+    final localUserTexts = _messages
+        .where((m) => m.isUser && m.seq == null)
+        .map((m) => stripAttachmentLabel(m.content).trim())
+        .where((s) => s.isNotEmpty)
+        .toSet();
+    if (localUserTexts.isNotEmpty) {
+      serverMessages.removeWhere((s) =>
+          s.isUser &&
+          s.clientRequestId == null &&
+          s.seq == null &&
+          localUserTexts.contains(stripAttachmentLabel(s.content).trim()));
+    }
     bool matchesServer(ChatMessage local) {
       return serverMessages.any((server) =>
           (local.clientRequestId != null &&

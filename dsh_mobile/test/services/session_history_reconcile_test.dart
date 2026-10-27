@@ -109,6 +109,37 @@ void main() {
       expect(ids.first, 'u101');
       expect(ids.contains('local1'), isTrue, reason: '刚发出的提问不能被服务端窗口吞掉');
     });
+
+    test('网关兜底伪造的首条提问不会与本机乐观消息并排出现', () {
+      // [fix 2026-10-27] 实况：引擎读不到历史时（网关鉴权失效/引擎重启中），
+      // 网关会拿本地投影缓存的 titleInput 造一条用户消息顶上 —— 它有 id 和时间，
+      // 但**没有 rpcId、也没有 seq**。对账靠身份配对，于是配不上，同一条提问在
+      // 聊天里并排出现两条（用户 2026-10-27 14:53 实测就是这样）。
+      final dsh = newService();
+      dsh.debugSetMessages([
+        ChatMessage(
+          id: 'local-opt',
+          role: 'user',
+          content: '你帮我看下这两个数据为什么不一样\n\n📎 a.png、b.png',
+          clientRequestId: 'req-1',
+          timestamp: DateTime.now(),
+        ),
+      ]);
+
+      dsh.debugReconcileServerMessages([
+        {
+          'id': 'hist_fake',
+          'role': 'user',
+          'content': '你帮我看下这两个数据为什么不一样',
+          'time': DateTime.now().millisecondsSinceEpoch,
+        },
+      ]);
+
+      expect(dsh.messages.where((m) => m.role == 'user').length, 1,
+          reason: '同一条提问只能留一条：影子消息必须让位');
+      expect(dsh.messages.single.content, contains('📎'),
+          reason: '该留下的是本机那条（带附件名，信息更多）');
+    });
   });
 
   group('首屏全量补齐（ensureFullHistory）', () {
