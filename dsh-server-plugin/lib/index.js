@@ -445,11 +445,32 @@ export function apply(ctx, config = {}, internals = {}) {
   let cookieFactory = createCookieFactory({ dshPort, secret: internalSecret });
   const reloadInternalSecret = () => {
     const next = resolveInternalSecret();
-    if (!next || next === internalSecret) return false;
-    internalSecret = next;
-    cookieFactory = createCookieFactory({ dshPort, secret: next });
-    logger.warn('[dsh-mobile-bridge] 引擎密钥已轮换，已重新加载并重试（旧 cookie 作废）');
-    audit('bridge/secret-reloaded', {});
+    const secretChanged = !!next && next !== internalSecret;
+    if (secretChanged) {
+      internalSecret = next;
+      cookieFactory = createCookieFactory({ dshPort, secret: next });
+      logger.warn('[dsh-mobile-bridge] 引擎密钥已轮换，已重新加载并重试（旧 cookie 作废）');
+      audit('bridge/secret-reloaded', {});
+    }
+    /* [fix 2026-10-27] 密钥没变也要重建 cookie。
+     *
+     * 签名 cookie 自带 24 小时有效期（core.mjs：`expiresAt = issuedAt + 86400s`），
+     * 而网关只在启动时铸一次。于是**跑满 24 小时的网关会原地过期**：此后引擎对
+     * 每个 RPC 都回 401 `unauthorized`，手机上看到的是
+     * 「发送失败: Failed to parse RPC response: unauthorized」，而磁盘上的密钥
+     * 一个字都没改，旧逻辑据此判定"密钥没变 = 问题不在密钥"，于是**不重试**、
+     * 直接把这个 401 抛给用户 —— 表现就是"网关没重启过，却突然发不出消息，
+     * 只有重启 dsh web 能好"（2026-10-27 实测：进程 03:58 启动，次日 08:55
+     * 开始全量失败，正好 24 小时后）。
+     *
+     * 现在无论密钥有没有变，都重建一次 cookie 再让上层重试一次：过期这条路径
+     * 也就自愈了。真·鉴权失败仍然会照原样抛出去（只多打一次请求）。
+     */
+    try {
+      cookieFactory.refresh();
+    } catch (e) {
+      logger.warn('[dsh-mobile-bridge] 重建 cookie 失败:', e?.message || e);
+    }
     return true;
   };
   const refreshCookie = async () => {

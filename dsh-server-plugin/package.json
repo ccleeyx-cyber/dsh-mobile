@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-access",
-  "version": "1.16.2",
+  "version": "1.16.3",
   "description": "把 DSH 变成手机可用的远程终端：带鉴权的移动网关（设备配对、会话流式中继、审批、交付物、Runbook），手机扫码即连，不暴露 3080。",
   "type": "module",
   "main": "lib/index.js",
@@ -68,4 +68,5 @@
     }
   }
 }
+
 
