@@ -58,8 +58,31 @@ enum QueueActionOutcome {
   failed,
 }
 
-class DshService extends ChangeNotifier {
-  WebSocketChannel? _channel;
+/// 把网关/引擎的原始失败文本翻译成一句能照着做的话（[fix 2026-10-27]）。
+///
+/// 原始文本复述的是网关内部链路（`Failed to parse RPC response: unauthorized`
+/// 这类）：用户看到只会以为手机坏了，而真正要做的事在电脑端。这里按**能采取的
+/// 动作**归类 —— 能自己重发的说重发，必须去电脑上处理的就明说电脑。
+String describeSendFailure(String raw) {
+  final s = raw.toLowerCase();
+  if (s.contains('failed to parse rpc response') || s.contains('unauthorized')) {
+    return '电脑上的网关与引擎鉴权已失效（引擎拒绝了网关）——重启 dsh web 后可恢复，可直接重发';
+  }
+  if (s.contains('401') || s.contains('403')) {
+    return '设备鉴权失效——到 设置 → 连接与诊断 重新连接或配对';
+  }
+  if (s.contains('timeout') || s.contains('timed out')) {
+    return '网关响应超时——网络不稳定，可直接重发';
+  }
+  if (s.contains('econnrefused') ||
+      s.contains('socket') ||
+      s.contains('connection')) {
+    return '连不上网关——检查电脑端是否还在运行、地址与端口是否正确';
+  }
+  return raw;
+}
+
+class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
   Timer? _heartbeatTimer;
   Timer? _sessionPollTimer;
 
@@ -2133,8 +2156,11 @@ class DshService extends ChangeNotifier {
           }
         } catch (_) {}
         _lastError = errStr;
-        assistantMsg.content = '❌ 发送失败: $errStr';
-        assistantMsg.isStreaming = false;
+        // [fix 2026-10-27] 这次发送没有产生任何一轮回答：撤掉凭空造出来的
+        // assistant 占位（它让聊天里永久多出一条"写着 ❌ 的 AI 回复"），
+        // 把原因记在**用户那条消息**上，就地标注 + 一键重发。
+        _messages.remove(assistantMsg);
+        userMsg.sendError = describeSendFailure(errStr);
         _setSending(false);
         // 正文还回草稿：网关没收到，用户不该只能凭记忆重打。
         // 还回**发起会话**的草稿键，而不是当前的（用户可能已切走）。
@@ -2150,13 +2176,26 @@ class DshService extends ChangeNotifier {
       if (_isCanceling || turnId <= _cancelledTurnSeq) return;
       debugPrint('[DshService] sendPrompt error: $e');
       _lastError = '发送指令异常: $e';
-      assistantMsg.content = '❌ 发送指令失败: $e';
-      assistantMsg.isStreaming = false;
+      _messages.remove(assistantMsg);
+      userMsg.sendError = describeSendFailure('$e');
       _setSending(false);
       drafts.write(draftKeyAtSend, text);
       _scheduleFailedSendResync(sessionId);
       notifyListeners();
     }
+  }
+
+  /// 重发一条「未送达」的消息（[fix 2026-10-27]）。
+  ///
+  /// 先把失败的那条从流里摘掉再重发 —— 否则每重试一次就多留一对气泡，而用户
+  /// 想要的只是"这一句再发一遍"。失败时正文还被写回了草稿，重发即视为用户
+  /// 已经确认要发，所以顺带把那份草稿清掉，免得输入框里再挂一份。
+  void retryFailedMessage(ChatMessage msg) {
+    if (msg.sendError == null) return;
+    _messages.remove(msg);
+    drafts.clear(_currentSession?.sessionId ?? 'default');
+    notifyListeners();
+    unawaited(sendChatMessage(msg.content));
   }
 
   /// [fix 2026-10-14] 发送失败后的延迟对账：5 秒后拉一次会话快照。若引擎其实

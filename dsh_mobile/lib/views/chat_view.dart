@@ -1329,6 +1329,53 @@ class _ChatViewState extends State<ChatView> {
                         ],
                       ),
                     ),
+                    // [fix 2026-10-27] 没送出去的这条就地标注 + 一键重发。
+                    //
+                    // 以前这个状态被写进一个凭空造出来的 assistant 气泡里，于是
+                    // 点一次发送、失败、再点一次，聊天里就永久留下两对
+                    // 「用户气泡 + 写着 ❌ 的 AI 气泡」——看起来像模型回了错误，
+                    // 实际上那一轮根本没发生。
+                    if (msg.sendError != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 3),
+                        child: GestureDetector(
+                          key: ValueKey('retry-${msg.id}'),
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () => dsh.retryFailedMessage(msg),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(Icons.error_outline_rounded,
+                                      size: 13, color: context.c.danger),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    '未送达 · 点此重试',
+                                    style: TextStyle(
+                                      fontSize: AppText.caption,
+                                      fontWeight: FontWeight.w600,
+                                      color: context.c.danger,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                msg.sendError!,
+                                textAlign: TextAlign.right,
+                                maxLines: 3,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  color: context.c.textTertiary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
                   ],
                 ),
               ),
@@ -1519,7 +1566,7 @@ class _ChatViewState extends State<ChatView> {
         '${tools.length}:${tools.where((t) => t.isRunning).length}:'
         '${lastTool?.output.length ?? 0}:${lastTool?.input.length ?? 0}|'
         '${m.attachments.length}:${m.localImagePreviews.length}|'
-        '${m.turnTokens ?? -1}|'
+        '${m.turnTokens ?? -1}|${m.sendError ?? ''}|'
         '${identityHashCode(dsh.deliverables)}:${dsh.deliverables.length}';
   }
 
