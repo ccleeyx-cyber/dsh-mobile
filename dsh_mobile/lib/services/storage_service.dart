@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -319,21 +320,6 @@ class StorageService {
     await _syncActiveMirror(profiles);
   }
 
-  /// Inserts or replaces by id. Assigns an id to [config] in place if it has
-  /// none, and returns the new list so the caller can refresh its state.
-  static Future<List<ServerConfig>> upsertProfile(ServerConfig config) async {
-    if (config.id.isEmpty) config.id = newId();
-    final profiles = await loadProfiles();
-    final i = profiles.indexWhere((p) => p.id == config.id);
-    if (i >= 0) {
-      profiles[i] = config;
-    } else {
-      profiles.add(config);
-    }
-    await _writeProfiles(profiles);
-    return profiles;
-  }
-
   /// 给一个新网关挑一个**不重复**的别名（[feat 2026-10-22]）。
   ///
   /// 为什么需要：用户可能挂着两台电脑走同一个域名（或同一台电脑的两个网关
@@ -371,23 +357,23 @@ class StorageService {
         final profiles = await loadProfiles();
         profiles.removeWhere((p) => p.id == id);
         await _writeProfiles(profiles);
-    // 连密钥槽一起删。失败不影响删除结果 —— 留一段读不到的密文远好过因为清理
-    // 失败而删不掉网关。
-    await SecureStore.delete(_tokenKey(id));
-    await SecureStore.delete(_authKey(id));
-    // [fix 2026-10-17] 迁移前的旧槽（_activeSecretScope）也要清：profile 早年
-    // 可能还没分配 id 就把密文写在了 active 槽里，只删主槽会把它留在 Keystore。
-    await SecureStore.delete(_tokenKey(_activeSecretScope));
-    await SecureStore.delete(_authKey(_activeSecretScope));
-    final prefs = await SharedPreferences.getInstance();
-    if (prefs.getString(_keyActiveId) == id) {
-      // 删掉的正是当前网关 → 留一个空墓碑，而不是把键删掉：键一旦不存在，
-      // 下次启动的迁移路径会把 `dsh_server_config` 镜像当成旧安装重新提升，
-      // 被删的网关就复活了。
-      await prefs.setString(_keyActiveId, _noActiveProfile);
-    }
-    return profiles;
-  }
+        // 连密钥槽一起删。失败不影响删除结果 —— 留一段读不到的密文远好过因为清理
+        // 失败而删不掉网关。
+        await SecureStore.delete(_tokenKey(id));
+        await SecureStore.delete(_authKey(id));
+        // [fix 2026-10-17] 迁移前的旧槽（_activeSecretScope）也要清：profile 早年
+        // 可能还没分配 id 就把密文写在了 active 槽里，只删主槽会把它留在 Keystore。
+        await SecureStore.delete(_tokenKey(_activeSecretScope));
+        await SecureStore.delete(_authKey(_activeSecretScope));
+        final prefs = await SharedPreferences.getInstance();
+        if (prefs.getString(_keyActiveId) == id) {
+          // 删掉的正是当前网关 → 留一个空墓碑，而不是把键删掉：键一旦不存在，
+          // 下次启动的迁移路径会把 `dsh_server_config` 镜像当成旧安装重新提升，
+          // 被删的网关就复活了。
+          await prefs.setString(_keyActiveId, _noActiveProfile);
+        }
+        return profiles;
+      });
 
   static Future<List<ServerConfig>> renameProfile(String id, String name) =>
       _withProfilesLock(() async {
@@ -591,33 +577,53 @@ class StorageService {
 
   /// [fix 2026-10-28] profile 读-改-写串行锁。
   ///
-  /// upsert/rename/delete/loadProfiles 的迁移回写都是「异步读 → 改 → 整体回写」。
-  /// 无互斥时并发调用后写覆盖前写：一次丢更新（典型：保存网关的同时列表在
-  /// 迁移回写/另一次保存，先完成的那份修改被静默抹掉）。用静态 future 链把
-  /// 所有涉及 _writeProfiles 的复合操作排队执行。
-  static Future<void> _profilesOpLock = Future.value();
+  /// upsert/rename/delete 都是「异步读 → 改 → 整体回写」。无互斥时并发调用
+  /// 后写覆盖前写：一次丢更新（典型：保存网关的同时另一次保存在途，先完成的
+  /// 那份修改被静默抹掉）。
+  static bool _profilesBusy = false;
+  static final List<Completer<void>> _profilesWaiters = <Completer<void>>[];
 
   /// 在串行锁内执行一次 profile 复合操作（读-改-写）。
-  static Future<T> _withProfilesLock<T>(Future<T> Function() op) {
-    final run = _profilesOpLock.then((_) => op());
-    // 锁链吞掉异常，否则一次失败会让后续排队操作全部短路。
-    _profilesOpLock = run.then((_) {}, onError: (_) {});
-    return run;
+  static Future<T> _withProfilesLock<T>(Future<T> Function() op) async {
+    // 无竞争时与直接调用完全同形（只多一个微任务），不会改变既有调用时序。
+    if (_profilesBusy) {
+      final waiter = Completer<void>();
+      _profilesWaiters.add(waiter);
+      // 排队等待，但**最多等 10 秒**：平台通道（Keystore / SharedPreferences）
+      // 出现过永不完成的情况，一次卡死不能把后续所有读写永久堵住。
+      await waiter.future
+          .timeout(const Duration(seconds: 10), onTimeout: () {});
+    }
+    _profilesBusy = true;
+    try {
+      return await op();
+    } finally {
+      _profilesBusy = false;
+      if (_profilesWaiters.isNotEmpty) {
+        final next = _profilesWaiters.removeAt(0);
+        if (!next.isCompleted) next.complete();
+      }
+    }
   }
 
-  static Future<List<ServerConfig>> upsertProfile(ServerConfig config) =>
-      _withProfilesLock(() async {
-        if (config.id.isEmpty) config.id = newId();
-        final profiles = await loadProfiles();
-        final i = profiles.indexWhere((p) => p.id == config.id);
-        if (i >= 0) {
-          profiles[i] = config;
-        } else {
-          profiles.add(config);
-        }
-        await _writeProfiles(profiles);
-        return profiles;
-      });
+  /// Inserts or replaces by id, serialized against other profile writes.
+  ///
+  /// [config.id] is assigned **同步**（与改锁之前一致）：调用方 `await` 之后
+  /// 立刻读 `config.id` 的既有契约不能因为排队而延后。
+  static Future<List<ServerConfig>> upsertProfile(ServerConfig config) {
+    if (config.id.isEmpty) config.id = newId();
+    return _withProfilesLock(() async {
+      final profiles = await loadProfiles();
+      final i = profiles.indexWhere((p) => p.id == config.id);
+      if (i >= 0) {
+        profiles[i] = config;
+      } else {
+        profiles.add(config);
+      }
+      await _writeProfiles(profiles);
+      return profiles;
+    });
+  }
 
   static Future<void> _writeProfiles(List<ServerConfig> profiles) async {
     _pendingScrub = false;

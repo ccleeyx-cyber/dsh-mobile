@@ -2160,8 +2160,8 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
       // 重发，与其他失败同款。
       if (res != null && _checkResponseAuth(res)) {
         _messages.remove(assistantMsg);
-        userMsg.sendError =
-            describeSendFailure(_lastError ?? '登录状态已失效，请重新配对');
+        userMsg.sendError = describeSendFailure(
+            _lastError.isEmpty ? '登录状态已失效，请重新配对' : _lastError);
         _setSending(false);
         drafts.write(draftKeyAtSend, text);
         notifyListeners();
@@ -2643,27 +2643,36 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
         firstServer.isUser &&
         firstServer.clientRequestId == null &&
         firstServer.content == stripAttachmentLabel(m.content));
-    // [fix 2026-10-28] 分桶不再按 wall-clock。
+    // [fix 2026-10-28] 分桶：仍按 wall-clock，但**正在跑的那一轮**豁免。
     //
     // 旧实现按 timestamp.isBefore(firstServerTime) 把 pending 分到服务端窗口
-    // 前后：手机与网关时钟偏差超过网络延迟时（NTP 关闭/时区漂移常见分钟级），
-    // 刚发出的乐观消息（本地时钟）会被判到 beforeServer 桶、插到旧窗口甚至
-    // 上一轮回答之前；手机时钟快则排在流式中的 assistant 之后——顺序错乱，
-    // 持续 2.5s（下轮对账身份合并自愈）到整个回合（纯文字+旧网关）。
-    // 改为语义分桶：**无 seq 的本地消息（乐观/占位）一律排到服务端窗口之后**
-    // ——它们在时间上必然晚于任何已落库的消息；带 seq 但未进窗口的（窗口边界
-    // 遗留）才按 seq/时间归位。firstServerTime 仅剩旧网关 startsTurn 判定用。
+    // 前后。手机与网关时钟偏差超过网络延迟时（NTP 关闭/时区漂移常见分钟级），
+    // 刚发出的乐观消息（本地时钟）会被判到 beforeServer 桶、插到旧窗口甚至上
+    // 一轮回答之前；手机时钟快则排在流式中的 assistant 之后。
+    //
+    // 不能一刀切改成"无 seq 一律排后面"——缓存恢复出来的更早历史同样无 seq，
+    // 那样会把它们整体推到列表末尾（比原缺陷更糟，已有回归用例钉住顺序）。
+    // 精确的判据是「这一轮还在跑」：本地尾部那个流式 assistant 占位及其前一条
+    // （乐观 user 消息）与网关时间不可比，一律排到服务端窗口**之后**；其余
+    // 消息照旧按时间落位。
+    final lastStreamingIdx = _messages.lastIndexWhere((m) => m.isStreaming);
+    bool forceAfterServer(ChatMessage m) {
+      if (lastStreamingIdx < 0) return false;
+      final idx = _messages.indexOf(m);
+      return idx >= lastStreamingIdx - 1;
+    }
+
     final beforeServer = firstServerTime == null || startsTurn
         ? const <ChatMessage>[]
         : pending
             .where((m) =>
-                m.seq != null &&
-                m.timestamp.isBefore(firstServerTime))
+                !forceAfterServer(m) && m.timestamp.isBefore(firstServerTime))
             .toList();
     final afterServer = firstServerTime == null || startsTurn
         ? pending
         : pending
-            .where((m) => m.seq == null || !m.timestamp.isBefore(firstServerTime))
+            .where((m) =>
+                forceAfterServer(m) || !m.timestamp.isBefore(firstServerTime))
             .toList();
     _messages = [...olderKept, ...beforeServer, ...serverMessages, ...afterServer];
     _cacheSessionHistory(targetSessionId, _historyExhausted);

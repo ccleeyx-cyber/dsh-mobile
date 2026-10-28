@@ -328,7 +328,6 @@ class _GenuiTextFieldState extends State<GenuiTextField> {
   @override
   Widget build(BuildContext context) {
     final scope = GenuiFormScope.maybeOf(context);
-    final id = _id(widget.node);
     final label = _label(widget.node);
     final hint = widget.node.nonEmpty('placeholder') ?? '';
     final keyboard = widget.node.nonEmpty('inputType');
