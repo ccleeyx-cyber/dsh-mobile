@@ -147,6 +147,7 @@ export function loadConfig() {
     try {
       fs.writeFileSync(f, JSON.stringify(fresh, null, 2), 'utf8');
     } catch (_) {}
+    _lastGoodConfig = fresh;
     return fresh;
   }
   try {
@@ -159,7 +160,7 @@ export function loadConfig() {
       npsPort: raw.npsPort,
       useHttps: raw.useHttps
     });
-    return {
+    const loaded = {
       token,
       port: Number(raw.port) || DEFAULT_CONFIG.port,
       remoteAccess,
@@ -169,10 +170,23 @@ export function loadConfig() {
       ntfyTopic: typeof raw.ntfyTopic === 'string' ? raw.ntfyTopic.trim() : '',
       ntfyToken: typeof raw.ntfyToken === 'string' ? raw.ntfyToken.trim() : ''
     };
+    _lastGoodConfig = loaded;
+    return loaded;
   } catch {
-    return { ...DEFAULT_CONFIG, token: generateToken() };
+    // [fix 2026-10-28] 文件存在但读失败（与 renameSync 写盘竞态 / EBUSY / 瞬时
+    // ENOENT）时绝不能静默换新随机 token：
+    //   * verifyToken 每个请求都 loadConfig，瞬时失败窗口内所有请求 401；
+    //   * 更糟的是 saveConfigInternal 第一步也 loadConfig——若此刻保存配置，
+    //   新随机 token 被持久化，所有手机凭据**永久失效**。
+    // 缓存上次成功读取的配置；冷启动且一次都没成功过时抛错（调用方如实报错，
+    // 好过静默发一个谁都不认识的 token）。
+    if (_lastGoodConfig) return _lastGoodConfig;
+    throw new Error(`config.json 读取失败（文件存在）：${f}`);
   }
 }
+
+/** [fix 2026-10-28] 上次成功读取的配置快照（见 loadConfig 的 catch 分支）。 */
+let _lastGoodConfig = null;
 
 /** 「配置已保存」钩子（同一时刻只保留一个）。 */
 let configSavedHook = null;
@@ -261,6 +275,7 @@ function saveConfigInternal(patch = {}) {
   if (patch.ntfyToken !== undefined) updated.ntfyToken = String(patch.ntfyToken || '').trim();
 
   fs.writeFileSync(configFile(), JSON.stringify(updated, null, 2), 'utf8');
+  _lastGoodConfig = updated;
   return updated;
 }
 

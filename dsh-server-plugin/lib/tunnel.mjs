@@ -276,6 +276,13 @@ export async function ensureCloudflared({
     // 2026.2.0 被删掉，52MB 下载卡成 0 字节的 `.part`，隧道再也起不来，而界面
     // 只显示"隧道未启动"（下载阶段没有状态）。实测 2026.2.0 能正常注册 ——
     // 版本旧 ≠ 不能用，升级必须是机会性的，不能当前置条件。
+    //
+    // [fix 2026-10-28] 未知哈希也**不要**删（缓存分支）。verify 的 'known' 模式
+    // 在哈希不匹配任何已知官方版本时抛错，旧 catch 无脑 rmSync —— 但二进制
+    // 被替换/是更新版本时它很可能仍能跑；下载被拦的机器上删了就永远起不来
+    // （与 10-21 那次修复的意图直接相悖，那次只保住了"已知哈希+旧版本"）。
+    // 现在 catch 里先探测 `--version`：跑得起来就带警告继续用；跑不起来（真
+    // 损坏/半个文件）才删掉重下。
     try {
       const verifiedBy = verify(dest, 'known');
       const onDisk = probeVersionFn(dest);
@@ -284,7 +291,17 @@ export async function ensureCloudflared({
       }
       logger.warn?.(`[tunnel] 本机 cloudflared 是 ${onDisk}（目标 ${version}），先用它，升级不阻塞隧道`);
       return { path: dest, downloaded: false, verifiedBy, version: onDisk, from: 'cache-old' };
-    } catch {
+    } catch (err) {
+      // 哈希不认识 ≠ 不能用：能跑就继续用（记录警告），跑不起来才删。
+      const runnable = (() => {
+        try { return Boolean(probeVersionFn(dest)); } catch { return false; }
+      })();
+      if (runnable) {
+        logger.warn?.(
+          `[tunnel] 缓存的 cloudflared 哈希未知（${err?.message || err}），` +
+          '但探测可运行——继续使用；如需校验请设置 DSH_CLOUDFLARED_SHA256');
+        return { path: dest, downloaded: false, verifiedBy: 'unknown-hash-runnable', version: probeVersionFn(dest), from: 'cache-unknown' };
+      }
       // 文件存在但跑不起来（损坏/半个文件）：删掉重下。
       try { fs.rmSync(dest, { force: true }); } catch { /* ignore */ }
     }

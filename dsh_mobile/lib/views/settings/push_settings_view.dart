@@ -89,11 +89,15 @@ class _PushSettingsViewState extends State<PushSettingsView> {
 
   Future<void> _savePush(DshService dsh) async {
     setState(() => _pushBusy = true);
+    // [fix 2026-10-28] token 留空 = 不改动（页面提示就是这么写的）：空串必须
+    // 传 null。此前无条件传空串，服务端 `if (token != null)` 不滤空——已保存
+    // 的访问令牌会在"只改 url/topic 后保存"时被空串覆盖清掉。
+    final tokenText = _ntfyTokenController.text.trim();
     final ok = await dsh.savePushConfig(
       enabled: _ntfyEnabled,
       url: _ntfyUrlController.text.trim(),
       topic: _ntfyTopicController.text.trim(),
-      token: _ntfyTokenController.text.trim(),
+      token: tokenText.isEmpty ? null : tokenText,
     );
     if (!mounted) return;
     setState(() {

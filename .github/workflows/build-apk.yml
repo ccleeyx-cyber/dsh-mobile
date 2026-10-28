@@ -102,9 +102,14 @@ jobs:
       # （2026-10-25 实测：tests 461 / pass 432 / 29 个套件 hookFailed）。
       # 这里按提交的 package-lock.json 装依赖；lock 与 package.json 万一不同步，
       # 退回 install 而不是让整条发布流水线因一个脆弱的 lock 直接红掉。
+      # [fix 2026-10-28] 两个分支都要带 --legacy-peer-deps：这份 lock 是刻意
+      # 不含 cordis peer 树的（见 bridge-tests.yml 的既有结论），裸 npm ci 必
+      # 因 peer 冲突失败，于是每次发布都走 install 兜底、装上本不该装的
+      # cordis peer —— 测的是重新解析的依赖树，不是提交的那份。两个分支都
+      # 带上后，lock 同步时真正走 ci、真正测提交的树。
       - name: Install gateway dependencies
         working-directory: ./dsh-server-plugin
-        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund --legacy-peer-deps || npm install --no-audit --no-fund --legacy-peer-deps
 
       - name: Test gateway (hermetic only)
         run: npm test
@@ -252,11 +257,17 @@ jobs:
         id: notes
         run: |
           VERSION="${{ steps.ver.outputs.version }}"
+          # [fix 2026-10-28] 小节正文以结尾的 `---` 分隔线收尾：提取时把分隔线
+          # 挡掉，否则 Release notes 与 latest.json 的 releaseNotes 末尾都多一行
+          # `---`。跳过小节头后第一行就是空行，用 NF/nr 兜住前导空行不重复。
           awk -v ver="$VERSION" '
             index($0, "## [" ver "]") == 1 { found=1; next }
             found && /^## / { exit }
+            found && /^---[ \t]*$/ { exit }
             found { print }
           ' CHANGELOG.md > notes.md
+          # 去掉结尾空行，notes.md 以正文收尾
+          printf '%s\n' "$(cat notes.md)" > notes.md
           if [ -s notes.md ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
             echo "--- CHANGELOG 小节 $VERSION ($(wc -l < notes.md) 行) ---"

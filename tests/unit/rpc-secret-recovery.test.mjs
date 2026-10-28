@@ -10,8 +10,9 @@
  * 用户看到的现象：「手机端突然没有会话信息显示了，只有我发送的第一段文字」——
  * 因为历史走不到引擎的 `session/page`，只能掉到投影缓存里 titleInput 的兜底。
  *
- * 这里钉住的是自愈本身的边界：只重试一次、只在密钥**真的变了**时重试、别的错误
- * 不许触发重载（否则一次网络抖动就会让网关偷偷换掉密钥状态）。
+ * 这里钉住的是自愈本身的边界：[fix 2026-10-28] unauthorized 一律刷一次重试
+ * 一次（cookie 24h 过期时密钥没变）、连续失败熔断防双发、别的错误不许触发
+ * 重载（否则一次网络抖动就会让网关偷偷换掉密钥状态）。
  */
 
 import { describe, it } from 'node:test';
@@ -78,6 +79,12 @@ describe('密钥轮换自愈：只重试一次', () => {
   });
 
   it('密钥没变就不重试，原样抛（问题不在密钥上）', async () => {
+    // [fix 2026-10-28] 语义已变：2026-10-27 修 cookie 24h 过期后
+    // reloadCredentials（网关侧 reloadInternalSecret）恒返回 true——密钥没变
+    // cookie 也可能过期，旧"返回 false 就不重试"防线恰好在过期场景放行失败。
+    // 现在 unauthorized 一律刷一次重试一次（防双发的熔断在连续失败侧，见
+    // 下一条用例）；本用例钉住的是"恒 false 也照样重试一次、第二次失败如实
+    // 抛出、不会无限循环"。
     let attempts = 0;
     const caller = createRetryingRpcCaller({
       makeClient: () => async () => { attempts += 1; throw new Error('unauthorized'); },
@@ -85,7 +92,44 @@ describe('密钥轮换自愈：只重试一次', () => {
     });
 
     await assert.rejects(() => caller.call('x', {}), /unauthorized/);
-    assert.equal(attempts, 1);
+    assert.equal(attempts, 2, '恒 false 也重试一次（cookie 过期路径），再失败如实抛');
+  });
+
+  it('[fix 2026-10-28] 连续 unauthorized 达到熔断阈值后不再双发', async () => {
+    let attempts = 0;
+    const caller = createRetryingRpcCaller({
+      makeClient: () => async () => { attempts += 1; throw new Error('unauthorized'); },
+      reloadCredentials: () => true
+    });
+    // 前 5 次 call 各自双发（attempts +2），之后熔断：单次 call 只发 1 次。
+    for (let i = 0; i < 6; i++) {
+      await assert.rejects(() => caller.call('x', {}), /unauthorized/);
+    }
+    const before = attempts;
+    await assert.rejects(() => caller.call('x', {}), /unauthorized/);
+    assert.equal(attempts - before, 1, '熔断后单次 call 只打一次（不再读盘+双发）');
+    // 一次成功即复位：熔解除后恢复重试语义。
+    let ok = false;
+    const caller2 = createRetryingRpcCaller({
+      makeClient: () => async () => {
+        if (ok) return 'fine';
+        throw new Error('unauthorized');
+      },
+      reloadCredentials: () => true
+    });
+    await assert.rejects(() => caller2.call('x', {}), /unauthorized/);
+    ok = true;
+    assert.equal(await caller2.call('x', {}), 'fine');
+    ok = false;
+    await assert.rejects(() => caller2.call('x', {}), /unauthorized/);
+    // 复位后又有重试额度。
+    const flaky = [false, true];
+    let i2 = 0;
+    const caller3 = createRetryingRpcCaller({
+      makeClient: () => async () => { i2++; return flaky[i2 - 1] ? 'y' : (() => { throw new Error('unauthorized'); })(); },
+      reloadCredentials: () => true
+    });
+    assert.equal(await caller3.call('x', {}), 'y');
   });
 
   it('非 401 的失败不触发重载', async () => {

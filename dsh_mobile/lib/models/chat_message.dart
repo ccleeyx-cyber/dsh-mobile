@@ -17,8 +17,12 @@ ToolExecution toolExecutionFromWire(dynamic raw) {
 }
 
 /// wire 时间戳（毫秒）。
+///
+/// [fix 2026-10-28] 与 wireSeq 同款 num 兜底：此前 `raw as int` 硬转，JSON 里
+/// 浮点毫秒（double，如 1761632105123.0）会抛 TypeError，整份消息列表解析
+/// 中断 —— 会话打不开/翻页失败，被外层 catch 吞成一句"加载会话异常"。
 DateTime? wireTime(dynamic raw) =>
-    raw == null ? null : DateTime.fromMillisecondsSinceEpoch(raw as int);
+    raw == null ? null : DateTime.fromMillisecondsSinceEpoch(wireSeq(raw)!);
 
 int? wireSeq(dynamic raw) =>
     raw is int ? raw : (raw is num ? raw.toInt() : null);
@@ -93,6 +97,16 @@ class ChatMessage {
   ///
   /// 只存在于本机乐观消息上；服务端回包与历史解析永远不设置它。
   String? sendError;
+
+  /// [fix 2026-10-28] 重发用的**原始发送载荷**（只存在于本机乐观消息上）。
+  ///
+  /// content 是展示文本：纯附件消息的正文是 `'📎 文件名'`、混合消息是
+  /// `'$text\n\n📎 …'`——直接拿它重发等于把展示标签发给模型。失败时把原始
+  /// text 与附件字节存到这两个字段，重发才用得上。附件字节不丢的关键：
+  /// PendingAttachment 是发送时就有的完整载荷（图片是 base64，文件是
+  /// receiptId），不随失败消失，只需要引用回来。
+  String? sendOriginalText;
+  List<dynamic>? sendOriginalAttachments;
 
   /// [feat 2026-10-17] 引擎注入的通知语义（见 [HarnessNotice]）。
   ///

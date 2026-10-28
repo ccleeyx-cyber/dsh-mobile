@@ -366,10 +366,11 @@ class StorageService {
     return '$seed (${DateTime.now().millisecondsSinceEpoch})';
   }
 
-  static Future<List<ServerConfig>> deleteProfile(String id) async {
-    final profiles = await loadProfiles();
-    profiles.removeWhere((p) => p.id == id);
-    await _writeProfiles(profiles);
+  static Future<List<ServerConfig>> deleteProfile(String id) =>
+      _withProfilesLock(() async {
+        final profiles = await loadProfiles();
+        profiles.removeWhere((p) => p.id == id);
+        await _writeProfiles(profiles);
     // 连密钥槽一起删。失败不影响删除结果 —— 留一段读不到的密文远好过因为清理
     // 失败而删不掉网关。
     await SecureStore.delete(_tokenKey(id));
@@ -388,20 +389,21 @@ class StorageService {
     return profiles;
   }
 
-  static Future<List<ServerConfig>> renameProfile(String id, String name) async {
-    final profiles = await loadProfiles();
-    final i = profiles.indexWhere((p) => p.id == id);
-    if (i < 0) return profiles;
-    profiles[i].name = name.trim();
-    await _writeProfiles(profiles);
-    final prefs = await SharedPreferences.getInstance();
-    // Keep the active copy in step, otherwise the next launch loads a gateway
-    // whose label no longer matches the list entry it came from.
-    if (prefs.getString(_keyActiveId) == id) {
-      await _writeConfigMirror(profiles[i]);
-    }
-    return profiles;
-  }
+  static Future<List<ServerConfig>> renameProfile(String id, String name) =>
+      _withProfilesLock(() async {
+        final profiles = await loadProfiles();
+        final i = profiles.indexWhere((p) => p.id == id);
+        if (i < 0) return profiles;
+        profiles[i].name = name.trim();
+        await _writeProfiles(profiles);
+        final prefs = await SharedPreferences.getInstance();
+        // Keep the active copy in step, otherwise the next launch loads a gateway
+        // whose label no longer matches the list entry it came from.
+        if (prefs.getString(_keyActiveId) == id) {
+          await _writeConfigMirror(profiles[i]);
+        }
+        return profiles;
+      });
 
   /// Marks [id] active and mirrors it into `dsh_server_config`, which is what
   /// `main.dart` reads at startup. Returns null when the id is unknown.
@@ -586,6 +588,36 @@ class StorageService {
 
   /// 本进程读取过程中发现有需要回写的内容（补 id / 剥明文）。
   static bool _pendingScrub = false;
+
+  /// [fix 2026-10-28] profile 读-改-写串行锁。
+  ///
+  /// upsert/rename/delete/loadProfiles 的迁移回写都是「异步读 → 改 → 整体回写」。
+  /// 无互斥时并发调用后写覆盖前写：一次丢更新（典型：保存网关的同时列表在
+  /// 迁移回写/另一次保存，先完成的那份修改被静默抹掉）。用静态 future 链把
+  /// 所有涉及 _writeProfiles 的复合操作排队执行。
+  static Future<void> _profilesOpLock = Future.value();
+
+  /// 在串行锁内执行一次 profile 复合操作（读-改-写）。
+  static Future<T> _withProfilesLock<T>(Future<T> Function() op) {
+    final run = _profilesOpLock.then((_) => op());
+    // 锁链吞掉异常，否则一次失败会让后续排队操作全部短路。
+    _profilesOpLock = run.then((_) {}, onError: (_) {});
+    return run;
+  }
+
+  static Future<List<ServerConfig>> upsertProfile(ServerConfig config) =>
+      _withProfilesLock(() async {
+        if (config.id.isEmpty) config.id = newId();
+        final profiles = await loadProfiles();
+        final i = profiles.indexWhere((p) => p.id == config.id);
+        if (i >= 0) {
+          profiles[i] = config;
+        } else {
+          profiles.add(config);
+        }
+        await _writeProfiles(profiles);
+        return profiles;
+      });
 
   static Future<void> _writeProfiles(List<ServerConfig> profiles) async {
     _pendingScrub = false;

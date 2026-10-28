@@ -398,9 +398,12 @@ class _DonutChart extends StatelessWidget {
                         ),
                       ),
                       Text(
+                        // [fix 2026-10-28] 图例与 painter 统一 clamp：painter 对
+                        // 负值按 0 画，图例却显示原始负百分比（-13%）——同一数据
+                        // 两处口径不一致。
                         total <= 0
                             ? _trim(data[i].value)
-                            : '${_trim(data[i].value)} · ${(data[i].value / total * 100).toStringAsFixed(0)}%',
+                            : '${_trim(data[i].value)} · ${(math.max(0, data[i].value) / total * 100).toStringAsFixed(0)}%',
                         style: TextStyle(fontSize: 11, color: onSurface),
                       ),
                     ],

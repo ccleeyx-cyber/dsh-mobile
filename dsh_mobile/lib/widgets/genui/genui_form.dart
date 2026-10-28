@@ -43,6 +43,18 @@ class GenuiFormController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// [fix 2026-10-28] 无 id 字段的兜底存储键：input/slider 忘写 id 时（模型
+  /// 输出很常见）旧实现静默丢提交数据——`setField('')` 直接 return，payload
+  /// 与「已填 N/M」计数都不含它。派生键 = `label:字段类型`，无 label 时用
+  /// 占位序号；仅作本地暂存与提交回传，行为对有 id 的字段不变。
+  String fieldKeyFor(GenuiNode node, [int? ordinal]) {
+    final id = node.nonEmpty('id');
+    if (id != null && id.isNotEmpty) return id;
+    final label = node.nonEmpty('label');
+    if (label != null && label.isNotEmpty) return '_${node.type}:$label';
+    return '_${node.type}:${ordinal ?? ''}';
+  }
+
   void setField(String id, String value) {
     if (locked || id.isEmpty) return;
     if (fields[id] == value) return;
@@ -166,6 +178,16 @@ String _action(GenuiNode node) => node.nonEmpty('action') ?? '';
 
 String _id(GenuiNode node) => node.nonEmpty('id') ?? '';
 
+/// [fix 2026-10-28] 无 id 时的兜底字段键（存入 controller.fields 用），与
+/// GenuiFormController.fieldKeyFor 同一规则。有 id 用 id；无 id 用 label+类型。
+String _fieldKey(GenuiNode node) {
+  final id = _id(node);
+  if (id.isNotEmpty) return id;
+  final label = node.nonEmpty('label') ?? '';
+  if (label.isNotEmpty) return '_${node.type}:$label';
+  return '_${node.type}:';
+}
+
 int? _int(GenuiNode node, String key) {
   final value = node.data[key];
   return value is num ? value.toInt() : null;
@@ -259,7 +281,7 @@ class _GenuiTextFieldState extends State<GenuiTextField> {
     if (_seeded) return;
     _seeded = true;
     final saved =
-        GenuiFormScope.maybeOf(context)?.controller.fields[_id(widget.node)];
+        GenuiFormScope.maybeOf(context)?.controller.fields[_fieldKey(widget.node)];
     if (saved != null && saved.isNotEmpty) {
       _text.text = saved;
       _lastSent = saved;
@@ -327,7 +349,8 @@ class _GenuiTextFieldState extends State<GenuiTextField> {
                   : TextInputType.text),
           style: TextStyle(fontSize: 13.5, color: context.c.textPrimary),
           decoration: _inputDecoration(context, hint),
-          onChanged: (value) => scope?.controller.setField(id, value),
+          onChanged: (value) =>
+              scope?.controller.setField(_fieldKey(widget.node), value),
           onSubmitted: (_) => _send(reason: 'submit'),
         ),
       ],
@@ -550,7 +573,7 @@ class _GenuiSelectFieldState extends State<GenuiSelectField> {
     if (_seeded) return;
     _seeded = true;
     final saved =
-        GenuiFormScope.maybeOf(context)?.controller.fields[_id(widget.node)];
+        GenuiFormScope.maybeOf(context)?.controller.fields[_fieldKey(widget.node)];
     if (saved != null &&
         saved.isNotEmpty &&
         _optionLabels(widget.node).contains(saved)) {
@@ -582,7 +605,10 @@ class _GenuiSelectFieldState extends State<GenuiSelectField> {
                 child: Text(option, overflow: TextOverflow.ellipsis),
               ),
           ],
-          onChanged: !(scope?.canAct ?? false) && action.isNotEmpty
+          // [fix 2026-10-28] 提交锁定后禁用（radio/checkbox 在 385 行有 locked
+          // 判定，select/switch 漏了）：点「提交选择」后继续点下拉仍会 _emit。
+          onChanged: ((scope?.controller.locked ?? false)) ||
+                  (!(scope?.canAct ?? false) && action.isNotEmpty)
               ? null
               : (value) {
                   if (value == null) return;
@@ -623,7 +649,9 @@ class _GenuiSwitchFieldState extends State<GenuiSwitchField> {
   Widget build(BuildContext context) {
     final action = _action(widget.node);
     final scope = GenuiFormScope.maybeOf(context);
-    final canTap = action.isEmpty || (scope?.canAct ?? false);
+    // [fix 2026-10-28] 提交锁定后禁用（与 select 同款漏判）。
+    final locked = scope?.controller.locked ?? false;
+    final canTap = !locked && (action.isEmpty || (scope?.canAct ?? false));
     return InkWell(
       borderRadius: BorderRadius.circular(8),
       onTap: !canTap
@@ -715,11 +743,16 @@ class _GenuiSliderFieldState extends State<GenuiSliderField> {
               ? null
               : (value) {
                   setState(() => _value = value);
-                  scope?.controller
-                      .setField(id, value.toStringAsFixed(step < 1 ? 1 : 0));
+                  scope?.controller.setField(
+                      _fieldKey(widget.node),
+                      value.toStringAsFixed(step < 1 ? 1 : 0));
                 },
           onChangeEnd: (value) {
-            if (action.isNotEmpty && (scope?.canAct ?? false)) {
+            // [fix 2026-10-28] 提交锁定后不再回传（onChanged 有 locked 判定，
+            // 这里漏了——锁定后拖完滑块仍 _emit [genui-action]）。
+            if (action.isNotEmpty &&
+                (scope?.canAct ?? false) &&
+                !(scope?.controller.locked ?? false)) {
               _emit(context, action, {
                 if (id.isNotEmpty) 'id': id,
                 'value': value,

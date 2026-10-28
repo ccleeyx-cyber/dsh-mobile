@@ -758,6 +758,13 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
       // 去重身份集：已有消息的 seq 与 id。
       final knownSeqs = _messages.map((m) => m.seq).whereType<int>().toSet();
       final knownIds = _messages.map((m) => m.id).toSet();
+      // [fix 2026-10-28] 无 seq 页消息按「角色+正文」去重（注释一直承诺但没
+      // 实现）：旧网关下网关页与实时尾部重叠时，无 seq 的那部分会既在头部
+      // 插入一遍又留在尾部——上翻页翻出重复消息。
+      final knownRoleTexts = _messages
+          .where((m) => m.seq == null)
+          .map((m) => '${m.role} ${m.content.trim()}')
+          .toSet();
       final older = <ChatMessage>[];
       for (final m in rawPage) {
         if (m is! Map) continue;
@@ -771,6 +778,11 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
           continue;
         }
         final msg = ChatMessage.fromWire(raw, newId: _uuid.v4);
+        if (msg.seq == null) {
+          final roleText = '${msg.role} ${msg.content.trim()}';
+          if (knownRoleTexts.contains(roleText)) continue;
+          knownRoleTexts.add(roleText);
+        }
         knownSeqs.add(seq ?? -1);
         knownIds.add(msg.id);
         older.add(msg);
@@ -2138,7 +2150,23 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
         return;
       }
 
-      if (res != null && _checkResponseAuth(res)) return;
+      // [fix 2026-10-28] 鉴权失败也走失败收尾，不能裸 return。
+      //
+      // _checkResponseAuth 只负责把 401 翻译成可读文案（handleAuthFailure），
+      // 它不清理本轮发送的本地状态：裸 return 会留下乐观 user 消息 + 凭空造的
+      // assistant 占位、_isSending 永久卡 true、草稿不还 —— 1.39.11 修掉的
+      // "失败留假 AI 气泡"在鉴权失败这条路径上原样存在。错误文案用翻译过的
+      // 那句（handleAuthFailure 已写入 _lastError 的口径），就地标注 + 一键
+      // 重发，与其他失败同款。
+      if (res != null && _checkResponseAuth(res)) {
+        _messages.remove(assistantMsg);
+        userMsg.sendError =
+            describeSendFailure(_lastError ?? '登录状态已失效，请重新配对');
+        _setSending(false);
+        drafts.write(draftKeyAtSend, text);
+        notifyListeners();
+        return;
+      }
 
       if (res != null && res.statusCode == 200) {
         // 3. Start fallback session polling
@@ -2161,6 +2189,10 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
         // 把原因记在**用户那条消息**上，就地标注 + 一键重发。
         _messages.remove(assistantMsg);
         userMsg.sendError = describeSendFailure(errStr);
+        // [fix 2026-10-28] 存下原始发送载荷供重发：content 是展示文本
+        //（含「📎 文件名」标签），直接重发会把标签发给模型、附件字节也会丢。
+        userMsg.sendOriginalText = text;
+        userMsg.sendOriginalAttachments = attachments;
         _setSending(false);
         // 正文还回草稿：网关没收到，用户不该只能凭记忆重打。
         // 还回**发起会话**的草稿键，而不是当前的（用户可能已切走）。
@@ -2178,6 +2210,9 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
       _lastError = '发送指令异常: $e';
       _messages.remove(assistantMsg);
       userMsg.sendError = describeSendFailure('$e');
+      // [fix 2026-10-28] 同上：异常路径也存原始载荷。
+      userMsg.sendOriginalText = text;
+      userMsg.sendOriginalAttachments = attachments;
       _setSending(false);
       drafts.write(draftKeyAtSend, text);
       _scheduleFailedSendResync(sessionId);
@@ -2190,12 +2225,24 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
   /// 先把失败的那条从流里摘掉再重发 —— 否则每重试一次就多留一对气泡，而用户
   /// 想要的只是"这一句再发一遍"。失败时正文还被写回了草稿，重发即视为用户
   /// 已经确认要发，所以顺带把那份草稿清掉，免得输入框里再挂一份。
+  ///
+  /// [fix 2026-10-28] 用**原始载荷**重发，不再用 content：content 是展示文本，
+  /// 纯附件消息的它形如 `'📎 a.png'`——旧行为把标签文字当正文发给模型；附件
+  /// 字节（PendingAttachment）也不随行，重发后图片/文件直接消失。失败时这两
+  /// 样已存进 [ChatMessage.sendOriginalText] / [sendOriginalAttachments]，
+  /// 这里取回；旧数据（升级前的失败消息）没有存过就回退 content。
   void retryFailedMessage(ChatMessage msg) {
     if (msg.sendError == null) return;
+    final text = msg.sendOriginalText ?? msg.content;
+    final rawAttachments = msg.sendOriginalAttachments;
+    final attachments = rawAttachments
+            ?.whereType<PendingAttachment>()
+            .toList() ??
+        const <PendingAttachment>[];
     _messages.remove(msg);
     drafts.clear(_currentSession?.sessionId ?? 'default');
     notifyListeners();
-    unawaited(sendChatMessage(msg.content));
+    unawaited(sendChatMessage(text, attachments: attachments));
   }
 
   /// [fix 2026-10-14] 发送失败后的延迟对账：5 秒后拉一次会话快照。若引擎其实
@@ -2490,8 +2537,14 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
             .toList();
     final olderIds = olderKept.map((m) => m.id).toSet();
     String stripAttachmentLabel(String s) {
+      // [fix 2026-10-28] 两种展示格式都要剥：
+      //   '$text\n\n📎 …'（混合消息，尾段剥除）与 '📎 …'（纯附件，首部标签，
+      //   displayText 见 sendChatMessage —— 旧实现只认前者，纯附件消息的正文
+      //   永远剥不掉，影剔与旧网关正文兜底对它系统性失效）。
       final idx = s.indexOf('\n\n📎 ');
-      return idx >= 0 ? s.substring(0, idx) : s;
+      if (idx >= 0) return s.substring(0, idx);
+      if (s.startsWith('📎 ')) return '';
+      return s;
     }
 
     // [fix 2026-10-27] 先剔掉网关**兜底伪造**的那条用户消息。
@@ -2528,12 +2581,49 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
               server.role == local.role &&
               server.content == stripAttachmentLabel(local.content)));
     }
+
+    // [fix 2026-10-28] 取消定格的本地 assistant 占位去重。
+    //
+    // cancelActiveTurn 把本地流式 assistant 就地定格成「*(已取消)*」——它无
+    // seq 无 rpcId。若引擎在取消生效前已落库一条 assistant 真身，切走再切回
+    // （缓存命中走本函数）时：matchesServer 四分支全不命中（真身带 rpcId+seq，
+    // 正文兜底要求双方都无 rpcId），下面的 `seq==null` 又把它永久收进
+    // pending ——「已取消」占位与真回答并排显示、且永远存在。
+    // 判据：本地无 seq、非流式的 assistant 占位，其正文剥掉取消尾注后若与
+    // 服务端窗口内某条 assistant 真身正文互为前缀（取消定格只在正文尾部追加
+    // 「\n*(任务已被手动停止)*」，前缀即发送时内容），即判同一轮、丢弃占位、
+    // 保留真身。取消早于任何内容到达（正文只有占位字样）时，只要窗口内存在
+    // assistant 真身即判重。
+    String stripCancelSuffix(String s) {
+      for (final suffix in ['\n*(任务已被手动停止)*', '\n*(已取消)*']) {
+        if (s.endsWith(suffix)) return s.substring(0, s.length - suffix.length);
+      }
+      return s;
+    }
+    final cancelledPlaceholderIds = <String>{};
+    for (final local in _messages) {
+      if (!local.isAssistant || local.seq != null || local.isStreaming) {
+        continue;
+      }
+      final bare = stripCancelSuffix(local.content).trim();
+      if (bare.isEmpty) continue;
+      final isPurePlaceholder =
+          bare == '*(已取消)*' || bare == '*(任务已被手动停止)*';
+      final matched = serverMessages.any((s) =>
+          s.isAssistant &&
+          (isPurePlaceholder ||
+              s.content.trim().startsWith(bare) ||
+              bare.startsWith(s.content.trim())));
+      if (matched) cancelledPlaceholderIds.add(local.id);
+    }
+
     final recentCutoff = DateTime.now().subtract(const Duration(minutes: 10));
     final pending = _messages.where((m) {
       if (olderIds.contains(m.id)) return false;
       if (m.seq != null && oldestServerSeq != null && m.seq! < oldestServerSeq) {
         return false;
       }
+      if (cancelledPlaceholderIds.contains(m.id)) return false;
       if (matchesServer(m)) return false;
       // 无 seq 的消息只存在于本地（乐观消息/实时占位），没有服务端真值可等，
       // 不能因时间老就丢；有 seq 的历史由上面的 olderKept/身份匹配负责。
@@ -2553,12 +2643,28 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
         firstServer.isUser &&
         firstServer.clientRequestId == null &&
         firstServer.content == stripAttachmentLabel(m.content));
+    // [fix 2026-10-28] 分桶不再按 wall-clock。
+    //
+    // 旧实现按 timestamp.isBefore(firstServerTime) 把 pending 分到服务端窗口
+    // 前后：手机与网关时钟偏差超过网络延迟时（NTP 关闭/时区漂移常见分钟级），
+    // 刚发出的乐观消息（本地时钟）会被判到 beforeServer 桶、插到旧窗口甚至
+    // 上一轮回答之前；手机时钟快则排在流式中的 assistant 之后——顺序错乱，
+    // 持续 2.5s（下轮对账身份合并自愈）到整个回合（纯文字+旧网关）。
+    // 改为语义分桶：**无 seq 的本地消息（乐观/占位）一律排到服务端窗口之后**
+    // ——它们在时间上必然晚于任何已落库的消息；带 seq 但未进窗口的（窗口边界
+    // 遗留）才按 seq/时间归位。firstServerTime 仅剩旧网关 startsTurn 判定用。
     final beforeServer = firstServerTime == null || startsTurn
         ? const <ChatMessage>[]
-        : pending.where((m) => m.timestamp.isBefore(firstServerTime)).toList();
+        : pending
+            .where((m) =>
+                m.seq != null &&
+                m.timestamp.isBefore(firstServerTime))
+            .toList();
     final afterServer = firstServerTime == null || startsTurn
         ? pending
-        : pending.where((m) => !m.timestamp.isBefore(firstServerTime)).toList();
+        : pending
+            .where((m) => m.seq == null || !m.timestamp.isBefore(firstServerTime))
+            .toList();
     _messages = [...olderKept, ...beforeServer, ...serverMessages, ...afterServer];
     _cacheSessionHistory(targetSessionId, _historyExhausted);
     _streamRevision++;
@@ -5520,16 +5626,22 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
     try {
       final uri =
           Uri.parse('${_currentConfig!.httpBaseUrl}/api/mobile/push/config');
+      // [fix 2026-10-28] 空串 token 视为「不改动」：与设置页「留空则不改动」
+      // 的契约对齐（调用方已传 null，这里再兜一层，防其他调用点传空串清令牌）。
+      final tokenToWire = (token != null && token.trim().isEmpty)
+          ? null
+          : token;
+      final body = jsonEncode({
+        if (enabled != null) 'enabled': enabled,
+        if (url != null) 'url': url,
+        if (topic != null) 'topic': topic,
+        if (tokenToWire != null) 'token': tokenToWire,
+      });
       final res = await _httpClient
           .post(
             uri,
             headers: _authHeaders,
-            body: jsonEncode({
-              if (enabled != null) 'enabled': enabled,
-              if (url != null) 'url': url,
-              if (topic != null) 'topic': topic,
-              if (token != null) 'token': token,
-            }),
+            body: body,
           )
           .timeout(const Duration(seconds: 10));
       if (_checkResponseAuth(res)) return false;
@@ -5905,7 +6017,16 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
             m.id == incoming.id);
         if (duplicate) return;
         _beginRemoteStream(sId);
-        if (_messages.isNotEmpty && _messages.last.isAssistant) {
+        // [fix 2026-10-28] 只有上一条 assistant 还在流式中才插到它前面。
+        //
+        // 旧条件只判 isAssistant：Web 端连续发起第二轮提问时，上一轮回答早已
+        // 完成（isStreaming=false），新 user 消息仍被插到那条**已完成**的回答
+        // 前面（u1,u2,a1,a2），随后 delta 在末尾新建气泡 —— 屏幕顺序错乱，直到
+        // 下次对账才纠正。正在流式中的 assistant 后面不该出现新 user（那是同
+        // 回合里的乱序），完成后新提问直接追加即可。
+        if (_messages.isNotEmpty &&
+            _messages.last.isAssistant &&
+            _messages.last.isStreaming) {
           _messages.insert(_messages.length - 1, incoming);
         } else {
           _messages.add(incoming);
@@ -6229,9 +6350,17 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
           );
         }
 
-        if (sId == null ||
-            _currentSession == null ||
+        if (sId == null) return;
+        // [fix 2026-10-28] 后台会话跑完也记账 + 触发 resync（原直接 return，
+        // 回看那个会话只能靠重进拉取、状态陈旧——isRunning 卡 true、缺最终
+        // 正文）。_requestFinalResync 只对**当前**会话发真实补拉（见其内部
+        // _resyncActiveSession 的当前会话守卫），但会把完成代次记进
+        // _completedTurnEpochs：迟到的流帧被拦；会话列表由 fetchWorkspaces
+        // 刷新出 idle 状态。通知照旧在前。
+        if (_currentSession == null ||
             !_currentSession!.matchesSessionId(sId)) {
+          _requestFinalResync(sId);
+          unawaited(fetchWorkspaces());
           return;
         }
         final doneText = json['text']?.toString() ?? '';

@@ -1172,7 +1172,13 @@ export function apply(ctx, config = {}, internals = {}) {
    * 这样引擎才会把它当成这次提问的附件。
    */
   function uploadFileToEngine({ sessionId, name, data }) {
-    return new Promise((resolve, reject) => {
+    // [fix 2026-10-28] 401 时刷 cookie 重试一次：同 1.16.3 修 unary RPC 那次，
+    // 这条 HTTP 直连路径此前绕过了 createRetryingRpcCaller 的自愈 —— 网关跑满
+    // 24 小时 cookie 过期后，带附件的发送必然失败（上传在 prompt 之前，没有别
+    // 的 RPC 先触发 refresh），且用户重试也无效（current() 一直返回缓存旧 cookie）。
+    // 引擎 401 回的是纯文本 `unauthorized`，JSON.parse 失败落进"无法解析"分支，
+    // 所以判据要同时认 statusCode===401 与 isUnauthorizedRpcError 两种形状。
+    const attempt = () => new Promise((resolve, reject) => {
       const authority = `127.0.0.1:${dshPort}`;
       const cookie = cookieFactory.current();
       const qs = new URLSearchParams();
@@ -1200,7 +1206,12 @@ export function apply(ctx, config = {}, internals = {}) {
           try {
             parsed = JSON.parse(body);
           } catch {
-            reject(new Error(`引擎上传响应无法解析 (HTTP ${res.statusCode}): ${body.slice(0, 120)}`));
+            const parseErr = new Error(`引擎上传响应无法解析 (HTTP ${res.statusCode}): ${body.slice(0, 120)}`);
+            if (res.statusCode === 401) {
+              reject(Object.assign(parseErr, { unauthorized: true }));
+            } else {
+              reject(parseErr);
+            }
             return;
           }
           if (parsed?.ok === true && parsed.value) {
@@ -1209,7 +1220,11 @@ export function apply(ctx, config = {}, internals = {}) {
             // 把引擎的业务错误原样带出去，不要吞成一句"上传失败" ——
             // 例如 FILE_TOO_LARGE / UNSUPPORTED_MEDIA_TYPE 都是用户能自己纠正的。
             const err = parsed?.error || {};
-            reject(new Error(err.message || `上传被拒绝 (HTTP ${res.statusCode})`));
+            const bizErr = new Error(err.message || `上传被拒绝 (HTTP ${res.statusCode})`);
+            if (res.statusCode === 401 || isUnauthorizedRpcError(bizErr)) {
+              bizErr.unauthorized = true;
+            }
+            reject(bizErr);
           }
         });
       });
@@ -1221,6 +1236,12 @@ export function apply(ctx, config = {}, internals = {}) {
       });
       req.write(data);
       req.end();
+    });
+
+    return attempt().catch((err) => {
+      if (!err?.unauthorized) throw err;
+      try { reloadInternalSecret(); } catch { /* 刷新失败就按原错误抛出 */ }
+      return attempt();
     });
   }
 
@@ -1290,6 +1311,26 @@ export function apply(ctx, config = {}, internals = {}) {
    * 条目：有过订阅者的条目按 30 分钟 TTL，交给关闭/作答/投影清理。
    */
   const QUESTION_UNCLAIMED_TTL_MS = 5 * 60 * 1000;
+
+  /**
+   * [fix 2026-10-28] pendingQuestions 的 TTL 此前**只在手机 subscribe 时**才被
+   * 检查（pendingQuestionsForReplay）；手机长期离线且 MUX 不断线时条目永不
+   * 过期 —— Map 无限增长，且 agent 每条新问题都会 pushNtfy 一遍（离线通知
+   * 轰炸）。60 秒一跳的周期性 prune 复用同一组 TTL 判定；unref 不阻退出，
+   * cleanupGateway 里清。
+   */
+  const questionPruneTimer = setInterval(() => {
+    if (isDisposed) return;
+    const now = Date.now();
+    for (const q of [...pendingQuestions.values()]) {
+      const age = now - q.createdAt;
+      if (age > QUESTION_TTL_MS ||
+          (q.offeredTo.size === 0 && age > QUESTION_UNCLAIMED_TTL_MS)) {
+        pendingQuestions.delete(q.eventId);
+      }
+    }
+  }, 60 * 1000);
+  questionPruneTimer.unref?.();
 
   /* -------------------------------------------------------------- *
    * Shared core wiring (see lib/core.mjs).
@@ -1470,6 +1511,10 @@ export function apply(ctx, config = {}, internals = {}) {
       try {
         const patchContent = fs.readFileSync(patchPath, 'utf8');
         const patchDoc = YAML.parse(patchContent);
+        // [fix 2026-10-28] 去重键带供应商前缀：两个供应商配了相同 id 的模型
+        // （如 wb 的 cn:glm-5.3 与 qwen 的 glm-5.3）时，旧的全局裸 id Set 会把
+        // 后一个供应商的同名模型**整体隐藏** —— App 侧 1.39.10 修的「同名模型
+        // 按供应商区分」在网关侧就被架空了，候选根本到不了手机。
         const seen = new Set();
         for (const entry of (Array.isArray(patchDoc) ? patchDoc : [])) {
           if (entry && (entry.id === 'llm-pi-ai' || entry.name === '@deepseek-ai/dsh-llm-pi-ai')) {
@@ -1483,8 +1528,9 @@ export function apply(ctx, config = {}, internals = {}) {
               if (Array.isArray(pVal?.models)) {
                 for (const m of pVal.models) {
                   const mId = m.id || m.name;
-                  if (mId && !seen.has(mId)) {
-                    seen.add(mId);
+                  const dedupeKey = `${pKey}:${mId}`;
+                  if (mId && !seen.has(dedupeKey)) {
+                    seen.add(dedupeKey);
                     availableModels.push({
                       id: mId,
                       name: m.name || mId,
@@ -6130,8 +6176,9 @@ export function apply(ctx, config = {}, internals = {}) {
       try { ws.close(); } catch (_) {}
     }
     connectedClients.clear();
-    // Nothing here holds a timer any more (see QUESTION_TTL_MS), but the map
-    // must not outlive the gateway so a re-apply starts clean.
+    // [fix 2026-10-28] 周期性 prune 定时器随网关一起收（见 questionPruneTimer）。
+    if (questionPruneTimer) clearInterval(questionPruneTimer);
+    // The map must not outlive the gateway so a re-apply starts clean.
     pendingQuestions.clear();
     questionSubscribers.clear();
     try { wss.close(); } catch (_) {}

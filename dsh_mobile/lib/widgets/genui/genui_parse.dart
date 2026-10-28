@@ -156,8 +156,13 @@ List<GenuiSegment> parseGenuiSegments(String markdown) {
     }
 
     // 找到同类型的闭合围栏（同字符、长度不短于起始围栏）。
+    // [fix 2026-10-28] CommonMark 语义：闭合围栏**不短于**起始即可（``` 开、
+    // ```` 关合法）。旧正则用 RegExp.escape(fence) 要求严格等长——比开栏长的
+    // 闭栏匹配不上，整段被误判未闭合降级成裸 JSON 代码块（组件消失）。与
+    // safe_markdown.dart 的 {fenceLen,} 写法对齐。
     final fence = m.group(1)!;
-    final closeRe = RegExp('^[ \\t]{0,3}${RegExp.escape(fence)}[ \t]*\$');
+    final closeRe =
+        RegExp('^[ \\t]{0,3}`{${fence.length},}[ \t]*\$');
     var j = i + 1;
     while (j < lines.length && !closeRe.hasMatch(lines[j])) {
       j++;

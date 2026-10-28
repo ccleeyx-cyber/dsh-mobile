@@ -150,9 +150,33 @@ class GenuiNodeView extends StatelessWidget {
   /// 规范上限 8 层；超过就不再往下画（防止畸形 spec 把界面撑爆）。
   static const int maxDepth = 8;
 
+  /// [fix 2026-10-28] 交互字段派生稳定 key，防 State 按位置串位。
+  ///
+  /// GenuiNodeView 无 key 时 Flutter 按位置复用 State：模型重新渲染调整过
+  /// 字段顺序/替换字段后，GenuiTextField 等的 TextEditingController 与本地
+  /// 值会迁到**别的字段**上（两字段初始 value 都为 null 时 didUpdateWidget
+  /// 也不重置），_send 还会用新节点的 action 配旧文本回传。
+  /// key 取 id（规格要求有），缺 id 时回退 label+类型；两者都缺用位置。
+  static const _interactiveTypes = {
+    'input', 'textarea', 'radio', 'checkbox', 'select', 'switch', 'slider',
+    'submit', 'quiz',
+  };
+
+  Key? _fieldKey() {
+    if (!_interactiveTypes.contains(node.type)) return null;
+    final id = node.nonEmpty('id');
+    if (id != null && id.isNotEmpty) return ValueKey('field-$id');
+    final label = node.nonEmpty('label');
+    if (label != null && label.isNotEmpty) {
+      return ValueKey('field-${node.type}-$label');
+    }
+    return null;
+  }
+
   @override
   Widget build(BuildContext context) {
     if (depth > maxDepth) return const SizedBox.shrink();
+    final fieldKey = _fieldKey();
     switch (node.type) {
       case 'text':
         return _text(context);
@@ -215,23 +239,31 @@ class GenuiNodeView extends StatelessWidget {
       case 'button':
         return GenuiButton(node: node);
       case 'input':
-        return GenuiTextField(node: node);
+        return KeyedSubtree(key: fieldKey, child: GenuiTextField(node: node));
       case 'textarea':
-        return GenuiTextField(node: node, multiline: true);
+        return KeyedSubtree(
+            key: fieldKey,
+            child: GenuiTextField(node: node, multiline: true));
       case 'radio':
-        return GenuiRadioField(node: node);
+        return KeyedSubtree(
+            key: fieldKey, child: GenuiRadioField(node: node));
       case 'checkbox':
-        return GenuiCheckboxField(node: node);
+        return KeyedSubtree(
+            key: fieldKey, child: GenuiCheckboxField(node: node));
       case 'select':
-        return GenuiSelectField(node: node);
+        return KeyedSubtree(
+            key: fieldKey, child: GenuiSelectField(node: node));
       case 'switch':
-        return GenuiSwitchField(node: node);
+        return KeyedSubtree(
+            key: fieldKey, child: GenuiSwitchField(node: node));
       case 'slider':
-        return GenuiSliderField(node: node);
+        return KeyedSubtree(
+            key: fieldKey, child: GenuiSliderField(node: node));
       case 'submit':
-        return GenuiSubmitButton(node: node);
+        return KeyedSubtree(
+            key: fieldKey, child: GenuiSubmitButton(node: node));
       case 'quiz':
-        return GenuiQuiz(node: node);
+        return KeyedSubtree(key: fieldKey, child: GenuiQuiz(node: node));
       default:
         return _Unsupported(node: node);
     }

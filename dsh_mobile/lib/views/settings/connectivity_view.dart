@@ -74,7 +74,24 @@ class _ConnectivityViewState extends State<ConnectivityView> {
     }
   }
 
+  // [fix 2026-10-28] 快照记忆化：context.watch 使流式期间每 150ms 一次 notify
+  // 都触发 build 重算——_snapshot 全量遍历 workspaces（本机 2300+ 会话）。
+  // 只有真正影响网关健康的输入变了才重算：workspaces 引用、连接态、ping、
+  // 待审批/提问数量。会话内容流式增量不改 workspaces 列表引用，直接复用。
+  GatewayHealth? _cachedHealth;
+  List<dynamic>? _cachedWorkspaces;
+  int _cachedConnState = -1;
+  int _cachedPing = -1;
+  int _cachedApprovals = -1;
+  int _cachedQuestions = -1;
+
   GatewayHealth _snapshot(DshService dsh) {
+    final signatureChanged = !identical(dsh.workspaces, _cachedWorkspaces) ||
+        dsh.isConnected != (_cachedConnState == 1) ||
+        dsh.pingMs != _cachedPing ||
+        dsh.pendingApprovals.length != _cachedApprovals ||
+        dsh.pendingQuestions.length != _cachedQuestions;
+    if (_cachedHealth != null && !signatureChanged) return _cachedHealth!;
     var running = 0;
     var total = 0;
     for (final ws in dsh.workspaces) {
@@ -83,7 +100,7 @@ class _ConnectivityViewState extends State<ConnectivityView> {
         if (s.isRunning) running++;
       }
     }
-    return GatewayHealth.build(
+    _cachedHealth = GatewayHealth.build(
       isConnected: dsh.isConnected,
       isTokenInvalid: dsh.isTokenInvalid,
       pingMs: dsh.pingMs,
@@ -94,6 +111,12 @@ class _ConnectivityViewState extends State<ConnectivityView> {
       workspaceCount: dsh.workspaces.length,
       lastError: dsh.lastError.isEmpty ? null : dsh.lastError,
     );
+    _cachedWorkspaces = dsh.workspaces;
+    _cachedConnState = dsh.isConnected ? 1 : 0;
+    _cachedPing = dsh.pingMs;
+    _cachedApprovals = dsh.pendingApprovals.length;
+    _cachedQuestions = dsh.pendingQuestions.length;
+    return _cachedHealth!;
   }
 
   @override

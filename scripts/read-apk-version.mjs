@@ -70,24 +70,38 @@ while (off < axml.length - 8) {
     }
     console.log('属性名索引:', JSON.stringify(found));
 
-    // Scan START_TAG chunks for STRING-typed attributes with those name indices.
+    // [fix 2026-10-28] 旧扫描条件 `off + size + 0 ||` 是恒真死代码；实际从字符串
+    // 池之后扫到文件尾即可。manifest 根节点（versionName/versionCode 所在）是
+    // 字符串池之后的第一个 START_ELEMENT。
     let scan = off + size;
-    while (scan < off + size + 0 || scan < axml.length - 8) {
+    while (scan < axml.length - 8) {
       if (scan + 8 > axml.length) break;
       const t2 = axml.readUInt16LE(scan);
       const s2 = axml.readUInt32LE(scan + 4);
       if (s2 <= 0) { scan += 4; continue; }
       if (t2 === 0x0102) { // START_ELEMENT
-        const attrStart = axml.readUInt16LE(scan + 20);
-        const attrSize = axml.readUInt16LE(scan + 22);
-        const attrCount = axml.readUInt16LE(scan + 24);
+        // [fix 2026-10-28] 逐字节实测（root 块十六进制 dump）确认的布局：
+        //   chunk头(8) + lineNumber(4)@+8 + comment(4)@+12 + ns(4)@+16 +
+        //   name(4)@+20 + attrStart(2)@+24 + attrSize(2)@+26 + attrCount(2)@+28
+        // attrStart 是**相对 +16（扩展头起点）**的偏移；属性区实际在
+        // chunk+16+attrStart。属性项（attrSize=20）：ns(4) name(4)@+4
+        // rawValue(4)@+8 + typedValue{size(2) res(1) dataType(1)@+15 data(4)@+16}。
+        // 旧代码三处全错：attrStart 读在 +20（name u32 的低 16 位）、
+        // 属性区从 chunk+attrStart 起算（差 16 字节）、data 读在 typedValue
+        // 起点 —— 从未输出过任何版本值，校验形同虚设。
+        const attrStart = axml.readUInt16LE(scan + 24);
+        const attrSize = axml.readUInt16LE(scan + 26) || 20;
+        const attrCount = axml.readUInt16LE(scan + 28);
         for (let a = 0; a < attrCount; a++) {
-          const ap = scan + attrStart + a * attrSize;
+          const ap = scan + 16 + attrStart + a * attrSize;
           const nameIdx = axml.readUInt32LE(ap + 4);
-          const rawIdx = ap + 8 + 4;
-          const dataType = axml.readUInt8(rawIdx + 3);
-          const data = axml.readInt32LE(rawIdx);
-          if (dataType === 0x03 && (nameIdx === found.versionName || nameIdx === found.versionCode)) {
+          const dataType = axml.readUInt8(ap + 15);
+          const data = axml.readInt32LE(ap + 16);
+          const label = nameIdx === found.versionName
+            ? 'versionName'
+            : nameIdx === found.versionCode ? 'versionCode' : null;
+          if (label === null) continue;
+          if (dataType === 0x03) { // STRING → data 是字符串池索引
             const p = poolStart + readIdx[data];
             let s;
             if (isUtf8) {
@@ -97,7 +111,9 @@ while (off < axml.length - 8) {
               const strLen = axml.readUInt16LE(p);
               s = axml.slice(p + 2, p + 2 + strLen * 2).toString('utf16le');
             }
-            console.log(`  ${nameIdx === found.versionName ? 'versionName' : 'versionCode'} = ${s}`);
+            console.log(`  ${label} = ${s}`);
+          } else if (dataType === 0x10) { // INT (versionCode)
+            console.log(`  ${label} = ${data}`);
           }
         }
       }

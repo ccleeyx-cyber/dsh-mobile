@@ -47,7 +47,7 @@ export function configurePersistence({ verifyToken: vt, findDeviceByToken: fdt }
 // cloudflared 校验、资源上限、ntfy 目标限制）。
 // 1.16.1：手机短暂掉线期间到达的提问先暂存，重连 subscribe 时按引擎投影回放。
 // 1.16.2：requestId 幂等、跨端实时提示词、最终正文快照与长回合状态修复。
-export const BRIDGE_VERSION = '1.16.3';
+export const BRIDGE_VERSION = '1.16.4';
 export const MAX_BODY_SIZE = 2 * 1024 * 1024; // 2MB defensive payload limit (F4.1)
 export const HEARTBEAT_INTERVAL_MS = 30000;
 /** 上游 RPC 响应硬上限：异常引擎/插件不能把网关进程堆内存拉爆。 */
@@ -107,12 +107,31 @@ export function decodeBase64Url(value) {
 /**
  * Mint a DSH auth cookie so the bridge can talk to the engine's own HTTP/RPC
  * surface as if it were an authenticated web client.
+ *
+ * [fix 2026-10-28] 构造时校验 secret 可解码。此前两条坏路径都静默：
+ *   * secret 含 + / = 等非 base64url 字符 → decodeBase64Url 返回 undefined →
+ *     createHmac('sha256', undefined) 抛 crypto 原始 TypeError，消息与鉴权无
+ *     字面关联，永不触发自愈，每个 RPC 以无线索的异常失败；
+ *   * 解码后零字节 → HMAC 空 key 正常签名 → 铸出**格式合法但必 401** 的
+ *     cookie，叠加恒-true 重试成"双发+永远 unauthorized+零日志线索"。
+ * 现在两种情况都在构造时抛带上下文的错，启动日志立刻可见。
  */
 export function createCookieFactory({ dshPort, secret }) {
+  const decoded = decodeBase64Url(secret);
+  if (decoded === undefined) {
+    throw new Error(
+      `引擎密钥不是合法的 base64url 字符串（${String(secret).slice(0, 8)}…，` +
+      `请检查 DSH_SECRET / ~/.dsh/.credentials.yaml）`);
+  }
+  if (decoded.length === 0) {
+    throw new Error(
+      '引擎密钥解码后为空（0 字节）：铸出的 cookie 必然被引擎拒绝，' +
+      '请检查 DSH_SECRET / ~/.dsh/.credentials.yaml');
+  }
   const cache = { cookie: '', authority: `127.0.0.1:${dshPort}` };
 
   function generate() {
-    const raw = decodeBase64Url(secret);
+    const raw = decoded;
     const authority = cache.authority;
     const cookieName = 'dsh-auth-' + encodeBase64Url(crypto.createHash('sha256').update(authority).digest());
     const issuedAt = Date.now();
@@ -220,15 +239,19 @@ export function createRpcCaller({ dshPort, cookieFactory, timeoutMs = 10000 }) {
  *   * HTTP 401 直接回文本 `unauthorized` → 解析失败，消息是
  *     `Failed to parse RPC response: unauthorized`（本机 2026-10-23 实测）；
  *   * 引擎回 JSON 里的 `{error:{message:'unauthorized'}}`。
- * 只认这两个词，别把别的解析失败也当成密钥问题（否则会拿无关错误反复重载）。
+ * [fix 2026-10-28] 去掉了 `\b401\b` 宽匹配：它会把**正文恰好含独立 "401"** 的域
+ * 错误也当成鉴权失败——典型是 probeSessionCursor 依赖的 past-cursor 拒绝
+ * "session page through seq … is past cursor 401"（cursor 恰为 401 的会话），
+ * 现在恒-true 重试语义下会变成每 2.5s 轮询都无谓双发一次。只认 unauthorized
+ * 字样；HTTP 状态码语境由调用方（uploadFileToEngine 等直接看 statusCode）补。
  */
 export function isUnauthorizedRpcError(err) {
   const msg = String(err?.message || err || '');
-  return /unauthorized|\b401\b/i.test(msg);
+  return /unauthorized/i.test(msg);
 }
 
 /**
- * 给 unary RPC 包一层"密钥过期就重读并重试一次"。
+ * 给 unary RPC 包一层"鉴权失败就刷新 cookie 并重试一次"。
  *
  * ## 为什么需要
  *
@@ -238,34 +261,53 @@ export function isUnauthorizedRpcError(err) {
  * 话**（历史走不到 `session/page`，只能掉到投影缓存的 titleInput 兜底），事件流
  * 也断着。唯一的解药是重启 dsh web，而用户不可能靠重启修每一次轮换。
  *
- * ## 边界
+ * ## 边界（[fix 2026-10-28] 语义已变，如实施述）
  *
  *   * 只重试**一次**：同一个请求不会被重放成一段循环；
- *   * 只有密钥**确实变了**才重试（`reloadCredentials()` 返回 false 就如实抛原错）;
+ *   * 2026-10-27 之后 `reloadCredentials()`（网关侧 `reloadInternalSecret`）
+ *     **恒返回 true**并无条件 `cookieFactory.refresh()`——因为签名 cookie 自带
+ *     24 小时有效期，跑满一天后**密钥没变也会 401**（实测 03:58 启动、次日
+ *     08:55 全量失败），旧"密钥没变就不重试"防线恰好在过期场景放行失败。
+ *     因此本函数现在对 unauthorized 一律刷一次重试一次；真·鉴权失败（DSH_SECRET
+ *     配错）时第二次仍 401 并如实抛出——代价是每个失败请求 2×引擎负载 +
+ *     一次同步读密钥文件，靠 createRetryingRpcCaller 内的连续失败熔断兜住
+ *     （见 `unauthorizedFailStreak`）；
  *   * 其他错误一律不碰 —— 网络抖动、方法不存在、参数错都不该触发重载。
  *
  * @param deps.makeClient - () => (method, payload) => Promise，每次用当前密钥新造一个客户端
- * @param deps.reloadCredentials - () => boolean，重读密钥；返回是否真的换了
- * @param deps.onReloaded - 可选回调（打日志 / 审计），只在真的重载后触发
+ * @param deps.reloadCredentials - () => boolean，重读密钥并刷新 cookie；返回是否值得重试
+ * @param deps.onReloaded - 可选回调（打日志 / 审计）
  */
 export function createRetryingRpcCaller({ makeClient, reloadCredentials, onReloaded }) {
   if (typeof makeClient !== 'function') throw new TypeError('makeClient is required');
   let client = makeClient();
 
+  // [fix 2026-10-28] 连续 unauthorized 失败熔断：密钥真的配错（DSH_SECRET 指错）
+  // 时，恒-true 重试语义会让进程内每个请求都"读盘+双发"（同步 readFileSync 还
+  // 阻塞事件循环）。连续 N 次重试后仍 unauthorized 就停跳，直到有一次非
+  // unauthorized 成功（说明密钥修好了）才复位。密钥轮换/cookie 过期的偶发
+  // 401 不受影响（成功即复位）。
+  let unauthorizedFailStreak = 0;
+  const FAIL_STREAK_LIMIT = 5;
+
   return {
     async call(method, payload) {
       try {
-        return await client(method, payload);
+        const result = await client(method, payload);
+        unauthorizedFailStreak = 0;
+        return result;
       } catch (err) {
         if (typeof reloadCredentials !== 'function' || !isUnauthorizedRpcError(err)) throw err;
-        let changed = false;
+        if (unauthorizedFailStreak >= FAIL_STREAK_LIMIT) {
+          // 熔断打开：大概率密钥本身错，读盘+双发没有意义，如实抛出。
+          throw err;
+        }
+        unauthorizedFailStreak++;
         try {
-          changed = reloadCredentials() === true;
+          reloadCredentials();
         } catch (reloadErr) {
           throw err;
         }
-        // 密钥没变 = 问题不在密钥上，原样抛：不假装重试过。
-        if (!changed) throw err;
         try { onReloaded?.(); } catch { /* 回调不该影响这次调用 */ }
         client = makeClient();
         return client(method, payload);
