@@ -110,6 +110,7 @@ import {
   archiveSession,
   renameSession,
   assertSessionId,
+  pendingQuestionExpired,
   configurePersistence,
   configurePermissionsPersistence
 } from './core.mjs';
@@ -1304,29 +1305,30 @@ export function apply(ctx, config = {}, internals = {}) {
   const QUESTION_TTL_MS = 30 * 60 * 1000;
 
   /**
-   * 没有手机订阅时，问题仍暂存这么久，等下一台手机连上来。
+   * 已废弃：曾经用来在「无人订阅超过 5 分钟」时丢掉提问。
    *
-   * 实测事故：问题 10:37:38 到达，手机 10:37:46 才重连（8 秒），旧逻辑在
-   * 第一秒就把问题交给 Web UI，手机订阅时 replay 为空。只延迟"无人接收"的
-   * 条目：有过订阅者的条目按 30 分钟 TTL，交给关闭/作答/投影清理。
+   * [fix 2026-10-29] 它把手机屏幕上正显示着的卡片一起删掉了（问题到达时手机
+   * 恰好离线 → offeredTo 为空 → 用户几分钟后点选时条目已消失 → 作答被判
+   * unknown-question，手机显示"提交成功"而电脑端仍在等）。改为只留 30 分钟
+   * 硬 TTL + 引擎投影判活。常量留着只为说明这段历史，不再使用。
    */
-  const QUESTION_UNCLAIMED_TTL_MS = 5 * 60 * 1000;
 
   /**
-   * [fix 2026-10-28] pendingQuestions 的 TTL 此前**只在手机 subscribe 时**才被
-   * 检查（pendingQuestionsForReplay）；手机长期离线且 MUX 不断线时条目永不
-   * 过期 —— Map 无限增长，且 agent 每条新问题都会 pushNtfy 一遍（离线通知
-   * 轰炸）。60 秒一跳的周期性 prune 复用同一组 TTL 判定；unref 不阻退出，
-   * cleanupGateway 里清。
+   * [fix 2026-10-28，2026-10-29 修正] pendingQuestions 的周期性清理。
+   *
+   * 2026-10-25 引入的「无人认领 5 分钟」在此**已取消**（见
+   * pendingQuestionsForReplay 的注释）：它会把手机正显示着、用户还没点的提问
+   * 删掉，作答随即落到 unknown-question —— 手机上看着"提交成功"、电脑端却还在
+   * 等着。现在只按 30 分钟硬 TTL 清理；「还能不能答」由引擎投影判定。
+   * 60 秒一跳，unref 不阻退出，cleanupGateway 里清。
    */
   const questionPruneTimer = setInterval(() => {
     if (isDisposed) return;
     const now = Date.now();
     for (const q of [...pendingQuestions.values()]) {
-      const age = now - q.createdAt;
-      if (age > QUESTION_TTL_MS ||
-          (q.offeredTo.size === 0 && age > QUESTION_UNCLAIMED_TTL_MS)) {
+      if (pendingQuestionExpired(q, now, QUESTION_TTL_MS)) {
         pendingQuestions.delete(q.eventId);
+        audit('question/ttl-expired', { eventId: q.eventId, sessionId: q.sessionId });
       }
     }
   }, 60 * 1000);
@@ -2353,7 +2355,14 @@ export function apply(ctx, config = {}, internals = {}) {
    */
   async function handleQuestionAnswer(eventId, answer) {
     const pending = pendingQuestions.get(eventId);
-    if (!pending) return { ok: false, error: 'unknown-question' };
+    if (!pending) {
+      // [fix 2026-10-29] 这条**必须**留痕：此前静默返回，线上出现"手机点了
+      // 提交、看着成功、电脑端还在等"时，日志里一个字都没有（2026-10-29 08:32
+      // 那次就是靠这条缺失才绕了一圈）。带上当前待办数量便于判断是"被清理"
+      // 还是"从未到达"。
+      audit('question/answer-unknown', { eventId, pendingCount: pendingQuestions.size });
+      return { ok: false, error: 'unknown-question' };
+    }
     // Delete only AFTER a successful RPC below — an rpc-failed keeps the
     // entry so the phone (or another subscriber) can retry.
     const value = { answers: Array.isArray(answer?.answers) ? answer.answers : [] };
@@ -2424,15 +2433,27 @@ export function apply(ctx, config = {}, internals = {}) {
    * question is still answerable. Without this check, a question that the Web UI
    * answered while the phone was offline would come back as a stale card — and
    * the phone's answer would be rejected with `unknown-question`.
+   *
+   * [fix 2026-10-29] 不再按「无人认领 5 分钟」删条目。
+   *
+   * 那是 2026-10-25 引入的启发式，本意是别把没人看的问题一直留着。但它与
+   * 「手机正在看这张卡」冲突：问题到达时手机恰好离线（→ `offeredTo` 为空），
+   * 手机稍后重连拿到 replay、用户几分钟后才点选，条目已在 5 分钟线上被删 ——
+   * 作答落到 `unknown-question`，手机上看着"提交成功"，电脑端却还在等他选
+   * （2026-10-29 08:32 到达、09:05 作答，实测就是这条路径挂的）。
+   * 现在唯一的时间上限是 30 分钟硬 TTL；「是否还能答」交给引擎投影判定
+   * （有 callId 的按 callId 核，没有 callId 的只能靠 TTL）。
+   *
+   * @param {import('ws').WebSocket} [subscriber] 正在订阅的手机socket：命中的
+   *   条目登记给它，这样该 socket 断开时 `offeredTo` 能如实反映"没人看着"。
    */
-  async function pendingQuestionsForReplay() {
+  async function pendingQuestionsForReplay(subscriber) {
     const now = Date.now();
     const candidates = [];
     for (const q of pendingQuestions.values()) {
-      const age = now - q.createdAt;
-      if (age > QUESTION_TTL_MS ||
-          (q.offeredTo.size === 0 && age > QUESTION_UNCLAIMED_TTL_MS)) {
+      if (pendingQuestionExpired(q, now, QUESTION_TTL_MS)) {
         pendingQuestions.delete(q.eventId);
+        audit('question/ttl-expired', { eventId: q.eventId, sessionId: q.sessionId });
         continue;
       }
       candidates.push(q);
@@ -2468,6 +2489,9 @@ export function apply(ctx, config = {}, internals = {}) {
         continue;
       }
       out.push({ eventId: q.eventId, sessionId: q.sessionId, questions: q.questions });
+      // 正在订阅的这台手机已经拿到卡片 → 登记进去：它断开时兜底逻辑才有据可依，
+      // 也避免以后任何"无人认领"判定误删一个屏幕上正显示着的提问。
+      if (subscriber && q.offeredTo instanceof Set) q.offeredTo.add(subscriber);
     }
     return out;
   }

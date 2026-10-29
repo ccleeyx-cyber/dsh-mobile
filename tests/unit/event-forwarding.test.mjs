@@ -22,7 +22,7 @@
  * process, which is the only evidence that the engine can see the answer.
  */
 
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -52,6 +52,7 @@ process.env.DSH_HOME = TMP_HOME;
 const { apply, MAX_CLIENT_BUFFER_BYTES, shouldDivertForBackpressure } =
   await import('../../dsh-server-plugin/lib/index.js');
 const { loadConfig } = await import('../../dsh-server-plugin/lib/store.mjs');
+const { pendingQuestionExpired } = await import('../../dsh-server-plugin/lib/core.mjs');
 const TOKEN = loadConfig().token;
 
 async function pickFreePort() {
@@ -534,6 +535,57 @@ describe('user-questions：领取与作答', () => {
 
     await a.close();
     await b.close();
+  });
+
+  /**
+   * [回归 2026-10-29] 无人订阅的提问超过 5 分钟后仍必须能作答。
+   *
+   * 现网事故：问题 08:32:34 到达时手机离线（审计记 `question/deferred`，
+   * `offeredTo` 为空），用户 09:05 才点选。中间那条「无人认领 5 分钟就丢」的
+   * 规则已在 08:37 把条目删掉，作答落到 `unknown-question` —— 手机上看着
+   * "提交成功"、电脑端（Web）却还在等他选。
+   *
+   * 判据钉在 `pendingQuestionExpired` 上：**只有时间**决定丢弃；「此刻有没有
+   * socket 认领」绝不能参与（`offeredTo` 为空只说明没手机连着，不代表这张卡
+   * 不在谁屏幕上）。下面用 mock 时钟把这条路径走完：问题上岸 → 6 分钟后回放
+   * → 作答必须被接受。
+   */
+  it('无人订阅的问题过了 5 分钟仍能作答（曾因 5 分钟清理被判过期）', async () => {
+    // ① 纯判据：6 分钟、无认领 → 不該丢；31 分钟 → 才丢。
+    const sixMinAgo = { createdAt: Date.now() - 6 * 60 * 1000, offeredTo: new Set() };
+    assert.equal(pendingQuestionExpired(sixMinAgo, Date.now()), false,
+      '5 分钟无人认领不等于过期：卡片可能正显示在手机上');
+    const halfHourAgo = { createdAt: Date.now() - 31 * 60 * 1000, offeredTo: new Set() };
+    assert.equal(pendingQuestionExpired(halfHourAgo, Date.now()), true,
+      '30 分钟硬上限仍然生效');
+    assert.equal(pendingQuestionExpired({}, Date.now()), false,
+      '缺时间戳时宁可不删');
+
+    // ② 端到端：问题到达（无人订阅）→ 6 分钟后重连订阅 → 回放仍在 → 作答成功。
+    mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    try {
+      pushToEngine(questionFrame(QUESTION, { id: 'evt-late-answer' }));
+      await sleep(300);
+      mock.timers.tick(6 * 60 * 1000);
+
+      const c = await connectClient();
+      const sub = await c.subscribe();
+      assert.ok(sub.pending.some((q) => q.eventId === 'evt-late-answer'),
+        '6 分钟后仍应回放：这张卡可能正显示在手机上，不能被时间线悄悄删掉');
+
+      c.send({
+        type: 'question_answer',
+        eventId: 'evt-late-answer',
+        answer: { answers: [{ id: 'q1', selected: ['继续'] }] }
+      });
+      const ack = await c.waitFor(
+        (m) => m.type === 'question_ack' && m.eventId === 'evt-late-answer');
+      assert.equal(ack.ok, true,
+        '作答必须被接受 —— 否则手机显示成功、引擎那边根本没收到');
+      await c.close();
+    } finally {
+      mock.timers.reset();
+    }
   });
 
   it('未订阅的连接收不到问题帧', async () => {

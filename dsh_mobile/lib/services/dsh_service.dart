@@ -355,6 +355,26 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
   /// 最近一次提问失败/失效的原因，用于卡片上的提示。成功作答后清空。
   String? _lastQuestionError;
 
+  /// 提问失败提示的自动清除定时器（[fix 2026-10-29]）。
+  ///
+  /// 卡片被移除后横幅是**唯一**的失败反馈，不能让它永久挂着；也不能不显示
+  /// （否则用户以为提交成功）。8 秒后自动收起。
+  Timer? _questionErrorTimer;
+
+  /// 写入提问失败提示，并在 8 秒后自动清除。
+  void _setQuestionError(String? message) {
+    _lastQuestionError = message;
+    _questionErrorTimer?.cancel();
+    _questionErrorTimer = null;
+    if (message == null) return;
+    _questionErrorTimer = Timer(const Duration(seconds: 8), () {
+      _questionErrorTimer = null;
+      if (_isDisposed) return;
+      _lastQuestionError = null;
+      notifyListeners();
+    });
+  }
+
   /// 每个会话当前的 TODO 整表（`todo/write` 是整表替换，不是增量）。
   final Map<String, List<TodoItem>> _todos = {};
 
@@ -1581,7 +1601,7 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
       'eventId': pending.eventId,
       'answer': AskUserQuestionAnswer(answers).toJson(),
     });
-    if (ok) _lastQuestionError = null;
+    if (ok) _setQuestionError(null);
     return ok;
   }
 
@@ -1800,7 +1820,7 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
     // 重放一次，清了就永远拿不回来（没有 HTTP 查询接口可补拉）。
     // 防"把别的会话的提问挂到当前会话"的职责本来就在 currentSessionQuestions
     // 的会话过滤上，这行 clear 既多余又有害。
-    _lastQuestionError = null;
+    _setQuestionError(null);
     // 失败横幅同样是会话级的：切走就清，等新会话自己的数据回来再决定。
     _lastTurnFailure = null;
     _setSending(false); // Reset sending state immediately
@@ -6217,8 +6237,8 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
       if (type == 'question_settled') {
         final eventId = json['eventId'];
         final ok = json['ok'] == true;
-        _lastQuestionError =
-            ok ? null : (json['reason']?.toString() ?? '提问未能送达');
+        _setQuestionError(
+            ok ? null : (json['reason']?.toString() ?? '提问未能送达'));
         // removeWhere returns void, so "did anything change" needs the length
         // comparison rather than the return value.
         final before = _pendingQuestions.length;
@@ -6235,8 +6255,8 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
       if (type == 'questions_invalidated') {
         if (_pendingQuestions.isNotEmpty) {
           _pendingQuestions.clear();
-          _lastQuestionError =
-              '提问已失效：${json['reason']?.toString() ?? '会话状态变化'}';
+          _setQuestionError(
+              '提问已失效：${json['reason']?.toString() ?? '会话状态变化'}');
           notifyListeners();
         }
         return;
@@ -6247,16 +6267,16 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
         // the failure report. Do NOT remove on ok:false — the engine may still
         // have the request open, and dropping the card would strand the user.
         if (json['ok'] == true) {
-          _lastQuestionError = null;
+          _setQuestionError(null);
           final before = _pendingQuestions.length;
           _pendingQuestions.removeWhere((p) => p.eventId == json['eventId']);
           if (_pendingQuestions.length != before) notifyListeners();
         } else {
           final err = json['error']?.toString();
           final retryable = json['retryable'] == true || err == 'rpc-failed';
-          _lastQuestionError = err == 'unknown-question'
+          _setQuestionError(err == 'unknown-question'
               ? '该提问已过期（可能已被其它设备回答）'
-              : '提交失败：${json['error'] ?? '未知错误'}';
+              : '提交失败：${json['error'] ?? '未知错误'}');
           // 只有**确认过期**（unknown-question）才收卡片。rpc-failed 时引擎侧
           // 请求还活着（网关也保留了它的 pending 记录），删卡片等于夺走用户
           // 唯一的重试入口 —— 这正是此前"点了没反应还把输入框收走"的成因。
@@ -7037,6 +7057,8 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
     _httpClient.close();
     drafts.flushNow();
     _historyCache.clear();
+    _questionErrorTimer?.cancel();
+    _questionErrorTimer = null;
     super.dispose();
   }
 }

@@ -47,7 +47,7 @@ export function configurePersistence({ verifyToken: vt, findDeviceByToken: fdt }
 // cloudflared 校验、资源上限、ntfy 目标限制）。
 // 1.16.1：手机短暂掉线期间到达的提问先暂存，重连 subscribe 时按引擎投影回放。
 // 1.16.2：requestId 幂等、跨端实时提示词、最终正文快照与长回合状态修复。
-export const BRIDGE_VERSION = '1.16.4';
+export const BRIDGE_VERSION = '1.16.5';
 export const MAX_BODY_SIZE = 2 * 1024 * 1024; // 2MB defensive payload limit (F4.1)
 export const HEARTBEAT_INTERVAL_MS = 30000;
 /** 上游 RPC 响应硬上限：异常引擎/插件不能把网关进程堆内存拉爆。 */
@@ -1766,6 +1766,34 @@ export function assertSessionId(sessionId) {
     return { ok: false, error: 'Invalid sessionId: only [A-Za-z0-9_-] up to 64 characters are allowed' };
   }
   return { ok: true, id, bare };
+}
+
+/**
+ * 一条待答提问是否已经过了「还能答」的时限。
+ *
+ * ## 为什么单独抽出来
+ *
+ * 2026-10-29 现网事故：问题 08:32:34 到达时手机恰好离线（审计记
+ * `question/deferred`，`offeredTo` 为空），用户 09:05 才点选 —— 中间那条
+ * **「无人认领 5 分钟就丢」** 的规则已经把条目删了，于是作答被判
+ * `unknown-question`：**手机上看着"提交成功"，电脑端（Web）却还在等他选**。
+ *
+ * 判据必须是「时间」与「引擎是否还认这个提问」两件事，**不能**掺进
+ * 「有没有 socket 认领」——`offeredTo` 为空只说明此刻没有手机连着，不代表
+ * 这张卡没显示在谁屏幕上；把两者混在一起，就会删掉用户正要点的东西。
+ *
+ * 「引擎是否还认」由调用方用 `userQuestions` 投影另行核对（有 callId 时），
+ * 这里只给出时间上限。
+ *
+ * @param {{createdAt?: number}} question 待答条目（`createdAt` 为毫秒时间戳）
+ * @param {number} now 当前毫秒时间戳
+ * @param {number} ttlMs 硬上限（默认 30 分钟）
+ * @returns {boolean} true = 应丢弃
+ */
+export function pendingQuestionExpired(question, now, ttlMs = 30 * 60 * 1000) {
+  const createdAt = Number(question?.createdAt);
+  if (!Number.isFinite(createdAt)) return false; // 时间戳缺失：宁可留着，也不误删
+  return Number(now) - createdAt > ttlMs;
 }
 
 /**

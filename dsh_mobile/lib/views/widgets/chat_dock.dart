@@ -1220,8 +1220,14 @@ class _ChatBlockerDockState extends State<ChatBlockerDock> {
       );
     }
 
+    // [fix 2026-10-29] 失败提示不能只在"还有卡片"时显示。
+    //
+    // 提交被网关判为过期（unknown-question）时，本帧同时把卡片移除了 —— 旧条件
+    // `questions.isNotEmpty` 于是永远不成立，横幅一次都画不出来：用户看到卡片
+    // 消失、以为提交成功，而电脑端其实还在等（2026-10-29 实测）。现在只要还有
+    // 未消费的错误就显示；服务层会在 8 秒后自动清掉，不会长期挂着。
     final qErr = dsh.lastQuestionError;
-    if (qErr != null && questions.isNotEmpty) {
+    if (qErr != null) {
       blocks.add(QuestionErrorBanner(message: qErr));
     }
 
