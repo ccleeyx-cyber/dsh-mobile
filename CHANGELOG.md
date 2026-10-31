@@ -7,6 +7,33 @@
 
 ---
 
+## [1.39.15] - 2026-10-31
+
+### 修复：发一张 PNG 截图报「Declared image type does not match its bytes.」
+
+现象：从相册选一张截图发出去，气泡变成**未送达**，错误文案是一句纯英文的
+`Declared image type does not match its bytes.`，重试也一样。
+
+- **根因是扩展名撒谎，不是服务端挑刺**：相册选图时 App 会先缩放
+  （`maxWidth/maxHeight 1600`、`quality 80`）。Android 端 image_picker 的编码格式
+  是按「位图有没有 alpha 通道」决定的（`ImageResizer`：`saveAsPNG = bitmap.hasAlpha()`），
+  可输出文件名却沿用原扩展名。**安卓截图是无 alpha 的 PNG** —— 于是产出
+  `scaled_193118.png`，内容却是 JPEG 字节。
+- App 之前按扩展名声明 `image/png`；引擎的图片准录用魔数嗅探真实类型，两者不一致
+  就整条拒绝（`IMAGE_TYPE_MISMATCH`）。校验本身是对的，不该放宽。
+- 现在**声明类型跟着字节走**：新增 `sniffImageMediaType()`（JPEG/PNG/GIF/WEBP/BMP
+  魔数），扩展名只在认不出时兜底。相册、文件选择、系统分享三个入口全部改为先看字节。
+- 分享入口另有反向坑：带 alpha 的 PNG 被无条件声明成 `image/jpeg`，撞同一句报错。
+  一并修好。
+
+### 回归测试
+
+- 新增 `image_sniff_test.dart`：钉住五种魔数、`%PDF`/zip 不被误判、`RIFF` 但不是
+  WEBP 不算图；并用「名字 `.png` + JPEG 字节」这条真实组合断言 wire part 上必须是
+  `image/jpeg`（改回按扩展名判断时这条必红）。
+
+---
+
 ## [1.39.14] - 2026-10-29
 
 ### 修复：手机上「提交选择」看着成功，电脑端还在等你选（网关 1.16.5）

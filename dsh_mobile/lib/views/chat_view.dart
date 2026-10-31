@@ -38,6 +38,7 @@ import '../models/pending_attachment.dart';
 import '../models/user_question.dart' show AttachmentRef;
 import '../models/task_center.dart';
 import '../services/attachment_picker.dart';
+import '../services/image_sniff.dart';
 
 class ChatView extends StatefulWidget {
   /// 「去设置建一条快捷指令」——输入区模板面板空态里的出口。
@@ -344,13 +345,17 @@ class _ChatViewState extends State<ChatView> {
       final name = shared.imageName.isNotEmpty
           ? shared.imageName
           : file.uri.pathSegments.last;
+      // 声明类型同样只看字节（v1.39.15）：原生侧抄进来的可能是 PNG（带 alpha 的图
+      // 不会被压成 JPEG），原先无条件写死 `image/jpeg` 会撞同一个
+      // 「Declared image type does not match its bytes.」。文件名只是展示用，
+      // 引擎校验的是字节与 mediaType 是否一致，所以这里不改名。
       final media = PickedMedia(
         bytes: bytes,
         name: name.toLowerCase().endsWith('.jpg') ||
                 name.toLowerCase().endsWith('.jpeg')
             ? name
             : '$name.jpg',
-        mimeType: 'image/jpeg',
+        mimeType: sniffImageMediaType(bytes) ?? 'image/jpeg',
       );
       final pending = _prepareImageAttachment(media);
       if (!mounted) return;

@@ -2,6 +2,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../models/pending_attachment.dart';
+import 'image_sniff.dart';
 
 /// 选取图片与文件（§4.2 上传图片/文件，v1.10.0；v1.33.1 起支持多选）。
 ///
@@ -45,10 +46,14 @@ class AttachmentPicker {
     final result = <PickedMedia>[];
     for (final file in picked) {
       final bytes = await file.readAsBytes();
-      // image_picker 在本机压缩后统一输出 JPEG（除非原图是 PNG 且未压缩），
-      // 所以按扩展名判断，兜底给 jpeg 而不是 octet-stream —— 后者会被引擎拒绝，
-      // 因为 image part 的 mediaType 必须是 image/*。
-      final mime = _mimeFor(file.name, fallback: 'image/jpeg');
+      // **类型必须看字节，不能看扩展名**（v1.39.15 修）：缩放后的文件名沿用原扩展名，
+      // 但 image_picker 是按「位图有没有 alpha」选编码格式的 —— 无 alpha 的截图哪怕
+      // 叫 `.png`，写出来的也是 JPEG 字节。按扩展名声明的结果是引擎回
+      // 「Declared image type does not match its bytes.」，整条消息未送达。
+      // 详见 image_sniff.dart。扩展名只在魔数认不出时兜底，且兜底给 jpeg 而不是
+      // octet-stream —— 后者会被引擎拒绝，因为 image part 的 mediaType 必须是 image/*。
+      final mime =
+          sniffImageMediaType(bytes) ?? mimeForName(file.name, fallback: 'image/jpeg');
       result.add(PickedMedia(bytes: bytes, name: file.name, mimeType: mime));
     }
     return result;
@@ -69,10 +74,16 @@ class AttachmentPicker {
     for (final file in picked?.files ?? const <PlatformFile>[]) {
       final bytes = file.bytes;
       if (bytes == null) continue;
+      final byExt = mimeForName(file.name);
+      // 只对「扩展名声称是图片」的文件做魔数校正：`.docx`/`.apk` 这类本就有自己的
+      // 容器格式（zip 头一样），拿图片魔数去猜毫无意义，还可能误判。
+      final mime = byExt.startsWith('image/')
+          ? (sniffImageMediaType(bytes) ?? byExt)
+          : byExt;
       result.add(PickedMedia(
         bytes: bytes,
         name: file.name,
-        mimeType: _mimeFor(file.name),
+        mimeType: mime,
       ));
     }
     return result;
@@ -86,8 +97,11 @@ class AttachmentPicker {
 
   /// 按扩展名推断媒体类型。认不出就给 octet-stream。
   ///
+  /// **只是兜底**：图片必须先用 [sniffImageMediaType] 看字节，扩展名只负责
+  /// 「魔数认不出」和「非图片文件」这两类（v1.39.15）。公开是为了能被单测钉住。
+  ///
   /// 不引 mime 包：这里只需要覆盖用户实际会发的类型，多一个依赖换不来什么。
-  static String _mimeFor(String filename, {String fallback = 'application/octet-stream'}) {
+  static String mimeForName(String filename, {String fallback = 'application/octet-stream'}) {
     final dot = filename.lastIndexOf('.');
     if (dot < 0 || dot == filename.length - 1) return fallback;
     switch (filename.substring(dot + 1).toLowerCase()) {
