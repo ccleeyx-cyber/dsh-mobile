@@ -111,8 +111,11 @@ class CockpitReadout extends StatelessWidget implements PreferredSizeWidget {
     return InkWell(
       onTap: onTap,
       child: Container(
-        color: c.surface,
+        // 底色必须写进 decoration，不能与 `color:` 并存 —— Container 对两者
+        // 同时非空会直接断言失败（`color == null || decoration == null`），
+        // 2026-11-15 的 CI 就是被这一处拦下的。
         decoration: BoxDecoration(
+          color: c.surface,
           border: Border(bottom: BorderSide(color: c.border)),
         ),
         child: SizedBox(
