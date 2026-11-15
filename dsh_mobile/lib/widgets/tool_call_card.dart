@@ -180,32 +180,10 @@ class _ToolCallCardState extends State<ToolCallCard>
     return '$lines 行 · $sizeStr';
   }
 
-  IconData _getToolIcon(String name) {
-    final lower = name.toLowerCase();
-    if (lower.contains('bash') ||
-        lower.contains('sh') ||
-        lower.contains('cmd') ||
-        lower.contains('terminal') ||
-        lower.contains('exec')) {
-      return Icons.terminal_rounded;
-    }
-    if (lower.contains('read') ||
-        lower.contains('cat') ||
-        lower.contains('file')) {
-      return Icons.description_outlined;
-    }
-    if (lower.contains('search') ||
-        lower.contains('grep') ||
-        lower.contains('find')) {
-      return Icons.search_rounded;
-    }
-    if (lower.contains('edit') ||
-        lower.contains('write') ||
-        lower.contains('patch')) {
-      return Icons.edit_note_rounded;
-    }
-    return Icons.build_rounded;
-  }
+  // [2026-11-15 方向 A] 原 `_getToolIcon` 已删除：卡头改用终端提示符 `$` 打头，
+  // 工具类型的信息由紧随其后的工具名承载（`$ pwsh` / `$ read`），图标遂成冗余。
+  // 删函数而不是留着未引用，是因为 CI 的 `flutter analyze --fatal-warnings` 会把
+  // unused_element 当错误（本次构建正是因此失败）。
 
   @override
   Widget build(BuildContext context) {
