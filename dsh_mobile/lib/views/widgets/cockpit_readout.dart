@@ -39,13 +39,18 @@ class CockpitReadout extends StatelessWidget implements PreferredSizeWidget {
   @override
   Size get preferredSize => const Size.fromHeight(height);
 
-  /// 与电脑端一致的紧凑口径：1.2M / 340K / 812。
+  /// 仪表格的紧凑口径。
+  ///
+  /// 阈值与信息面板（`session_info_sheet.dart` 的 `_compact`）**刻意不同**：那是
+  /// 一整行的明细，用千分位精确值更好读；这里每格只有约 72dp，`12,345` 会挤爆
+  /// 等宽格，所以从一万往上收成 K/M。一万以下仍给精确值 —— 把 1540 写成 `1.5K`
+  /// 是在丢信息，而四个字符放得下。
   static String compact(int n) {
-    if (n >= 1000000) {
-      return '${(n / 1000000).toStringAsFixed(n >= 10000000 ? 0 : 1)}M';
-    }
-    if (n >= 1000) return '${(n / 1000).round()}K';
-    return '$n';
+    final abs = n.abs();
+    String trim(String s) => s.endsWith('.0') ? s.substring(0, s.length - 2) : s;
+    if (abs < 10000) return '$n';
+    if (abs < 1000000) return '${trim((n / 1000).toStringAsFixed(1))}K';
+    return '${trim((n / 1000000).toStringAsFixed(1))}M';
   }
 
   Widget _cell(

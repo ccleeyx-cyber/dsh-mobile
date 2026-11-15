@@ -800,7 +800,13 @@ void main() {
       // 紧凑徽标（📦 1）—— 同一张截图里用户说"产出单独一行太突兀"。
       expect(find.byType(SessionStatusStrip), findsOneWidget);
       expect(find.byKey(const ValueKey('chat-deliverable-count')), findsOneWidget);
-      expect(find.text('1'), findsOneWidget);
+      // 断言收紧到徽标本身：2026-11-15 顶栏下新增了仪表簇，它的 OUT 格也会显示
+      // 同一个产出数（都是 1）。`find.text('1')` 全局断言从此会命中两处 —— 而
+      // 这条用例要守的是「标题行右端那枚徽标显示 1」，不是"全页只有一个 1"。
+      expect(
+        tester.widget<Text>(find.byKey(const ValueKey('chat-deliverable-count'))).data,
+        '1',
+      );
       // 上下文是"这个会话是什么"，常驻在标题第二行，不进事件带（它天天在变，
       // 却不是需要你反应的事）。
       expect(find.text('上下文 50%'), findsOneWidget);
@@ -1047,7 +1053,14 @@ void main() {
       expect(find.text('本轮消耗'), findsOneWidget);
       expect(find.text('统计中…'), findsWidgets,
           reason: '没量到本轮消耗时必须显示「统计中…」（解释在 ? 图标的 Tooltip 里）');
-      expect(find.text('0'), findsNothing, reason: '0 会被读成"这轮没花钱"，而真相是"不知道"');
+      // 「绝不显示 0」这条规则的对象是**本轮消耗这一行**，不是全页任何一个数字。
+      // 2026-11-15 顶栏仪表簇上线后，OUT 格会合法地显示 `0`（产出确实是 0 件），
+      // 那是真值而不是"未知冒充零"。所以断言范围收窄到信息面板之内。
+      expect(
+        find.descendant(of: find.byType(SessionInfoSheet), matching: find.text('0')),
+        findsNothing,
+        reason: '0 会被读成"这轮没花钱"，而真相是"不知道"',
+      );
 
       // 量到了就显示真值（含千分位）。
       dsh.debugSetTaskCenter(measuredTurnTokens: 12345);
