@@ -190,6 +190,39 @@
 
 ## [Unreleased]
 
+### 网关 1.17.0：手机上归档 / 取消归档真正生效（改走引擎 RPC）
+
+现象：手机上点归档，Snackbar 显示"已归档"，可过一会儿那一行又回来了；电脑端
+Web UI 永远看不到这次归档；取消归档同理。
+
+- **根因是和引擎抢写同一个文件**。归档以前是网关直接改
+  `~/.dsh/storages/workspace.json` 的 `global.archivedSessionIds`，而该文件是引擎
+  workspaceRegistry 的**存储**——引擎启动时读进内存，之后"内存即真相"：
+  pin/unpin、归档、工作区建/删/排序、甚至每次进程启动的 bootstrap 都会按内存态
+  **整体重写**文件。网关在旁边 read-modify-write，写进去的 id 要么被引擎下一次
+  操作抹掉，要么在引擎重启时丢。
+- **活体验证**（2026-11-15）：向文件植入标记 id（完全模拟网关旧写法）→ 引擎
+  内存不含它（RPC 查得 50 vs 磁盘 51）→ 触发一次 `workspace/pinSession` +
+  `unpinSession` → 文件被引擎重写，标记 id **消失**。
+- **网关注释里的历史论断是错的**：当年"引擎没有 session/archive RPC，只能直写
+  文件"只探了 `session/*` 命名空间，漏了 `workspace/*` —— 仓库自己的探针文件
+  `.probe/remotes-authoritative.txt` 131/140 行一直记着
+  `workspace/archiveSession` / `workspace/unarchiveSession`。
+- **修复**：归档/取消归档改走引擎 RPC（`stopActivity: true`，与删除的硬语义对齐
+  ——手机上归档一个正在跑的会话，期望就是收进抽屉先停掉）。引擎不可达时如实
+  502，**绝不**退回直写文件的旧路径（那正是本 bug 的根因，静默降级等于保留
+  故障模式）。
+- **删除会话一并修**：删除 = 引擎 RPC 归档（名单交给引擎权威）+ 文件层
+  `detachSession`（从工作区表 detach + 删投影缓存，新增导出；不碰归档名单）。
+  响应形状 `{ok, message:'Deleted', sessionId, detached}` 不变。
+- `core.mjs` 的 `archiveSession` / `deleteSession` 保留但注明"仅供无引擎场景
+  （session-cleanup.js direct-FS 模式）与单测"，生产路径不再调用。
+- 新增 `tests/unit/archive-routes.test.mjs`（假引擎 harness，仿
+  session-model-select）：锁死 RPC 形状（`args.request.{sessionId,
+  stopActivity}`）、失败透传 502、失败后不得直写文件（回归锁）、delete 两步
+  顺序、非法 sessionId 零次上游调用。
+- **行为变化**：引擎不在时归档/删除从"静默假成功（然后被回滚）"变为如实报错。
+
 ### 网关 1.16.1：提问在手机短暂断线时不再丢失
 
 - 问题到达时若手机订阅者恰好为 0，不再立刻写 `question/relinquished`；先暂存

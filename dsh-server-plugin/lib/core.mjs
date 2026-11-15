@@ -1607,21 +1607,144 @@ export function parseJsonBody(raw) {
  * ------------------------------------------------------------------ */
 
 /**
- * Delete a session.
+ * Delete a session — file-layer half only (detach + projection-cache drop).
  *
- * The DSH engine exposes NO session/delete RPC — verified: session/delete,
- * session/remove, session/destroy, session/archive and variants all return 404.
- * The previous bridge code called it anyway, swallowed the 404 with
- * `catch (_) {}`, and answered HTTP 200 "Deleted", so the client's delete button
- * silently did nothing and the E2E suite accumulated >1000 empty sessions.
+ * ## 2026-11-15 根因更正（归档在手机上"不生效"）
  *
- * The only mutation the engine accepts and persists is `global.archivedSessionIds`
- * (its own UI uses exactly that). So we: detach the id from its workspace, append
- * it to the archive set, and drop the projection cache file.
+ * 这条注释开头原来的断言「The DSH engine exposes NO session/delete RPC」只探过
+ * `session/*` 命名空间。引擎其实一直有 `workspace/archiveSession` /
+ * `workspace/unarchiveSession` RPC（仓库 .probe/remotes-authoritative.txt 131/140
+ * 行早有记录），当年漏查了。
  *
- * Returns { ok, archived, detached, cacheRemoved, error } — callers must surface
+ * 更要命的是：**直接改 `global.archivedSessionIds`（本函数原来做的事）会被引擎
+ * 静默回滚**。workspace.json 是引擎 workspaceRegistry 的存储，registry 启动时把
+ * 它读进内存，之后"内存即真相"——pin/unpin、归档、工作区建/删/排序、甚至每次
+ * 进程启动的 bootstrap 都会 setState → 按内存态**整体重写**该文件。本进程在旁边
+ * read-modify-write 同一个文件，写进去的 id 要么被下一次引擎操作抹掉，要么在
+ * 引擎重启时丢（bootstrap 无条件 setState）。活体实验：植入标记 id → 引擎内存
+ * 无它（RPC 查得 50 vs 磁盘 51）→ 一次 workspace/pinSession+unpinSession →
+ * 文件被重写，标记 id 消失。这正是"手机上归档/取消归档看着成功、过一会又变
+ * 回去，电脑端 Web 永远看不到"的根因。
+ *
+ * 所以生产路径（index.js 的 delete 路由）现在分两步：先走引擎 RPC
+ * `workspace/archiveSession`（内存态一致、永不被覆盖），再调本函数做文件层清理。
+ *
+ * 本函数保留：归档步骤已移除（那是引擎的职责），只做 detach + 删投影缓存。
+ * `tables.workspaces` 的表行写入不走引擎的 setState 整体重写（insertSessionBefore
+ * 只写表行），且归档名单已是引擎权威——即使 detach 行被引擎写回，exclude 过滤
+ * 照样隐藏该会话。session-cleanup.js 的无引擎清理场景与单测仍直接用它。
+ *
+ * Returns { ok, detached, cacheRemoved, error } — callers must surface
  * failures instead of claiming success.
  */
+export function detachSession({ home = dshHome(), sessionId, workspaceId = null }) {
+  const checked = assertSessionId(sessionId);
+  if (!checked.ok) return { ok: false, error: checked.error };
+  const id = checked.id;
+  const clean = checked.bare;
+
+  const wsPath = path.join(home, 'storages', 'workspace.json');
+  const cacheDir = path.join(home, 'storages', 'session_projcache', 'sessions');
+
+  let ws;
+  try {
+    ws = JSON.parse(fs.readFileSync(wsPath, 'utf8'));
+  } catch (err) {
+    return { ok: false, error: `Cannot read workspace store: ${err?.message}` };
+  }
+
+  // Detach from the workspace id list (also honouring the session- prefix variants).
+  let detached = 0;
+  const table = ws?.tables?.workspaces;
+  if (table) {
+    for (const [wsKey, info] of Object.entries(table)) {
+      if (!Array.isArray(info.sessionIds)) continue;
+      if (workspaceId && wsKey !== workspaceId && info.workspaceId !== workspaceId) continue;
+      const before = info.sessionIds.length;
+      info.sessionIds = info.sessionIds.filter((s) => s !== id && s !== clean && s !== `session-${clean}`);
+      detached += before - info.sessionIds.length;
+    }
+  }
+
+  // Persist atomically.
+  try {
+    const tmp = `${wsPath}.bridge-delete.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(ws, null, 2), 'utf8');
+    fs.renameSync(tmp, wsPath);
+  } catch (err) {
+    return { ok: false, error: `Cannot write workspace store: ${err?.message}` };
+  }
+
+  // Drop the projection cache.
+  let cacheRemoved = false;
+  for (const name of [`${clean}.json`, `${id}.json`, `session-${clean}.json`]) {
+    const p = path.join(cacheDir, name);
+    try {
+      if (fs.existsSync(p)) { fs.unlinkSync(p); cacheRemoved = true; }
+    } catch { /* the archive entry already hides it */ }
+  }
+
+  return { ok: true, sessionId: id, detached, cacheRemoved };
+}
+
+/**
+ * Back-compat wrapper: detach + file-layer archive in one call.
+ *
+ * DO NOT use this on the hot path: the archive-set write below races the
+ * engine's in-memory registry and loses (see detachSession's header comment).
+ * The delete route now archives via the engine RPC first and then calls
+ * detachSession(); this wrapper only survives for tests and for
+ * session-cleanup.js's engine-less direct-FS mode.
+ *
+ * Returns { ok, archived, detached, cacheRemoved, evicted, error }.
+ */
+export function deleteSession({ home = dshHome(), sessionId, workspaceId = null }) {
+  const detachedResult = detachSession({ home, sessionId, workspaceId });
+  if (!detachedResult.ok) return detachedResult;
+
+  const id = sessionId.trim();
+  const clean = id.replace(/^session-/, '');
+
+  const wsPath = path.join(home, 'storages', 'workspace.json');
+  let ws;
+  try {
+    ws = JSON.parse(fs.readFileSync(wsPath, 'utf8'));
+  } catch (err) {
+    return { ok: false, error: `Cannot read workspace store: ${err?.message}` };
+  }
+
+  // File-layer archive. See detachSession's header: engine-owned state — a
+  // write here is last-writer-wins at best and silently reverted at worst.
+  if (!ws.global) ws.global = {};
+  const archived = Array.isArray(ws.global.archivedSessionIds) ? ws.global.archivedSessionIds : [];
+  if (!archived.includes(id)) archived.push(id);
+  let evicted = 0;
+  while (archived.length > MAX_ARCHIVED_SESSION_IDS) {
+    archived.shift();
+    evicted++;
+  }
+  // No audit() call here: core.mjs deliberately does not import store.mjs (store
+  // imports core for the audit sink, so the reverse edge would be a cycle). The
+  // eviction count is returned instead and the caller audits it.
+  ws.global.archivedSessionIds = archived;
+
+  try {
+    const tmp = `${wsPath}.bridge-delete.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(ws, null, 2), 'utf8');
+    fs.renameSync(tmp, wsPath);
+  } catch (err) {
+    return { ok: false, error: `Cannot write workspace store: ${err?.message}`, archived: true };
+  }
+
+  return {
+    ok: true,
+    sessionId: id,
+    archived: true,
+    detached: detachedResult.detached,
+    cacheRemoved: detachedResult.cacheRemoved,
+    evicted
+  };
+}
 /* ------------------------------------------------------------------ *
  * Deliverables: extraction + membership
  *
@@ -1812,76 +1935,18 @@ export function pendingQuestionExpired(question, now, ttlMs = 30 * 60 * 1000) {
  */
 const MAX_ARCHIVED_SESSION_IDS = Number(process.env.DSH_MAX_ARCHIVED_SESSIONS || 20000);
 
-export function deleteSession({ home = dshHome(), sessionId, workspaceId = null }) {
-  const checked = assertSessionId(sessionId);
-  if (!checked.ok) return { ok: false, error: checked.error };
-  const id = checked.id;
-  const clean = checked.bare;
-
-  const wsPath = path.join(home, 'storages', 'workspace.json');
-  const cacheDir = path.join(home, 'storages', 'session_projcache', 'sessions');
-
-  let ws;
-  try {
-    ws = JSON.parse(fs.readFileSync(wsPath, 'utf8'));
-  } catch (err) {
-    return { ok: false, error: `Cannot read workspace store: ${err?.message}` };
-  }
-
-  // 1. Archive — the one change the engine round-trips instead of overwriting.
-  if (!ws.global) ws.global = {};
-  const archived = Array.isArray(ws.global.archivedSessionIds) ? ws.global.archivedSessionIds : [];
-  if (!archived.includes(id)) archived.push(id);
-  let evicted = 0;
-  while (archived.length > MAX_ARCHIVED_SESSION_IDS) {
-    archived.shift();
-    evicted++;
-  }
-  // No audit() call here: core.mjs deliberately does not import store.mjs (store
-  // imports core for the audit sink, so the reverse edge would be a cycle). The
-  // eviction count is returned instead and the caller audits it.
-  ws.global.archivedSessionIds = archived;
-
-  // 2. Detach from the workspace id list (also honouring the session- prefix variants).
-  let detached = 0;
-  const table = ws?.tables?.workspaces;
-  if (table) {
-    for (const [wsKey, info] of Object.entries(table)) {
-      if (!Array.isArray(info.sessionIds)) continue;
-      if (workspaceId && wsKey !== workspaceId && info.workspaceId !== workspaceId) continue;
-      const before = info.sessionIds.length;
-      info.sessionIds = info.sessionIds.filter((s) => s !== id && s !== clean && s !== `session-${clean}`);
-      detached += before - info.sessionIds.length;
-    }
-  }
-
-  // 3. Persist atomically.
-  try {
-    const tmp = `${wsPath}.bridge-delete.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(ws, null, 2), 'utf8');
-    fs.renameSync(tmp, wsPath);
-  } catch (err) {
-    return { ok: false, error: `Cannot write workspace store: ${err?.message}`, archived: true };
-  }
-
-  // 4. Drop the projection cache.
-  let cacheRemoved = false;
-  for (const name of [`${clean}.json`, `${id}.json`, `session-${clean}.json`]) {
-    const p = path.join(cacheDir, name);
-    try {
-      if (fs.existsSync(p)) { fs.unlinkSync(p); cacheRemoved = true; }
-    } catch { /* the archive entry already hides it */ }
-  }
-
-  return { ok: true, sessionId: id, archived: true, detached, cacheRemoved, evicted };
-}
-
 /**
  * Archive / un-archive a session WITHOUT detaching it from its workspace.
  *
- * The engine's own UI toggles exactly this field (`global.archivedSessionIds`),
- * so writing it here is the same mutation the Web UI performs — unlike
- * deleteSession, the session stays registered and merely changes visibility.
+ * ⚠️ [2026-11-15] **生产路径不再使用本函数**：它直写 workspace.json 的
+ * `global.archivedSessionIds`，而该文件是引擎 workspaceRegistry 的存储——
+ * 引擎在内存里持有同一份状态，任何注册表操作（pin/unpin、归档、工作区建/删/
+ * 排序、每次启动的 bootstrap）都会按内存态**整体重写**文件，把这里的写入静默
+ * 回滚（根因分析见 detachSession 头注释，含 pin/unpin 活体实验证据）。
+ * index.js 的 archive 路由已改走引擎 RPC `workspace/archiveSession` /
+ * `workspace/unarchiveSession`。本函数仅供无引擎的场景（session-cleanup.js 的
+ * direct-FS 清理模式）与单测使用。
+ *
  * Returns { ok, archived, error }.
  */
 export function archiveSession({ home = dshHome(), sessionId, archive = true }) {

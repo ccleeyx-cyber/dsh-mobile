@@ -106,8 +106,10 @@ import {
   authenticateRequest,
   readBodyWithLimit,
   parseJsonBody,
-  deleteSession,
-  archiveSession,
+  // deleteSession / archiveSession 已不再从 index.js 调用：归档一律走引擎 RPC
+  // （workspace/archiveSession / unarchiveSession），文件层 detach 用 detachSession。
+  // 两个直写函数保留在 core.mjs 供 session-cleanup.js 与单测使用。
+  detachSession,
   renameSession,
   assertSessionId,
   pendingQuestionExpired,
@@ -5437,10 +5439,34 @@ export function apply(ctx, config = {}, internals = {}) {
 
       if (pathname === '/api/mobile/sessions/delete' && req.method === 'POST') {
         const { sessionId, workspaceId } = jsonBody;
-        // Implemented bridge-side: the engine has no session/delete RPC, so the
-        // old callDshRpc('session/delete') + `catch(_){}` returned 200 "Deleted"
-        // while removing nothing. [fixed]
-        const result = deleteSession({ home: dshHomeDir, sessionId, workspaceId });
+        // [fix 2026-11-15] 删除 = 引擎侧归档（workspace/archiveSession）+ 文件层
+        // detach。此前整个流程都是直接改 workspace.json：归档名单那一步会被引擎
+        // 的内存态注册表整体回写静默回滚（根因分析见 core.mjs detachSession 头
+        // 注释，含活体实验证据）——手机上删掉的会话过一阵子又"复活"，电脑端
+        // Web 也永远看不到。引擎其实一直有 workspace/archiveSession RPC（当年
+        // 只探了 session/* 命名空间，漏了 workspace/*，见
+        // .probe/remotes-authoritative.txt:131）。
+        const idCheck = assertSessionId(sessionId);
+        if (!idCheck.ok) {
+          audit('session/delete-failed', { sessionId, error: idCheck.error });
+          sendJson(400, { ok: false, code: 400, sessionId, error: idCheck.error });
+          return;
+        }
+        try {
+          // stopActivity: true —— delete 本来就是硬删语义，正在跑的会话先停再归档。
+          await callDshRpc('workspace/archiveSession', {
+            args: { request: { sessionId: idCheck.id, stopActivity: true } }
+          });
+        } catch (err) {
+          // 引擎不可达/拒绝时如实失败，绝不退回旧的文件直写路径（那正是本 bug
+          // 的根因，静默降级等于保留故障模式）。
+          audit('session/delete-failed', { sessionId, error: err?.message || String(err) });
+          sendJson(502, { ok: false, code: 502, sessionId, error: `引擎归档失败：${err?.message || err}` });
+          return;
+        }
+        // 文件层清理：从工作区 detach + 删投影缓存。归档名单已由引擎权威写入；
+        // 这一步即使被引擎写回表行，exclude 过滤照样隐藏该会话（见函数头注释）。
+        const result = detachSession({ home: dshHomeDir, sessionId, workspaceId });
 
         if (!result.ok) {
           audit('session/delete-failed', { sessionId, error: result.error });
@@ -5691,21 +5717,46 @@ export function apply(ctx, config = {}, internals = {}) {
 
       // ---- 会话归档 / 取消归档 ----
       if (pathname === '/api/mobile/sessions/archive' && req.method === 'POST') {
-        const result = archiveSession({
-          home: dshHomeDir,
-          sessionId: jsonBody.sessionId,
-          archive: jsonBody.archive !== false
-        });
-        if (!result.ok) {
-          sendJson(400, { ok: false, code: 400, error: result.error });
+        // [fix 2026-11-15] 改走引擎 RPC workspace/archiveSession / unarchiveSession。
+        // 此前 archiveSession() 直接改 workspace.json 的 global.archivedSessionIds，
+        // 而该文件是引擎 workspaceRegistry 的存储——引擎内存里持有同一份状态，
+        // 任何注册表操作（pin/unpin、归档、工作区建/删/排序、启动 bootstrap）都会
+        // 按内存态整体重写文件，把这里的写入静默回滚。实测：手机归档"成功"，过一
+        // 会儿行又回来了，电脑端 Web 永远看不到。RPC 形状见
+        // .probe/remotes-authoritative.txt:131/140；根因与活体实验见 core.mjs
+        // detachSession 头注释。
+        const sessionId = String(jsonBody.sessionId || '').trim();
+        const wantArchive = jsonBody.archive !== false;
+        const idCheck = assertSessionId(sessionId);
+        if (!idCheck.ok) {
+          audit('session/archive-failed', { sessionId, archive: wantArchive, error: idCheck.error });
+          sendJson(400, { ok: false, code: 400, error: idCheck.error });
           return;
         }
-        audit('session/archive', { sessionId: jsonBody.sessionId, archived: result.archived });
+        try {
+          // stopActivity: true —— 与 delete 的硬语义对齐：手机上归档一个正在跑的
+          // 会话，期望就是收进抽屉、先停掉它（引擎默认会以 workspace/session-active
+          // 拒绝活跃会话）。取消归档幂等，引擎对未归档 id 直接成功。
+          if (wantArchive) {
+            await callDshRpc('workspace/archiveSession', {
+              args: { request: { sessionId: idCheck.id, stopActivity: true } }
+            });
+          } else {
+            await callDshRpc('workspace/unarchiveSession', {
+              args: { request: { sessionId: idCheck.id } }
+            });
+          }
+        } catch (err) {
+          audit('session/archive-failed', { sessionId, archive: wantArchive, error: err?.message || String(err) });
+          sendJson(502, { ok: false, code: 502, error: `引擎${wantArchive ? '归档' : '取消归档'}失败：${err?.message || err}` });
+          return;
+        }
+        audit('session/archive', { sessionId, archived: wantArchive });
         broadcastToMobileClients({
-          type: result.archived ? 'session_archived' : 'session_unarchived',
-          sessionId: jsonBody.sessionId
+          type: wantArchive ? 'session_archived' : 'session_unarchived',
+          sessionId
         });
-        sendJson(200, { ok: true, code: 0, sessionId: result.sessionId, archived: result.archived });
+        sendJson(200, { ok: true, code: 0, sessionId, archived: wantArchive });
         return;
       }
 

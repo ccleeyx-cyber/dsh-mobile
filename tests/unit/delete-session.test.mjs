@@ -1,5 +1,11 @@
 /**
- * Unit tests for session deletion (the previously-fake sessions/delete endpoint).
+ * Unit tests for the core.mjs file-layer session-removal helpers.
+ *
+ * [2026-11-15] 契约变化：生产 delete 路由已改为「引擎 RPC 归档 + detachSession」
+ * 两步（见 archive-routes.test.mjs），因为直接写 global.archivedSessionIds 会被
+ * 引擎的内存态注册表整体回写静默回滚（根因分析见 core.mjs detachSession 头
+ * 注释）。deleteSession 现在只是兼容旧调用方的包装（detach + 文件层归档），
+ * 仅供 session-cleanup.js 的无引擎场景与这些单测使用。
  *
  * Runs against a throwaway DSH_HOME, never the real store.
  */
@@ -10,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { deleteSession } from '../../dsh-server-plugin/lib/core.mjs';
+import { deleteSession, detachSession } from '../../dsh-server-plugin/lib/core.mjs';
 
 let HOME;
 
@@ -110,5 +116,54 @@ describe('core: deleteSession', () => {
     const ws = readStore(wsPath);
     assert.deepEqual(ws.tables.workspaces['ws-1'].sessionIds, ['session-b', 'session-c']);
     assert.equal(fs.existsSync(path.join(HOME, 'storages', 'session_projcache', 'sessions', 'b.json')), true);
+  });
+});
+
+describe('core: detachSession（生产 delete 路由的文件层）', () => {
+  beforeEach(() => {
+    HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-detach-'));
+  });
+  afterEach(() => {
+    try { fs.rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it('detaches and removes the cache entry WITHOUT touching the archive set', () => {
+    const wsPath = seedWorkspace({ sessionIds: ['session-a', 'session-b'], archived: ['session-z'] });
+    const cache = seedCache('session-a', { title: 'hello' });
+
+    const r = detachSession({ home: HOME, sessionId: 'session-a', workspaceId: 'ws-1' });
+    assert.equal(r.ok, true);
+    assert.equal(r.detached, 1);
+    assert.equal(r.cacheRemoved, true);
+
+    const ws = readStore(wsPath);
+    // 归档名单是引擎的权威域，文件层一个字节都不能动。
+    assert.deepEqual(ws.global.archivedSessionIds, ['session-z']);
+    assert.deepEqual(ws.tables.workspaces['ws-1'].sessionIds, ['session-b']);
+    assert.equal(fs.existsSync(cache), false);
+  });
+
+  it('rejects an invalid sessionId before touching the store', () => {
+    seedWorkspace({ sessionIds: ['session-a'] });
+    for (const bad of ['', '   ', null, undefined]) {
+      const r = detachSession({ home: HOME, sessionId: bad });
+      assert.equal(r.ok, false, `expected failure for ${JSON.stringify(bad)}`);
+      assert.match(r.error, /sessionId/i);
+    }
+  });
+
+  it('reports failure when the store cannot be read', () => {
+    const r = detachSession({ home: HOME, sessionId: 'session-x' });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /Cannot read workspace store/);
+  });
+
+  it('is idempotent — detaching twice succeeds with detached:0', () => {
+    seedWorkspace({ sessionIds: ['session-a'] });
+    const first = detachSession({ home: HOME, sessionId: 'session-a' });
+    assert.equal(first.ok, true);
+    const second = detachSession({ home: HOME, sessionId: 'session-a' });
+    assert.equal(second.ok, true);
+    assert.equal(second.detached, 0);
   });
 });
