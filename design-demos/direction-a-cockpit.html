@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>方向 A · 驾驶舱 Cockpit</title>
+<style>
+  :root{
+    --bg:#0A0C10; --panel:#10141B; --panel2:#141B26; --hair:#1C222C; --hair2:#232C3A;
+    --ink:#E6EAF2; --ink2:#8B94A3; --ink3:#5C6675;
+    --green:#3DD68C; --amber:#E5A50A; --red:#F0564A; --cyan:#5AC8E8;
+    --mono:"JetBrains Mono","Cascadia Code",Consolas,"Sarasa Mono SC",monospace;
+    --sans:"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);font-family:var(--sans);color:var(--ink);
+    background-image:linear-gradient(var(--hair) 1px,transparent 1px),linear-gradient(90deg,var(--hair) 1px,transparent 1px);
+    background-size:64px 64px;background-position:-1px -1px;}
+  .board{width:1560px;padding:56px 64px 64px;position:relative}
+  .board::before{content:"";position:absolute;inset:24px;border:1px solid var(--hair2);pointer-events:none}
+  header{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:44px}
+  .kicker{font-family:var(--mono);font-size:11px;letter-spacing:.22em;color:var(--green);text-transform:uppercase;margin-bottom:14px}
+  h1{font-size:44px;font-weight:650;letter-spacing:-.01em;line-height:1.05}
+  h1 em{font-style:normal;color:var(--ink3)}
+  .lede{max-width:520px;font-size:13.5px;line-height:1.75;color:var(--ink2);margin-top:14px}
+  .meta{font-family:var(--mono);font-size:11px;color:var(--ink3);text-align:right;line-height:2}
+  .meta b{color:var(--ink2);font-weight:500}
+  .stage{display:flex;gap:56px;align-items:flex-start}
+  .slot{position:relative}
+  .slot .tag{font-family:var(--mono);font-size:10.5px;letter-spacing:.18em;color:var(--ink3);text-transform:uppercase;margin-bottom:12px;display:flex;gap:10px;align-items:center}
+  .slot .tag::before{content:"";width:22px;height:1px;background:var(--green)}
+  .phone{background:var(--panel);border:1px solid var(--hair2);border-radius:26px;overflow:hidden;box-shadow:0 40px 80px -40px #000}
+  .phone.main{width:392px}
+  .phone.sub{width:348px;margin-top:52px}
+  /* status bar */
+  .sb{display:flex;justify-content:space-between;align-items:center;padding:10px 20px 6px;font-family:var(--mono);font-size:11px;color:var(--ink2)}
+  .sb .r{display:flex;gap:6px;align-items:center}
+  .sb .bat{width:18px;height:9px;border:1px solid var(--ink3);border-radius:2px;position:relative}
+  .sb .bat::after{content:"";position:absolute;inset:1.5px;right:5px;background:var(--ink2)}
+  /* top bar */
+  .top{display:flex;align-items:center;gap:10px;padding:8px 16px 12px;border-bottom:1px solid var(--hair)}
+  .top .back{color:var(--ink2);font-size:16px}
+  .top .t{flex:1;min-width:0}
+  .top .t .n{font-size:14.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .top .t .s{font-family:var(--mono);font-size:10px;color:var(--ink3);margin-top:3px;display:flex;gap:8px;align-items:center}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
+  .dot.a{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+  .top .ic{color:var(--ink2);font-size:15px}
+  /* stream */
+  .stream{padding:16px 16px 8px;display:flex;flex-direction:column;gap:14px;height:520px;overflow:hidden}
+  .sub .stream{height:470px}
+  .u{align-self:flex-end;max-width:82%;background:var(--panel2);border:1px solid var(--hair2);border-radius:12px 12px 3px 12px;padding:10px 13px;font-size:13px;line-height:1.65}
+  .ai{font-size:13px;line-height:1.75;color:var(--ink)}
+  .ai .lbl{font-family:var(--mono);font-size:9.5px;letter-spacing:.2em;color:var(--ink3);text-transform:uppercase;margin-bottom:6px}
+  .ai p+p{margin-top:8px}
+  .ai b{color:var(--green);font-weight:600}
+  .tool{border:1px solid var(--hair);border-radius:8px;background:#0C1016;overflow:hidden}
+  .tool .h{display:flex;align-items:center;gap:8px;padding:8px 11px;border-bottom:1px solid var(--hair);font-family:var(--mono);font-size:10.5px;color:var(--ink2)}
+  .tool .h .ok{color:var(--green)}
+  .tool .h .ms{margin-left:auto;color:var(--ink3)}
+  .tool .b{padding:9px 11px;font-family:var(--mono);font-size:10.5px;line-height:1.7;color:var(--ink2);white-space:pre}
+  .tool .b .g{color:var(--green)}
+  .code{border-left:2px solid var(--cyan);background:#0C1016;padding:9px 12px;font-family:var(--mono);font-size:10.5px;line-height:1.7;color:var(--ink2);white-space:pre;border-radius:0 6px 6px 0}
+  .code .k{color:var(--cyan)} .code .s{color:var(--amber)}
+  /* readout strip */
+  .readout{display:flex;border-top:1px solid var(--hair);border-bottom:1px solid var(--hair);margin:2px 0 4px}
+  .readout div{flex:1;padding:7px 4px;text-align:center;font-family:var(--mono);font-size:10px;color:var(--ink3);border-right:1px solid var(--hair)}
+  .readout div:last-child{border-right:0}
+  .readout b{display:block;color:var(--ink);font-size:12px;font-weight:500;margin-bottom:2px}
+  /* composer */
+  .composer{margin:10px 14px 12px;border:1px solid var(--hair2);border-radius:10px;background:var(--panel2);padding:10px 12px;display:flex;gap:10px;align-items:center}
+  .composer .ph{flex:1;font-family:var(--mono);font-size:11px;color:var(--ink3)}
+  .composer .send{width:30px;height:30px;border-radius:8px;background:var(--green);color:#06110B;display:flex;align-items:center;justify-content:center;font-size:14px}
+  .composer .mi{color:var(--ink3);font-size:15px}
+  /* nav */
+  .nav{display:flex;border-top:1px solid var(--hair)}
+  .nav div{flex:1;padding:10px 0 14px;text-align:center;font-family:var(--mono);font-size:9.5px;letter-spacing:.14em;color:var(--ink3);text-transform:uppercase}
+  .nav div.on{color:var(--green);box-shadow:inset 0 2px 0 var(--green)}
+  .nav div i{display:block;font-style:normal;font-size:15px;margin-bottom:4px;letter-spacing:0}
+  /* workspace list */
+  .ws{padding:6px 0}
+  .ws .grp{font-family:var(--mono);font-size:9.5px;letter-spacing:.2em;color:var(--ink3);text-transform:uppercase;padding:12px 18px 8px}
+  .row{display:flex;align-items:center;gap:12px;padding:12px 18px;border-top:1px solid var(--hair)}
+  .row .nm{flex:1;min-width:0}
+  .row .nm .a{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .nm .b{font-family:var(--mono);font-size:10px;color:var(--ink3);margin-top:3px}
+  .chip{font-family:var(--mono);font-size:9.5px;padding:3px 7px;border-radius:4px;border:1px solid var(--hair2);color:var(--ink2)}
+  .chip.run{color:var(--green);border-color:#1E4433;background:#0E1A14}
+  .chip.wait{color:var(--amber);border-color:#4A3A12;background:#1A1509}
+  .foot{margin-top:40px;display:flex;gap:48px;font-family:var(--mono);font-size:10.5px;color:var(--ink3);line-height:1.9}
+  .foot b{color:var(--ink2);font-weight:500}
+</style>
+</head>
+<body>
+<div class="board">
+  <header>
+    <div>
+      <div class="kicker">Direction A / Cockpit</div>
+      <h1>驾驶舱 <em>/ 把会话当成一次飞行</em></h1>
+      <p class="lede">深色石墨底、发丝分隔线、等宽读数。状态不再是徽章，而是一排仪表：轮次、步数、tok/s、上下文占用常驻可读。参照 Linear 暗色与终端美学的混合体。</p>
+    </div>
+    <div class="meta">
+      <b>参照</b> Raycast / Linear dark / tmux 状态行<br>
+      <b>母题</b> 发丝线 + 等宽读数 + 信号灯<br>
+      <b>底色</b> #0A0C10 · 信号绿 #3DD68C
+    </div>
+  </header>
+
+  <div class="stage">
+    <div class="slot">
+      <div class="tag">Chat / 主屏</div>
+      <div class="phone main">
+        <div class="sb"><span>9:41</span><span class="r">▪▪▪ <span class="bat"></span> 87%</span></div>
+        <div class="top">
+          <span class="back">‹</span>
+          <div class="t">
+            <div class="n">会话界面顶部布局改造</div>
+            <div class="s"><span class="dot"></span>RUNNING · dsh_mobile · ctx 23%</div>
+          </div>
+          <span class="ic">⌕</span><span class="ic">ⓘ</span>
+        </div>
+        <div class="readout">
+          <div><b>6</b>轮</div><div><b>351</b>步</div><div><b>210</b>tok/s</div><div><b>113M</b>tok</div><div><b>3</b>产出</div>
+        </div>
+        <div class="stream">
+          <div class="u">顶栏数字全挤在一条 34dp 里，横向还要滑？</div>
+          <div class="ai">
+            <div class="lbl">Agent</div>
+            <p>是的。六组读数横向溢出，靠渐隐遮断只是把问题藏起来。改成双行身份栏：主栏回答「我在哪个会话」，第二行放工作区与上下文，<b>省 37dp</b>。</p>
+          </div>
+          <div class="tool">
+            <div class="h"><span class="ok">✓</span> pwsh · 测量顶栏高度 <span class="ms">1.2s</span></div>
+            <div class="b">$ measure-appbar --session topbar
+<span class="g">old 90dp → new 53dp</span></div>
+          </div>
+          <div class="code"><span class="k">Container</span>(
+  padding: EdgeInsets.symmetric(
+    horizontal: <span class="s">16</span>),
+)</div>
+          <div class="u">改完推上去，CI 出包。</div>
+          <div class="ai" style="display:flex;gap:8px;align-items:center;color:var(--ink3)">
+            <span class="dot"></span><span style="font-family:var(--mono);font-size:10.5px;letter-spacing:.14em">WRITING · 210 TOK/S</span>
+          </div>
+        </div>
+        <div class="composer"><span class="ph">继续对话_</span><span class="mi">🎙</span><span class="mi">＋</span><span class="send">↑</span></div>
+        <div class="nav"><div class="on"><i>▣</i>chat</div><div><i>▤</i>work</div><div><i>⚙</i>cfg</div></div>
+      </div>
+    </div>
+
+    <div class="slot">
+      <div class="tag">Workspaces / 列表</div>
+      <div class="phone sub">
+        <div class="sb"><span>9:41</span><span class="r">▪▪▪ <span class="bat"></span> 87%</span></div>
+        <div class="top">
+          <div class="t"><div class="n">工作区</div><div class="s">4 WORKSPACES · 2 ACTIVE</div></div>
+          <span class="ic">⌕</span>
+        </div>
+        <div class="stream" style="height:auto;padding:0">
+          <div class="ws">
+            <div class="grp">Active</div>
+            <div class="row"><div class="nm"><div class="a">dsh_mobile</div><div class="b">3 sessions · push → CI</div></div><span class="chip run">RUN 1</span></div>
+            <div class="row"><div class="nm"><div class="a">tickflow-stock-panel</div><div class="b">12 sessions · 2h ago</div></div><span class="chip">IDLE</span></div>
+            <div class="grp">Queued</div>
+            <div class="row"><div class="nm"><div class="a">work/wecom-ocr</div><div class="b">审批预设待确认</div></div><span class="chip wait">WAIT 2</span></div>
+            <div class="row"><div class="nm"><div class="a">HORIZON-EXPERIMENTAL</div><div class="b">last: 3d ago</div></div><span class="chip">IDLE</span></div>
+            <div class="grp">Sessions · dsh_mobile</div>
+            <div class="row"><div class="nm"><div class="a">会话界面顶部布局改造</div><div class="b">6 轮 · 351 步</div></div><span class="chip run">RUN</span></div>
+            <div class="row"><div class="nm"><div class="a">深色模式对比度审查</div><div class="b">产出 3 · 昨天</div></div><span class="chip">DONE</span></div>
+          </div>
+        </div>
+        <div class="nav" style="margin-top:26px"><div><i>▣</i>chat</div><div class="on"><i>▤</i>work</div><div><i>⚙</i>cfg</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <div><b>字体</b>  grotesk 半粗标题 + JetBrains Mono 全数据层</div>
+    <div><b>层级</b>  不用卡片阴影，用发丝线与明度三档</div>
+    <div><b>代价</b>  浅色模式需要单独一套仪表取值</div>
+  </div>
+</div>
+</body>
+</html>

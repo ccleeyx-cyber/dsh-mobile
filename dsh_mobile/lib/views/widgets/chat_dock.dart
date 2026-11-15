@@ -25,6 +25,7 @@ import '../../widgets/approval_card.dart';
 import '../config_page.dart';
 import 'attachment_tile.dart';
 import 'question_card.dart';
+import 'cockpit_readout.dart';
 import 'session_status_strip.dart';
 
 /// dock（审批卡 / 提问卡 / TODO / 附件）最多占屏幕高度的多少。
@@ -62,6 +63,29 @@ const double _dockMaxHeightFraction = 0.45;
 /// 数量类读数的去向也写死：轮/步、tok/s、累计 tok、缓存命中、改动数、产出总数
 /// 全部进会话信息面板 —— 它们本来就是"翻明细"才看的东西。顶部只留**会变、且
 /// 需要你反应**的那几样，否则永远是在 34dp 里塞 8 组数字。
+/// 顶栏 bottom 的复合带：仪表簇（常驻）+ 事件带（按需）。
+///
+/// 两段各自是 PreferredSizeWidget，复合体的 preferredSize 必须是两段之和 ——
+/// Scaffold 按这个值给顶栏留高，算少一条就会把事件带压进消息流里。
+class _TopStack extends StatelessWidget implements PreferredSizeWidget {
+  const _TopStack({required this.readout, required this.strip});
+
+  final CockpitReadout readout;
+  final SessionStatusStrip strip;
+
+  @override
+  Size get preferredSize => Size.fromHeight(
+      readout.preferredSize.height + strip.preferredSize.height);
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [readout, strip],
+    );
+  }
+}
+
 class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
   const ChatAppBar({
     super.key,
@@ -125,8 +149,8 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
   }
 
   @override
-  Size get preferredSize =>
-      Size.fromHeight(toolbarHeight + _eventStrip(null).preferredSize.height);
+  Size get preferredSize => Size.fromHeight(
+      toolbarHeight + CockpitReadout.height + _eventStrip(null).preferredSize.height);
 
   @override
   Widget build(BuildContext context) {
@@ -198,7 +222,14 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
           onPressed: () => onOpenSessionInfo(SessionInsightSection.usage),
         ),
       ],
-      bottom: _eventStrip(context),
+      bottom: _TopStack(
+        readout: CockpitReadout(
+          stats: stats,
+          deliverableCount: dsh.deliverableCount,
+          onTap: () => onOpenSessionInfo(SessionInsightSection.usage),
+        ),
+        strip: _eventStrip(context),
+      ),
     );
   }
 

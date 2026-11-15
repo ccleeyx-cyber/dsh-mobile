@@ -235,10 +235,15 @@ class _ToolCallCardState extends State<ToolCallCard>
             ),
             child: Row(
               children: [
-                Icon(
-                  _getToolIcon(tool.name),
-                  size: 13,
-                  color: isRunning ? context.c.accent : context.c.textSecondary,
+                // 驾驶舱方向：工具图标换成终端提示符 `$`，卡头读作一行 shell。
+                Text(
+                  r'$',
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: isRunning ? context.c.accent : context.c.textTertiary,
+                  ),
                 ),
                 const SizedBox(width: AppSpace.s),
                 Expanded(
@@ -408,6 +413,8 @@ class _ToolCallCardState extends State<ToolCallCard>
         fontSize: AppText.body,
         fontWeight: FontWeight.w600,
         color: context.c.textPrimary,
+        // 驾驶舱方向：工具名进等宽层，卡头读作终端行。
+        fontFamily: 'monospace',
       ),
     );
     if (preview == null || preview.isEmpty) return title;

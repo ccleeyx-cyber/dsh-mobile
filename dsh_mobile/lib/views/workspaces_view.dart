@@ -869,7 +869,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
           else
             Icon(icon, size: 12, color: color),
           const SizedBox(width: 5),
-          Text(label, style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
+          Text(label, style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.w700, fontFamily: 'monospace', letterSpacing: 1.2)),
         ],
       ),
     );
@@ -1307,7 +1307,7 @@ class _WorkspacesViewState extends State<WorkspacesView> with WidgetsBindingObse
                   ),
                   const SizedBox(width: 6),
                 ],
-                Text(_formatTime(s.lastPromptAt), style: TextStyle(fontSize: 10, color: context.c.textTertiary)),
+                Text(_formatTime(s.lastPromptAt), style: TextStyle(fontSize: 10, color: context.c.textTertiary, fontFamily: 'monospace')),
               ],
             ),
           ],

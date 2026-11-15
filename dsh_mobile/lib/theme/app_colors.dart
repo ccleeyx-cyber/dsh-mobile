@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-/// 语义色 token 层（v1.6.0 深色模式的地基）。
+/// 语义色 token 层（v1.6.0 深色模式的地基；2026-11-15 换「驾驶舱」方向取值）。
 ///
 /// ## 为什么先做这一层
 ///
@@ -21,14 +21,24 @@ import 'package:flutter/material.dart';
 /// - 卡片之间的描边 → `border`
 /// - 正文文字 → `textPrimary`
 /// - 次要说明/时间戳 → `textSecondary` / `textTertiary`
-/// - 品牌蓝（按钮、选中态）→ `accent`
+/// - 信号绿（按钮、选中态、运行中）→ `accent`
 /// - 用户消息气泡 → `userBubble`；AI 气泡 → `aiBubble`（透明，裸排版）
 /// - 危险红 → `danger`
 /// - 成功绿 → `success`；命令输出成功 → `terminalGreen`
-/// - 警告橙 → `warning`
+/// - 警告琥珀 → `warning`
 ///
 /// 拿不准就先用 `textPrimary` 之外的中性槽位，**不要**为了让某处"看起来对"
 /// 而新增一个一次性色值 —— 那等于把硬编码换个地方继续。
+///
+/// ## 驾驶舱方向（2026-11-15，用户选定方向 A）
+///
+/// 深色侧是主体验：石墨底 #0A0C10、面板 #10141B、发丝线 #1C222C、等宽读数、
+/// 信号绿 #3DD68C 表示「在跑」。品牌蓝整体退场 —— 这个 App 的「主色」语义
+/// 本来就是「agent 正在做事」，绿灯比蓝钮诚实。
+///
+/// 浅色侧不是深色的反相，而是「白昼驾驶舱」：冷纸灰底 + 同一套发丝线语言 +
+/// 深信号绿 #0B7A4B（白字 4.76:1，过正文 AA）。两侧守同一条层级规则：
+/// 页面底 → 浮层 → 内嵌区逐级抬明度。
 ///
 /// ## 为什么用 InheritedWidget 而不是 GetIt / 全局单例
 ///
@@ -37,39 +47,20 @@ import 'package:flutter/material.dart';
 class AppColors {
   AppColors._();
 
-  // ---- 品牌 ----
+  // ---- 品牌 / 信号 ----
   //
-  // 旧值 #0078D4 是 Flutter/Windows 的默认蓝，本身不丑，但它在整整一代 Windows
-  // 应用里出现过，用户看到它不会觉得这是「这个产品的颜色」，只觉得自己还在系统
-  // 设置页里。现在换成偏紫的 #3F5AF0：与正文的中性灰拉开色相距离，也让选中态
-  // 不再和系统 UI 撞色。
+  // 驾驶舱方向：主色 = 信号灯绿。深色 #3DD68C 对页面底 #0A0C10 约 10.5:1，
+  // 对面板 #10141B 约 9.6:1；浅色 #0B7A4B 对页面底 #EEF1F4 4.76:1、白字压它
+  // 4.9:1 —— 两侧都过正文 AA（4.5:1）。
   //
-  // 深色侧 #6E8BFF 是同一色相提亮，而不是简单取反 —— 取反得到的是低饱和的暗蓝，
-  // 那会让所有按钮在深色下看起来都是禁用态。
-  //
-  // 实测对比度（WCAG 公式自测，改色前必须重算）：
-  // - accent(#3F5AF0) 对白底 5.34:1、对页面底 #F1F5F9 4.88:1 —— 白字压在 accent
-  //   上同样是 5.34:1，正文级 AA(4.5:1) 达标，用户气泡/实心按钮可以放心用正文号；
-  // - accentDark(#6E8BFF) 对页面底 #0D1117 6.13:1、对卡片面 #161B22 5.60:1。
-  //
-  // 之所以是 #3F5AF0 而不是更亮的 #4C6FFF：后者白字只有 4.18:1，卡在正文 AA 线上
-  // 下。#4C6FFF 的穿透感更好，但用户气泡里是 13.5~14.5pt 的正常字重正文，不是大字，
-  // 拿不到 3:1 的大字豁免。token 层的责任是先把可访问性做对 —— 观感问题应该在
-  // 排版层（字号、字重、留白）解决，而不是靠把底色调亮换来的假对比。
-  static const Color accent = Color(0xFF3F5AF0);
-  static const Color accentDark = Color(0xFF6E8BFF);
+  // onAccent 两侧相反：浅绿底压近黑字（#06110B，11:1），深绿底压白字。
+  static const Color accent = Color(0xFF0B7A4B);
+  static const Color accentDark = Color(0xFF3DD68C);
 
-  /// 用户消息气泡底。
-  ///
-  /// [fix 2026-10-17] 之前直接复用 `accent`（实心蓝）。问题不是好看不好看，而是
-  /// **选中文字看不见**：Flutter 的选区高亮是 accent 的半透明叠色，压在实心 accent
-  /// 底上几乎看不出变化 —— 用户长按选中一句话，屏幕上像没反应，只能靠"复制"
-  /// 按钮亮起来猜自己选中了没有（用户实测反馈）。
-  ///
-  /// 现在改成 accent 的**浅色 tint** + 深色正文：选区高亮压在浅底上对比明显，
-  /// 气泡仍有品牌感，与"裸排版的 AI 正文"也依然一眼可分。
-  static const Color userBubble = Color(0xFFE3EAFE);
-  static const Color userBubbleDark = Color(0xFF1E2B4D);
+  /// 用户消息气泡底。驾驶舱里是一块带发丝描边的内嵌面板，不是彩色胶囊：
+  /// 选中文字的高亮压在面板底上对比明显（2026-10-17 那条教训继续生效）。
+  static const Color userBubble = Color(0xFFE2EDE7);
+  static const Color userBubbleDark = Color(0xFF141B26);
 
   /// AI 消息气泡底。透明 —— AI 正文裸排在页面底上，不再套卡片（Phase 2.1）。
   ///
@@ -81,115 +72,74 @@ class AppColors {
 
   // ---- 中性：文字 ----
   /// 主要文字（正文、标题）。
-  static const Color textPrimary = Color(0xFF111827);
-  static const Color textPrimaryDark = Color(0xFFE5E7EB);
+  static const Color textPrimary = Color(0xFF0C1116);
+  static const Color textPrimaryDark = Color(0xFFE6EAF2);
 
   /// 次要文字（说明、标签）。
-  static const Color textSecondary = Color(0xFF6B7280);
-  static const Color textSecondaryDark = Color(0xFF9CA3AF);
+  static const Color textSecondary = Color(0xFF4A5563);
+  static const Color textSecondaryDark = Color(0xFF9AA4B2);
 
-  /// 最低对比度文字（时间戳、占位符、禁用态）。
-  ///
-  /// 这三档此前是「按视觉轻重分级」而非「按对比度分级」：#9CA3AF 在白底只有约
-  /// 2.8:1，#6B7280 在 #111827 深底约 3.9:1，两者都低于 WCAG AA 对正文的 4.5:1。
-  /// 而这一档恰好用在时间戳、工具卡副文案、输入框占位符上 —— 正是视力最弱的用户
-  /// 最需要看清的位置。现已改为满足 AA：浅底 #4B5563(7.5:1)、深底 #9CA3AF(7.0:1)。
-  static const Color textTertiary = Color(0xFF4B5563);
-  static const Color textTertiaryDark = Color(0xFF9CA3AF);
+  /// 最低对比度文字（时间戳、占位符、禁用态）。两侧均过正文 AA：
+  /// 浅 #5A6472 对页面底 5.3:1；深 #7E8896 对面板 #10141B 5.1:1。
+  static const Color textTertiary = Color(0xFF5A6472);
+  static const Color textTertiaryDark = Color(0xFF7E8896);
 
   // ---- 中性：面 ----
   //
-  // 三级明度模型：**页面底最暗 → 浮层（surface）→ 内嵌区（surfaceMuted）逐级变亮**。
-  // 浅色与深色守着同一条规则，只是绝对值相反 —— 浅色从灰白往上走到纯白，深色从
-  // 近黑往上走到炭灰。这样「层级越高越亮」在两种主题里是同一句话，不需要每个
-  // widget 自己判断深浅。
+  // 三级明度模型：**页面底 → 浮层（surface）→ 内嵌区（surfaceMuted）逐级抬亮**，
+  // 浅色与深色守同一条规则。驾驶舱的深色三档差距刻意比旧值小（#0A0C10 /
+  // #10141B / #141B26 每档约 +6 通道值）：分层主要交给发丝线，明度只做辅助 ——
+  // 仪表板的质感来自线，不来自块。
   //
-  // 旧取值有两个具体问题：
-  //
-  // 1. 浅色三档太挤。#F8FAFC(页面底) / #F9FAFB(内嵌) / #FFFFFF(卡片) 之间只差 6~7
-  //    个通道值，肉眼分辨不出层级，于是所有分层都要靠 1px 边框去说 —— 结果是满屏
-  //    都是框。现在把页面底压到 #F1F5F9（与卡片每通道差 14，约 5.5%），边框变成
-  //    补充说明而不是唯一的分层手段。
-  // 2. 深色里同一个 token 的相对层级幅度和浅色对不上。旧的 surfaceMuted #374151
-  //    相对 surface #1F2937 亮了整整两档（+24 每通道），而浅色下 surfaceMuted
-  //    相对 surface 只暗一档。同一个语义在两种主题里差了两个量级，导致「内嵌区」
-  //    在深色下看起来像「浮起的选中卡片」。新取值把幅度对齐成对称的一档：
-  //    浅色压一档（#FFFFFF → #F8FAFC），深色抬一档（#161B22 → #21262D）。
-  //
-  // 深色边框从 #4B5563 压到 #30363D：旧值相对 #1F2937 的面对比过强，看上去像
-  // 发光的白色描边，深色下最刺眼的往往不是文字而是这些线。
+  // 发丝线 #1C222C 对面板 #10141B 的面对比约 1.35:1 —— 够看见结构，不够刺眼。
+  // 深色下最刺眼的从来不是文字而是发光的描边（2026-10 那条教训继续生效）。
 
   /// 页面底色（最低一层）。
-  static const Color background = Color(0xFFF1F5F9);
-  static const Color backgroundDark = Color(0xFF0D1117);
+  static const Color background = Color(0xFFEEF1F4);
+  static const Color backgroundDark = Color(0xFF0A0C10);
 
   /// 卡片/输入框底色（第二层）。
-  static const Color surface = Color(0xFFFFFFFF);
-  static const Color surfaceDark = Color(0xFF161B22);
+  static const Color surface = Color(0xFFFAFBFC);
+  static const Color surfaceDark = Color(0xFF10141B);
 
   /// 次级面（内嵌区域、hover、工具输出的外层）。
-  static const Color surfaceMuted = Color(0xFFF8FAFC);
-  static const Color surfaceMutedDark = Color(0xFF21262D);
+  static const Color surfaceMuted = Color(0xFFF3F5F8);
+  static const Color surfaceMutedDark = Color(0xFF141B26);
 
-  /// 描边 / 分隔线。
-  static const Color border = Color(0xFFE2E8F0);
-  static const Color borderDark = Color(0xFF30363D);
+  /// 描边 / 分隔线（发丝线）。
+  static const Color border = Color(0xFFD8DEE6);
+  static const Color borderDark = Color(0xFF1C222C);
 
-  /// 代码块 / 终端输出底色。
-  ///
-  /// 刻意不直接复用 [surfaceMuted]：内嵌区可能同时既是 surfaceMuted（浮层内的
-  /// 区块）又要放一段代码，两者共用一个值时就分不出边界了。现在浅色取页面底色
-  /// （代码块看起来是「挖进卡片里的洞」），深色取最暗的页面底色（同理）。它比
-  /// surfaceMuted 更深一档，等宽字在上面也更容易读。
-  static const Color codeBackground = Color(0xFFF1F5F9);
-  static const Color codeBackgroundDark = Color(0xFF0D1117);
+  /// 代码块 / 终端输出底色。比 surfaceMuted 更深一档（浅色）/ 更暗一档（深色），
+  // 看起来是「挖进面板里的洞」，等宽字在上面更容易读。
+  static const Color codeBackground = Color(0xFFEDF0F4);
+  static const Color codeBackgroundDark = Color(0xFF0C1016);
 
   // ---- 状态 ----
-  static const Color danger = Color(0xFFDC2626);
-  static const Color dangerDark = Color(0xFFF87171);
+  static const Color danger = Color(0xFFC2362C);
+  static const Color dangerDark = Color(0xFFF0564A);
 
-  static const Color success = Color(0xFF10B981);
-  static const Color successDark = Color(0xFF34D399);
+  static const Color success = Color(0xFF0B7A4B);
+  static const Color successDark = Color(0xFF3DD68C);
 
-  /// 命令/工具执行成功的绿色（终端语义）。
-  ///
-  /// 与 [success] 分开是因为两者出现的位置反差很大：[success] 用在徽章、状态点
-  /// 这类小色块上，可以偏青、偏亮；terminalGreen 用于等宽正文里的整行回显。
-  ///
-  /// 统一按**正文 AA** 取值，状态圆点复用同一个色而不是再开一档浅绿：同一个语义
-  /// 在界面里出现两种绿，用户看到圆点和文字颜色不一致时只会怀疑哪个才是"成功"。
-  /// 一个绿同时满足圆点（门槛 3:1）和 11.5pt 回显正文（门槛 4.5:1），就没有取舍
-  /// 要讲 —— 事实上更深的那档反而更适合整屏终端输出，亮绿在大面积上会发飘。
-  ///
-  /// 实测对比度：浅色 #15803D 对页面底 #F1F5F9 4.58:1、对白底 5.02:1；
-  /// 深色 #4ADE80 对 #0D1117 10.9:1、对卡片面 #161B22 9.9:1。两条主题都过 AA。
-  static const Color terminalGreen = Color(0xFF15803D);
-  static const Color terminalGreenDark = Color(0xFF4ADE80);
+  /// 命令/工具执行成功的绿色（终端语义）。驾驶舱里与 [success] 同值 ——
+  // 信号灯只有一种绿，圆点与回显文字共用，用户不需要猜哪个才是"成功"。
+  static const Color terminalGreen = Color(0xFF0B7A4B);
+  static const Color terminalGreenDark = Color(0xFF3DD68C);
 
-  static const Color warning = Color(0xFFD97706);
-  static const Color warningDark = Color(0xFFFBBF24);
+  /// 警告琥珀。浅色 #9A6A00 白字 4.9:1；深色 #E5A50A 压近黑字 8:1。
+  static const Color warning = Color(0xFF9A6A00);
+  static const Color warningDark = Color(0xFFE5A50A);
 
   // ---- 实心色块上的前景（对比度 token）----
-  //
-  // [add 2026-10-20 全面审查] 此前调用方一律写死 `Colors.white` 压在 accent /
-  // warning 上，共 33 处。问题在于两种主题的同名色明度差极大：
-  //
-  // - accent 浅色 #3F5AF0（深蓝）白字 5.34:1 达标；深色 #6E8BFF（提亮浅蓝）
-  //   白字只有 2.6:1，正文 AA 要求 4.5:1 —— 深色下所有主按钮文字都偏淡。
-  // - warning 两侧都是亮琥珀：#D97706 白字 3.16:1、#FBBF24 白字仅 1.65:1，
-  //   连非文本 3:1 都不到，角标上的数字会糊成一块白斑。
-  //
-  // 结论：这两种底在**两种主题下都必须用深色前景**。取值已按 WCAG 公式复核：
-  // onAccent 深色 #161B22 对 #6E8BFF 5.60:1；onWarning 浅色 #111827 对 #D97706
-  // 5.62:1、深色 #161B22 对 #FBBF24 10.5:1。
-
-  /// 实心 accent（品牌蓝）上的前景色。
+  /// 实心 accent（信号绿）上的前景色：浅侧深绿底压白字，深侧亮绿底压近黑。
   static const Color onAccent = Color(0xFFFFFFFF);
-  static const Color onAccentDark = Color(0xFF161B22);
+  static const Color onAccentDark = Color(0xFF06110B);
 
-  /// 警告色（琥珀）上的前景色。
-  static const Color onWarning = Color(0xFF111827);
-  static const Color onWarningDark = Color(0xFF161B22);
+  /// 警告色（琥珀）上的前景色。两侧都用深色/白色按各自底明度取：
+  /// 浅侧 #9A6A00 压白字，深侧 #E5A50A 压近黑。
+  static const Color onWarning = Color(0xFFFFFFFF);
+  static const Color onWarningDark = Color(0xFF10141B);
 
   static const Color purple = Color(0xFF7C3AED);
   static const Color purpleDark = Color(0xFFA78BFA);
@@ -199,67 +149,50 @@ class AppColors {
 
   // ---- 带色底（tint）----
   //
-  // 实测 lib/ 下有 151 处浅色 tint 底色，散落在审批卡、提问卡、徽章、选中态等
-  // 位置。它们不是"某个中性色的浅版本"，而是有语义的底 —— 浅红=危险、浅黄=警告、
-  // 浅绿=成功、浅蓝=选中。深色下没有"翻过来"的等价物：把 #FEF2F2 直接取反会
-  // 变成刺眼的深红。所以每种语义给一对显式取值，深色侧压低明度并提高饱和度，
-  // 保证在深底上仍是"提示色"而不是"发光的色块"。
+  // 语义底：浅红=危险、浅琥珀=警告、浅绿=成功/选中。深色侧压低明度提高饱和，
+  // 保证在石墨底上仍是"提示色"而不是"发光的色块"。驾驶舱的 tint 整体比旧值
+  // 更冷、更灰一档：仪表板上不该出现糖果色。
 
-  /// 危险提示底（浅红）。
-  static const Color dangerSurface = Color(0xFFFEF2F2);
-  static const Color dangerSurfaceDark = Color(0xFF3F1414);
+  /// 危险提示底。
+  static const Color dangerSurface = Color(0xFFFBECEA);
+  static const Color dangerSurfaceDark = Color(0xFF200F0D);
 
-  /// 危险提示描边（浅红边）。
-  static const Color dangerBorder = Color(0xFFFECACA);
-  static const Color dangerBorderDark = Color(0xFF7F1D1D);
+  /// 危险提示描边。
+  static const Color dangerBorder = Color(0xFFEBC4C0);
+  static const Color dangerBorderDark = Color(0xFF5A2420);
 
-  /// 警告提示底（浅黄/橙）。
-  static const Color warningSurface = Color(0xFFFFFBEB);
-  static const Color warningSurfaceDark = Color(0xFF3A2C10);
+  /// 警告提示底。
+  static const Color warningSurface = Color(0xFFFBF4E4);
+  static const Color warningSurfaceDark = Color(0xFF1A1509);
 
-  /// 警告徽章底（浅琥珀）。
-  static const Color warningBadgeSurface = Color(0xFFFEF3C7);
-  static const Color warningBadgeSurfaceDark = Color(0xFF422006);
+  /// 警告徽章底。
+  static const Color warningBadgeSurface = Color(0xFFF6E7C0);
+  static const Color warningBadgeSurfaceDark = Color(0xFF241C07);
 
-  /// 警告描边（浅琥珀边）。
-  static const Color warningBorder = Color(0xFFFDE68A);
-  static const Color warningBorderDark = Color(0xFF854D0E);
+  /// 警告描边。
+  static const Color warningBorder = Color(0xFFE8D29A);
+  static const Color warningBorderDark = Color(0xFF4A3A12);
 
-  /// 成功提示底（浅绿）。
-  static const Color successSurface = Color(0xFFDCFCE7);
-  static const Color successSurfaceDark = Color(0xFF0F2E1C);
+  /// 成功提示底。
+  static const Color successSurface = Color(0xFFE2F2E9);
+  static const Color successSurfaceDark = Color(0xFF0E1A14);
 
-  /// 选中态底（浅蓝，选中行/选中工作区）。
-  ///
-  /// **取值以页面底 `background` 为基准校对比，不是以卡片白面为基准** —— 选中行
-  /// 大多数时候直接落在页面底上（工作区列表、会话列表），拿白色卡片去校会得出
-  /// "看起来还行"的结论，实际在 #F1F5F9 上几乎看不出选中。
-  ///
-  /// 旧值 #EFF6FC 是照着旧的浅页面底 #F8FAFC 调的；页面底压到 #F1F5F9 之后两者
-  /// 相对亮度几乎相等（1.005:1），选中态等于消失了。现值 #E3EDF9 对页面底
-  /// 1.08:1、对白卡片 1.18:1。深色侧 #14263F 对 #0D1117 1.24:1、对 #161B22 1.14:1
-  /// （旧 #10243A 在卡片上只有 1.10:1，偏弱）。
-  static const Color selectedSurface = Color(0xFFE3EDF9);
-  static const Color selectedSurfaceDark = Color(0xFF14263F);
+  /// 选中态底（当前行/当前工作区）。绿灰 tint，与页面底对比约 1.08:1（浅）/
+  /// 1.24:1（深）—— 够认出"是当前项"，不够抢正文的戏。
+  static const Color selectedSurface = Color(0xFFE4EDE8);
+  static const Color selectedSurfaceDark = Color(0xFF14241D);
 
-  /// 品牌浅蓝底（输入框 hover、强调区块）。
-  ///
-  /// 同样**以页面底 `background` 为基准校对比**，理由见 [selectedSurface]。
-  ///
-  /// 与 [selectedSurface] 的区别只在色相强弱：这个更接近品牌蓝（用于 hover、引导
-  /// 区块），那个更中性（用于"当前项"）。现值 #E8F0FE 对页面底 1.05:1、对白卡片
-  /// 1.15:1；深色侧 #12233A 对 #0D1117 1.20:1、对 #161B22 1.09:1。深色侧刻意取
-  /// 比 [selectedSurfaceDark] 低一档的对比（1.20 对 1.24），hover 与选中才区分得开。
-  static const Color accentSurface = Color(0xFFE8F0FE);
-  static const Color accentSurfaceDark = Color(0xFF12233A);
+  /// 品牌 tint 底（输入框 hover、强调区块）。比 [selectedSurface] 绿味重一档。
+  static const Color accentSurface = Color(0xFFDFEAE4);
+  static const Color accentSurfaceDark = Color(0xFF10291F);
 
-  /// 提问卡片底（浅橙，§4.1 提问）。
-  static const Color questionSurface = Color(0xFFFFF7ED);
-  static const Color questionSurfaceDark = Color(0xFF3A2410);
+  /// 提问卡片底（§4.1 提问）。
+  static const Color questionSurface = Color(0xFFFBF1E4);
+  static const Color questionSurfaceDark = Color(0xFF241809);
 
-  /// 提问卡片描边（浅橙边）。
-  static const Color questionBorder = Color(0xFFFED7AA);
-  static const Color questionBorderDark = Color(0xFF9A5B13);
+  /// 提问卡片描边。
+  static const Color questionBorder = Color(0xFFE8CFA8);
+  static const Color questionBorderDark = Color(0xFF5A3A12);
 }
 
 /// 深色模式作用域。
@@ -306,7 +239,7 @@ class ThemeScope extends InheritedWidget {
   /// 实心 accent 上的前景色（深色侧必须是近黑，见 [AppColors.onAccent]）。
   Color get onAccent => isDark ? AppColors.onAccentDark : AppColors.onAccent;
 
-  /// 警告色上的前景色（两侧都是亮琥珀，故两侧都用深色，见 [AppColors.onWarning]）。
+  /// 警告色上的前景色（按各自底明度取，见 [AppColors.onWarning]）。
   Color get onWarning => isDark ? AppColors.onWarningDark : AppColors.onWarning;
 
   // 带色底（tint）

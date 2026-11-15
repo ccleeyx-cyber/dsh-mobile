@@ -1247,7 +1247,8 @@ class _ChatComposerState extends State<ChatComposer> {
           child: Container(
             decoration: BoxDecoration(
               color: context.c.surfaceMuted,
-              borderRadius: BorderRadius.circular(18),
+              // 驾驶舱方向：输入卡从胶囊收成内嵌面板（10 圆角 + 发丝描边）。
+              borderRadius: BorderRadius.circular(10),
               border: Border.all(color: context.c.border),
             ),
             padding: const EdgeInsets.fromLTRB(10, 8, 8, 6),
@@ -1398,8 +1399,10 @@ class _ChatComposerState extends State<ChatComposer> {
           hintText: '发消息…',
           hintStyle: TextStyle(
             color: context.c.textTertiary,
-            fontSize: 13.5,
+            fontSize: 12.5,
             fontWeight: FontWeight.w400,
+            // 驾驶舱方向：占位符走等宽，输入栏读作仪表的一部分。
+            fontFamily: 'monospace',
           ),
           border: InputBorder.none,
           isDense: true,
@@ -2453,8 +2456,8 @@ class _ChatComposerState extends State<ChatComposer> {
             value.text.trim().isNotEmpty || _pendingAttachments.isNotEmpty;
         final queued = dsh.isSessionRunning ? dsh.queueItems.length : 0;
         return SizedBox(
-          width: 44,
-          height: 44,
+          width: 40,
+          height: 40,
           child: Stack(
             alignment: Alignment.center,
             children: [
@@ -2462,6 +2465,7 @@ class _ChatComposerState extends State<ChatComposer> {
                 // [fix 2026-10-20] 补语义标签：发送键是图标按钮，读屏此前只念
                 // 「按钮」。同时把实心 accent 上的前景色换成 onAccent —— 深色下
                 // Colors.white 对 #6E8BFF 只有 2.6:1。
+                // [2026-11-15 方向 A] 圆发送键改成 10 圆角方键：驾驶舱里没有圆钮。
                 child: Semantics(
                   button: true,
                   enabled: canSend,
@@ -2469,11 +2473,11 @@ class _ChatComposerState extends State<ChatComposer> {
                   child: InkWell(
                     key: const ValueKey('chat-send-button'),
                     onTap: canSend ? () => _sendMessage(dsh) : null,
-                    borderRadius: BorderRadius.circular(22),
+                    borderRadius: BorderRadius.circular(10),
                     child: Container(
                       decoration: BoxDecoration(
                         color: canSend ? context.c.accent : context.c.border,
-                        shape: BoxShape.circle,
+                        borderRadius: BorderRadius.circular(10),
                       ),
                       child: Icon(
                         Icons.arrow_upward_rounded,

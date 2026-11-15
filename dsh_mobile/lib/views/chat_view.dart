@@ -1288,10 +1288,16 @@ class _ChatViewState extends State<ChatView> {
                         ),
                         decoration: BoxDecoration(
                           color: context.c.userBubble,
-                          // 圆角统一 12：以前右上角是 3 的小圆角当"气泡尾巴"。
-                          // 那套拟物语言与现在的扁平层级冲突，而且 3px 的小角在
-                          // 深色下看起来像缺了一块。
-                          borderRadius: BorderRadius.circular(12),
+                          // 驾驶舱方向（2026-11-15 方向 A）：气泡是带发丝描边的内嵌
+                          // 面板，右下角 3px 切角作仪表面板倒角签名。切角朝时间戳
+                          // 一侧，读作"面板倒角"而不是旧版那种"气泡尾巴"。
+                          border: Border.all(color: context.c.border),
+                          borderRadius: const BorderRadius.only(
+                            topLeft: Radius.circular(12),
+                            topRight: Radius.circular(12),
+                            bottomLeft: Radius.circular(12),
+                            bottomRight: Radius.circular(3),
+                          ),
                         ),
                         child: SafeMarkdown(
                           data: linkifyDeliverableRefs(

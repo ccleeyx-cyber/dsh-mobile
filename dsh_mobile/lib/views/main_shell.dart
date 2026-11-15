@@ -155,6 +155,63 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     );
   }
 
+  /// 驾驶舱底导航单格（2026-11-15 方向 A）：等宽大写标签 + 选中态顶部 2dp
+  /// 发丝指示线。角标复用 [_buildNavBadge]；语义标签给读屏中文含义，
+  /// 视觉标签是方向板定下的英文 monospace。widget 测试按 `nav-tab-<i>` 认 tab。
+  Widget _navCell(
+    int index,
+    IconData icon,
+    IconData selectedIcon,
+    String label,
+    String semanticLabel,
+    int badge,
+  ) {
+    final selected = _currentIndex == index;
+    final color = selected ? context.c.accent : context.c.textSecondary;
+    return Expanded(
+      child: Semantics(
+        button: true,
+        selected: selected,
+        label: semanticLabel,
+        child: InkWell(
+          key: ValueKey('nav-tab-$index'),
+          onTap: () => _setIndex(index),
+          child: Container(
+            height: 54,
+            decoration: BoxDecoration(
+              border: Border(
+                top: BorderSide(
+                  color: selected ? context.c.accent : Colors.transparent,
+                  width: 2,
+                ),
+              ),
+            ),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _buildNavBadge(
+                  Icon(selected ? selectedIcon : icon, size: 20, color: color),
+                  badge,
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 9.5,
+                    letterSpacing: 1.6,
+                    fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                    color: color,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     // 只订阅 build() 真正用到的两个值。
@@ -297,62 +354,24 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       // 键盘弹出时置空 —— 见上面 keyboardOpen 处的说明，这是修输入框下方
       // 那条空白的必要一步。
       bottomNavigationBar: keyboardOpen ? null : Container(
+        key: const ValueKey('main-bottom-nav'),
         decoration: BoxDecoration(
           color: context.c.surface,
           border: Border(top: BorderSide(color: context.c.border, width: 1.0)),
         ),
         child: SafeArea(
-          child: NavigationBarTheme(
-            data: NavigationBarThemeData(
-              backgroundColor: context.c.surface,
-              indicatorColor: context.c.accent.withOpacity(0.12),
-              labelTextStyle: WidgetStateProperty.resolveWith<TextStyle>((states) {
-                if (states.contains(WidgetState.selected)) {
-                  return TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: context.c.accent,
-                  );
-                }
-                return TextStyle(fontSize: 12, color: context.c.textSecondary);
-              }),
-              iconTheme: WidgetStateProperty.resolveWith<IconThemeData>((states) {
-                if (states.contains(WidgetState.selected)) {
-                  return IconThemeData(color: context.c.accent, size: 24);
-                }
-                return IconThemeData(color: context.c.textSecondary, size: 24);
-              }),
-            ),
-            child: NavigationBar(
-              selectedIndex: _currentIndex,
-              onDestinationSelected: _setIndex,
-              destinations: [
-                NavigationDestination(
-                  icon: _buildNavBadge(const Icon(Icons.chat_bubble_outline_rounded), waitingCount),
-                  selectedIcon: _buildNavBadge(const Icon(Icons.chat_bubble_rounded), waitingCount),
-                  label: '对话',
-                ),
-                NavigationDestination(
-                  icon: _buildNavBadge(const Icon(Icons.folder_outlined), pendingCount),
-                  selectedIcon: _buildNavBadge(const Icon(Icons.folder_rounded), pendingCount),
-                  label: '工作区',
-                ),
-                // [feat 2026-10-17] 原来这里还有「安全策略」tab，它与「工作区」挂着
-                // **同一个** pendingCount 角标（同一个数字出现两次，反而分散注意力），
-                // 而权限/审批预设是低频配置，不该占一级入口。现在从「设置 → 安全策略
-                // 与授权」推入；待处理数量改由设置页那张卡片承载。
-                //
-                // [fix] selectedIcon 必须与未选中图标**不同**，否则选中时只有底部
-                // 那枚浅蓝胶囊在变，图标本身毫无变化 —— 另两个 tab（对话/工作区）
-                // 选中都会换成实心图标，反馈不一致。这里用 tune 的 outlined/rounded
-                // 一对补上同样的"变实"效果。
-                const NavigationDestination(
-                  icon: Icon(Icons.tune_outlined),
-                  selectedIcon: Icon(Icons.tune_rounded),
-                  label: '设置',
-                ),
-              ],
-            ),
+          // 驾驶舱方向（2026-11-15 方向 A）：等宽大写标签 + 选中态顶部 2dp 发丝
+          // 指示线，替换 M3 NavigationBar 的胶囊指示。标签用英文 monospace 是
+          // 方向板定下的仪表语言；语义标签（Semantics.label）仍给读屏中文含义。
+          child: Row(
+            children: [
+              _navCell(0, Icons.chat_bubble_outline_rounded,
+                  Icons.chat_bubble_rounded, 'CHAT', '对话', waitingCount),
+              _navCell(1, Icons.folder_outlined, Icons.folder_rounded,
+                  'WORK', '工作区', pendingCount),
+              _navCell(2, Icons.tune_outlined, Icons.tune_rounded,
+                  'CFG', '设置', 0),
+            ],
           ),
         ),
       ),

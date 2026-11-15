@@ -233,7 +233,7 @@ void main() {
 
     testWidgets('键盘收起时底部导航栏存在', (tester) async {
       await pumpShell(tester);
-      expect(find.byType(NavigationBar), findsOneWidget);
+      expect(find.byKey(const ValueKey('main-bottom-nav')), findsOneWidget);
       await teardown(tester);
     });
 
@@ -245,13 +245,13 @@ void main() {
       //
       // 去掉导航栏后内层底边等于屏幕底边，抬高量恰好等于键盘高度。
       await pumpShell(tester);
-      expect(find.byType(NavigationBar), findsOneWidget,
+      expect(find.byKey(const ValueKey('main-bottom-nav')), findsOneWidget,
           reason: '前置条件：收起时有导航栏');
 
       tester.view.viewInsets = const FakeViewPadding(bottom: 320);
       await tester.pump();
 
-      expect(find.byType(NavigationBar), findsNothing,
+      expect(find.byKey(const ValueKey('main-bottom-nav')), findsNothing,
           reason: '键盘弹出时必须移除导航栏，否则输入框下方会空出一条等高空白');
 
       await teardown(tester);
@@ -261,12 +261,12 @@ void main() {
       await pumpShell(tester);
       tester.view.viewInsets = const FakeViewPadding(bottom: 320);
       await tester.pump();
-      expect(find.byType(NavigationBar), findsNothing);
+      expect(find.byKey(const ValueKey('main-bottom-nav')), findsNothing);
 
       tester.view.viewInsets = FakeViewPadding.zero;
       await tester.pump();
 
-      expect(find.byType(NavigationBar), findsOneWidget, reason: '收起键盘后必须恢复');
+      expect(find.byKey(const ValueKey('main-bottom-nav')), findsOneWidget, reason: '收起键盘后必须恢复');
       await teardown(tester);
     });
 
@@ -578,10 +578,7 @@ void main() {
       final node = tester.widget<TextField>(field).focusNode!;
       expect(node.hasFocus, isTrue, reason: '前置条件：用户刚在对话页打字');
 
-      final settingsTab = find.descendant(
-        of: find.byType(NavigationBar),
-        matching: find.text('设置'),
-      );
+      final settingsTab = find.byKey(const ValueKey('nav-tab-2'));
       await tester.tap(settingsTab);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));

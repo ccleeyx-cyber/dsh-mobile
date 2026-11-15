@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>方向 B · 瑞士网格 Swiss Grid</title>
+<style>
+  :root{
+    --paper:#FFFFFF; --ink:#0A0A0A; --ink2:#555555; --ink3:#9A9A9A;
+    --red:#D50000; --rule:#0A0A0A;
+    --sans:"Helvetica Neue",Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+    --mono:"JetBrains Mono",Consolas,monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#FFFFFF;font-family:var(--sans);color:var(--ink)}
+  .board{width:1560px;padding:64px;background:var(--paper);position:relative}
+  header{display:grid;grid-template-columns:1fr 300px;gap:40px;margin-bottom:0;padding-bottom:36px;border-bottom:3px solid var(--rule)}
+  .stage{margin-top:64px}
+  .kicker{font-size:11px;letter-spacing:.28em;text-transform:uppercase;color:var(--red);font-weight:700;margin-bottom:18px}
+  h1{font-size:64px;font-weight:800;letter-spacing:-.025em;line-height:.98;text-transform:none}
+  h1 span{color:var(--red)}
+  .lede{font-size:14px;line-height:1.8;color:var(--ink2);max-width:560px;margin-top:22px;border-left:3px solid var(--red);padding-left:16px}
+  .meta{font-family:var(--mono);font-size:11px;line-height:2.1;color:var(--ink2);border-left:1px solid var(--ink3);padding-left:20px;align-self:end}
+  .meta b{color:var(--ink);font-weight:700}
+  .stage{display:flex;gap:64px;align-items:flex-start}
+  .slot .tag{font-size:10px;letter-spacing:.26em;text-transform:uppercase;font-weight:700;color:var(--ink);border-bottom:2px solid var(--rule);display:inline-block;padding-bottom:6px;margin-bottom:16px}
+  .slot .tag i{font-style:normal;color:var(--red)}
+  .phone{background:var(--paper);border:2px solid var(--rule);width:392px;position:relative}
+  .phone.sub{width:348px;margin-top:64px}
+  .sb{display:flex;justify-content:space-between;padding:10px 18px 8px;font-family:var(--mono);font-size:11px;font-weight:700}
+  .top{border-top:2px solid var(--rule);border-bottom:2px solid var(--rule);padding:14px 18px}
+  .top .n{font-size:21px;font-weight:800;letter-spacing:-.015em;line-height:1.15}
+  .top .s{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--ink2);margin-top:8px;display:flex;gap:10px;align-items:center;text-transform:uppercase;letter-spacing:.08em}
+  .sq{width:8px;height:8px;background:var(--red)}
+  .stream{padding:18px;display:flex;flex-direction:column;gap:16px;height:500px;overflow:hidden}
+  .sub .stream{height:452px}
+  .u{align-self:flex-end;max-width:80%;background:var(--ink);color:#fff;padding:11px 14px;font-size:13.5px;line-height:1.6;font-weight:500}
+  .ai{font-size:13.5px;line-height:1.8}
+  .ai .lbl{font-size:9.5px;letter-spacing:.26em;text-transform:uppercase;font-weight:800;color:var(--red);margin-bottom:7px}
+  .ai b{font-weight:800;border-bottom:2px solid var(--red)}
+  .tool{border:1.5px solid var(--rule)}
+  .tool .h{display:flex;gap:8px;align-items:center;padding:8px 11px;border-bottom:1.5px solid var(--rule);font-family:var(--mono);font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}
+  .tool .h .ok{color:var(--red)}
+  .tool .h .ms{margin-left:auto;color:var(--ink3);font-weight:400}
+  .tool .b{padding:9px 11px;font-family:var(--mono);font-size:10.5px;line-height:1.7;color:var(--ink2);white-space:pre}
+  .code{border:1.5px solid var(--rule);background:#F4F4F2;padding:10px 12px;font-family:var(--mono);font-size:10.5px;line-height:1.7;white-space:pre}
+  .code .k{font-weight:700} .code .s{color:var(--red)}
+  .composer{margin:0 18px 14px;border:2px solid var(--rule);display:flex;align-items:center}
+  .composer .ph{flex:1;padding:12px 14px;font-size:12.5px;color:var(--ink3)}
+  .composer .send{width:46px;align-self:stretch;background:var(--red);color:#fff;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:800}
+  .nav{display:flex;border-top:2px solid var(--rule)}
+  .nav div{flex:1;padding:11px 0 14px;text-align:center;font-size:10px;letter-spacing:.22em;text-transform:uppercase;font-weight:700;color:var(--ink3);border-right:1.5px solid var(--rule)}
+  .nav div:last-child{border-right:0}
+  .nav div.on{color:var(--ink);box-shadow:inset 0 -4px 0 var(--red)}
+  .nav div i{display:block;font-style:normal;font-size:15px;margin-bottom:5px}
+  .ws .grp{font-size:9.5px;letter-spacing:.26em;text-transform:uppercase;font-weight:800;padding:14px 18px 8px;color:var(--ink2)}
+  .row{display:flex;align-items:center;gap:12px;padding:13px 18px;border-top:1.5px solid var(--rule)}
+  .row .nm{flex:1;min-width:0}
+  .row .nm .a{font-size:13.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .nm .b{font-family:var(--mono);font-size:10px;color:var(--ink2);margin-top:4px}
+  .chip{font-family:var(--mono);font-size:9.5px;font-weight:700;padding:3px 7px;border:1.5px solid var(--rule);text-transform:uppercase;letter-spacing:.06em}
+  .chip.run{background:var(--red);color:#fff;border-color:var(--red)}
+  .foot{margin-top:56px;border-top:3px solid var(--rule);padding-top:20px;display:flex;gap:56px;font-family:var(--mono);font-size:10.5px;color:var(--ink2);line-height:1.9}
+  .foot b{color:var(--ink)}
+  .num{position:absolute;right:64px;top:64px;font-size:120px;font-weight:800;color:var(--paper);-webkit-text-stroke:2px var(--ink);line-height:1}
+</style>
+</head>
+<body>
+<div class="board">
+  <div class="num">B</div>
+  <header>
+    <div>
+      <div class="kicker">Direction B / Swiss Grid</div>
+      <h1>瑞士网格<br><span>秩序即美感</span></h1>
+      <p class="lede">纯白纸面、2px 墨线、零圆角零阴影。层级全靠网格与字重说话：标题压到 800 字重，数据进等宽栏，红色只出现在「正在发生」的地方。参照 Müller-Brockmann 的网格系统与 SBB 导视。</p>
+    </div>
+    <div class="meta">
+      <b>参照</b> Josef Müller-Brockmann / SBB<br>
+      <b>母题</b> 墨线网格 + 字重层级 + 单红信号<br>
+      <b>底色</b> #FFFFFF · 信号红 #D50000
+    </div>
+  </header>
+
+  <div class="stage">
+    <div class="slot">
+      <div class="tag"><i>01</i> &nbsp;Chat / 主屏</div>
+      <div class="phone">
+        <div class="sb"><span>9:41</span><span>87%</span></div>
+        <div class="top">
+          <div class="n">会话界面顶部布局改造</div>
+          <div class="s"><span class="sq"></span>Running · dsh_mobile · ctx 23%</div>
+        </div>
+        <div class="stream">
+          <div class="u">顶栏数字全挤在一条 34dp 里，横向还要滑？</div>
+          <div class="ai">
+            <div class="lbl">Agent</div>
+            是的。六组读数横向溢出，靠渐隐遮断只是把问题藏起来。改成双行身份栏，<b>省 37dp</b>。
+          </div>
+          <div class="tool">
+            <div class="h"><span class="ok">■</span> pwsh · 测量顶栏高度 <span class="ms">1.2s</span></div>
+            <div class="b">$ measure-appbar --session topbar
+old 90dp → new 53dp</div>
+          </div>
+          <div class="code"><span class="k">Container</span>(
+  padding: EdgeInsets.symmetric(
+    horizontal: <span class="s">16</span>),
+)</div>
+          <div class="u">改完推上去，CI 出包。</div>
+        </div>
+        <div class="composer"><span class="ph">继续对话</span><span class="send">↑</span></div>
+        <div class="nav"><div class="on"><i>▣</i>对话</div><div><i>▤</i>工作区</div><div><i>⚙</i>设置</div></div>
+      </div>
+    </div>
+
+    <div class="slot">
+      <div class="tag"><i>02</i> &nbsp;Workspaces / 列表</div>
+      <div class="phone sub">
+        <div class="sb"><span>9:41</span><span>87%</span></div>
+        <div class="top">
+          <div class="n">工作区</div>
+          <div class="s">4 Workspaces · 2 Active</div>
+        </div>
+        <div class="stream" style="height:auto;padding:0">
+          <div class="ws">
+            <div class="grp">Active</div>
+            <div class="row"><div class="nm"><div class="a">dsh_mobile</div><div class="b">3 sessions · push → CI</div></div><span class="chip run">Run 1</span></div>
+            <div class="row"><div class="nm"><div class="a">tickflow-stock-panel</div><div class="b">12 sessions · 2h ago</div></div><span class="chip">Idle</span></div>
+            <div class="grp">Queued</div>
+            <div class="row"><div class="nm"><div class="a">work/wecom-ocr</div><div class="b">审批预设待确认</div></div><span class="chip">Wait 2</span></div>
+            <div class="grp">Sessions · dsh_mobile</div>
+            <div class="row"><div class="nm"><div class="a">会话界面顶部布局改造</div><div class="b">6 轮 · 351 步</div></div><span class="chip run">Run</span></div>
+            <div class="row"><div class="nm"><div class="a">深色模式对比度审查</div><div class="b">产出 3 · 昨天</div></div><span class="chip">Done</span></div>
+          </div>
+        </div>
+        <div class="nav" style="margin-top:30px"><div><i>▣</i>对话</div><div class="on"><i>▤</i>工作区</div><div><i>⚙</i>设置</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <div><b>字体</b>  Helvetica/Archivo 800 标题 + 等宽数据栏</div>
+    <div><b>层级</b>  2px 墨线分区，无圆角无阴影无渐变</div>
+    <div><b>代价</b>  硬边在长列表里偏「表格感」，需靠留白救</div>
+  </div>
+</div>
+</body>
+</html>

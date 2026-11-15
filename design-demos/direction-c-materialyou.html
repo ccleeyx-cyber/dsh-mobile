@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>方向 C · 原生通讯 Material You</title>
+<style>
+  :root{
+    --bg:#F3F4FA; --surf:#FFFFFF; --surf1:#ECEEF6; --surf2:#E3E6F2;
+    --ink:#1B1C25; --ink2:#5A5C6B; --ink3:#8B8D9C;
+    --pri:#4C5BD4; --pri-c:#DDE2FF; --pri-ink:#00174A;
+    --run:#0B6B3A; --run-c:#C4EED1; --wait:#7A5200; --wait-c:#F4E3B2;
+    --sans:"Roboto","Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    --mono:"Roboto Mono",Consolas,monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:linear-gradient(160deg,#E9EBF6 0%,#F6F3EF 60%,#EFEAF4 100%);font-family:var(--sans);color:var(--ink)}
+  .board{width:1560px;padding:64px}
+  header{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:52px}
+  .kicker{display:inline-flex;align-items:center;gap:8px;background:var(--pri-c);color:var(--pri-ink);font-size:11px;font-weight:600;letter-spacing:.06em;padding:6px 14px;border-radius:999px;margin-bottom:18px}
+  .kicker::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--pri)}
+  h1{font-size:46px;font-weight:600;letter-spacing:-.02em;line-height:1.08}
+  h1 em{font-style:normal;color:var(--pri)}
+  .lede{max-width:540px;font-size:14px;line-height:1.8;color:var(--ink2);margin-top:16px}
+  .meta{background:var(--surf);border-radius:20px;padding:18px 22px;font-size:12px;color:var(--ink2);line-height:2.1;box-shadow:0 12px 32px -18px rgba(27,28,37,.25)}
+  .meta b{color:var(--ink);font-weight:600}
+  .stage{display:flex;gap:60px;align-items:flex-start}
+  .slot .tag{font-size:12px;font-weight:600;color:var(--ink2);margin-bottom:14px;display:flex;align-items:center;gap:8px}
+  .slot .tag::before{content:"";width:8px;height:8px;border-radius:3px;background:var(--pri)}
+  .phone{background:var(--bg);border-radius:34px;overflow:hidden;box-shadow:0 30px 70px -30px rgba(27,28,37,.35),0 0 0 1px rgba(27,28,37,.08)}
+  .phone.main{width:392px}
+  .phone.sub{width:348px;margin-top:56px}
+  .sb{display:flex;justify-content:space-between;padding:12px 22px 6px;font-size:11.5px;font-weight:600;color:var(--ink2)}
+  .top{padding:10px 20px 14px;display:flex;gap:12px;align-items:center}
+  .top .av{width:38px;height:38px;border-radius:12px;background:var(--pri-c);color:var(--pri-ink);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px}
+  .top .t{flex:1;min-width:0}
+  .top .t .n{font-size:16.5px;font-weight:600;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .top .t .s{display:flex;gap:6px;align-items:center;margin-top:4px}
+  .chip{font-size:10.5px;font-weight:600;padding:3px 9px;border-radius:999px;white-space:nowrap;flex:none}
+  .chip.run{background:var(--run-c);color:var(--run)}
+  .chip.wait{background:var(--wait-c);color:var(--wait)}
+  .chip.n{background:var(--surf2);color:var(--ink2)}
+  .top .ic{width:36px;height:36px;border-radius:50%;background:var(--surf1);display:flex;align-items:center;justify-content:center;color:var(--ink2);font-size:15px}
+  .stream{padding:8px 18px 4px;display:flex;flex-direction:column;gap:14px;height:498px;overflow:hidden}
+  .sub .stream{height:452px}
+  .u{align-self:flex-end;max-width:80%;background:var(--pri-c);color:var(--pri-ink);padding:11px 16px;font-size:14px;line-height:1.6;border-radius:20px 20px 6px 20px;font-weight:500}
+  .ai{font-size:14px;line-height:1.8;color:var(--ink)}
+  .ai b{font-weight:600;color:var(--pri)}
+  .tool{background:var(--surf);border-radius:18px;padding:12px 14px;display:flex;gap:12px;align-items:flex-start;box-shadow:0 2px 8px -4px rgba(27,28,37,.12)}
+  .tool .ic{width:32px;height:32px;border-radius:10px;background:var(--surf1);color:var(--ink2);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:12px;font-weight:700;flex:none}
+  .tool .x{flex:1;min-width:0}
+  .tool .x .a{font-size:12.5px;font-weight:600}
+  .tool .x .b{font-family:var(--mono);font-size:10.5px;color:var(--ink2);margin-top:5px;line-height:1.6;white-space:pre}
+  .tool .ok{color:var(--run);font-size:14px}
+  .code{background:var(--surf1);border-radius:14px;padding:11px 14px;font-family:var(--mono);font-size:10.5px;line-height:1.7;color:var(--ink2);white-space:pre}
+  .code .k{color:var(--pri);font-weight:600} .code .s{color:var(--wait)}
+  .composer{margin:12px 16px 14px;background:var(--surf);border-radius:28px;padding:8px 8px 8px 20px;display:flex;align-items:center;gap:10px;box-shadow:0 8px 24px -12px rgba(27,28,37,.3)}
+  .composer .ph{flex:1;font-size:13.5px;color:var(--ink3)}
+  .composer .mi{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:var(--ink2);font-size:15px}
+  .composer .send{width:40px;height:40px;border-radius:50%;background:var(--pri);color:#fff;display:flex;align-items:center;justify-content:center;font-size:16px}
+  .nav{background:var(--surf2);display:flex;padding:8px 12px 16px;gap:6px}
+  .nav div{flex:1;text-align:center;font-size:11px;font-weight:600;color:var(--ink2);padding:6px 0 4px;border-radius:999px}
+  .nav div.on{background:var(--pri-c);color:var(--pri-ink)}
+  .nav div i{display:block;font-style:normal;font-size:17px;margin-bottom:3px}
+  .nav svg{width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;display:block;margin:0 auto 3px}
+  .ws .grp{font-size:11px;font-weight:600;color:var(--ink3);letter-spacing:.08em;padding:14px 22px 8px;text-transform:uppercase}
+  .card{background:var(--surf);border-radius:20px;margin:0 14px 10px;padding:14px 16px;box-shadow:0 2px 8px -4px rgba(27,28,37,.1)}
+  .card .a{font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .card .b{font-size:11.5px;color:var(--ink2);margin-top:5px}
+  .foot{margin-top:48px;display:flex;gap:52px;font-size:12px;color:var(--ink2);line-height:1.9}
+  .foot b{color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="board">
+  <header>
+    <div>
+      <div class="kicker">Direction C / Material You</div>
+      <h1>原生通讯感<br><em>零学习成本</em></h1>
+      <p class="lede">跟随 Android 原生通讯范式：tonal 面、胶囊气泡、悬浮输入栏、M3 导航胶囊。和微信 / Telegram 同一套骨架，用户不需要学任何新东西；品牌色沉到 container 层而不是铺满界面。</p>
+    </div>
+    <div class="meta">
+      <b>参照</b> Google Messages / Telegram · M3 expressive<br>
+      <b>母题</b> tonal 面 + 胶囊 + 悬浮 composer<br>
+      <b>底色</b> #F3F4FA · primary #4C5BD4
+    </div>
+  </header>
+
+  <div class="stage">
+    <div class="slot">
+      <div class="tag">对话 / 主屏</div>
+      <div class="phone main">
+        <div class="sb"><span>9:41</span><span>▪▪▪ 87%</span></div>
+        <div class="top">
+          <div class="av">顶</div>
+          <div class="t">
+            <div class="n">会话界面顶部布局改造</div>
+            <div class="s"><span class="chip run">执行中</span><span class="chip n">dsh_mobile · ctx 23%</span></div>
+          </div>
+          <div class="ic">ⓘ</div>
+        </div>
+        <div class="stream">
+          <div class="u">顶栏数字全挤在一条 34dp 里，横向还要滑？</div>
+          <div class="ai">是的。六组读数横向溢出，靠渐隐遮断只是把问题藏起来。改成双行身份栏，<b>省 37dp</b>。</div>
+          <div class="tool">
+            <div class="ic">$</div>
+            <div class="x"><div class="a">pwsh · 测量顶栏高度</div><div class="b">old 90dp → new 53dp</div></div>
+            <div class="ok">✓</div>
+          </div>
+          <div class="code"><span class="k">Container</span>(
+  padding: EdgeInsets.symmetric(
+    horizontal: <span class="s">16</span>),
+)</div>
+          <div class="u">改完推上去，CI 出包。</div>
+          <div style="align-self:flex-start;background:var(--surf1);border-radius:16px 16px 16px 4px;padding:12px 16px;display:flex;gap:5px">
+            <span style="width:7px;height:7px;border-radius:50%;background:var(--ink3)"></span>
+            <span style="width:7px;height:7px;border-radius:50%;background:var(--ink3);opacity:.7"></span>
+            <span style="width:7px;height:7px;border-radius:50%;background:var(--ink3);opacity:.4"></span>
+          </div>
+        </div>
+        <div class="composer"><span class="ph">继续对话</span><span class="mi">🎙</span><span class="mi">＋</span><span class="send">↑</span></div>
+        <div class="nav"><div class="on"><svg viewBox="0 0 24 24"><path d="M4 5.5h16v10.5H9l-5 4z"/></svg>对话</div><div><svg viewBox="0 0 24 24"><path d="M3.5 6.5h6l2 2.5h9v10h-17z"/></svg>工作区</div><div><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.4"/><path d="M12 3.8v2.6M12 17.6v2.6M3.8 12h2.6M17.6 12h2.6M6.2 6.2l1.9 1.9M15.9 15.9l1.9 1.9M17.8 6.2l-1.9 1.9M8.1 15.9l-1.9 1.9"/></svg>设置</div></div>
+      </div>
+    </div>
+
+    <div class="slot">
+      <div class="tag">工作区 / 列表</div>
+      <div class="phone sub">
+        <div class="sb"><span>9:41</span><span>▪▪▪ 87%</span></div>
+        <div class="top">
+          <div class="t"><div class="n" style="font-size:20px">工作区</div></div>
+          <div class="ic">⌕</div>
+        </div>
+        <div class="stream" style="height:auto;padding:0">
+          <div class="ws">
+            <div class="grp">Active</div>
+            <div class="card"><div class="a">dsh_mobile <span class="chip run">执行 1</span></div><div class="b">3 个会话 · push → CI 出包</div></div>
+            <div class="card"><div class="a">tickflow-stock-panel</div><div class="b">12 个会话 · 2 小时前</div></div>
+            <div class="grp">Queued</div>
+            <div class="card"><div class="a">work/wecom-ocr <span class="chip wait">待审批 2</span></div><div class="b">审批预设待确认</div></div>
+            <div class="grp">Sessions · dsh_mobile</div>
+            <div class="card"><div class="a">会话界面顶部布局改造 <span class="chip run">执行中</span></div><div class="b">6 轮 · 351 步</div></div>
+            <div class="card"><div class="a">深色模式对比度审查</div><div class="b">产出 3 · 昨天</div></div>
+          </div>
+        </div>
+        <div class="nav" style="margin-top:24px"><div><svg viewBox="0 0 24 24"><path d="M4 5.5h16v10.5H9l-5 4z"/></svg>对话</div><div class="on"><svg viewBox="0 0 24 24"><path d="M3.5 6.5h6l2 2.5h9v10h-17z"/></svg>工作区</div><div><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.4"/><path d="M12 3.8v2.6M12 17.6v2.6M3.8 12h2.6M17.6 12h2.6M6.2 6.2l1.9 1.9M15.9 15.9l1.9 1.9M17.8 6.2l-1.9 1.9M8.1 15.9l-1.9 1.9"/></svg>设置</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <div><b>字体</b>  Roboto / 系统 sans，14-16px 正文，比现状大一档</div>
+    <div><b>层级</b>  tonal 面三级 + 圆角 20，无描边</div>
+    <div><b>代价</b>  与系统其他 M3 应用同质，个性最弱</div>
+  </div>
+</div>
+</body>
+</html>
