@@ -3557,9 +3557,18 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
     }
   }
 
-  /// 跨会话搜索（标题 + 首条 prompt）。
+  /// 跨会话搜索（标题 + 首条 prompt + 正文）。
+  ///
+  /// [lastSearchPartial] / [lastSearchScanned] 是这次搜索的**扫描元数据**：网关
+  /// 有扫描预算（条数 + 毫秒），到点会返回已找到的部分并把 `partial` 置真。
+  /// 界面必须能把"没搜完"与"没命中"区分开 —— 悄悄截断会让用户以为真的没有。
+  bool lastSearchPartial = false;
+  int lastSearchScanned = 0;
+
   Future<List<SessionSearchHit>> searchSessions(String query,
       {int limit = 30}) async {
+    lastSearchPartial = false;
+    lastSearchScanned = 0;
     if (_currentConfig == null || query.trim().isEmpty) return const [];
     try {
       final url =
@@ -3571,6 +3580,9 @@ class DshService extends ChangeNotifier {  WebSocketChannel? _channel;
       if (_checkResponseAuth(res)) return const [];
       if (res.statusCode == 200) {
         final data = jsonDecode(utf8.decode(res.bodyBytes));
+        lastSearchPartial = data['partial'] == true;
+        lastSearchScanned =
+            data['scanned'] is int ? data['scanned'] as int : 0;
         final list = data['results'] as List<dynamic>? ?? [];
         return list
             .whereType<Map>()

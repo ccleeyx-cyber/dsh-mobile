@@ -1504,6 +1504,181 @@ export function normalizeSubagentCatalog(catalog) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Cross-session search（标题 + 首条 prompt + 正文）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 命中点前后各取多少个字符。
+ *
+ * 一行结果只放得下 60~80 个汉字，所以上下文的职责是「让人认出这是哪一句」，
+ * 不是「把整段搬过来」——手机上有整段，点进去就看见了。
+ */
+const SEARCH_SNIPPET_RADIUS = 36;
+
+/**
+ * 截出命中点周围的一段文字，两端按需加省略号。
+ *
+ * 纯函数、按下标切（不用正则），所以查询里带 `.*` `$` `(` 这类字符也不会抛，
+ * 这与 App 侧 `MessageSearch` 的处理方式一致：搜索框里这些符号是常客。
+ *
+ * @param text - 原文本。
+ * @param at - 命中起始下标（在 `text` 的坐标里）。
+ * @param length - 命中长度。
+ * @param radius - 左右各取多少字符。
+ */
+export function makeSearchSnippet(text, at, length, radius = SEARCH_SNIPPET_RADIUS) {
+  if (typeof text !== 'string' || !text) return '';
+  const start = Number.isFinite(at) && at > 0 ? at : 0;
+  const len = Number.isFinite(length) && length > 0 ? length : 0;
+  const from = Math.max(0, start - radius);
+  const to = Math.min(text.length, start + len + radius);
+  // 折叠换行：结果是单行 ListTile，多行会让行高跳动。
+  const body = text.slice(from, to).replace(/\s+/g, ' ').trim();
+  if (!body) return '';
+  return `${from > 0 ? '…' : ''}${body}${to < text.length ? '…' : ''}`;
+}
+
+/**
+ * 在会话投影的 `turnOutline` 里找第一条命中的轮次（**从最新一轮往前找**）。
+ *
+ * ## 为什么用 turnOutline 而不是完整日志
+ *
+ * 完整正文只存在于两处：引擎的 `session/page` RPC（每条会话一次往返，搜全库
+ * 等于几百次 RPC）与磁盘上的 `session.v4.jsonl.zstd`（需要 zstd 解压，Node 版本
+ * 依赖不保证）。`turnOutline` 是引擎已经写进 projcache 的**每轮 prompt + 响应
+ * 开头**，本地就有、已被 `projCacheReader` 按 mtime 缓存，搜全库是纯磁盘读。
+ *
+ * 代价必须说清：正文是**截断**的（引擎写 outline 时就截了），所以命中只在每轮的
+ * 前半段有效。这比"搜不到"诚实得多，也是这条路由此前只搜标题/首条 prompt 时
+ * 英文必然搜不到的根因 —— 英文词基本只出现在正文里。
+ *
+ * @param rows - projcache 的 `record.rows`。
+ * @param needle - 已 lower-case 的关键词。
+ * @returns `{ field, turn, text, at }` 或 null。
+ */
+export function findTurnOutlineMatch(rows, needle) {
+  const turns = rows?.turnOutline?.val?.turns;
+  if (!Array.isArray(turns) || turns.length === 0) return null;
+  const q = typeof needle === 'string' ? needle : '';
+  if (!q) return null;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i];
+    if (!t || typeof t !== 'object') continue;
+    for (const field of ['prompt', 'response']) {
+      const text = t[field];
+      if (typeof text !== 'string' || !text) continue;
+      const at = text.toLowerCase().indexOf(q);
+      if (at >= 0) {
+        return { field, turn: Number.isFinite(t.turn) ? t.turn : null, text, at };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * 跨会话搜索：标题 → 首条 prompt → 正文（turnOutline）。
+ *
+ * 三档按「用户有多希望它命中」排序，而不是按成本：标题命中说明他找的就是这条
+ * 会话；其次是他自己说过的话；最后才是正文里被提到的地方。
+ *
+ * ⚠️ 扫描是**有预算**的：`maxScan` 条会话或 `budgetMs` 毫秒，谁先到算谁。
+ * 到点时把已找到的结果返回，并把 `partial: true` 交给调用方 —— 悄悄截断会让
+ * "没搜到"与"没搜完"变成同一句话，那正是这个模块反复吃过亏的地方。
+ *
+ * @param deps.query - 用户输入。
+ * @param deps.workspaces - `getWorkspacesData()` 的结果。
+ * @param deps.readProjectionRows - `(sessionId) => rows|null`，读 projcache。
+ * @param deps.max - 最多返回多少条结果。
+ * @param deps.maxScan - 最多扫多少条会话。
+ * @param deps.budgetMs - 扫描时间预算。
+ * @returns `{ results, scanned, partial }`。
+ */
+export function searchSessionsInWorkspaces({
+  query,
+  workspaces,
+  readProjectionRows,
+  max = 30,
+  maxScan = 800,
+  budgetMs = 2500
+} = {}) {
+  const needle = String(query || '').trim().toLowerCase();
+  if (!needle) return { results: [], scanned: 0, partial: false };
+
+  const cap = Math.max(1, Math.min(Number(max) || 30, 200));
+  const scanCap = Math.max(1, Number(maxScan) || 800);
+  const deadline = Date.now() + Math.max(1, Number(budgetMs) || 2500);
+
+  const results = [];
+  let scanned = 0;
+  let partial = false;
+
+  outer:
+  for (const ws of Array.isArray(workspaces) ? workspaces : []) {
+    for (const s of ws?.sessions || []) {
+      if (scanned >= scanCap || Date.now() > deadline) {
+        partial = true;
+        break outer;
+      }
+      scanned++;
+
+      const title = typeof s.title === 'string' ? s.title : '';
+      const firstPrompt = typeof s.firstPrompt === 'string' ? s.firstPrompt : '';
+      let matchField = null;
+      let snippet = '';
+      let turn = null;
+
+      const titleAt = title.toLowerCase().indexOf(needle);
+      const promptAt = firstPrompt.toLowerCase().indexOf(needle);
+      if (titleAt >= 0) {
+        matchField = 'title';
+      } else if (promptAt >= 0) {
+        matchField = 'prompt';
+        snippet = makeSearchSnippet(firstPrompt, promptAt, needle.length);
+      } else {
+        let outline = null;
+        try {
+          outline = findTurnOutlineMatch(readProjectionRows?.(s.sessionId), needle);
+        } catch (_) {
+          // 投影读不出来（文件锁/半写入）等于"这条查不了"，不是"这条没命中"；
+          // 但也不该让整次搜索失败 —— 继续扫下一条。
+          outline = null;
+        }
+        if (outline) {
+          matchField = 'body';
+          turn = outline.turn;
+          snippet = makeSearchSnippet(outline.text, outline.at, needle.length);
+        }
+      }
+
+      if (!matchField) continue;
+
+      results.push({
+        workspaceId: ws.workspaceId,
+        workspaceTitle: ws.title,
+        sessionId: s.sessionId,
+        title: s.title,
+        firstPrompt: s.firstPrompt,
+        lastPromptAt: s.lastPromptAt,
+        archived: !!s.archived,
+        // [feat 2026-11-18] 命中位置与摘要。老 App 读不到这两个键就退回
+        // 「标题 + 首条 prompt」的旧呈现，不需要版本协商。
+        matchField,
+        snippet,
+        turn
+      });
+    }
+  }
+
+  // 最近的先说：搜历史会话时，用户十有八九在找刚发生的事。
+  //
+  // 排序必须在**截断之前**：边扫边截会把"最先扫到的三条"当成"最近的三条"，
+  // 而扫描顺序是工作区里的登记顺序，与时间无关。
+  results.sort((a, b) => (Number(b.lastPromptAt) || 0) - (Number(a.lastPromptAt) || 0));
+  return { results: results.slice(0, cap), scanned, partial };
+}
+
+/* ------------------------------------------------------------------ *
  * Route handling
  * ------------------------------------------------------------------ */
 

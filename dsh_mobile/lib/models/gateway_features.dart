@@ -27,6 +27,18 @@ class Snippet {
 }
 
 /// 跨会话搜索命中（GET /api/mobile/sessions/search?q=）。
+///
+/// ## 2026-11-18：搜索范围扩到正文
+///
+/// 此前网关只匹配标题与首条 prompt，于是「搜中文有结果、搜英文没有」—— 英文词
+/// 几乎只出现在正文里。现在网关会把命中位置一起返回：
+///
+/// * [matchField]：`title` / `prompt` / `body`，App 用它决定标签文案；
+/// * [snippet]：命中点周围的一小段上下文（正文命中时才有），可直接渲染；
+/// * [turn]：正文命中所在的轮次，没有跨会话轮次概念时为 null。
+///
+/// 三者都是**新增可选字段**：老网关不返回它们时，App 退回「标题 + 首条 prompt」
+/// 的旧呈现，不需要版本协商。
 class SessionSearchHit {
   final String workspaceId;
   final String workspaceTitle;
@@ -36,6 +48,15 @@ class SessionSearchHit {
   final int lastPromptAt;
   final bool archived;
 
+  /// 命中位置：`title` / `prompt` / `body`。老网关为 null。
+  final String? matchField;
+
+  /// 命中点周围的上下文摘要。老网关或标题命中时为空串。
+  final String snippet;
+
+  /// 正文命中所在的轮次。
+  final int? turn;
+
   const SessionSearchHit({
     required this.workspaceId,
     required this.workspaceTitle,
@@ -44,7 +65,34 @@ class SessionSearchHit {
     this.firstPrompt = '',
     this.lastPromptAt = 0,
     this.archived = false,
+    this.matchField,
+    this.snippet = '',
+    this.turn,
   });
+
+  /// 命中位于消息正文（而不是会话标题/首条 prompt）。
+  bool get matchedInBody => matchField == 'body';
+
+  /// 结果行第二行该显示什么：优先正文摘要，否则退回首条 prompt / 工作区名。
+  String get previewText {
+    if (snippet.isNotEmpty) return snippet;
+    if (firstPrompt.isNotEmpty) return firstPrompt;
+    return workspaceTitle;
+  }
+
+  /// 结果行右侧的短标签，说清"为什么它会出现"。
+  String get matchLabel {
+    switch (matchField) {
+      case 'title':
+        return '标题';
+      case 'prompt':
+        return '首条消息';
+      case 'body':
+        return turn == null ? '正文' : '第 $turn 轮';
+      default:
+        return '';
+    }
+  }
 
   factory SessionSearchHit.fromJson(Map<String, dynamic> json) =>
       SessionSearchHit(
@@ -55,6 +103,9 @@ class SessionSearchHit {
         firstPrompt: json['firstPrompt']?.toString() ?? '',
         lastPromptAt: json['lastPromptAt'] is int ? json['lastPromptAt'] as int : 0,
         archived: json['archived'] == true || json['archived'] == 'true',
+        matchField: json['matchField'] is String ? json['matchField'] as String : null,
+        snippet: json['snippet']?.toString() ?? '',
+        turn: json['turn'] is int ? json['turn'] as int : null,
       );
 }
 

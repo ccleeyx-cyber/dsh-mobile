@@ -1481,7 +1481,7 @@ class _GlobalSearchSheetState extends State<_GlobalSearchSheet> {
                   const SizedBox(width: 8),
                   Text('全库搜索', style: TextStyle(color: context.c.textPrimary, fontSize: 16, fontWeight: FontWeight.bold)),
                   const SizedBox(width: 6),
-                  Text('含已归档 · 按标题与首条消息', style: TextStyle(color: context.c.textTertiary, fontSize: 11)),
+                  Text('含已归档 · 标题 / 首条消息 / 正文', style: TextStyle(color: context.c.textTertiary, fontSize: 11)),
                   const Spacer(),
                   IconButton(
                     icon: Icon(Icons.close_rounded, size: 20, color: context.c.textTertiary),
@@ -1539,6 +1539,16 @@ class _GlobalSearchSheetState extends State<_GlobalSearchSheet> {
                                   Icon(Icons.search_off_rounded, size: 44, color: context.c.textTertiary.withOpacity(0.5)),
                                   const SizedBox(height: 10),
                                   Text('没有命中会话', style: TextStyle(color: context.c.textTertiary, fontSize: 13)),
+                                  // 扫描被预算截断时如实说一句：否则"没搜完"会被读成
+                                  // "没有这个会话"，而用户会据此以为记录丢了。
+                                  if (widget.dsh.lastSearchPartial)
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 6),
+                                      child: Text(
+                                        '已扫描 ${widget.dsh.lastSearchScanned} 条会话，未扫完',
+                                        style: TextStyle(color: context.c.warning, fontSize: 11.5),
+                                      ),
+                                    ),
                                 ],
                               ),
                             )
@@ -1569,15 +1579,34 @@ class _GlobalSearchSheetState extends State<_GlobalSearchSheet> {
                                     padding: const EdgeInsets.only(top: 2),
                                     child: Row(
                                       children: [
-                                        Flexible(
-                                          child: Text(
-                                            hit.firstPrompt.isEmpty ? hit.workspaceTitle : hit.firstPrompt,
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: TextStyle(color: context.c.textSecondary, fontSize: 12),
+                                        Expanded(
+                                          child: _SearchPreview(
+                                            text: hit.previewText,
+                                            query: _controller.text.trim(),
+                                            style: TextStyle(
+                                              color: context.c.textSecondary,
+                                              fontSize: 12,
+                                            ),
+                                            highlightStyle: TextStyle(
+                                              color: context.c.warning,
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w700,
+                                            ),
                                           ),
                                         ),
                                         const SizedBox(width: 6),
+                                        // 说清"为什么它会出现"：标题命中 / 首条消息 /
+                                        // 正文第 N 轮。空标签（老网关）时不占位。
+                                        if (hit.matchLabel.isNotEmpty) ...[
+                                          Text(
+                                            hit.matchLabel,
+                                            style: TextStyle(
+                                              color: context.c.textTertiary,
+                                              fontSize: 10.5,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 6),
+                                        ],
                                         Text(
                                           hit.archived ? '· 已归档' : '· ${hit.workspaceTitle}',
                                           style: TextStyle(color: context.c.textTertiary, fontSize: 11),
@@ -1593,6 +1622,53 @@ class _GlobalSearchSheetState extends State<_GlobalSearchSheet> {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// 搜索结果的正文摘要，把命中的关键词高亮出来。
+///
+/// 为什么不用正则：搜索框里 `.` `*` `$` `(` 是常客，把它们当正则会让整次搜索抛异常
+/// 或错配。这里按 `indexOf` 逐段切，与 `MessageSearch` 的匹配口径保持一致 ——
+/// 两边用同一套规则，才不会出现"列表里高亮了、点进去搜不到"的错位。
+class _SearchPreview extends StatelessWidget {
+  final String text;
+  final String query;
+  final TextStyle style;
+  final TextStyle highlightStyle;
+
+  const _SearchPreview({
+    required this.text,
+    required this.query,
+    required this.style,
+    required this.highlightStyle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final q = query.trim();
+    if (q.isEmpty) {
+      return Text(text, maxLines: 2, overflow: TextOverflow.ellipsis, style: style);
+    }
+    final lowerText = text.toLowerCase();
+    final lowerQuery = q.toLowerCase();
+    final spans = <TextSpan>[];
+    var from = 0;
+    while (true) {
+      final at = lowerText.indexOf(lowerQuery, from);
+      if (at < 0) break;
+      if (at > from) spans.add(TextSpan(text: text.substring(from, at)));
+      spans.add(TextSpan(text: text.substring(at, at + lowerQuery.length), style: highlightStyle));
+      from = at + lowerQuery.length;
+    }
+    if (from < text.length) spans.add(TextSpan(text: text.substring(from)));
+    if (spans.isEmpty) {
+      return Text(text, maxLines: 2, overflow: TextOverflow.ellipsis, style: style);
+    }
+    return Text.rich(
+      TextSpan(style: style, children: spans),
+      maxLines: 2,
+      overflow: TextOverflow.ellipsis,
     );
   }
 }

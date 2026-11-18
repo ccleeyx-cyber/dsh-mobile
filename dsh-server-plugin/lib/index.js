@@ -50,7 +50,8 @@ import {
   convertSessionRecordsToMessages,
   readHistoryPage,
   probeSessionCursor,
-  claimsMobileFeatureRoute
+  claimsMobileFeatureRoute,
+  searchSessionsInWorkspaces
 } from './features.mjs';
 import {
   handleExtensionRoute,
@@ -5037,7 +5038,7 @@ export function apply(ctx, config = {}, internals = {}) {
         return;
       }
 
-      // ---- 跨会话搜索（标题 + 首条 prompt）----
+      // ---- 跨会话搜索（标题 + 首条 prompt + 正文）----
       //
       // ⚠️ 必须排在下面的 startsWith('/api/mobile/sessions/') 通配路由之前：
       // 它也是 GET，晚于通配时 'search' 会被当成 sessionId 送进
@@ -5049,28 +5050,31 @@ export function apply(ctx, config = {}, internals = {}) {
           return;
         }
         const max = Math.min(Number(parsedUrl.query?.limit) || 30, 100);
-        const needle = q.toLowerCase();
-        const results = [];
-        for (const ws of getWorkspacesData({ archived: 'include' })) {
-          for (const s of ws.sessions) {
-            const title = (s.title || '').toLowerCase();
-            const first = (s.firstPrompt || '').toLowerCase();
-            if (title.includes(needle) || first.includes(needle)) {
-              results.push({
-                workspaceId: ws.workspaceId,
-                workspaceTitle: ws.title,
-                sessionId: s.sessionId,
-                title: s.title,
-                firstPrompt: s.firstPrompt,
-                lastPromptAt: s.lastPromptAt,
-                archived: !!s.archived
-              });
-              if (results.length >= max) break;
-            }
-          }
-          if (results.length >= max) break;
-        }
-        sendJson(200, { ok: true, code: 0, query: q, results });
+        // [feat 2026-11-18] 搜索范围从「标题 + 首条 prompt」扩到**正文**。
+        //
+        // 用户实测反馈：搜中文有结果、搜英文出不来。根因就是这两个字段 ——
+        // 会话标题与首条 prompt 基本都是中文，而英文词（push / AppBar /
+        // sessionId 这类）只出现在消息正文里，此前根本没有被匹配过。
+        //
+        // 正文取自 projcache 的 `turnOutline`（引擎已写好的每轮 prompt + 响应
+        // 开头），不是逐会话打 `session/page` RPC：搜全库是纯本地磁盘读，
+        // 有 `maxScan` 条数与 `budgetMs` 时间双预算，到点返回并如实置
+        // `partial`，绝不把"没搜完"说成"没搜到"。
+        const { results, scanned, partial } = searchSessionsInWorkspaces({
+          query: q,
+          workspaces: getWorkspacesData({ archived: 'include' }),
+          readProjectionRows,
+          max
+        });
+        sendJson(200, {
+          ok: true,
+          code: 0,
+          query: q,
+          results,
+          // 扫描元数据：App 只在 partial 时用它说一句"没扫完"，平时不占像素。
+          scanned,
+          partial
+        });
         return;
       }
 
