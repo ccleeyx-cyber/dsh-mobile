@@ -1,0 +1,67 @@
+# 平台下限与 Runner 的 IPHONEOS_DEPLOYMENT_TARGET 保持一致（15.0）。
+#
+# 为什么是 15.0 而不是 Flutter 默认的 12.0：
+#  * Xcode 27 / iOS 27 SDK **只支持 15.0 及以上**的部署目标，低于它的 target
+#    会直接报 "range of supported deployment target versions is 15.0 to 27.2.x"。
+#    这不是可选项 —— 12.0 在这套工具链上根本编不过。
+#  * 15.0 覆盖 iPhone 6s 及以后，对本 App 的目标用户没有实际损失。
+#  * 同步放宽了下面 post_install 的强制下限，让老 pod 的 9.0/10.0 声明也被抬到 15.0。
+# 改这里必须同步改 project.pbxproj 的三处 IPHONEOS_DEPLOYMENT_TARGET，
+# 否则 pod 按一个版本编、App target 按另一个版本链，会出现离奇的链接错误。
+platform :ios, '15.0'
+
+# CocoaPods analytics sends network stats synchronously affecting flutter build latency.
+ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+project 'Runner', {
+  'Debug' => :debug,
+  'Profile' => :release,
+  'Release' => :release,
+}
+
+def flutter_root
+  generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
+  unless File.exist?(generated_xcode_build_settings_path)
+    raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure flutter pub get is executed first"
+  end
+
+  File.foreach(generated_xcode_build_settings_path) do |line|
+    matches = line.match(/FLUTTER_ROOT\=(.*)/)
+    return matches[1].strip if matches
+  end
+  raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Generated.xcconfig, then run flutter pub get"
+end
+
+require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+
+flutter_ios_podfile_setup
+
+target 'Runner' do
+  use_frameworks!
+  use_modular_headers!
+
+  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+  target 'RunnerTests' do
+    inherit! :search_paths
+  end
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    flutter_additional_ios_build_settings(target)
+
+    # 把每个 pod 自己的部署目标抬到 15.0。
+    #
+    # 为什么必须暴力统一：很多 pod（尤其 file_picker 拖进来的 DKImagePickerController
+    # / DKPhotoGallery 这类）还在 pbxproj 里写 IPHONEOS_DEPLOYMENT_TARGET = 9.0 / 10.0，
+    # 而 Xcode 27 的 iOS 27 SDK 最低只支持 15.0 —— 不抬就会被判为
+    # "Target Integrity" 错误，整个 build 直接失败，且报错指向 Pods.xcodeproj
+    # 而不是本工程，很容易误以为是我们的代码有问题。
+    #
+    # flutter_additional_ios_build_settings 不会做这件事（它只管权限宏），
+    # 所以下面这段是必需的，不是冗余的双保险。
+    target.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
+    end
+  end
+end

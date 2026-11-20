@@ -3,13 +3,18 @@
 DeepSeek Harness（DSH）的手机端控制台 + 配套网关插件。
 
 ```
-dsh_mobile/          Flutter Android 客户端（本仓库的主体）
+dsh_mobile/          Flutter 客户端（Android + iOS 双平台，本仓库的主体）
+dsh_mobile/ios/      iPhone 版平台工程 + PlatformBridge.swift（七个原生通道）
 dsh-server-plugin/   Node.js 网关插件，跑在 DSH 宿主机上
 tests/               网关插件的测试（node --test），分层见 docs/TESTING.md
 scripts/             手动工具：等 APK 构建产物、读 APK 版本号
-docs/                测试分层说明（TESTING.md）
+docs/                测试分层说明（TESTING.md）、iOS 落地实现
 docs/archive/        历史设计与排查记录（只作证据，描述的状态可能已修复）
 ```
+
+**平台**：Android 与 iOS 共用同一套 Dart 业务代码，差异只在原生侧。
+iOS 版的能力矩阵、七个 MethodChannel 的 Swift 实现、以及"哪些能力 iOS 上就是没有"
+见 [docs/2026-11-20-iOS-落地实现.md](docs/2026-11-20-iOS-落地实现.md)。
 
 ---
 
@@ -111,10 +116,36 @@ DSH 设置页与网关首页只给 Releases 链接。
 
 ---
 
+## 三·五、构建 iPhone 版
+
+```bash
+cd dsh_mobile
+flutter pub get
+flutter analyze && flutter test     # 与 Android 同一套标准
+flutter build ios --no-codesign     # 无签名构建，只需验证能编过时用这个
+```
+
+三个只在 macOS 上才会遇到的坑，以及本机工具链的完整配置（Rosetta / 国内镜像 /
+CocoaPods 用的 Ruby 版本 / 代理会把 `flutter test` 打红），见
+[docs/2026-11-20-iOS-落地实现.md](docs/2026-11-20-iOS-落地实现.md) §五。
+
+- 部署目标是 **iOS 15.0**（不是 Flutter 默认的 12.0）：Xcode 27 的 iOS 27 SDK
+  最低只支持 15.0。改它要同步改 `Podfile`、`project.pbxproj` 三处、以及
+  `Podfile` 里抬升 pod 部署目标的 `post_install`。
+- **iOS 没有"下载安装包自更新"**：`UpdateService` 在 iOS 上整条动线被拦截，
+  设置页显示"通过 App Store 更新"。
+- **iOS 没有前台服务**：`startForeground` 如实返回 `false`，后台提醒走服务端
+  ntfy 推送，WS 长连接只在 App 前台保持。
+- 签名与上架需要 Apple 开发者账号，步骤见该文档 §六。
+
+---
+
 ## 四、凭据与网络
 
-- **凭据**：token / authCode 走 Android Keystore（AES-256/GCM，密钥不可导出）。
-  迁移先写后校验，失败保留明文兜底；Android 5/6 或 Keystore 故障时同样降级。
+- **凭据**：token / authCode 在 Android 上走 Android Keystore（AES-256/GCM，密钥
+  不可导出），在 iOS 上走 Keychain（`AfterFirstUnlockThisDeviceOnly`，不进 iCloud、
+  不随备份迁移）。迁移先写后校验，失败保留明文兜底；Android 5/6、Keystore 故障、
+  Keychain 拒绝写入时同样降级到进程内存储。
 - **TLS**：网关可同时监听明文 `3088` 与自签 HTTPS/WSS `3443`。App 的 REST 与
   WebSocket **共用同一套 TOFU 指纹校验**：首次信任，指纹变化时阻止连接并要求确认。
 - **明文**：`3088` 仍可用，但 Token 会明文过网；只建议可信局域网。远程连接请启用

@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>DSH Mobile</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>dsh_mobile</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(FLUTTER_BUILD_NAME)</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIMainStoryboardFile</key>
+	<string>Main</string>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+
+	<!-- ================= 深链接 =================
+	     dshmobile://open?session=<id>
+	     ntfy 的离线推送点开后直达那一轮会话。Android 侧靠 AndroidManifest 的
+	     intent-filter 实现，iOS 必须在这里声明 scheme，并在 AppDelegate 的
+	     application(_:open:options:) 里接收（见 PlatformBridge.handleDeepLink）。
+
+	     ⚠️ 这个 scheme 是**全局唯一**的：两个 App 声明同一个 scheme 时系统不报错，
+	     而是随机挑一个打开。上架前建议改成带你自己前缀的（如 dshmobileccleeyx），
+	     同时改 lib/services/platform_services.dart 里拼接的深链接前缀。 -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>com.example.dshMobile.deeplink</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>dshmobile</string>
+			</array>
+		</dict>
+	</array>
+
+	<!-- ================= 权限用途说明（中文） =================
+	     iOS 上这些字符串是**硬性要求**：缺少对应的 UsageDescription，调用相关 API 时
+	     系统会立刻杀掉进程（不是抛异常，是 SIGABRT）。每条都要能对上真实功能，
+	     因为 App Review 会拿它跟实际行为比对。
+
+	     * 麦克风 + 语音识别：§4.2 的语音输入，用系统识别服务转文字（对接
+	       speech_to_text 插件，Android 侧对应 RECORD_AUDIO）。
+	     * 相册读取：发图片给模型（image_picker，选择已有照片）。
+	     * 相机：现场拍一张（image_picker，Android 侧对应 CAMERA）。
+	       不加这条的话，"拍照"按钮在 iOS 上一按就崩。
+	     * 相册写入：把生成/交付的图片存回相册（saveToGallery 动线）。
+	       只读权限不含写入，Apple 把它算作两个独立权限。 -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>用于语音输入：把你说的话转成文字填进输入框，不会在后台录音。</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>用于把语音转成文字。识别由 iOS 系统语音服务完成，音频不会上传到我们的服务器。</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>用于从相册选择图片发给模型。只读取你主动选中的那一张。</string>
+	<key>NSCameraUsageDescription</key>
+	<string>用于拍摄照片并发送给模型。</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>用于把生成的结果图片保存到相册。</string>
+
+	<!-- ================= 明文 HTTP / WebSocket =================
+	     网关是**用户自己填地址**的内网服务，几乎都是 http:// 和 ws://（没有证书、
+	     也不可能有公网可信证书）。iOS 的 ATS 默认禁止明文，会让连接直接失败并
+	     只给一条"资源无法载入"的模糊错误。
+
+	     取舍：这里放开到允许任意明文，而不是只列几个域名 —— 与 Android 侧的
+	     network_security_config 同理，目标地址在编译期未知（任意局域网 IP）。
+	     NSAllowsLocalNetworking 单独保留，让"本地网络"这档在系统层面也算显式允许
+	     （iOS 14+ 首次访问局域网还会弹一次本地网络授权，那是系统行为，无法绕过）。 -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>需要访问局域网，才能连接你自己部署的 DSH 网关。</string>
+
+	<!-- 提示用户"App 支持文件分享"（交付物通过系统分享面板导出）。 -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+</dict>
+</plist>

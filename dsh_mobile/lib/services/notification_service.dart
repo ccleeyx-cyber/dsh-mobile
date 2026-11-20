@@ -71,13 +71,32 @@ class NotificationService {
     if (_initialized) return _granted;
     _initialized = true;
 
+    // 权限申请要**按平台分开**，不能只问 Android。
+    //
+    // 旧写法只调 `AndroidFlutterLocalNotificationsPlugin`，在 iOS 上那个
+    // `resolvePlatformSpecificImplementation` 返回 null，于是 `granted ?? true`
+    // 恒为 true —— 用户在系统弹窗里点了"不允许"，App 仍然认为一切正常，
+    // 界面上不会出现任何"你收不到通知"的提示。这正是需要显式查 iOS 的原因。
+    //
+    // 顺序说明：iOS 的授权弹窗由下面的 `DarwinInitializationSettings` 在
+    // initialize() 时触发（它默认 requestAlertPermission=true），所以这里先
+    // 只**查**、不请求；initialize 之后再查一次，才能拿到用户的真实选择。
     try {
-      // Android 13+ 需要显式申请 POST_NOTIFICATIONS。低于 13 的版本系统自动放行。
-      final granted = await _plugin
-          .resolvePlatformSpecificImplementation<
-              AndroidFlutterLocalNotificationsPlugin>()
-          ?.requestNotificationsPermission();
-      _granted = granted ?? true;
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        final ios = _plugin.resolvePlatformSpecificImplementation<
+            IOSFlutterLocalNotificationsPlugin>();
+        final perms = await ios?.checkPermissions();
+        // null = 尚未询问（首次启动）。此时不要武断置 false，
+        // 交给 initialize() 触发弹窗、再由下面的复查拿到真值。
+        _granted = perms?.isEnabled ?? true;
+      } else {
+        // Android 13+ 需要显式申请 POST_NOTIFICATIONS。低于 13 的版本系统自动放行。
+        final granted = await _plugin
+            .resolvePlatformSpecificImplementation<
+                AndroidFlutterLocalNotificationsPlugin>()
+            ?.requestNotificationsPermission();
+        _granted = granted ?? true;
+      }
     } catch (e) {
       // 权限查询失败不能当"有权限"，也不能崩 —— 保守当作没有。
       debugPrint('[NotificationService] 权限查询失败: $e');
@@ -125,6 +144,18 @@ class NotificationService {
       );
       _pluginReady = true;
       _lastError = null;
+
+      // iOS 专项复查：initialize() 刚刚弹过授权窗，这里拿到的是用户的真实选择。
+      // 不复查的话，_granted 还停在"尚未询问=true"的乐观值上。
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        try {
+          final perms = await _plugin.resolvePlatformSpecificImplementation<
+              IOSFlutterLocalNotificationsPlugin>()?.checkPermissions();
+          if (perms != null) _granted = perms.isEnabled;
+        } catch (e) {
+          debugPrint('[NotificationService] iOS 权限复查失败: $e');
+        }
+      }
     } catch (e) {
       // 刻意不再只写 debugPrint：这个失败以前完全不可见，用户只能看到
       // "就是没有通知"这个现象。现在记进 _lastError，由设置页如实展示。
@@ -176,6 +207,10 @@ class NotificationService {
   Future<bool> enableBackground() async {
     if (!_granted) return false;
     if (_backgroundOn) return true;
+    // iOS 没有前台服务，长连接在后台一定会被系统挂起 —— 原生侧
+    // （ios/Runner/PlatformBridge.swift 的 registerForeground）如实回 false。
+    // 这里不做平台判断、照样走通道，是为了让"能力由原生决定"这件事只有一处
+    // 真相：iOS 上离线提醒走服务端 ntfy 推送，WS 只在 App 前台时保持。
     try {
       const channel = MethodChannel('dsh_mobile/foreground');
       final ok = await channel.invokeMethod<bool>('startForeground') ?? false;

@@ -22,6 +22,14 @@ class UpdateDownload {
 
 /// 客户端更新：可选的 `latest.json` 清单 + APK 下载 + 安装交接。
 ///
+/// ## 这个类**只服务 Android**
+///
+/// 整条动线（latest.json 的 versionCode、按 ABI 拆分的 .apk、交给系统包安装器）
+/// 是 Android 的发布形态。iOS 的更新由 App Store / TestFlight 负责 —— 系统不允许
+/// 应用自更新，侧载 .ipa 也不是 App 能做的事。所以在 iOS 上 [check] 与 [download]
+/// 一律拒绝工作（见 [apkUpdatesSupported]），由 UI 换成"打开发布页 / 去 App Store"，
+/// 而不是下载一个在 iOS 上永远装不上的 .apk 文件。
+///
 /// 设计上的三条硬约束：
 ///  1. **启动时不查**。没有任何后台/自动检查，只有用户在设置里点「检查更新」才会
 ///     发这一次请求（和以前"更新只指向发布页"的静默行为一致，只是现在用户主动问
@@ -42,19 +50,30 @@ class UpdateService {
   static const Duration _manifestTimeout = Duration(seconds: 10);
   static const Duration _downloadTimeout = Duration(minutes: 5);
 
+  /// 本平台是否支持"下载 APK 自更新"。iOS 恒为 false，理由见类注释。
+  ///
+  /// 用 `defaultTargetPlatform` 而不是 `Platform.isIOS`：后者依赖 dart:io，
+  /// 在 widget 测试里会跟着宿主机（macOS/Linux）走，测不出 iOS 分支。
+  static bool get apkUpdatesSupported =>
+      defaultTargetPlatform != TargetPlatform.iOS;
+
   /// GitHub 对没有 UA 的请求会 403，显式带上自己的标识（也方便在日志里对账）。
-  static const String _userAgent =
-      'dsh-mobile/${AppVersion.version}+${AppVersion.buildNumber} (Android)';
+  ///
+  /// 平台名不再写死 Android：请求头会出现在网关/发布侧日志里，写错平台会让
+  /// 排查"这个 404 是谁打的"变成猜谜。
+  static String get _userAgent =>
+      'dsh-mobile/${AppVersion.version}+${AppVersion.buildNumber} '
+      '(${defaultTargetPlatform == TargetPlatform.iOS ? 'iOS' : 'Android'})';
 
-  static const Map<String, String> _manifestHeaders = {
-    'Accept': 'application/json',
-    'User-Agent': _userAgent,
-  };
+  static Map<String, String> get _manifestHeaders => {
+        'Accept': 'application/json',
+        'User-Agent': _userAgent,
+      };
 
-  static const Map<String, String> _downloadHeaders = {
-    'Accept': 'application/vnd.android.package-archive, application/octet-stream',
-    'User-Agent': _userAgent,
-  };
+  static Map<String, String> get _downloadHeaders => {
+        'Accept': 'application/vnd.android.package-archive, application/octet-stream',
+        'User-Agent': _userAgent,
+      };
 
   /// 最近一次 [check] 失败的具体原因（成功时清空）。
   ///
@@ -68,6 +87,13 @@ class UpdateService {
   /// 任何失败（404 没有这个 asset、超时、离线、JSON 坏了、字段不合法）都归到
   /// null，由调用方回退到发布页 —— 功能不会因为新源不可用而变差。
   static Future<UpdateCheck?> check({http.Client? client}) async {
+    // iOS 上不查：latest.json 描述的是 Android 包，拿它比版本只会得出
+    // "有新版"这种在 iOS 上无法执行的结论。直接回 null（"问不到"），
+    // 调用方据此走"打开发布页 / App Store"的回退分支。
+    if (!apkUpdatesSupported) {
+      lastFailure = 'iOS 版由 App Store 更新，不使用 APK 清单。';
+      return null;
+    }
     final own = client == null ? http.Client() : null;
     final c = client ?? own!;
     lastFailure = '';
@@ -110,6 +136,11 @@ class UpdateService {
     UpdateManifest manifest, {
     http.Client? client,
   }) async {
+    // 双保险：check() 已经拦过一次，但 download 是公开 API（测试也会直接调），
+    // 不能让它在 iOS 上真的去下 8MB 的 .apk。
+    if (!apkUpdatesSupported) {
+      return const UpdateDownload(error: 'iOS 版不支持通过 APK 更新，请前往 App Store。');
+    }
     final own = client == null ? http.Client() : null;
     final c = client ?? own!;
     try {
@@ -156,6 +187,10 @@ class UpdateService {
     UpdateManifest manifest,
     List<int> bytes,
   ) {
+    // iOS 上**故意**返回 false：系统没有任何能"安装 .apk"的接口，
+    // 经 UIActivityViewController 把 .apk 丢进分享面板只会让用户一脸茫然。
+    // 如实回 false，让 UI 显示"请改用 App Store / 打开发布页"。
+    if (!apkUpdatesSupported) return Future<bool>.value(false);
     return FileOpener.openBytes('dsh-mobile-${manifest.version}.apk', bytes);
   }
 }

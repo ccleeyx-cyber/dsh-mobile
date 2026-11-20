@@ -180,6 +180,22 @@ class _AboutViewState extends State<AboutView> {
     });
     if (!context.mounted) return;
 
+    // iOS 版没有"下载安装包"这条路：系统只允许 App Store 更新。这里必须**先说清楚**，
+    // 否则会落到下面"读不到 latest.json"的分支，用户会以为是自己网络的问题。
+    if (!UpdateService.apkUpdatesSupported) {
+      await _showUpdateDialog(
+        context,
+        title: 'iOS 版通过 App Store 更新',
+        body: '本机 v${AppVersion.version} (Build ${AppVersion.buildNumber})。\n\n'
+            'iPhone 版不允许应用自更新 —— 这是系统限制，不是功能缺失。'
+            '新版本会发布到 App Store（内测走 TestFlight），在 App Store 里更新即可。\n\n'
+            '想看当前发布进度，可以「打开发布页」。',
+        primaryLabel: '打开发布页',
+        primary: () => _openDownloadPage(context),
+      );
+      return;
+    }
+
     if (check == null || check.verdict == UpdateVerdict.manifestRejected) {
       // 把**具体原因**带出来：以前只有"读不到清单"，用户分不清是发布侧漏传了
       // latest.json、还是手机到不了 GitHub。两者修法完全不同。
