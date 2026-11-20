@@ -805,6 +805,14 @@ test('route: a declared file that vanished answers 404, never a silent hang', as
 // cursor any other way — see parseCursorFromPastSeqError's docblock.
 const REAL_PAST_CURSOR = 'session page through seq 9007199254740991 is past cursor 4431';
 
+// 2026-11 的 DSH 把文案换了，且换法是"同一件事换一种说法"：
+//   旧: session page through seq 9007199254740991 is past cursor 4431
+//   新: session history cut 9007199254740991 exceeds 1468
+// 只认旧文案的后果不是"少一页"，而是 readHistoryPage 直接回空页 —— 手机上
+// 打开会话只见标题、一条消息都没有（2026-11-20 现场事故）。所以两种文案
+// 都必须钉在测试里，任何时候回归都能立刻看见。
+const REAL_PAST_CURSOR_NEW = 'session history cut 9007199254740991 exceeds 1468';
+
 test('parseCursorFromPastSeqError: reads the engine cursor, refuses anything else', () => {
   assert.equal(parseCursorFromPastSeqError(REAL_PAST_CURSOR), 4431);
   assert.equal(parseCursorFromPastSeqError('session page through seq 5 is past cursor 0'), 0);
@@ -812,6 +820,24 @@ test('parseCursorFromPastSeqError: reads the engine cursor, refuses anything els
   assert.equal(parseCursorFromPastSeqError('typert gateway: session/page: wire field "request" failed boundary validation'), null);
   assert.equal(parseCursorFromPastSeqError(undefined), null);
   assert.equal(parseCursorFromPastSeqError('past cursor -3'), null);
+});
+
+test('parseCursorFromPastSeqError: 认 2026-11 引擎的新文案 "history cut N exceeds M"', () => {
+  assert.equal(parseCursorFromPastSeqError(REAL_PAST_CURSOR_NEW), 1468);
+  // 包在 typert 前缀里（真实形态）也要认。
+  assert.equal(
+    parseCursorFromPastSeqError(`typert gateway: session/page: gateway/bad-request: ${REAL_PAST_CURSOR_NEW}`),
+    1468
+  );
+  // 空会话（cursor=0）同样成立。
+  assert.equal(parseCursorFromPastSeqError('session history cut 9007199254740991 exceeds 0'), 0);
+});
+
+test('parseCursorFromPastSeqError: 不把无关错误里的数字当游标', () => {
+  // 这些都必须回 null —— 给错游标会让历史从中间截断，比空页面更难发现。
+  assert.equal(parseCursorFromPastSeqError('DSH RPC session/page response exceeds 1048576 bytes'), null);
+  assert.equal(parseCursorFromPastSeqError('session "session-x" not found, tried 3 times'), null);
+  assert.equal(parseCursorFromPastSeqError('gateway/input-invalid: wire field "throughSeq" exceeds limit of 200'), null);
 });
 
 test('collectSessionRecords: every page carries the REQUIRED throughSeq', async () => {

@@ -218,10 +218,36 @@ export async function probeSessionCursor({ callDshRpc, sessionId }) {
 
 export function parseCursorFromPastSeqError(message) {
   if (typeof message !== 'string') return null;
-  const m = /past cursor (\d+)/.exec(message);
-  if (!m) return null;
-  const n = Number(m[1]);
-  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+  // ⚠️ 引擎换过文案，两种都必须认。**只认一种的代价是"整段历史无声消失"**：
+  //
+  //   旧（本函数最初针对的 DSH）：
+  //     session page through seq 9007199254740991 is past cursor 794
+  //   新（2026-11 的 DSH，实测）：
+  //     session history cut 9007199254740991 exceeds 1468
+  //
+  // 2026-11-20 的现场：手机端打开会话只看到标题、**一条消息都没有**，网关
+  // /api/mobile/sessions/history/page 返回 {"messages":[],"hasMore":false}。
+  // 原因是新文案里没有 "past cursor"，正则不匹配 → 这里回 null →
+  // readHistoryPage 当作"拿不到游标"直接返回空页。数据完好地躺在
+  // session.v4.jsonl.zstd 里，只是没人把它读出来。交付物扫描
+  // （collectSessionRecords）用的是同一个函数，所以那段时间每个会话的
+  // 交付物列表其实也是空的 —— 一处文案漂移，两个功能同时静默失效。
+  //
+  // 第二条正则要求 "history/cut/seq" 之类的上下文，是为了不把
+  // "DSH RPC ... response exceeds 1048576 bytes" 这类无关错误里的数字
+  // 当成游标：宁可回 null（调用方退到兜底），也不能给出一个错的游标
+  // —— 错的游标会让页面从中间截断，比空页面更难被发现。
+  const patterns = [
+    /past cursor (\d+)/,
+    /(?:history|cut|through[ _]?seq|seq)[^\n]{0,120}?exceeds (\d+)/i
+  ];
+  for (const re of patterns) {
+    const m = re.exec(message);
+    if (!m) continue;
+    const n = Number(m[1]);
+    if (Number.isSafeInteger(n) && n >= 0) return n;
+  }
+  return null;
 }
 
 /** Messages per page. Only `user/message`/`assistant/message` count toward it. */
