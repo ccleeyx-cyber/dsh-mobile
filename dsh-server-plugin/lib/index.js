@@ -148,20 +148,29 @@ try {
 }
 
 const name = 'dsh-mobile-access';
-// [fix 2026-10-15] 只声明 `connection`，**去掉 `webServer`**。
+// [fix 2026-11-20] `webServer` **必须注入**，这是本插件最容易踩的坑，两次都栽在它身上：
 //
-// 为什么必须去掉：本插件不注入 webServer，就无法在本fiber 里访问它。Cordis 的
-// ctx 是 Proxy，未声明的服务一访问就抛 `cannot get property "webServer" without
-// inject`（cordis/lib/index.js:675）—— 而且这个抛出发生在 apply() 里，于是整个
-// apply 中断，installRpc() 从未被调用，浏览器里所有 RPC 落进 SPA fallback 回
-// 405，设备列表与配对码一起失效，而 3088 网关因为端口早已 bind 仍在监听。
+//   * 2026-10-15 的错法：`inject = ['connection']`，却在 apply() 里读 `ctx.webServer`。
+//     Cordis 的 ctx 是 Proxy，未声明的服务一访问就抛
+//     `cannot get property "webServer" without inject`（cordis/lib/index.js:675），
+//     而这个抛出发生在 apply() 里 → 整个 apply 中断 → installRpc() 从未被调用 →
+//     浏览器里所有 RPC 落进 SPA fallback 回 405，设备列表与配对码一起失效。
+//   * 当时的"修复"是把 inject 保持成只声明 connection、再用 try/catch 把读取包住。
+//     这样确实不再崩，但 `readWebServerPort()` 永远失败，引擎端口静默落回写死的
+//     **3080**。旧版 DSH 引擎恰好固定在 3080，所以看不出问题。
+//   * 2026-11-20 的现场：新版 DSH 的引擎端口是**动态**的（实测 60940），3080 上根本
+//     没人监听 → 所有 `callDshRpc` 连接被拒 → 手机上打开会话只有标题、**一条消息
+//     都没有**，且 HTTP 仍是 200（失败被各路由 swallow 成空数组）。同时暴露的还有
+//     交付物列表、队列等一切依赖 RPC 的面板 —— 而 workspace 列表因为读的是引擎写在
+//     磁盘上的投影快照，照常显示，极容易让人误判成"同步问题"而不是"端口问题"。
 //
-// 而它其实并不需要 webServer：引擎端口取自 internals/config/默认值 3080，
-// readWebServerPort() 只是可选增强，取不到就退回 3080，行为完全正确。
+// 正确写法就是把 `webServer` 真的声明进来。同一份 DSH 里的 dsh-pocket-fork 与
+// dsh-genui 都是 `inject = ['connection', 'webServer']` / `['systemPrompt','webServer']`，
+// 说明该服务在本版存在且可用。
 //
-// 保留 `connection` 是必须的 —— installRpc() 要用它注册 RPC 通道，没有它设置页
+// 保留 `connection` 同样是必须的 —— installRpc() 要用它注册 RPC 通道，没有它设置页
 // 的 devices/list 与 pair/qrdata 一律 405。
-const inject = ['connection'];
+const inject = ['connection', 'webServer'];
 
 /**
  * HMAC secret used to mint the signed cookie that lets the bridge talk to the
@@ -325,7 +334,22 @@ export function apply(ctx, config = {}, internals = {}) {
   // （index.js 那条 `node index.js` 路径）显式传入。ctx.webServer 只是锦上添花，
   // 拿不到就用下面的兜底 —— 为了一个可有可无的值把整个插件的 RPC 通道搭进去不划算。
   const webServerPort = readWebServerPort(ctx, logger);
-  const dshPort = internals.dshPort ?? config.dshPort ?? webServerPort ?? 3080;
+  // 优先级：显式入口（独立网关）> 插件配置 > **运行时 config.json** > webServer > 3080。
+  // 加上 cfg.dshPort（~/.dsh/mobile-bridge/config.json）是因为它是唯一用户**可以自己
+  // 改、而且改完立刻生效**的逃生口：万一某个 DSH 版本既不注入 webServer、引擎端口
+  // 又不在默认值上，用户手填一个数字就能自救，不必等我发新版。
+  const dshPort = internals.dshPort ?? config.dshPort ?? cfg.dshPort ?? webServerPort ?? 3080;
+  // 兜底值 3080 不再静默。**这条日志是本次事故唯一的可见证据**：当端口取不到时，
+  // 3088 网关照样监听、/api/mobile/workspaces 照样能回磁盘快照，只有真正需要
+  // 跟引擎对话的接口（会话历史、交付物、队列…）全空 —— 没有这条日志的话，
+  // 排查会一路跑偏到"App 同步逻辑"上去（2026-11-20 实际就这么偏了一轮）。
+  if (internals.dshPort == null && config.dshPort == null && cfg.dshPort == null && webServerPort == null) {
+    logger.warn?.(
+      'dsh-mobile-bridge: 引擎端口未知，回退 3080。若本机 DSH 用的是动态端口，' +
+      '则所有 RPC 接口（会话历史/交付物/队列）都会失败而 HTTP 仍返回 200。' +
+      '请确认 webServer 已注入，或在 ~/.dsh/mobile-bridge/config.json 显式设置 dshPort。'
+    );
+  }
   const listenPort = internals.port ?? config.port ?? cfg.port ?? 3088;
   // Security default: loopback only.
   //
