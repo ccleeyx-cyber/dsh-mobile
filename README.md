@@ -137,6 +137,9 @@ CocoaPods 用的 Ruby 版本 / 代理会把 `flutter test` 打红），见
 - **iOS 没有前台服务**：`startForeground` 如实返回 `false`，后台提醒走服务端
   ntfy 推送，WS 长连接只在 App 前台保持。
 - 签名与上架需要 Apple 开发者账号，步骤见该文档 §六。
+- **CI**：`.github/workflows/build-ios.yml` 在 push 到 main / PR / 手动触发时构建
+  未签名与 ad-hoc 两个 IPA，成功后挂到对应版本的 Release。它**刻意不做签名分发**
+  —— 证书和 provisioning profile 不该进公开仓库的 secrets，理由见该文件头部注释。
 
 ---
 

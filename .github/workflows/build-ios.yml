@@ -1,0 +1,228 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+# 与 build-apk.yml 同样的最小权限：只有 release job 需要写。
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ════════════════════════════════════════════════════════════════════════════
+# 为什么这条流水线只产出**未签名 / ad-hoc 伪签名**的 IPA
+#
+# iOS 不能像 Android 那样"打个包谁都能装"。正经分发只有三条路：App Store、
+# TestFlight/Ad Hoc（都要付费开发者账号 + 证书 + provisioning profile）、
+# 或企业签（要企业账号）。
+#
+# 本仓库是公开仓库，**不适合**把开发者证书塞进 secrets：
+#   · 证书一旦泄露，任何人都能用你的开发者身份签名恶意 App；
+#   · Ad Hoc 的 provisioning profile 绑定设备 UDID，每加一台手机就要改一次；
+#   · 公开仓库的 fork PR 无法访问 secrets，那条路径永远只能构建未签名包 ——
+#     两条路径产出不同形态的产物，比只有一条更麻烦。
+#
+# 所以这里刻意只做"验证能编过 + 产出可自签安装的包"，定位与 APK 不同：
+#   · 越狱设备：AppSync Unified 直接装 `-unsigned.ipa`，永久有效；
+#   · 非越狱设备：用 Xcode 配自己的 Team 跑 `flutter run`，或自行签名后装。
+# 真要上架/TestFlight，见 docs/2026-11-20-iOS-落地实现.md §六（签名步骤），
+# 那一步天然需要本地机器上的证书，不该塞进 CI。
+# ════════════════════════════════════════════════════════════════════════════
+
+jobs:
+  build:
+    name: Build Unsigned IPA
+    # macos runner 是唯一能跑 Xcode 的；GitHub 公共仓库免费额度足够这条流水线
+    # （每次约 10-15 分钟）。ubuntu runner 完全没有 iOS 工具链。
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 版本钉在 3.24.5（不是 3.24.x）：pubspec 里 speech_to_text 钉在 6.6.2 正是
+      # 因为 3.24.5 带的 plugin-loader 不支持 7.x 的 compileSdk 写法（见 pubspec 注释）。
+      # 只写 3.24.x 会让某天 3.24 分支出补丁版时悄悄换掉工具链，而 iOS 这边对
+      # Xcode/Podfile 部署目标很敏感，不值得为省几次缓存冒这个险。
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: 'stable'
+          cache: true
+
+      - name: Cache pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('dsh_mobile/pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
+
+      # CocoaPods 与 Ruby 在 GitHub 的 macos runner 上是预装的，但版本会随镜像
+      # 漂移。这条 step 只做"报一下版本 + 断言 pod 存在"，失败时能立刻看出是
+      # 环境问题而不是我们的代码问题 —— 缺了它，`flutter build ios` 会以
+      # "CocoaPods not installed" 的形式埋在几百行日志中间。
+      - name: Report iOS toolchain
+        run: |
+          set -euo pipefail
+          echo "--- Xcode ---"; xcodebuild -version
+          echo "--- CocoaPods ---"; pod --version
+          echo "--- Ruby ---"; ruby -v
+          echo "--- 最低支持的部署目标（低于 15.0 会在 build 阶段报 Target Integrity）---"
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # 版本真源仍是 dsh_mobile/pubspec.yaml，解析逻辑只有 scripts/app-version.mjs
+      # 一份（与 APK 流水线同一个脚本、同一套输出）。
+      - name: Read version from pubspec.yaml
+        id: ver
+        run: node scripts/app-version.mjs --github-output
+
+      - name: flutter pub get
+        working-directory: ./dsh_mobile
+        run: flutter pub get
+
+      # 与 APK 流水线同一套门槛：iOS 也是同一个 Dart 代码库，静态检查与单测
+      # 必须同样过关，否则"Android 绿、iOS 红"会变成常态。
+      - name: Analyze Flutter
+        working-directory: ./dsh_mobile
+        run: flutter analyze --fatal-warnings
+
+      - name: Test Flutter
+        working-directory: ./dsh_mobile
+        run: flutter test
+
+      # 版本真源仍是 dsh_mobile/pubspec.yaml，解析逻辑只有 scripts/app-version.mjs
+      # 一份。三个 --dart-define 与 APK 那条流水线完全同源 —— 漏传会退回
+      # lib/models/app_version.dart 的兜底默认值。
+      #
+      # 注意 packageName 这里**不用**脚本从 android/app/build.gradle 解析出来的
+      # com.example.dsh_mobile，而是 iOS 自己的 bundle id（com.example.dshMobile）。
+      # 两者只是占位名前缀相同、并不是同一个标识：App 侧拿它校验 latest.json
+      # 是不是给本应用的，而 iOS 上根本没有 APK 更新动线（见 UpdateService.
+      # apkUpdatesSupported），填 iOS 的真实 bundle id 才是诚实的值。
+      - name: Build iOS (Release, no codesign)
+        working-directory: ./dsh_mobile
+        run: |
+          set -euo pipefail
+          flutter build ios --release --no-codesign \
+            --dart-define=APP_VERSION=${{ steps.ver.outputs.version }} \
+            --dart-define=APP_BUILD=${{ steps.ver.outputs.build }} \
+            --dart-define=APP_PACKAGE_NAME=com.example.dshMobile
+
+      # 打成 .ipa 只是把 Runner.app 放进 Payload/ 再 zip —— iOS 的 IPA 本质就是
+      # 这个结构，没有额外的清单文件。
+      #
+      # 两个变体是给两种安装方式用的（见文件头的说明）：
+      #   · unsigned：AppSync Unified（越狱）直接装，永久有效；
+      #   · adhoc   ：`codesign -s -` 伪签名。某些 AppSync 版本/越狱形态要求
+      #               二进制里至少有 CodeDirectory 结构，否则装完点图标闪退。
+      #               先用 unsigned，闪退就换 adhoc —— 这个顺序别倒过来。
+      - name: Package IPA (unsigned + ad-hoc)
+        working-directory: ./dsh_mobile
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          test -d "$APP" || { echo "::error title=缺少构建产物::找不到 $APP"; exit 1; }
+
+          # 断言版本真的进包了。--no-codesign 的构建里 Info.plist 的版本来自
+          # pubspec（经 Generated.xcconfig 注入），与 --dart-define 是两条独立
+          # 通路 —— 这里显式核对一次，避免发出一个"版本号看起来没变"的包。
+          PLIST_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")
+          PLIST_BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist")
+          echo "Info.plist: $PLIST_VER ($PLIST_BUILD)"
+
+          OUT="dist"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+
+          rm -rf /tmp/ipa-u /tmp/ipa-a
+          mkdir -p /tmp/ipa-u/Payload /tmp/ipa-a/Payload
+          cp -R "$APP" /tmp/ipa-u/Payload/
+          cp -R "$APP" /tmp/ipa-a/Payload/
+
+          ( cd /tmp/ipa-u && zip -qry "$GITHUB_WORKSPACE/dsh_mobile/$OUT/dsh-mobile-$PLIST_VER-ios-unsigned.ipa" Payload )
+
+          codesign --force --deep --sign - /tmp/ipa-a/Payload/Runner.app
+          codesign -dv /tmp/ipa-a/Payload/Runner.app 2>&1 | head -3 || true
+          ( cd /tmp/ipa-a && zip -qry "$GITHUB_WORKSPACE/dsh_mobile/$OUT/dsh-mobile-$PLIST_VER-ios-adhoc.ipa" Payload )
+
+          ls -lh "$OUT"
+          # if-no-files-found: error 已经能兜住空目录，但这里再断言一次大小非零，
+          # 免得 zip 因为隐藏错误产出一个合法的空壳包。
+          for f in "$OUT"/*.ipa; do
+            test -s "$f" || { echo "::error title=空的 IPA::$f"; exit 1; }
+          done
+
+      - name: Upload IPA Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-mobile-ios-${{ github.run_number }}
+          path: dsh_mobile/dist/*.ipa
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: Attach IPA to GitHub Release
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Read version from pubspec.yaml
+        id: ver
+        run: node scripts/app-version.mjs --github-output
+
+      - name: Download IPA artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dsh-mobile-ios-${{ github.run_number }}
+          path: dist
+
+      # ⚠️ 这里**不创建** release，而是等 build-apk.yml 的 release job 把它建出来
+      # 再挂资产。原因：同一次 push 会同时触发两条流水线，谁先跑完不确定。
+      # 如果这边抢先 create，正文会是空的（CHANGELOG 提取逻辑在 APK 那边），
+      # 随后 APK 那边又会 upsert 同一个 tag，两边互相覆盖。
+      #
+      # 所以：轮询等它出现（最多 ~10 分钟）。等不到就明确告警退出 0 —— 不 fail，
+      # 因为 IPA 已经在 artifacts 里了，release 缺失是 APK 那条线的问题，
+      # 不该让两个 job 一起红。
+      - name: Wait for the release created by build-apk.yml
+        id: wait
+        run: |
+          set -uo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          for i in $(seq 1 40); do
+            if gh release view "v$VERSION" >/dev/null 2>&1; then
+              echo "release v$VERSION 已就绪（第 $i 次检查）"
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::warning title=Release 未出现::等了约 10 分钟仍没有 v$VERSION。IPA 已作为 artifact 保留（dsh-mobile-ios-${{ github.run_number }}），可手工 gh release upload。"
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPAs to the release
+        if: steps.wait.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          # --clobber：同一版本号重复 push 会重建 release，资产要覆盖而不是报
+          # "asset already exists"，与 APK 那边的行为保持一致。
+          gh release upload "v$VERSION" dist/*.ipa --clobber
+          echo "--- 当前资产 ---"
+          gh release view "v$VERSION" --json assets \
+            --jq '.assets[] | "\(.name)  \(.size/1048576*10|floor/10)MB"'
