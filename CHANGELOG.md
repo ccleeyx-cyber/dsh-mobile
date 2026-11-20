@@ -7,6 +7,71 @@
 
 ---
 
+## [1.39.17] - 2026-11-20
+
+### 新功能：iPhone 版
+
+仓库此前只有 `android/` 平台工程，iOS 版完全不存在。本次补齐并验证构建通过
+（`flutter build ios --no-codesign` 的 debug 与 release 均出包）。
+
+- 新增 `dsh_mobile/ios/`：部署目标 **15.0**（Xcode 27 的 iOS 27 SDK 最低只支持 15.0，
+  留 Flutter 默认的 12.0 会报 Target Integrity 且报错指向 `Pods.xcodeproj`），
+  `Podfile` 加 `post_install` 把各 pod 自己的部署目标也抬到 15.0。
+- 新增 `ios/Runner/PlatformBridge.swift`：七个 MethodChannel 的 Swift 实现，
+  通道名与 Android 逐字一致，**Dart 侧接口不变**。
+  - `secure` → **Keychain**（`AfterFirstUnlockThisDeviceOnly`，不进 iCloud、不随备份迁移）。
+    iOS 有系统级按应用隔离的凭据存储，所以这一侧不需要像 Android 那样手写 AES/GCM。
+  - `url` / `file` / `deeplink` → 等价实现（`file` 走系统分享面板，处理了 iPad
+    popover 锚点与交付物文件名清洗）。
+  - `foreground` → **如实返回 false**：iOS 没有前台服务，后台音频/voip 保活会被
+    审核拒，`beginBackgroundTask` 只买到约 30 秒。离线提醒改由服务端 ntfy 推送承担，
+    因此也刻意不声明任何 `UIBackgroundModes`。
+  - `share` / `widget` → 需独立 Xcode target（Share Extension / WidgetKit Extension），
+    本版未做，如实回 `nil` / `false`，不回假成功。
+- `Info.plist` 补齐麦克风/语音识别/相册/相机/相册写入五条用途串（缺了 iOS 直接
+  SIGABRT）、ATS 放开明文（网关是用户自填的内网地址）、`dshmobile` scheme。
+- `scripts/make-ios-app-icons.py`：从项目自己的 1024 母版生成 iOS 全套 19 个图标
+  （强制去 alpha、不烘圆角、按 Contents.json 反查校验），与 Android 各档 mipmap 同源。
+
+### 修复：iOS 上三处只在真机才会暴露的问题
+
+- **通知权限在 iOS 上恒为"已授权"**：原代码只调
+  `resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()`，
+  iOS 上返回 null，于是 `granted ?? true` 恒真 —— 用户点"不允许"后 App 仍认为一切
+  正常，界面一句提示都没有。改为按平台分支，iOS 用 `checkPermissions()`，并在
+  `initialize()`（触发授权弹窗）之后**再查一次**才能拿到真实选择。
+- **iOS 上会去下载并"安装"APK**：`UpdateService` 整条动线是 Android 的发布形态。
+  新增 `apkUpdatesSupported`，在 `check` / `download` / `handToSystemInstaller`
+  三处拦截；设置页改显示「iOS 版通过 App Store 更新」。
+- **User-Agent 把平台写死成 Android**：改为按 `defaultTargetPlatform` 取真值
+  （不用 `Platform.isIOS`，否则 widget 测试里跟着宿主机走，iOS 分支测不到）。
+
+### 修复：手机端会话历史全空（两个叠在一起的网关 bug）
+
+现象：手机上打开会话只看到标题，**里面一条消息都没有**。`history/page` 返回
+`{"messages":[],"hasMore":false,"oldestSeq":null}`，HTTP **200**、不报错。
+
+1. **引擎游标报错文案换代**：插件用 `/past cursor (\d+)/` 从引擎拒绝信息里抠
+   会话游标，而当前引擎已改成 `session history cut N exceeds M`，正则不匹配 →
+   回 null → 历史页直接返回空。现同时认两种文案（第二条要求带 `history/cut/seq`
+   上下文，避免把 `response exceeds …` 这类无关错误的数字当游标）。
+2. **引擎端口静默回落到 3080**：`inject = ['connection']` 没有注入 `webServer`，
+   `ctx.webServer?.port` 一读就抛（cordis 的 ctx 是 Proxy），被 try/catch 吞掉 →
+   端口回落到写死的 3080。旧版 DSH 引擎恰好在 3080 所以没显形；**桌面版 DSH 的
+   引擎端口是动态的**（实测 50760 / 60940 / 61400），3080 上无人监听 → 所有
+   `callDshRpc` 连接被拒 → 历史、交付物、队列全部静默为空。而 `/workspaces` 读的是
+   磁盘投影快照、不走 RPC，所以标题照常显示，极易误判成 App 的同步问题。
+   现改回 `inject = ['connection', 'webServer']`（同仓 `dsh-pocket-fork` /
+   `dsh-genui` 均如此且工作正常），并新增 `cfg.dshPort` 逃生口
+   （`~/.dsh/mobile-bridge/config.json`）与端口回落时的 warn 日志。
+
+> 两个 bug 症状完全一致（空历史 + HTTP 200 + 不报错），修掉任一个都不够。
+
+### 网关 1.18.1
+
+- 上述两个网关修复（游标文案、引擎端口注入），`BRIDGE_VERSION` 同步到 `1.18.1`。
+- 新增回归测试锁死新旧两种游标报错文案，并覆盖"无关错误不许误判"。
+
 ## [1.39.16] - 2026-11-18
 
 ### 修复：全库搜索搜英文没有结果
